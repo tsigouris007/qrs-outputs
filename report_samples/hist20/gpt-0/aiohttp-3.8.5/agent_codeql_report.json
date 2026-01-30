@@ -1,0 +1,672 @@
+{
+  "session_id": "20260118011055",
+  "package_name": "aiohttp-3.8.5",
+  "package_path": "packages/aiohttp-3.8.5",
+  "database_path": "databases/aiohttp-3.8.5-db",
+  "model": "gpt-5.1",
+  "temperature": 0.0,
+  "max_tokens": 8000,
+  "iterations": 14,
+  "total_input_tokens": 155080,
+  "total_output_tokens": 9822,
+  "total_tokens": 164902,
+  "elapsed_time_seconds": 449.64,
+  "estimated_cost_usd": 0.4089,
+  "summary": "## Package\n- **Name:** aiohttp\n- **Version analyzed:** 3.8.5 (as packaged in the provided environment)\n- **Type:** Async HTTP client/server framework (asyncio)\n\n## Scope and Focus\nAnalysis was focused on HTTP header parsing and validation, with emphasis on RFC 9110 and RFC 9112 compliance and potential request smuggling vectors:\n- Content-Length parsing and validation (CWE-444, CWE-436)\n- Header value forbidden characters (CR, LF, NUL) (CWE-444, CWE-436)\n- Header field name format and whitespace handling around ':' (CWE-444, CWE-436)\n\nTools used:\n- CodeQL custom queries targeting aiohttp\u2019s HTTP parsing and header handling code paths.\n\n## Key Findings\n\n### 1. Content-Length parsed with `int()` without explicit digit validation\n- **Location:** `aiohttp/helpers.py`, around line 788\n- **Pattern detected:**\n  - A variable named `content_length` is passed directly to Python\u2019s built-in `int()` constructor.\n  - The CodeQL query specifically matched calls of the form `int(content_length)` where the argument expression name indicates it is a Content-Length value.\n  - No preceding character-by-character validation (such as `.isdigit()` or equivalent strict digit-only check) was detected in the immediate expression.\n- **Security relevance:**\n  - RFC 9110 \u00a78.6 requires Content-Length to be a decimal number consisting only of ASCII digits.\n  - Using `int()` directly on a header-derived string can accept forms that are not strictly compliant (e.g., leading `+`, leading/trailing whitespace, possibly other non-digit forms depending on how the string is normalized before this call).\n  - If a front-end proxy or intermediary enforces stricter RFC-compliant parsing while aiohttp\u2019s backend accepts more permissive forms, this can create an interpretation discrepancy (CWE-444 / CWE-436) and contribute to HTTP request smuggling scenarios.\n- **Impact:**\n  - Potential for inconsistent interpretation of request body length between aiohttp and other components in a chain.\n  - In certain deployment topologies (e.g., behind strict RFC-compliant reverse proxies), this discrepancy can be exploitable for request smuggling.\n- **Severity:** **High** in environments where aiohttp is behind or in front of other HTTP components with stricter parsing; otherwise **Medium**.\n- **CWE:**\n  - CWE-444: Inconsistent Interpretation of HTTP Requests\n  - CWE-436: Interpretation Conflict\n- **Recommendation:**\n  - Before converting Content-Length to an integer, validate that the header value consists **only** of ASCII digits (`0-9`) and reject any value containing `+`, `-`, whitespace, underscores, or other non-digit characters.\n  - Consider a dedicated parsing routine that enforces RFC 9110 semantics explicitly rather than relying on `int()`\u2019s permissive behavior.\n\n### 2. Header value setting without explicit CR/LF/NUL filtering\n- **Locations (representative matches):**\n  - `aiohttp/client.py` around line 911\n  - `aiohttp/client_reqrep.py` around lines 407, 418, 878, 882, 884\n  - `aiohttp/connector.py` around line 879\n  - `aiohttp/helpers.py` around line 360\n  - `aiohttp/http_parser.py` around line 211\n  - `aiohttp/web_request.py` around lines 738, 744, 746\n  - `aiohttp/web_response.py` around line 448\n- **Pattern detected:**\n  - Multiple call sites where header values are set or manipulated (e.g., building request/response headers, copying or normalizing headers) without explicit, local filtering of forbidden characters: carriage return (CR, `\\r`), line feed (LF, `\\n`), or NUL (`\\x00`).\n  - The CodeQL query flagged these as locations where header values are accepted or propagated without visible CR/LF/NUL sanitization in the same expression.\n- **Security relevance:**\n  - RFC 9110 \u00a75.5 and related sections require that header field values not contain raw CR/LF that would create additional header lines or prematurely terminate the header section.\n  - If user-controlled input can reach these header-setting APIs without prior global sanitization, an attacker may be able to inject CR/LF sequences into header values.\n  - This can lead to:\n    - HTTP response/request splitting\n    - Confusion about where headers end and body begins\n    - Request smuggling when different components in the chain treat such malformed headers differently.\n- **Impact:**\n  - The actual exploitability depends on upstream validation and how user input is mapped into these header values.\n  - The flagged sites are **hotspots** where missing or non-obvious sanitization should be carefully reviewed.\n- **Severity:** **Medium** (potentially **High** if user input can directly populate these headers without prior sanitization).\n- **CWE:**\n  - CWE-444: Inconsistent Interpretation of HTTP Requests\n  - CWE-436: Interpretation Conflict\n- **Recommendation:**\n  - Ensure that any path that constructs or sets header values enforces a strict character set, explicitly rejecting or normalizing CR (`\\r`), LF (`\\n`), and NUL (`\\x00`).\n  - Centralize header value validation in a single utility and use it consistently across client and server code paths.\n  - Add tests that verify rejection of headers containing forbidden characters and confirm consistent behavior with RFC 9110.\n\n### 3. No evidence of header-name whitespace normalization before ':'\n- **Pattern tested:**\n  - CodeQL queries looked for patterns where header field names are stripped (e.g., `.strip()`, `.lstrip()`) before splitting on `':'`.\n- **Result:**\n  - No matches were found for the specific pattern of `strip`/`lstrip` on header names immediately before splitting on `':'`.\n- **Interpretation:**\n  - Within the limits of the queries used, aiohttp does not appear to normalize header field names by stripping whitespace before the colon in a way that would obviously violate RFC 9112 \u00a75.1.\n  - This reduces the likelihood of certain whitespace-based header smuggling vectors, though a full manual review of the C-extensions or non-Python parsing code (if any) would be needed for absolute assurance.\n\n### 4. Content-Length non-digit pattern search\n- **Pattern tested:**\n  - A query attempted to find assignments to variables named like `content_length` where the right-hand side expression contained `+`, `_`, or `-` characters, suggesting acceptance of non-digit forms.\n- **Result:**\n  - The more advanced syntactic query could not be automatically fixed by the helper and was not executed successfully.\n  - However, the `int(content_length)` finding (Finding #1) already indicates that Content-Length parsing relies on `int()` without strict digit-only validation, which is the core concern.\n\n## Overall Assessment\n- aiohttp 3.8.5 contains at least one concrete pattern where **Content-Length** is parsed using `int()` without explicit digit-only validation. This is a potential RFC 9110 violation and can contribute to **HTTP request smuggling** in certain deployment scenarios (CWE-444, CWE-436).\n- Multiple header value handling sites do not show local CR/LF/NUL filtering, and should be reviewed to ensure that either:\n  - upstream validation guarantees forbidden characters cannot reach these points, or\n  - explicit sanitization is added.\n- No strong evidence was found of header-name whitespace normalization before `':'`, which is positive with respect to RFC 9112 \u00a75.1, but this conclusion is limited to the Python-level code analyzed.\n\n## Recommendations for Maintainers\n1. **Harden Content-Length parsing**\n   - Implement a dedicated Content-Length parser that:\n     - Rejects any value containing characters outside `0-9`.\n     - Rejects leading `+` or `-`, underscores, embedded spaces, or other non-digit characters.\n   - Use this parser instead of directly calling `int()` on header-derived strings.\n\n2. **Centralize and enforce header value sanitization**\n   - Introduce a shared utility for validating header values that:\n     - Rejects CR (`\\r`), LF (`\\n`), and NUL (`\\x00`).\n     - Optionally enforces a stricter subset of visible ASCII as per RFC 9110.\n   - Apply this utility consistently in:\n     - `aiohttp/client.py`\n     - `aiohttp/client_reqrep.py`\n     - `aiohttp/connector.py`\n     - `aiohttp/helpers.py`\n     - `aiohttp/http_parser.py`\n     - `aiohttp/web_request.py`\n     - `aiohttp/web_response.py`\n\n3. **Add regression tests for RFC compliance**\n   - Tests for Content-Length:\n     - Ensure that values like `+10`, `-0`, `01`, `0_2`, `10\\r`, `10\\n` are rejected.\n   - Tests for header values:\n     - Ensure that any header containing CR/LF/NUL is rejected or normalized in a way that cannot create additional header lines.\n\n4. **Document parsing behavior**\n   - Clearly document aiohttp\u2019s HTTP parsing rules and how they align with RFC 9110/9112.\n   - This helps operators reason about interoperability with proxies, load balancers, and other intermediaries.\n\n## Classification\n- **Primary package classification:**\n  - Type: `library`, `framework`\n  - Layer: `network`, `http`, `application`",
+  "package_classification": {
+    "type": [
+      "library",
+      "framework"
+    ],
+    "layer": [
+      "network",
+      "http",
+      "application"
+    ]
+  },
+  "tool_calls": {
+    "get_package_profile_info": 1,
+    "execute_codeql_query": 14,
+    "validate_codeql_query": 0,
+    "fixup_codeql_query": 5,
+    "finalize_report": 1
+  },
+  "queries_executed": {
+    "critical": 0,
+    "high": 9,
+    "medium": 1,
+    "low": 0,
+    "total_executed": 17,
+    "total_with_results": 10,
+    "total_failed": 11
+  },
+  "query_findings": {
+    "critical": 0,
+    "high": 16,
+    "medium": 0,
+    "low": 0,
+    "total": 16
+  },
+  "findings": [
+    {
+      "codeql_query_uuid": "20260118011210",
+      "codeql_raw_query": "/**\n * @name Direct int() usage on Content-Length header without digit validation\n * @description Finds places where the Content-Length header is parsed using int() without prior character-level validation, which may violate RFC 9110 and enable request smuggling.\n * @kind problem\n * @problem.severity warning\n * @id py/aiohttp-content-length-int-without-validation\n * @tags security\n *       external/cwe/cwe-444\n *       external/cwe/cwe-436\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode intCall, Expr headerExpr\nwhere\n  intCall = API::builtin(\"int\").getACall() and\n  headerExpr = intCall.getArg(0).asExpr() and\n  headerExpr.toString().regexpMatch(\"(?i)content[-_]?length\")\nselect intCall, \"Content-Length parsed with int() without explicit digit validation: \" + headerExpr.toString()",
+      "hypothesis": "aiohttp parses Content-Length using int() directly on header values without strict digit validation, violating RFC 9110 and enabling request smuggling.",
+      "severity": "high",
+      "cwe_ids": [
+        "cwe-444",
+        "cwe-436"
+      ],
+      "results_count": 1,
+      "results": [
+        {
+          "ruleId": "py/aiohttp-content-length-int-without-validation",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/aiohttp-content-length-int-without-validation",
+            "index": 0
+          },
+          "message": {
+            "text": "Content-Length parsed with int() without explicit digit validation: content_length"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "aiohttp/helpers.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 788,
+                  "startColumn": 20,
+                  "endColumn": 39
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "faf5527da3a77ec5:1",
+            "primaryLocationStartColumnFingerprint": "7"
+          }
+        }
+      ]
+    },
+    {
+      "codeql_query_uuid": "20260118011226",
+      "codeql_raw_query": "/**\n * @name Header name whitespace stripping before colon\n * @description Detects uses of strip/lstrip on header field names before splitting on ':', which violates RFC 9112 header field syntax and may cause request smuggling.\n * @kind problem\n * @problem.severity warning\n * @id py/aiohttp-header-name-strip-before-colon\n * @tags security\n *       external/cwe/cwe-444\n *       external/cwe/cwe-436\n */\n\nimport python\n\nfrom Call stripCall, Expr recv, Expr arg\nwhere\n  stripCall.getFunc() instanceof Attribute and\n  recv = stripCall.getFunc().(Attribute).getObject() and\n  stripCall.getFunc().(Attribute).getName().matches(\"%strip%\") and\n  arg = stripCall.getArg(0) and\n  arg.toString().regexpMatch(\":\")\nselect stripCall, \"Potential header name whitespace stripping before colon, which should be rejected per RFC 9112.\"",
+      "hypothesis": "aiohttp strips whitespace from header field names before the colon, violating RFC 9112 and enabling request smuggling.",
+      "severity": "high",
+      "cwe_ids": [
+        "cwe-444",
+        "cwe-436"
+      ],
+      "results_count": 0,
+      "results": []
+    },
+    {
+      "codeql_query_uuid": "20260118011302",
+      "codeql_raw_query": "/**\n * @name Forbidden CR/LF/NUL characters allowed in header values\n * @description Finds header value processing that does not filter CR (\\r), LF (\\n), or NUL (\\x00) characters, which violates RFC 9110 and may enable request smuggling.\n * @kind problem\n * @problem.severity warning\n * @id py/aiohttp-header-forbidden-chars\n * @tags security\n *       external/cwe/cwe-444\n *       external/cwe/cwe-436\n */\n\nimport python\n\nfrom Call headerSetCall, Expr value\nwhere\n  headerSetCall.getFunc() instanceof Attribute and\n  headerSetCall.getFunc().(Attribute).getName() in [\"__setitem__\", \"add\", \"append\", \"update\"] and\n  value = headerSetCall.getArg(1) and\n  not value.toString().regexpMatch(\"\\\\\\r|\\\\\\n|\\\\x00\")\nselect headerSetCall, \"Header value is set without explicit filtering of CR/LF/NUL characters; verify RFC 9110 compliance.\"",
+      "hypothesis": "Look for header value assignments that lack explicit CR/LF/NUL filtering.",
+      "severity": "high",
+      "cwe_ids": [
+        "cwe-444",
+        "cwe-436"
+      ],
+      "results_count": 13,
+      "results": [
+        {
+          "ruleId": "py/aiohttp-header-forbidden-chars",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/aiohttp-header-forbidden-chars",
+            "index": 0
+          },
+          "message": {
+            "text": "Header value is set without explicit filtering of CR/LF/NUL characters; verify RFC 9110 compliance."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "aiohttp/client.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 911,
+                  "startColumn": 21,
+                  "endColumn": 43
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "b4b7cff5f424b996:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "py/aiohttp-header-forbidden-chars",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/aiohttp-header-forbidden-chars",
+            "index": 0
+          },
+          "message": {
+            "text": "Header value is set without explicit filtering of CR/LF/NUL characters; verify RFC 9110 compliance."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "aiohttp/client_reqrep.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 1
+                },
+                "region": {
+                  "startLine": 407,
+                  "startColumn": 21,
+                  "endColumn": 49
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "67b86974bec37422:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "py/aiohttp-header-forbidden-chars",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/aiohttp-header-forbidden-chars",
+            "index": 0
+          },
+          "message": {
+            "text": "Header value is set without explicit filtering of CR/LF/NUL characters; verify RFC 9110 compliance."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "aiohttp/client_reqrep.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 1
+                },
+                "region": {
+                  "startLine": 418,
+                  "startColumn": 17,
+                  "endColumn": 43
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "1f33b15ef4671d53:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "py/aiohttp-header-forbidden-chars",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/aiohttp-header-forbidden-chars",
+            "index": 0
+          },
+          "message": {
+            "text": "Header value is set without explicit filtering of CR/LF/NUL characters; verify RFC 9110 compliance."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "aiohttp/client_reqrep.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 1
+                },
+                "region": {
+                  "startLine": 878,
+                  "startColumn": 17,
+                  "endColumn": 37
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "c875d24018b3155f:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "py/aiohttp-header-forbidden-chars",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/aiohttp-header-forbidden-chars",
+            "index": 0
+          },
+          "message": {
+            "text": "Header value is set without explicit filtering of CR/LF/NUL characters; verify RFC 9110 compliance."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "aiohttp/client_reqrep.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 1
+                },
+                "region": {
+                  "startLine": 882,
+                  "startColumn": 13,
+                  "endColumn": 53
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "35a37f5aae2e5f9:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "py/aiohttp-header-forbidden-chars",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/aiohttp-header-forbidden-chars",
+            "index": 0
+          },
+          "message": {
+            "text": "Header value is set without explicit filtering of CR/LF/NUL characters; verify RFC 9110 compliance."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "aiohttp/client_reqrep.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 1
+                },
+                "region": {
+                  "startLine": 884,
+                  "startColumn": 13,
+                  "endColumn": 49
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "230cf3a8c8cca07e:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "py/aiohttp-header-forbidden-chars",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/aiohttp-header-forbidden-chars",
+            "index": 0
+          },
+          "message": {
+            "text": "Header value is set without explicit filtering of CR/LF/NUL characters; verify RFC 9110 compliance."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "aiohttp/connector.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 2
+                },
+                "region": {
+                  "startLine": 879,
+                  "startColumn": 17,
+                  "endColumn": 51
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "2f0b21732dbcbdb6:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "py/aiohttp-header-forbidden-chars",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/aiohttp-header-forbidden-chars",
+            "index": 0
+          },
+          "message": {
+            "text": "Header value is set without explicit filtering of CR/LF/NUL characters; verify RFC 9110 compliance."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "aiohttp/helpers.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 3
+                },
+                "region": {
+                  "startLine": 360,
+                  "startColumn": 9,
+                  "endColumn": 59
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "3acc6c76ee75344d:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "py/aiohttp-header-forbidden-chars",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/aiohttp-header-forbidden-chars",
+            "index": 0
+          },
+          "message": {
+            "text": "Header value is set without explicit filtering of CR/LF/NUL characters; verify RFC 9110 compliance."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "aiohttp/http_parser.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 4
+                },
+                "region": {
+                  "startLine": 211,
+                  "startColumn": 13,
+                  "endColumn": 37
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "e745c0c2a133c30d:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "py/aiohttp-header-forbidden-chars",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/aiohttp-header-forbidden-chars",
+            "index": 0
+          },
+          "message": {
+            "text": "Header value is set without explicit filtering of CR/LF/NUL characters; verify RFC 9110 compliance."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "aiohttp/web_request.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 5
+                },
+                "region": {
+                  "startLine": 738,
+                  "startColumn": 25,
+                  "endColumn": 48
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "9026151a72b0a2b7:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "py/aiohttp-header-forbidden-chars",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/aiohttp-header-forbidden-chars",
+            "index": 0
+          },
+          "message": {
+            "text": "Header value is set without explicit filtering of CR/LF/NUL characters; verify RFC 9110 compliance."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "aiohttp/web_request.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 5
+                },
+                "region": {
+                  "startLine": 744,
+                  "startColumn": 29,
+                  "endColumn": 71
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "b46d5518499d2c4f:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "py/aiohttp-header-forbidden-chars",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/aiohttp-header-forbidden-chars",
+            "index": 0
+          },
+          "message": {
+            "text": "Header value is set without explicit filtering of CR/LF/NUL characters; verify RFC 9110 compliance."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "aiohttp/web_request.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 5
+                },
+                "region": {
+                  "startLine": 746,
+                  "startColumn": 29,
+                  "endColumn": 55
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "2b6ca03c470b1700:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "py/aiohttp-header-forbidden-chars",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/aiohttp-header-forbidden-chars",
+            "index": 0
+          },
+          "message": {
+            "text": "Header value is set without explicit filtering of CR/LF/NUL characters; verify RFC 9110 compliance."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "aiohttp/web_response.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 6
+                },
+                "region": {
+                  "startLine": 448,
+                  "startColumn": 13,
+                  "endColumn": 48
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "85ff65c485f114d6:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        }
+      ]
+    },
+    {
+      "codeql_query_uuid": "20260118011445",
+      "codeql_raw_query": "/**\n * @name Direct int() usage on Content-Length header without digit validation\n * @description Finds places where the Content-Length header is parsed using int() without prior character-level validation, which may violate RFC 9110 and enable request smuggling.\n * @kind problem\n * @problem.severity warning\n * @id py/aiohttp-content-length-int-without-validation\n * @tags security\n *       external/cwe/cwe-444\n *       external/cwe/cwe-436\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode intCall, Expr headerExpr\nwhere\n  intCall = API::builtin(\"int\").getACall() and\n  headerExpr = intCall.getArg(0).asExpr() and\n  headerExpr.toString().regexpMatch(\"(?i)content[-_]?length\")\nselect intCall, \"Content-Length parsed with int() without explicit digit validation: \" + headerExpr.toString()",
+      "hypothesis": "Direct int() on Content-Length without strict digit validation (RFC 9110 violation)",
+      "severity": "high",
+      "cwe_ids": [
+        "cwe-444",
+        "cwe-436"
+      ],
+      "results_count": 1,
+      "results": [
+        {
+          "ruleId": "py/aiohttp-content-length-int-without-validation",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/aiohttp-content-length-int-without-validation",
+            "index": 0
+          },
+          "message": {
+            "text": "Content-Length parsed with int() without explicit digit validation: content_length"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "aiohttp/helpers.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 788,
+                  "startColumn": 20,
+                  "endColumn": 39
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "faf5527da3a77ec5:1",
+            "primaryLocationStartColumnFingerprint": "7"
+          }
+        }
+      ]
+    },
+    {
+      "codeql_query_uuid": "20260118011507",
+      "codeql_raw_query": "/**\n * @name HTTP header name parsing with whitespace stripping\n * @description Detects header name parsing that strips or normalizes whitespace around the colon,\n *              which violates RFC 9112 and can cause request smuggling via interpretation conflicts.\n * @kind problem\n * @problem.severity warning\n * @id py/aiohttp-header-name-whitespace-parsing\n * @tags security\n *       external/cwe/cwe-444\n *       external/cwe/cwe-436\n */\n\nimport python\n\nfrom Call splitCall, Expr recv\nwhere\n  splitCall.getFunc() instanceof Attribute and\n  recv = splitCall.getFunc().(Attribute).getObject() and\n  splitCall.getFunc().(Attribute).getName() = \"split\" and\n  splitCall.getArg(0).toString().regexpMatch(\":\") and\n  exists(Call stripCall |\n    stripCall.getFunc() instanceof Attribute and\n    stripCall.getFunc().(Attribute).getObject() = recv and\n    stripCall.getFunc().(Attribute).getName().matches(\"%strip%\")\n  )\nselect splitCall, \"Header name/value parsed from a string where whitespace is stripped before or after the colon; this may accept invalid header field syntax per RFC 9112.\"",
+      "hypothesis": "Header name parsing strips whitespace around colon, accepting invalid header syntax and enabling request smuggling.",
+      "severity": "high",
+      "cwe_ids": [
+        "cwe-444",
+        "cwe-436"
+      ],
+      "results_count": 0,
+      "results": []
+    },
+    {
+      "codeql_query_uuid": "20260118011535",
+      "codeql_raw_query": "/**\n * @name HTTP header name whitespace stripping in aiohttp\n * @description Detects potential RFC 9112 violations where header field names are stripped of whitespace before the colon.\n * @kind problem\n * @problem.severity warning\n * @id py/aiohttp-header-name-strip-before-colon-focused\n * @tags security\n *       external/cwe/cwe-444\n *       external/cwe/cwe-436\n */\n\nimport python\n\nfrom Call stripCall, Attribute attr\nwhere\n  stripCall.getFunc() = attr and\n  attr.getName().matches(\"%strip%\") and\n  // Heuristically restrict to aiohttp HTTP parsing modules\n  stripCall.getLocation().getFile().getRelativePath().regexpMatch(\"aiohttp/(http_.*|web_.*|helpers.py|web_request.py|http_parser.py)\") and\n  exists(Expr e |\n    e = stripCall.getArg(0) and\n    e.toString().regexpMatch(\":\")\n  )\nselect stripCall, \"Possible header name whitespace stripping before colon; RFC 9112 requires rejecting such fields.\"",
+      "hypothesis": "Header name parsing may strip whitespace before colon, violating RFC 9112 and enabling request smuggling.",
+      "severity": "high",
+      "cwe_ids": [
+        "cwe-444",
+        "cwe-436"
+      ],
+      "results_count": 0,
+      "results": []
+    },
+    {
+      "codeql_query_uuid": "20260118011552",
+      "codeql_raw_query": "/**\n * @name aiohttp header value acceptance of CR/LF/NUL in parsing\n * @description Finds places in HTTP parsing where header values are accepted or normalized without rejecting CR/LF/NUL characters.\n * @kind problem\n * @problem.severity warning\n * @id py/aiohttp-header-parse-forbidden-chars\n * @tags security\n *       external/cwe/cwe-444\n *       external/cwe/cwe-436\n */\n\nimport python\n\nfrom Expr e\nwhere\n  e.getLocation().getFile().getRelativePath().regexpMatch(\"aiohttp/(http_.*|web_.*|web_request.py|http_parser.py)\") and\n  e.toString().regexpMatch(\"\\\\\\r|\\\\\\n|\\\\x00\")\nselect e, \"Header parsing logic references CR/LF/NUL; verify that such characters are rejected per RFC 9110.\"",
+      "hypothesis": "Header parsing may allow CR/LF/NUL characters in header values, violating RFC 9110.",
+      "severity": "high",
+      "cwe_ids": [
+        "cwe-444",
+        "cwe-436"
+      ],
+      "results_count": 0,
+      "results": []
+    },
+    {
+      "codeql_query_uuid": "20260118011620",
+      "codeql_raw_query": "/**\n * @name HTTP header name parsing with whitespace stripping\n * @description Detects header name parsing that strips or normalizes whitespace around the colon, which may violate RFC 9112 and enable request smuggling.\n * @kind problem\n * @problem.severity warning\n * @id py/aiohttp-header-name-whitespace-parsing\n * @tags security\n *       external/cwe/cwe-444\n *       external/cwe/cwe-436\n */\n\nimport python\n\nfrom Call stripCall, Expr recv\nwhere\n  stripCall.getFunc() instanceof Attribute and\n  recv = stripCall.getFunc().(Attribute).getObject() and\n  stripCall.getFunc().(Attribute).getName().matches(\"%strip%\") and\n  recv.toString().regexpMatch(\"header\")\nselect stripCall, \"Potential header name/value whitespace stripping that may conflict with RFC 9112 parsing rules.\"",
+      "hypothesis": "Header name parsing may strip whitespace around colon, allowing invalid header fields to be accepted.",
+      "severity": "medium",
+      "cwe_ids": [
+        "cwe-444",
+        "cwe-436"
+      ],
+      "results_count": 0,
+      "results": []
+    },
+    {
+      "codeql_query_uuid": "20260118011719",
+      "codeql_raw_query": "/**\n * @name Header field name parsing that strips whitespace before colon\n * @description Detects header parsing that strips or normalizes whitespace in header field names before the ':' separator, violating RFC 9112 and potentially enabling request smuggling.\n * @kind problem\n * @problem.severity warning\n * @id py/aiohttp-header-name-whitespace-before-colon\n * @tags security\n *       external/cwe/cwe-444\n *       external/cwe/cwe-436\n */\n\nimport python\n\nfrom Call splitCall, Expr recv\nwhere\n  splitCall.getFunc() instanceof Attribute and\n  splitCall.getFunc().(Attribute).getName() = \"split\" and\n  recv = splitCall.getFunc().(Attribute).getObject() and\n  recv.toString().regexpMatch(\"strip\\\\(\\\\)\") and\n  exists(Expr arg | arg = splitCall.getArg(0) and arg.toString() = \":\")\nselect splitCall, \"Header field name appears to be stripped before splitting on ':'; invalid header syntax should be rejected, not normalized.\"",
+      "hypothesis": "Header name parsing strips whitespace before colon, violating RFC 9112 and enabling request smuggling.",
+      "severity": "high",
+      "cwe_ids": [
+        "cwe-444",
+        "cwe-436"
+      ],
+      "results_count": 0,
+      "results": []
+    },
+    {
+      "codeql_query_uuid": "20260118011736",
+      "codeql_raw_query": "/**\n * @name Direct int() usage on Content-Length header without digit validation\n * @description Finds places where the Content-Length header is parsed using int() without prior character-level validation, which may violate RFC 9110 and enable request smuggling.\n * @kind problem\n * @problem.severity warning\n * @id py/aiohttp-content-length-int-without-validation\n * @tags security\n *       external/cwe/cwe-444\n *       external/cwe/cwe-436\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode intCall, Expr headerExpr\nwhere\n  intCall = API::builtin(\"int\").getACall() and\n  headerExpr = intCall.getArg(0).asExpr() and\n  headerExpr.toString().regexpMatch(\"(?i)content[-_]?length\")\nselect intCall, \"Content-Length parsed with int() without explicit digit validation: \" + headerExpr.toString()",
+      "hypothesis": "Content-Length is parsed with int() without strict digit validation, allowing non-digit characters and violating RFC 9110.",
+      "severity": "high",
+      "cwe_ids": [
+        "cwe-444",
+        "cwe-436"
+      ],
+      "results_count": 1,
+      "results": [
+        {
+          "ruleId": "py/aiohttp-content-length-int-without-validation",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/aiohttp-content-length-int-without-validation",
+            "index": 0
+          },
+          "message": {
+            "text": "Content-Length parsed with int() without explicit digit validation: content_length"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "aiohttp/helpers.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 788,
+                  "startColumn": 20,
+                  "endColumn": 39
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "faf5527da3a77ec5:1",
+            "primaryLocationStartColumnFingerprint": "7"
+          }
+        }
+      ]
+    }
+  ]
+}

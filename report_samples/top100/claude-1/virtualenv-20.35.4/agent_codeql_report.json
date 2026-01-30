@@ -1,0 +1,825 @@
+{
+  "session_id": "20251229171332",
+  "package_name": "virtualenv-20.35.4",
+  "package_path": "packages/virtualenv-20.35.4",
+  "database_path": "databases/virtualenv-20.35.4-db",
+  "model": "claude-sonnet-4-5-20250929",
+  "temperature": 1.0,
+  "max_tokens": 8000,
+  "iterations": 19,
+  "total_input_tokens": 242001,
+  "total_output_tokens": 6822,
+  "total_tokens": 248823,
+  "elapsed_time_seconds": 350.35,
+  "estimated_cost_usd": 0.8283,
+  "summary": "## Security Analysis Summary for virtualenv-20.35.4\n\n### Overview\nAnalyzed the virtualenv package, a production-stable tool for creating isolated Python environments. The package handles file operations, subprocess execution, and zip file extraction as core functionality.\n\n### Key Findings\n\n#### 1. **Zip Slip Vulnerability (HIGH SEVERITY)** - CWE-022\n**Finding**: 2 instances of potentially unsafe zip extraction operations detected:\n- `src/virtualenv/seed/embed/via_app_data/pip_install/base.py:52` - Uses `zipfile.ZipFile.extractall()` without path validation\n- `src/virtualenv/util/zipapp.py:24` - Similar unsafe zip extraction pattern\n\n**Risk**: An attacker could craft a malicious zip file with path traversal sequences (e.g., `../../evil.py`) to write files outside the intended extraction directory, potentially achieving arbitrary file write and code execution.\n\n#### 2. **Symlink Race Conditions (MEDIUM SEVERITY)** - CWE-367\n**Finding**: 20 instances of TOCTOU (Time-of-Check-Time-of-Use) vulnerabilities where file existence is checked before operations:\n- Multiple files including `src/virtualenv/app_data/__init__.py:39`, `src/virtualenv/util/path/_sync.py:49`, and throughout `src/virtualenv/discovery/py_info.py`\n- Pattern: `os.path.exists()` checks followed by file operations without atomic guarantees\n\n**Risk**: In multi-user or concurrent environments, an attacker could exploit the race window between check and use to replace legitimate files with symlinks pointing to sensitive locations, leading to unauthorized file access or modification.\n\n#### 3. **No Remote Flow Sources Detected (POSITIVE)**\n**Finding**: No data flows from remote/untrusted sources to critical sinks (command execution, path operations, deserialization) were detected.\n\n**Conclusion**: The package appears to be designed for local execution without accepting untrusted remote input, which significantly reduces attack surface.\n\n### Additional Observations\n- No unsafe deserialization (pickle/yaml) usage found\n- No weak cryptographic algorithm usage detected\n- Subprocess usage appears to be internal without remote input flows\n- The codebase follows reasonable security practices for a local development tool\n\n### Recommendations\n1. **HIGH PRIORITY**: Implement path validation for zip extraction operations using `os.path.commonpath()` or similar to prevent zip slip attacks\n2. **MEDIUM PRIORITY**: Use atomic file operations or proper locking mechanisms to mitigate symlink race conditions\n3. Consider input validation if the tool is extended to accept remote configurations or downloads\n\n### Package Classification\n- **Type**: CLI tool and library\n- **Layer**: Development tooling\n- **Risk Level**: Medium (local execution context reduces severity of findings)",
+  "package_classification": {
+    "type": [
+      "cli_tool",
+      "library"
+    ],
+    "layer": [
+      "dev_tool",
+      "infrastructure"
+    ]
+  },
+  "tool_calls": {
+    "get_package_profile_info": 1,
+    "execute_codeql_query": 10,
+    "validate_codeql_query": 0,
+    "fixup_codeql_query": 2,
+    "finalize_report": 1
+  },
+  "queries_executed": {
+    "critical": 2,
+    "high": 3,
+    "medium": 3,
+    "low": 0,
+    "total_executed": 12,
+    "total_with_results": 8,
+    "total_failed": 3
+  },
+  "query_findings": {
+    "critical": 0,
+    "high": 2,
+    "medium": 20,
+    "low": 0,
+    "total": 22
+  },
+  "findings": [
+    {
+      "codeql_query_uuid": "20251229171448",
+      "codeql_raw_query": "/**\n * @name Command injection via subprocess\n * @description Using subprocess with user-controlled input without proper sanitization can lead to command injection\n * @kind path-problem\n * @problem.severity error\n * @id py/command-injection\n * @tags security\n *        external/cwe/cwe-078\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.dataflow.new.RemoteFlowSources\nimport semmle.python.Concepts\n\nmodule CommandInjectionConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    source instanceof RemoteFlowSource\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(SystemCommandExecution cmd |\n      sink = cmd.getCommand()\n    )\n  }\n}\n\nmodule CommandInjectionFlow = TaintTracking::Global<CommandInjectionConfig>;\nimport CommandInjectionFlow::PathGraph\n\nfrom CommandInjectionFlow::PathNode source, CommandInjectionFlow::PathNode sink\nwhere CommandInjectionFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"Command injection from $@.\", source.getNode(), \"user input\"",
+      "hypothesis": "Check for command injection vulnerabilities where user-controlled input flows to subprocess execution without proper sanitization",
+      "severity": "critical",
+      "cwe_ids": [
+        "cwe-078"
+      ],
+      "results_count": 0,
+      "results": []
+    },
+    {
+      "codeql_query_uuid": "20251229171524",
+      "codeql_raw_query": "/**\n * @name Subprocess call with shell=True\n * @description Using subprocess with shell=True can be dangerous if arguments are not properly sanitized\n * @kind problem\n * @problem.severity warning\n * @id py/subprocess-shell-true\n * @tags security\n *        external/cwe/cwe-078\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call, DataFlow::Node shellArg\nwhere\n  (\n    call = API::moduleImport(\"subprocess\").getMember([\"call\", \"run\", \"Popen\", \"check_call\", \"check_output\"]).getACall() or\n    call = API::moduleImport(\"os\").getMember([\"system\", \"popen\", \"popen2\", \"popen3\", \"popen4\"]).getACall()\n  ) and\n  (\n    shellArg = call.getArgByName(\"shell\") or\n    shellArg = call.getArg(any(int i | i >= 0))\n  ) and\n  shellArg.asExpr().(BooleanLiteral).booleanValue() = true\nselect call, \"Subprocess call with shell=True may allow command injection if arguments are not sanitized.\"\n",
+      "hypothesis": "Subprocess calls with shell=True which could allow command injection if arguments are not properly sanitized",
+      "severity": "high",
+      "cwe_ids": [
+        "cwe-078"
+      ],
+      "results_count": 0,
+      "results": []
+    },
+    {
+      "codeql_query_uuid": "20251229171630",
+      "codeql_raw_query": "/**\n * @name Path traversal in file operations\n * @description Using unsanitized user input in file operations can allow path traversal attacks\n * @kind path-problem\n * @problem.severity error\n * @id py/path-traversal\n * @tags security\n *        external/cwe/cwe-022\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.dataflow.new.RemoteFlowSources\nimport semmle.python.Concepts\n\nmodule PathTraversalConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    source instanceof RemoteFlowSource\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(FileSystemAccess fa |\n      sink = fa.getAPathArgument()\n    )\n  }\n}\n\nmodule PathTraversalFlow = TaintTracking::Global<PathTraversalConfig>;\nimport PathTraversalFlow::PathGraph\n\nfrom PathTraversalFlow::PathNode source, PathTraversalFlow::PathNode sink\nwhere PathTraversalFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"Path traversal from $@.\", source.getNode(), \"user input\"",
+      "hypothesis": "Path traversal vulnerability in file operations from remote sources",
+      "severity": "high",
+      "cwe_ids": [
+        "cwe-022"
+      ],
+      "results_count": 0,
+      "results": []
+    },
+    {
+      "codeql_query_uuid": "20251229171709",
+      "codeql_raw_query": "/**\n * @name Unsafe deserialization\n * @description Deserializing untrusted data using pickle or other unsafe methods can lead to arbitrary code execution\n * @kind problem\n * @problem.severity error\n * @id py/unsafe-deserialization\n * @tags security\n *        external/cwe/cwe-502\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  (\n    call = API::moduleImport(\"pickle\").getMember([\"load\", \"loads\", \"Unpickler\"]).getACall() or\n    call = API::moduleImport(\"yaml\").getMember([\"load\", \"unsafe_load\"]).getACall() or\n    call = API::moduleImport(\"marshal\").getMember([\"load\", \"loads\"]).getACall() or\n    call = API::moduleImport(\"shelve\").getMember(\"open\").getACall()\n  )\nselect call, \"Potentially unsafe deserialization operation that could execute arbitrary code.\"",
+      "hypothesis": "Insecure deserialization using pickle, yaml, or marshal that could lead to arbitrary code execution",
+      "severity": "critical",
+      "cwe_ids": [
+        "cwe-502"
+      ],
+      "results_count": 0,
+      "results": []
+    },
+    {
+      "codeql_query_uuid": "20251229171729",
+      "codeql_raw_query": "/**\n * @name Insecure temporary file usage\n * @description Using insecure methods for temporary file creation can lead to race conditions\n * @kind problem\n * @problem.severity warning\n * @id py/insecure-temp-file\n * @tags security\n *        external/cwe/cwe-377\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  (\n    call = API::moduleImport(\"tempfile\").getMember([\"mktemp\"]).getACall() or\n    call = API::moduleImport(\"os\").getMember([\"tempnam\", \"tmpnam\"]).getACall()\n  )\nselect call, \"Insecure temporary file creation that may be vulnerable to race conditions.\"",
+      "hypothesis": "Insecure temporary file or directory creation that could lead to race conditions or predictable file names",
+      "severity": "medium",
+      "cwe_ids": [
+        "cwe-377",
+        "cwe-379"
+      ],
+      "results_count": 0,
+      "results": []
+    },
+    {
+      "codeql_query_uuid": "20251229171753",
+      "codeql_raw_query": "/**\n * @name Symlink race condition\n * @description Time-of-check-time-of-use vulnerabilities in file operations\n * @kind problem\n * @problem.severity warning\n * @id py/symlink-race\n * @tags security\n *        external/cwe/cwe-362\n *        external/cwe/cwe-59\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  (\n    call = API::moduleImport(\"os\").getMember([\"symlink\", \"link\", \"readlink\"]).getACall() or\n    call = API::moduleImport(\"os\").getMember(\"path\").getMember([\"exists\", \"islink\", \"isfile\", \"isdir\"]).getACall() or\n    call = API::moduleImport(\"pathlib\").getMember(\"Path\").getReturn().getMember([\"symlink_to\", \"is_symlink\", \"readlink\"]).getACall()\n  )\nselect call, \"Potential symlink race condition vulnerability in file operations.\"\n",
+      "hypothesis": "Symlink race conditions where files are created or accessed without proper atomic operations",
+      "severity": "medium",
+      "cwe_ids": [
+        "cwe-362",
+        "cwe-59"
+      ],
+      "results_count": 20,
+      "results": [
+        {
+          "ruleId": "py/symlink-race",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/symlink-race",
+            "index": 0
+          },
+          "message": {
+            "text": "Potential symlink race condition vulnerability in file operations."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/virtualenv/app_data/__init__.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 39,
+                  "startColumn": 12,
+                  "endColumn": 33
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "1d9004e004c22bdd:1",
+            "primaryLocationStartColumnFingerprint": "7"
+          }
+        },
+        {
+          "ruleId": "py/symlink-race",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/symlink-race",
+            "index": 0
+          },
+          "message": {
+            "text": "Potential symlink race condition vulnerability in file operations."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/virtualenv/util/path/_sync.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 1
+                },
+                "region": {
+                  "startLine": 49,
+                  "startColumn": 16,
+                  "endColumn": 39
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "c5bcf011fd59394a:1",
+            "primaryLocationStartColumnFingerprint": "7"
+          }
+        },
+        {
+          "ruleId": "py/symlink-race",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/symlink-race",
+            "index": 0
+          },
+          "message": {
+            "text": "Potential symlink race condition vulnerability in file operations."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/virtualenv/discovery/cached_py_info.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 2
+                },
+                "region": {
+                  "startLine": 81,
+                  "startColumn": 48,
+                  "endColumn": 71
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "8091d2e279308be9:1",
+            "primaryLocationStartColumnFingerprint": "31"
+          }
+        },
+        {
+          "ruleId": "py/symlink-race",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/symlink-race",
+            "index": 0
+          },
+          "message": {
+            "text": "Potential symlink race condition vulnerability in file operations."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/virtualenv/info.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 3
+                },
+                "region": {
+                  "startLine": 26,
+                  "startColumn": 38,
+                  "endColumn": 75
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "450df70f76b5446b:1",
+            "primaryLocationStartColumnFingerprint": "25"
+          }
+        },
+        {
+          "ruleId": "py/symlink-race",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/symlink-race",
+            "index": 0
+          },
+          "message": {
+            "text": "Potential symlink race condition vulnerability in file operations."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/virtualenv/info.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 3
+                },
+                "region": {
+                  "startLine": 43,
+                  "startColumn": 21,
+                  "endColumn": 52
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "b8114103e75204d6:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "py/symlink-race",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/symlink-race",
+            "index": 0
+          },
+          "message": {
+            "text": "Potential symlink race condition vulnerability in file operations."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/virtualenv/info.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 3
+                },
+                "region": {
+                  "startLine": 16,
+                  "startColumn": 13,
+                  "endColumn": 33
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "8b18e64ce12d96ec:1",
+            "primaryLocationStartColumnFingerprint": "12"
+          }
+        },
+        {
+          "ruleId": "py/symlink-race",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/symlink-race",
+            "index": 0
+          },
+          "message": {
+            "text": "Potential symlink race condition vulnerability in file operations."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/virtualenv/util/lock.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 4
+                },
+                "region": {
+                  "startLine": 20,
+                  "startColumn": 16,
+                  "endColumn": 37
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "37b485cde2e0c11f:1",
+            "primaryLocationStartColumnFingerprint": "7"
+          }
+        },
+        {
+          "ruleId": "py/symlink-race",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/symlink-race",
+            "index": 0
+          },
+          "message": {
+            "text": "Potential symlink race condition vulnerability in file operations."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/virtualenv/discovery/windows/pep514.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 5
+                },
+                "region": {
+                  "startLine": 87,
+                  "startColumn": 36,
+                  "endColumn": 55
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "a0a2427a7559002:1",
+            "primaryLocationStartColumnFingerprint": "23"
+          }
+        },
+        {
+          "ruleId": "py/symlink-race",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/symlink-race",
+            "index": 0
+          },
+          "message": {
+            "text": "Potential symlink race condition vulnerability in file operations."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/virtualenv/discovery/py_info.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 6
+                },
+                "region": {
+                  "startLine": 160,
+                  "startColumn": 35,
+                  "endColumn": 56
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "e7f4fea0054f2173:1",
+            "primaryLocationStartColumnFingerprint": "14"
+          }
+        },
+        {
+          "ruleId": "py/symlink-race",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/symlink-race",
+            "index": 0
+          },
+          "message": {
+            "text": "Potential symlink race condition vulnerability in file operations."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/virtualenv/discovery/py_info.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 6
+                },
+                "region": {
+                  "startLine": 181,
+                  "startColumn": 32,
+                  "endColumn": 58
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "111a85d9e0f529dc:1",
+            "primaryLocationStartColumnFingerprint": "7"
+          }
+        },
+        {
+          "ruleId": "py/symlink-race",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/symlink-race",
+            "index": 0
+          },
+          "message": {
+            "text": "Potential symlink race condition vulnerability in file operations."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/virtualenv/discovery/py_info.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 6
+                },
+                "region": {
+                  "startLine": 184,
+                  "startColumn": 28,
+                  "endColumn": 79
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "e9f62e8499d18389:1",
+            "primaryLocationStartColumnFingerprint": "3"
+          }
+        },
+        {
+          "ruleId": "py/symlink-race",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/symlink-race",
+            "index": 0
+          },
+          "message": {
+            "text": "Potential symlink race condition vulnerability in file operations."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/virtualenv/discovery/py_info.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 6
+                },
+                "region": {
+                  "startLine": 213,
+                  "startColumn": 12,
+                  "endColumn": 43
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "a2eaf843be34e46b:1",
+            "primaryLocationStartColumnFingerprint": "3"
+          }
+        },
+        {
+          "ruleId": "py/symlink-race",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/symlink-race",
+            "index": 0
+          },
+          "message": {
+            "text": "Potential symlink race condition vulnerability in file operations."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/virtualenv/discovery/py_info.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 6
+                },
+                "region": {
+                  "startLine": 242,
+                  "startColumn": 16,
+                  "endColumn": 41
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "2e1b41beba624c8b:1",
+            "primaryLocationStartColumnFingerprint": "3"
+          }
+        },
+        {
+          "ruleId": "py/symlink-race",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/symlink-race",
+            "index": 0
+          },
+          "message": {
+            "text": "Potential symlink race condition vulnerability in file operations."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/virtualenv/discovery/py_info.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 6
+                },
+                "region": {
+                  "startLine": 330,
+                  "startColumn": 16,
+                  "endColumn": 36
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "d6aae2f03425db8f:1",
+            "primaryLocationStartColumnFingerprint": "7"
+          }
+        },
+        {
+          "ruleId": "py/symlink-race",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/symlink-race",
+            "index": 0
+          },
+          "message": {
+            "text": "Potential symlink race condition vulnerability in file operations."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/virtualenv/discovery/py_info.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 6
+                },
+                "region": {
+                  "startLine": 333,
+                  "startColumn": 16,
+                  "endColumn": 40
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "fc18258497249b91:1",
+            "primaryLocationStartColumnFingerprint": "3"
+          }
+        },
+        {
+          "ruleId": "py/symlink-race",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/symlink-race",
+            "index": 0
+          },
+          "message": {
+            "text": "Potential symlink race condition vulnerability in file operations."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/virtualenv/discovery/py_info.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 6
+                },
+                "region": {
+                  "startLine": 557,
+                  "startColumn": 16,
+                  "endColumn": 40
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "e3ebde61d5006141:1",
+            "primaryLocationStartColumnFingerprint": "7"
+          }
+        },
+        {
+          "ruleId": "py/symlink-race",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/symlink-race",
+            "index": 0
+          },
+          "message": {
+            "text": "Potential symlink race condition vulnerability in file operations."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/virtualenv/discovery/py_info.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 6
+                },
+                "region": {
+                  "startLine": 614,
+                  "startColumn": 48,
+                  "endColumn": 65
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "b040cdbc7c304902:1",
+            "primaryLocationStartColumnFingerprint": "39"
+          }
+        },
+        {
+          "ruleId": "py/symlink-race",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/symlink-race",
+            "index": 0
+          },
+          "message": {
+            "text": "Potential symlink race condition vulnerability in file operations."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/virtualenv/create/pyenv_cfg.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 7
+                },
+                "region": {
+                  "startLine": 38,
+                  "startColumn": 69,
+                  "endColumn": 90
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "7bbe53146e2a1c5f:1",
+            "primaryLocationStartColumnFingerprint": "56"
+          }
+        },
+        {
+          "ruleId": "py/symlink-race",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/symlink-race",
+            "index": 0
+          },
+          "message": {
+            "text": "Potential symlink race condition vulnerability in file operations."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/virtualenv/app_data/read_only.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 8
+                },
+                "region": {
+                  "startLine": 14,
+                  "startColumn": 16,
+                  "endColumn": 37
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "bdf5b202dce43a7a:1",
+            "primaryLocationStartColumnFingerprint": "7"
+          }
+        },
+        {
+          "ruleId": "py/symlink-race",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/symlink-race",
+            "index": 0
+          },
+          "message": {
+            "text": "Potential symlink race condition vulnerability in file operations."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/virtualenv/seed/embed/via_app_data/pip_install/symlink.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 9
+                },
+                "region": {
+                  "startLine": 14,
+                  "startColumn": 9,
+                  "endColumn": 39
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "8d6fa53a685eed53:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        }
+      ]
+    },
+    {
+      "codeql_query_uuid": "20251229171816",
+      "codeql_raw_query": "/**\n * @name Zip Slip vulnerability\n * @description Extracting zip files without validating paths can lead to arbitrary file write\n * @kind problem\n * @problem.severity error\n * @id py/zipslip\n * @tags security\n *        external/cwe/cwe-022\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  (\n    call = API::moduleImport(\"zipfile\").getMember(\"ZipFile\").getReturn().getMember([\"extract\", \"extractall\"]).getACall()\n  )\nselect call, \"Potentially unsafe zip extraction that may be vulnerable to zip slip attacks.\"\n",
+      "hypothesis": "Zip file extraction without path validation can lead to directory traversal (zip slip)",
+      "severity": "high",
+      "cwe_ids": [
+        "cwe-022"
+      ],
+      "results_count": 2,
+      "results": [
+        {
+          "ruleId": "py/zipslip",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/zipslip",
+            "index": 0
+          },
+          "message": {
+            "text": "Potentially unsafe zip extraction that may be vulnerable to zip slip attacks."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/virtualenv/seed/embed/via_app_data/pip_install/base.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 52,
+                  "startColumn": 13,
+                  "endColumn": 53
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "153facef49e6e581:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "py/zipslip",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/zipslip",
+            "index": 0
+          },
+          "message": {
+            "text": "Potentially unsafe zip extraction that may be vulnerable to zip slip attacks."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/virtualenv/util/zipapp.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 1
+                },
+                "region": {
+                  "startLine": 24,
+                  "startColumn": 9,
+                  "endColumn": 49
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "6c0c151e8f8c6695:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        }
+      ]
+    },
+    {
+      "codeql_query_uuid": "20251229171850",
+      "codeql_raw_query": "/**\n * @name Use of weak cryptographic hashing\n * @description Using weak cryptographic algorithms like MD5 or SHA1 for security purposes can be insecure\n * @kind problem\n * @problem.severity warning\n * @id py/weak-crypto\n * @tags security\n *        external/cwe/cwe-327\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  (\n    call = API::moduleImport(\"hashlib\").getMember([\"md5\", \"sha1\"]).getACall() or\n    call = API::moduleImport(\"md5\").getMember(\"new\").getACall() or\n    call = API::moduleImport(\"sha\").getMember(\"new\").getACall()\n  )\nselect call, \"Use of weak cryptographic hashing algorithm that should not be used for security purposes.\"",
+      "hypothesis": "Detect usage of weak cryptographic hash functions like MD5 or SHA1",
+      "severity": "medium",
+      "cwe_ids": [
+        "cwe-327"
+      ],
+      "results_count": 0,
+      "results": []
+    }
+  ]
+}

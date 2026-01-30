@@ -1,0 +1,1658 @@
+{
+  "session_id": "20260118111031",
+  "package_name": "pyyaml-5.3",
+  "package_path": "packages/pyyaml-5.3",
+  "database_path": "databases/pyyaml-5.3-db",
+  "model": "gpt-5.1",
+  "temperature": 0.0,
+  "max_tokens": 8000,
+  "iterations": 10,
+  "total_input_tokens": 125946,
+  "total_output_tokens": 10362,
+  "total_tokens": 136308,
+  "elapsed_time_seconds": 461.87,
+  "estimated_cost_usd": 0.3655,
+  "summary": "## Package Overview\n- **Name:** PyYAML\n- **Version:** 5.3\n- **Type:** Python library for YAML parsing and emitting\n- **Scope analyzed:** `lib/yaml/*` and `lib3/yaml/*` (Python 2/3 implementations)\n\nThe analysis focused on high\u2011impact classes for YAML parsers:\n- Code execution via dynamic imports / code generation (CWE\u201194)\n- Unsafe deserialization / arbitrary object construction (CWE\u2011502)\n\nCodeQL was used to scan the package with custom queries tailored to PyYAML\u2019s constructors and loaders.\n\n---\n\n## Key Findings\n\n### 1. Dynamic code execution primitives inside PyYAML\n\n**Evidence (CodeQL query `py/pyyaml/dangerous-code-execution`):**\n- Multiple uses of `compile` and `__import__` were found inside the `yaml` package:\n  - `lib/yaml/constructor.py`\n    - `compile` around line 321\n    - `__import__` around lines 520 and 540\n  - `lib3/yaml/constructor.py`\n    - `compile` around line 302\n    - `__import__` around lines 513 and 533\n  - `lib/yaml/reader.py` and `lib3/yaml/reader.py`\n    - `compile` used near the end of the file (around lines 137\u2013142 / 140\u2013142)\n  - `lib/yaml/resolver.py` and `lib3/yaml/resolver.py`\n    - multiple `compile` calls in the 170\u2013225 line range\n\n**Risk interpretation**\n- These primitives (`compile`, `__import__`) are powerful building blocks for **arbitrary code execution** when their inputs are influenced by untrusted YAML content.\n- In PyYAML\u2019s design, these are used to:\n  - Dynamically import modules and attributes referenced by Python\u2011specific YAML tags.\n  - Build and evaluate regular expressions and other dynamic constructs.\n- On their own, these calls are not necessarily vulnerabilities, but they are part of the attack surface when combined with unsafe loaders and Python\u2011specific tags (see Finding 2 and 3).\n\n**CWE classification**\n- **CWE\u201194**: Improper Control of Generation of Code (\u2018Code Injection\u2019) \u2013 due to `compile` and dynamic import usage that can be driven by YAML content.\n\n**Mitigation / usage guidance**\n- Do **not** expose `yaml.load`, `FullLoader`, or other unsafe loaders to untrusted input (see below).\n- Prefer `yaml.safe_load` / `SafeLoader` for any untrusted YAML.\n- If you must use Python\u2011specific tags, constrain and validate the set of allowed modules/classes and avoid passing attacker\u2011controlled strings into these dynamic primitives.\n\n---\n\n### 2. Dynamic module imports in constructors (Python tags)\n\n**Evidence (CodeQL query `py/pyyaml/dynamic-import-constructors`):**\n- Dynamic imports in `yaml/constructor.py`:\n  - `lib/yaml/constructor.py`\n    - Around line 520: call to `__import__` inside a constructor helper.\n    - Around line 540: another `__import__` call for resolving modules/attributes.\n  - `lib3/yaml/constructor.py`\n    - Around line 513: `__import__` call.\n    - Around line 533: `__import__` call.\n\nThese locations correspond to the logic that resolves Python objects from YAML tags such as `!!python/object`, `!!python/module`, etc.\n\n**Risk interpretation**\n- When using **unsafe loaders** that honor Python\u2011specific tags, an attacker controlling YAML input can:\n  - Cause PyYAML to import arbitrary modules via `__import__`.\n  - Access attributes on those modules and instantiate objects.\n- In many real\u2011world exploitation scenarios, this is chained with classes that have dangerous `__reduce__` / `__setstate__` / `__init__` behavior, leading to **arbitrary code execution on load**.\n\n**CWE classification**\n- **CWE\u2011502**: Deserialization of Untrusted Data \u2013 YAML is used as a serialization format, and these constructors deserialize into arbitrary Python objects.\n- **CWE\u201194**: Improper Control of Generation of Code \u2013 because the dynamic import mechanism can be driven by attacker\u2011controlled tags.\n\n**Mitigation / usage guidance**\n- Treat any YAML that may be influenced by external users as **untrusted**.\n- For untrusted YAML:\n  - Use `yaml.safe_load` / `yaml.safe_load_all` or `SafeLoader`.\n  - Avoid `yaml.load`, `yaml.full_load`, `yaml.unsafe_load`, `FullLoader`, `UnsafeLoader`, or custom loaders that register Python\u2011specific constructors.\n- If you must support Python tags in a controlled environment:\n  - Restrict the set of allowed modules and classes.\n  - Avoid importing arbitrary modules based on YAML content.\n\n---\n\n### 3. Python\u2011specific YAML constructors for arbitrary object creation\n\n**Evidence (CodeQL query `py/pyyaml/python-tag-constructors`):**\n- Functions in `yaml/constructor.py` whose names match `construct_python_.*` were identified as Python\u2011specific constructors.\n- In **Python 2 implementation** (`lib/yaml/constructor.py`):\n  - Constructors around lines:\n    - 499, 502, 505, 508, 511\n    - 554, 562\n    - 607, 616\n    - 651\n- In **Python 3 implementation** (`lib3/yaml/constructor.py`):\n  - Constructors around lines:\n    - 476, 479, 482\n    - 498, 501, 504\n    - 547, 554\n    - 591, 600\n    - 635\n\nThese functions correspond to handlers for tags like:\n- `!!python/object`\n- `!!python/object/new`\n- `!!python/module`\n- `!!python/name`\n- `!!python/tuple`\n- and related Python\u2011specific tags.\n\n**Risk interpretation**\n- These constructors are explicitly designed to **instantiate arbitrary Python objects** from YAML tags.\n- When reachable from untrusted YAML (via `yaml.load`, `FullLoader`, `UnsafeLoader`, or custom loaders that enable them), they provide a powerful primitive for:\n  - Instantiating attacker\u2011chosen classes.\n  - Triggering arbitrary code via class constructors or special methods.\n- This behavior underlies the well\u2011known remote code execution issues historically associated with unsafe use of PyYAML.\n\n**CWE classification**\n- **CWE\u2011502**: Deserialization of Untrusted Data \u2013 arbitrary object graph reconstruction from untrusted YAML.\n\n**Mitigation / usage guidance**\n- For any untrusted YAML input:\n  - Use only `SafeLoader` / `safe_load`, which do **not** register these Python\u2011specific constructors.\n- If you define custom loaders:\n  - Avoid calling `add_constructor` for Python\u2011specific tags unless you fully control the YAML source.\n  - Consider whitelisting only a small, audited set of safe types.\n\n---\n\n### 4. No direct evidence of unsafe loader usage inside the package itself\n\n**Evidence (CodeQL query `py/pyyaml/unsafe-loader-usage`):**\n- The query searched for calls to:\n  - `yaml.load`, `yaml.full_load`, `yaml.unsafe_load`, `yaml.load_all`\n  - `yaml.FullLoader`, `yaml.UnsafeLoader`\n- **Result:** No such calls were found within the PyYAML package\u2019s own code.\n\n**Interpretation**\n- PyYAML, as a library, **exposes** unsafe loaders and Python\u2011specific constructors, but does not itself call them on external data.\n- The primary risk is therefore **how consuming applications use the library**, not the library\u2019s own internal use.\n\n**CWE classification**\n- The library provides APIs that can be misused in ways that lead to CWE\u2011502 / CWE\u201194, but the package itself does not directly deserialize untrusted data.\n\n**Mitigation / usage guidance for consumers**\n- Audit your own code (and dependencies) for calls to:\n  - `yaml.load`, `yaml.full_load`, `yaml.unsafe_load`, `yaml.load_all`\n  - `yaml.Loader`, `yaml.FullLoader`, `yaml.UnsafeLoader`, or custom loaders that enable Python tags.\n- Replace with:\n  - `yaml.safe_load`, `yaml.safe_load_all`, or `SafeLoader` where possible.\n\n---\n\n## Overall Security Assessment\n\n- **Primary risk:** The combination of Python\u2011specific YAML constructors, dynamic imports (`__import__`), and code generation (`compile`) means that **if an application uses PyYAML\u2019s unsafe loaders on untrusted input, it is highly likely to be vulnerable to arbitrary code execution**.\n- **Within the library itself:**\n  - The dangerous primitives are present and wired into constructors for Python tags.\n  - There is no evidence that PyYAML itself fetches untrusted data; the attack surface is exposed via its public API.\n- **Severity for misuse:** High to Critical (CWE\u2011502, CWE\u201194) when unsafe loaders are used on attacker\u2011controlled YAML.\n\n---\n\n## Recommendations for Users of PyYAML 5.3\n\n1. **For untrusted YAML input**\n   - Use only:\n     - `yaml.safe_load` / `yaml.safe_load_all`\n     - or explicitly `yaml.load(..., Loader=yaml.SafeLoader)`\n   - Do **not** use:\n     - `yaml.load` without specifying `Loader=SafeLoader`\n     - `yaml.full_load`, `yaml.unsafe_load`, `yaml.load_all` with default or unsafe loaders\n     - `FullLoader`, `UnsafeLoader`, or custom loaders that enable Python\u2011specific tags.\n\n2. **Audit existing codebases**\n   - Search for `yaml.load(`, `yaml.full_load(`, `yaml.unsafe_load(`, `yaml.load_all(`, `FullLoader`, `UnsafeLoader`.\n   - Replace or wrap them with safe alternatives.\n\n3. **If Python\u2011specific tags are required in a trusted environment**\n   - Restrict the set of allowed modules/classes.\n   - Avoid importing arbitrary modules based on YAML content.\n   - Consider a custom, whitelisted constructor instead of the generic Python tag constructors.\n\n4. **Consider upgrading**\n   - Newer PyYAML versions have improved defaults and documentation around safe loading.\n   - Review the changelog and security advisories for additional hardening.\n\n---\n\n## Conclusion\n\nPyYAML 5.3 is a powerful YAML library that, by design, supports Python\u2011specific tags and dynamic object construction. The CodeQL analysis confirms the presence of dynamic imports and Python\u2011specific constructors that can be driven by YAML content. While the library does not itself deserialize untrusted data, **any application that uses its unsafe loaders on untrusted YAML is exposed to high\u2011impact vulnerabilities (CWE\u2011502, CWE\u201194)**.\n\nSafe usage patterns (e.g., `safe_load`) and careful avoidance of Python\u2011specific tags for untrusted data are essential to mitigate these risks.",
+  "package_classification": {
+    "type": "library",
+    "layer": [
+      "data",
+      "application"
+    ]
+  },
+  "tool_calls": {
+    "get_package_profile_info": 1,
+    "execute_codeql_query": 8,
+    "validate_codeql_query": 0,
+    "fixup_codeql_query": 5,
+    "finalize_report": 1
+  },
+  "queries_executed": {
+    "critical": 2,
+    "high": 2,
+    "medium": 0,
+    "low": 0,
+    "total_executed": 11,
+    "total_with_results": 4,
+    "total_failed": 12
+  },
+  "query_findings": {
+    "critical": 4,
+    "high": 46,
+    "medium": 0,
+    "low": 0,
+    "total": 50
+  },
+  "findings": [
+    {
+      "codeql_query_uuid": "20260118111301",
+      "codeql_raw_query": "/**\n * @name Dangerous dynamic code execution in PyYAML\n * @description Find uses of eval, exec, compile, and __import__ in the yaml package\n * @kind problem\n * @problem.severity warning\n * @id py/pyyaml/dangerous-code-execution\n * @tags security\n *       external/cwe/cwe-094\n */\n\nimport python\n\npredicate isDangerousFunction(string name) {\n  name in [\"eval\", \"exec\", \"compile\", \"__import__\"]\n}\n\nfrom Call c, string funcName, File f\nwhere\n  f = c.getLocation().getFile() and\n  f.getRelativePath().regexpMatch(\"^(lib|lib3)/yaml/.*\") and\n  (\n    c.getFunc().(Name).getId() = funcName and isDangerousFunction(funcName)\n    or\n    c.getFunc().(Attribute).getName() = funcName and isDangerousFunction(funcName)\n  )\nselect c, \"Dangerous code execution function found: \" + funcName\n",
+      "hypothesis": "PyYAML may use dynamic code execution primitives internally, which could be leveraged during YAML parsing or object construction.",
+      "severity": "high",
+      "cwe_ids": [
+        "cwe-094"
+      ],
+      "results_count": 25,
+      "results": [
+        {
+          "ruleId": "py/pyyaml/dangerous-code-execution",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/pyyaml/dangerous-code-execution",
+            "index": 0
+          },
+          "message": {
+            "text": "Dangerous code execution function found: compile"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "lib/yaml/constructor.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 321,
+                  "startColumn": 24,
+                  "endLine": 331,
+                  "endColumn": 64
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "448adf2602194267:1",
+            "primaryLocationStartColumnFingerprint": "19"
+          }
+        },
+        {
+          "ruleId": "py/pyyaml/dangerous-code-execution",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/pyyaml/dangerous-code-execution",
+            "index": 0
+          },
+          "message": {
+            "text": "Dangerous code execution function found: __import__"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "lib/yaml/constructor.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 520,
+                  "startColumn": 17,
+                  "endColumn": 33
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "a9d7e6c2a0c8ffb5:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "py/pyyaml/dangerous-code-execution",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/pyyaml/dangerous-code-execution",
+            "index": 0
+          },
+          "message": {
+            "text": "Dangerous code execution function found: __import__"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "lib/yaml/constructor.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 540,
+                  "startColumn": 17,
+                  "endColumn": 40
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "5e8aab8724d7cf7a:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "py/pyyaml/dangerous-code-execution",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/pyyaml/dangerous-code-execution",
+            "index": 0
+          },
+          "message": {
+            "text": "Dangerous code execution function found: compile"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "lib3/yaml/constructor.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 1
+                },
+                "region": {
+                  "startLine": 302,
+                  "startColumn": 24,
+                  "endLine": 312,
+                  "endColumn": 64
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "b6cab1771f87b6b6:1",
+            "primaryLocationStartColumnFingerprint": "19"
+          }
+        },
+        {
+          "ruleId": "py/pyyaml/dangerous-code-execution",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/pyyaml/dangerous-code-execution",
+            "index": 0
+          },
+          "message": {
+            "text": "Dangerous code execution function found: __import__"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "lib3/yaml/constructor.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 1
+                },
+                "region": {
+                  "startLine": 513,
+                  "startColumn": 17,
+                  "endColumn": 33
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "272a175984837d25:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "py/pyyaml/dangerous-code-execution",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/pyyaml/dangerous-code-execution",
+            "index": 0
+          },
+          "message": {
+            "text": "Dangerous code execution function found: __import__"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "lib3/yaml/constructor.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 1
+                },
+                "region": {
+                  "startLine": 533,
+                  "startColumn": 17,
+                  "endColumn": 40
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "4872e4c281270e82:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "py/pyyaml/dangerous-code-execution",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/pyyaml/dangerous-code-execution",
+            "index": 0
+          },
+          "message": {
+            "text": "Dangerous code execution function found: compile"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "lib3/yaml/reader.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 2
+                },
+                "region": {
+                  "startLine": 137,
+                  "startColumn": 21,
+                  "endColumn": 108
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "5a88ec6d0eb4f05:1",
+            "primaryLocationStartColumnFingerprint": "16"
+          }
+        },
+        {
+          "ruleId": "py/pyyaml/dangerous-code-execution",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/pyyaml/dangerous-code-execution",
+            "index": 0
+          },
+          "message": {
+            "text": "Dangerous code execution function found: compile"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "lib/yaml/reader.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 3
+                },
+                "region": {
+                  "startLine": 140,
+                  "startColumn": 25,
+                  "endColumn": 113
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "e3d6ab11207b325b:1",
+            "primaryLocationStartColumnFingerprint": "16"
+          }
+        },
+        {
+          "ruleId": "py/pyyaml/dangerous-code-execution",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/pyyaml/dangerous-code-execution",
+            "index": 0
+          },
+          "message": {
+            "text": "Dangerous code execution function found: compile"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "lib/yaml/reader.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 3
+                },
+                "region": {
+                  "startLine": 142,
+                  "startColumn": 25,
+                  "endColumn": 155
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "ca6eb182667d3a23:1",
+            "primaryLocationStartColumnFingerprint": "16"
+          }
+        },
+        {
+          "ruleId": "py/pyyaml/dangerous-code-execution",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/pyyaml/dangerous-code-execution",
+            "index": 0
+          },
+          "message": {
+            "text": "Dangerous code execution function found: compile"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "lib/yaml/resolver.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 4
+                },
+                "region": {
+                  "startLine": 172,
+                  "startColumn": 9,
+                  "endLine": 174,
+                  "endColumn": 54
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "637e7c4c22637f0b:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "py/pyyaml/dangerous-code-execution",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/pyyaml/dangerous-code-execution",
+            "index": 0
+          },
+          "message": {
+            "text": "Dangerous code execution function found: compile"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "lib/yaml/resolver.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 4
+                },
+                "region": {
+                  "startLine": 179,
+                  "startColumn": 9,
+                  "endLine": 183,
+                  "endColumn": 51
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "993618b0cf521a6e:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "py/pyyaml/dangerous-code-execution",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/pyyaml/dangerous-code-execution",
+            "index": 0
+          },
+          "message": {
+            "text": "Dangerous code execution function found: compile"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "lib/yaml/resolver.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 4
+                },
+                "region": {
+                  "startLine": 188,
+                  "startColumn": 9,
+                  "endLine": 192,
+                  "endColumn": 68
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "49a36338c44cc2f9:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "py/pyyaml/dangerous-code-execution",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/pyyaml/dangerous-code-execution",
+            "index": 0
+          },
+          "message": {
+            "text": "Dangerous code execution function found: compile"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "lib/yaml/resolver.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 4
+                },
+                "region": {
+                  "startLine": 197,
+                  "startColumn": 9,
+                  "endColumn": 33
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "199b9f332fbc3149:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "py/pyyaml/dangerous-code-execution",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/pyyaml/dangerous-code-execution",
+            "index": 0
+          },
+          "message": {
+            "text": "Dangerous code execution function found: compile"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "lib/yaml/resolver.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 4
+                },
+                "region": {
+                  "startLine": 202,
+                  "startColumn": 9,
+                  "endLine": 204,
+                  "endColumn": 35
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "222c4cd4a0f3ca49:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "py/pyyaml/dangerous-code-execution",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/pyyaml/dangerous-code-execution",
+            "index": 0
+          },
+          "message": {
+            "text": "Dangerous code execution function found: compile"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "lib/yaml/resolver.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 4
+                },
+                "region": {
+                  "startLine": 209,
+                  "startColumn": 9,
+                  "endLine": 213,
+                  "endColumn": 82
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "2790468fb8ba7726:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "py/pyyaml/dangerous-code-execution",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/pyyaml/dangerous-code-execution",
+            "index": 0
+          },
+          "message": {
+            "text": "Dangerous code execution function found: compile"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "lib/yaml/resolver.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 4
+                },
+                "region": {
+                  "startLine": 218,
+                  "startColumn": 9,
+                  "endColumn": 32
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "e236ab753f98c441:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "py/pyyaml/dangerous-code-execution",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/pyyaml/dangerous-code-execution",
+            "index": 0
+          },
+          "message": {
+            "text": "Dangerous code execution function found: compile"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "lib/yaml/resolver.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 4
+                },
+                "region": {
+                  "startLine": 225,
+                  "startColumn": 9,
+                  "endColumn": 37
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "ada5b688088fc27c:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "py/pyyaml/dangerous-code-execution",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/pyyaml/dangerous-code-execution",
+            "index": 0
+          },
+          "message": {
+            "text": "Dangerous code execution function found: compile"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "lib3/yaml/resolver.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 5
+                },
+                "region": {
+                  "startLine": 172,
+                  "startColumn": 9,
+                  "endLine": 174,
+                  "endColumn": 54
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "cdcff79471a602d:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "py/pyyaml/dangerous-code-execution",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/pyyaml/dangerous-code-execution",
+            "index": 0
+          },
+          "message": {
+            "text": "Dangerous code execution function found: compile"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "lib3/yaml/resolver.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 5
+                },
+                "region": {
+                  "startLine": 179,
+                  "startColumn": 9,
+                  "endLine": 183,
+                  "endColumn": 51
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "d0669a064596d5d1:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "py/pyyaml/dangerous-code-execution",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/pyyaml/dangerous-code-execution",
+            "index": 0
+          },
+          "message": {
+            "text": "Dangerous code execution function found: compile"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "lib3/yaml/resolver.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 5
+                },
+                "region": {
+                  "startLine": 188,
+                  "startColumn": 9,
+                  "endLine": 192,
+                  "endColumn": 68
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "50325facadd13197:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "py/pyyaml/dangerous-code-execution",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/pyyaml/dangerous-code-execution",
+            "index": 0
+          },
+          "message": {
+            "text": "Dangerous code execution function found: compile"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "lib3/yaml/resolver.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 5
+                },
+                "region": {
+                  "startLine": 197,
+                  "startColumn": 9,
+                  "endColumn": 32
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "d48de6ee2dccd2bb:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "py/pyyaml/dangerous-code-execution",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/pyyaml/dangerous-code-execution",
+            "index": 0
+          },
+          "message": {
+            "text": "Dangerous code execution function found: compile"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "lib3/yaml/resolver.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 5
+                },
+                "region": {
+                  "startLine": 202,
+                  "startColumn": 9,
+                  "endLine": 204,
+                  "endColumn": 35
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "da46b4c119b567dc:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "py/pyyaml/dangerous-code-execution",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/pyyaml/dangerous-code-execution",
+            "index": 0
+          },
+          "message": {
+            "text": "Dangerous code execution function found: compile"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "lib3/yaml/resolver.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 5
+                },
+                "region": {
+                  "startLine": 209,
+                  "startColumn": 9,
+                  "endLine": 213,
+                  "endColumn": 82
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "636f3b3e01ac3c26:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "py/pyyaml/dangerous-code-execution",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/pyyaml/dangerous-code-execution",
+            "index": 0
+          },
+          "message": {
+            "text": "Dangerous code execution function found: compile"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "lib3/yaml/resolver.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 5
+                },
+                "region": {
+                  "startLine": 218,
+                  "startColumn": 9,
+                  "endColumn": 31
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "21270dd0f09474be:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "py/pyyaml/dangerous-code-execution",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/pyyaml/dangerous-code-execution",
+            "index": 0
+          },
+          "message": {
+            "text": "Dangerous code execution function found: compile"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "lib3/yaml/resolver.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 5
+                },
+                "region": {
+                  "startLine": 225,
+                  "startColumn": 9,
+                  "endColumn": 36
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "538579a724538812:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        }
+      ]
+    },
+    {
+      "codeql_query_uuid": "20260118111444",
+      "codeql_raw_query": "/**\n * @name PyYAML constructors using dynamic imports\n * @description Find uses of __import__ in yaml/constructor.py that may load arbitrary modules based on YAML content\n * @kind problem\n * @problem.severity error\n * @id py/pyyaml/dynamic-import-constructors\n * @tags security\n *       external/cwe/cwe-094\n *       external/cwe/cwe-502\n */\n\nimport python\n\nfrom Call c, File f\nwhere\n  f = c.getLocation().getFile() and\n  f.getRelativePath().regexpMatch(\"^(lib|lib3)/yaml/constructor.py\") and\n  c.getFunc().(Name).getId() = \"__import__\"\nselect c, \"Dynamic module import in PyYAML constructor; ensure this is not reachable from untrusted YAML input.\"\n",
+      "hypothesis": "PyYAML constructors use __import__ in ways that can be influenced by YAML tags, enabling code execution when loading untrusted YAML.",
+      "severity": "critical",
+      "cwe_ids": [
+        "cwe-094",
+        "cwe-502"
+      ],
+      "results_count": 4,
+      "results": [
+        {
+          "ruleId": "py/pyyaml/dynamic-import-constructors",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/pyyaml/dynamic-import-constructors",
+            "index": 0
+          },
+          "message": {
+            "text": "Dynamic module import in PyYAML constructor; ensure this is not reachable from untrusted YAML input."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "lib/yaml/constructor.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 520,
+                  "startColumn": 17,
+                  "endColumn": 33
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "a9d7e6c2a0c8ffb5:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "py/pyyaml/dynamic-import-constructors",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/pyyaml/dynamic-import-constructors",
+            "index": 0
+          },
+          "message": {
+            "text": "Dynamic module import in PyYAML constructor; ensure this is not reachable from untrusted YAML input."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "lib/yaml/constructor.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 540,
+                  "startColumn": 17,
+                  "endColumn": 40
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "5e8aab8724d7cf7a:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "py/pyyaml/dynamic-import-constructors",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/pyyaml/dynamic-import-constructors",
+            "index": 0
+          },
+          "message": {
+            "text": "Dynamic module import in PyYAML constructor; ensure this is not reachable from untrusted YAML input."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "lib3/yaml/constructor.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 1
+                },
+                "region": {
+                  "startLine": 513,
+                  "startColumn": 17,
+                  "endColumn": 33
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "272a175984837d25:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "py/pyyaml/dynamic-import-constructors",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/pyyaml/dynamic-import-constructors",
+            "index": 0
+          },
+          "message": {
+            "text": "Dynamic module import in PyYAML constructor; ensure this is not reachable from untrusted YAML input."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "lib3/yaml/constructor.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 1
+                },
+                "region": {
+                  "startLine": 533,
+                  "startColumn": 17,
+                  "endColumn": 40
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "4872e4c281270e82:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        }
+      ]
+    },
+    {
+      "codeql_query_uuid": "20260118111642",
+      "codeql_raw_query": "/**\n * @name PyYAML unsafe loader usage\n * @description Find calls to yaml.load and FullLoader/UnsafeLoader that may deserialize untrusted data\n * @kind problem\n * @problem.severity error\n * @id py/pyyaml/unsafe-loader-usage\n * @tags security\n *       external/cwe/cwe-502\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call, File f\nwhere\n  f = call.getLocation().getFile() and\n  f.getRelativePath().regexpMatch(\".*\") and\n  (\n    call = API::moduleImport(\"yaml\").getMember([\"load\", \"full_load\", \"unsafe_load\", \"load_all\"]).getACall() or\n    call = API::moduleImport(\"yaml\").getMember(\"FullLoader\").getACall() or\n    call = API::moduleImport(\"yaml\").getMember(\"UnsafeLoader\").getACall()\n  )\nselect call, \"Potential unsafe PyYAML loader usage that can construct arbitrary Python objects from YAML input.\"\n",
+      "hypothesis": "PyYAML exposes unsafe loaders (load, FullLoader, UnsafeLoader) that may be used on untrusted data",
+      "severity": "critical",
+      "cwe_ids": [
+        "cwe-502"
+      ],
+      "results_count": 0,
+      "results": []
+    },
+    {
+      "codeql_query_uuid": "20260118111703",
+      "codeql_raw_query": "/**\n * @name PyYAML arbitrary object construction from YAML tags\n * @description Locate constructors that handle Python-specific YAML tags that can instantiate arbitrary objects\n * @kind problem\n * @problem.severity error\n * @id py/pyyaml/python-tag-constructors\n * @tags security\n *       external/cwe/cwe-502\n */\n\nimport python\n\nfrom Function f, File file\nwhere\n  file = f.getLocation().getFile() and\n  file.getRelativePath().regexpMatch(\"^(lib|lib3)/yaml/constructor.py\") and\n  f.getName().regexpMatch(\"construct_python_.*\")\nselect f, \"Python-specific YAML constructor that may create arbitrary Python objects from YAML tags.\"\n",
+      "hypothesis": "PyYAML has Python-specific YAML tag constructors that can instantiate arbitrary objects",
+      "severity": "high",
+      "cwe_ids": [
+        "cwe-502"
+      ],
+      "results_count": 21,
+      "results": [
+        {
+          "ruleId": "py/pyyaml/python-tag-constructors",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/pyyaml/python-tag-constructors",
+            "index": 0
+          },
+          "message": {
+            "text": "Python-specific YAML constructor that may create arbitrary Python objects from YAML tags."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "lib/yaml/constructor.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 499,
+                  "startColumn": 5,
+                  "endColumn": 42
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "8f3424b58002a059:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "py/pyyaml/python-tag-constructors",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/pyyaml/python-tag-constructors",
+            "index": 0
+          },
+          "message": {
+            "text": "Python-specific YAML constructor that may create arbitrary Python objects from YAML tags."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "lib/yaml/constructor.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 502,
+                  "startColumn": 5,
+                  "endColumn": 46
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "a74783acb4a85ddd:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "py/pyyaml/python-tag-constructors",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/pyyaml/python-tag-constructors",
+            "index": 0
+          },
+          "message": {
+            "text": "Python-specific YAML constructor that may create arbitrary Python objects from YAML tags."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "lib/yaml/constructor.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 505,
+                  "startColumn": 5,
+                  "endColumn": 43
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "f5946dc28326287e:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "py/pyyaml/python-tag-constructors",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/pyyaml/python-tag-constructors",
+            "index": 0
+          },
+          "message": {
+            "text": "Python-specific YAML constructor that may create arbitrary Python objects from YAML tags."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "lib/yaml/constructor.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 508,
+                  "startColumn": 5,
+                  "endColumn": 46
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "aa75c4f22c0a2abb:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "py/pyyaml/python-tag-constructors",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/pyyaml/python-tag-constructors",
+            "index": 0
+          },
+          "message": {
+            "text": "Python-specific YAML constructor that may create arbitrary Python objects from YAML tags."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "lib/yaml/constructor.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 511,
+                  "startColumn": 5,
+                  "endColumn": 44
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "b5c24ed48fb8a856:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "py/pyyaml/python-tag-constructors",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/pyyaml/python-tag-constructors",
+            "index": 0
+          },
+          "message": {
+            "text": "Python-specific YAML constructor that may create arbitrary Python objects from YAML tags."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "lib/yaml/constructor.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 554,
+                  "startColumn": 5,
+                  "endColumn": 51
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "a47e71071509d81d:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "py/pyyaml/python-tag-constructors",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/pyyaml/python-tag-constructors",
+            "index": 0
+          },
+          "message": {
+            "text": "Python-specific YAML constructor that may create arbitrary Python objects from YAML tags."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "lib/yaml/constructor.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 562,
+                  "startColumn": 5,
+                  "endColumn": 53
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "da6e1d48aefdbc2e:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "py/pyyaml/python-tag-constructors",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/pyyaml/python-tag-constructors",
+            "index": 0
+          },
+          "message": {
+            "text": "Python-specific YAML constructor that may create arbitrary Python objects from YAML tags."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "lib/yaml/constructor.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 607,
+                  "startColumn": 5,
+                  "endColumn": 53
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "2644af1177430712:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "py/pyyaml/python-tag-constructors",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/pyyaml/python-tag-constructors",
+            "index": 0
+          },
+          "message": {
+            "text": "Python-specific YAML constructor that may create arbitrary Python objects from YAML tags."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "lib/yaml/constructor.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 616,
+                  "startColumn": 5,
+                  "endColumn": 73
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "46006964fd7704b5:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "py/pyyaml/python-tag-constructors",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/pyyaml/python-tag-constructors",
+            "index": 0
+          },
+          "message": {
+            "text": "Python-specific YAML constructor that may create arbitrary Python objects from YAML tags."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "lib/yaml/constructor.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 651,
+                  "startColumn": 5,
+                  "endColumn": 57
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "9a2a1edfffef26cd:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "py/pyyaml/python-tag-constructors",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/pyyaml/python-tag-constructors",
+            "index": 0
+          },
+          "message": {
+            "text": "Python-specific YAML constructor that may create arbitrary Python objects from YAML tags."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "lib3/yaml/constructor.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 1
+                },
+                "region": {
+                  "startLine": 476,
+                  "startColumn": 5,
+                  "endColumn": 42
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "3104e36d575d1f91:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "py/pyyaml/python-tag-constructors",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/pyyaml/python-tag-constructors",
+            "index": 0
+          },
+          "message": {
+            "text": "Python-specific YAML constructor that may create arbitrary Python objects from YAML tags."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "lib3/yaml/constructor.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 1
+                },
+                "region": {
+                  "startLine": 479,
+                  "startColumn": 5,
+                  "endColumn": 46
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "a74783acb3923f2c:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "py/pyyaml/python-tag-constructors",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/pyyaml/python-tag-constructors",
+            "index": 0
+          },
+          "message": {
+            "text": "Python-specific YAML constructor that may create arbitrary Python objects from YAML tags."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "lib3/yaml/constructor.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 1
+                },
+                "region": {
+                  "startLine": 482,
+                  "startColumn": 5,
+                  "endColumn": 44
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "8f8610ebc21fdffe:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "py/pyyaml/python-tag-constructors",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/pyyaml/python-tag-constructors",
+            "index": 0
+          },
+          "message": {
+            "text": "Python-specific YAML constructor that may create arbitrary Python objects from YAML tags."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "lib3/yaml/constructor.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 1
+                },
+                "region": {
+                  "startLine": 498,
+                  "startColumn": 5,
+                  "endColumn": 43
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "95ddba522725b00d:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "py/pyyaml/python-tag-constructors",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/pyyaml/python-tag-constructors",
+            "index": 0
+          },
+          "message": {
+            "text": "Python-specific YAML constructor that may create arbitrary Python objects from YAML tags."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "lib3/yaml/constructor.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 1
+                },
+                "region": {
+                  "startLine": 501,
+                  "startColumn": 5,
+                  "endColumn": 46
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "aa75c4f22c0a2abb:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "py/pyyaml/python-tag-constructors",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/pyyaml/python-tag-constructors",
+            "index": 0
+          },
+          "message": {
+            "text": "Python-specific YAML constructor that may create arbitrary Python objects from YAML tags."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "lib3/yaml/constructor.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 1
+                },
+                "region": {
+                  "startLine": 504,
+                  "startColumn": 5,
+                  "endColumn": 44
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "b5c24ed48fb8a856:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "py/pyyaml/python-tag-constructors",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/pyyaml/python-tag-constructors",
+            "index": 0
+          },
+          "message": {
+            "text": "Python-specific YAML constructor that may create arbitrary Python objects from YAML tags."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "lib3/yaml/constructor.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 1
+                },
+                "region": {
+                  "startLine": 547,
+                  "startColumn": 5,
+                  "endColumn": 51
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "a47e71071509d81d:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "py/pyyaml/python-tag-constructors",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/pyyaml/python-tag-constructors",
+            "index": 0
+          },
+          "message": {
+            "text": "Python-specific YAML constructor that may create arbitrary Python objects from YAML tags."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "lib3/yaml/constructor.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 1
+                },
+                "region": {
+                  "startLine": 554,
+                  "startColumn": 5,
+                  "endColumn": 53
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "da6e1d48aefdbc2e:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "py/pyyaml/python-tag-constructors",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/pyyaml/python-tag-constructors",
+            "index": 0
+          },
+          "message": {
+            "text": "Python-specific YAML constructor that may create arbitrary Python objects from YAML tags."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "lib3/yaml/constructor.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 1
+                },
+                "region": {
+                  "startLine": 591,
+                  "startColumn": 5,
+                  "endColumn": 53
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "2644af1177430712:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "py/pyyaml/python-tag-constructors",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/pyyaml/python-tag-constructors",
+            "index": 0
+          },
+          "message": {
+            "text": "Python-specific YAML constructor that may create arbitrary Python objects from YAML tags."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "lib3/yaml/constructor.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 1
+                },
+                "region": {
+                  "startLine": 600,
+                  "startColumn": 5,
+                  "endColumn": 73
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "46006964fd7704b5:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "py/pyyaml/python-tag-constructors",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/pyyaml/python-tag-constructors",
+            "index": 0
+          },
+          "message": {
+            "text": "Python-specific YAML constructor that may create arbitrary Python objects from YAML tags."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "lib3/yaml/constructor.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 1
+                },
+                "region": {
+                  "startLine": 635,
+                  "startColumn": 5,
+                  "endColumn": 57
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "9a2a1edfffef26cd:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        }
+      ]
+    }
+  ]
+}

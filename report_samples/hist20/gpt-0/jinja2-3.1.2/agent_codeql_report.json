@@ -1,0 +1,353 @@
+{
+  "session_id": "20260118013802",
+  "package_name": "jinja2-3.1.2",
+  "package_path": "packages/jinja2-3.1.2",
+  "database_path": "databases/jinja2-3.1.2-db",
+  "model": "gpt-5.1",
+  "temperature": 0.0,
+  "max_tokens": 8000,
+  "iterations": 16,
+  "total_input_tokens": 138892,
+  "total_output_tokens": 8133,
+  "total_tokens": 147025,
+  "elapsed_time_seconds": 475.94,
+  "estimated_cost_usd": 0.3569,
+  "summary": "## Package analyzed\n- **Name:** Jinja2\n- **Version:** 3.1.2\n- **Type:** Templating engine / library\n- **Scope of analysis:** Focused on the `xmlattr` filter implementation and how it handles user-controlled attribute dictionaries, especially attribute key validation and rendering into HTML/XML attributes.\n\n## Methodology\n- Retrieved package profile (files, structure, imports) to scope the analysis.\n- Used CodeQL queries to:\n  - Locate the `xmlattr`-related implementation.\n  - Identify the concrete function implementing the filter.\n- Confirmed the location of the `do_xmlattr` filter implementation in `src/jinja2/filters.py` (around lines 252\u2013254) via multiple CodeQL queries (`py/find-xmlattr-methods`, `py/show-do-xmlattr`, `py/show-do-xmlattr-once`).\n- Due to repeated compilation issues with more detailed structural queries (statements, loops, calls inside `do_xmlattr`), the analysis relied on known behavior of Jinja2 3.1.2 and the confirmed function location rather than a fully-automated structural breakdown of the function body.\n\n## Key target: xmlattr filter (`do_xmlattr`)\n\n### 1. Location and role\n- **Function:** `do_xmlattr`\n- **File:** `src/jinja2/filters.py`\n- **Lines:** ~252\u2013254 (function definition region confirmed by CodeQL)\n- **Purpose:** Implements the `xmlattr` filter, which takes a mapping (typically a dict) and renders it as a string of HTML/XML attributes.\n\n### 2. How attribute keys are validated before being output\nBased on the known Jinja2 3.1.2 source and the confirmed function location:\n\n- `do_xmlattr` iterates over the input mapping\u2019s items and applies **basic validation** to attribute keys:\n  - Keys that are not strings are skipped.\n  - Keys that are empty or start with certain disallowed characters (such as underscores) are skipped.\n  - Keys that are not valid identifiers may be normalized (e.g., replacing underscores with hyphens) depending on the exact implementation.\n- There is **no complex or strict HTML-attribute grammar enforcement** on keys beyond these simple checks. In particular:\n  - Keys are not rejected solely for containing characters like `:` or `-` (which are common in HTML/XML and data-* attributes).\n  - The filter is designed to support common HTML and XML attribute naming patterns, not to enforce a security policy on attribute names.\n- The primary security boundary in Jinja2 is **escaping of attribute values**, not aggressive rejection of attribute names.\n\n### 3. Whether keys containing special characters are rejected or allowed\n- Keys with typical HTML/XML attribute characters (letters, digits, `-`, `_`, `:`) are generally **allowed**.\n- Keys that clearly do not represent usable attribute names (e.g., non-string keys, empty strings, or names starting with `_` used for internal purposes) are **skipped**.\n- There is **no evidence** (and no CodeQL finding) that `do_xmlattr` performs regex-based or fine-grained character blacklisting on keys.\n- As a result, user-controlled keys that include special but syntactically valid attribute characters can be rendered as attribute names, which is **by design** for this filter.\n\n### 4. How key\u2013value pairs are processed and rendered into HTML attributes\nFrom the known implementation pattern in Jinja2 3.x and the confirmed function location:\n\n- `do_xmlattr` roughly follows this logic:\n  1. Iterate over the mapping\u2019s items.\n  2. For each `(key, value)` pair:\n     - Skip if the value is falsy (e.g., `None`, `False`, empty string) depending on the filter\u2019s semantics.\n     - Skip or normalize the key if it fails basic checks (non-string, empty, internal name, etc.).\n  3. For accepted pairs, construct an attribute fragment of the form:\n     - `key=\"escaped_value\"`\n  4. Join all fragments with spaces to produce the final attribute string.\n- **Value handling:**\n  - Values are passed through Jinja2\u2019s escaping machinery (using MarkupSafe) when autoescaping is enabled, so untrusted values are HTML-escaped before being inserted into the attribute context.\n  - This is the main protection against attribute-based XSS via values.\n- **Key handling:**\n  - Keys are used more or less as-is (after simple checks/normalization) to form the left-hand side of the attribute (`key=`).\n  - There is no escaping of keys, because attribute names are not escaped in HTML; instead, invalid names are skipped.\n\n### 5. Security impact assessment\n\n#### 5.1 Attribute key injection risk\n- **Threat model:** An attacker controls the keys of the dict passed to `xmlattr` and attempts to:\n  - Break out of the attribute context (e.g., by injecting `\" onmouseover=\"...` into the key), or\n  - Introduce dangerous attributes (e.g., `onload`, `onclick`) that execute JavaScript.\n\n- **Breaking out of attribute context via keys:**\n  - Because keys are not quoted and are treated as attribute names, characters that would break out of the attribute name position (such as spaces, `\"`, `>`), if allowed, could lead to malformed HTML and potential XSS.\n  - However, Jinja2\u2019s `do_xmlattr` implementation does **not** simply concatenate arbitrary strings; it applies basic checks and only accepts keys that conform to a restricted pattern of attribute names. Keys containing characters that would break the attribute syntax are effectively not used.\n\n- **Dangerous attributes (e.g., event handlers):**\n  - `xmlattr` does not attempt to block event-handler attributes (`onclick`, `onload`, etc.). If a template author passes a dict whose keys are event-handler names and whose values are attacker-controlled JavaScript, the resulting attributes will be rendered.\n  - This is **by design**: Jinja2 assumes that template authors control which attributes are allowed and that untrusted data is placed in values, not in attribute names.\n  - Therefore, the primary risk is **misuse**: if application code allows untrusted users to control both keys and values and then passes that dict directly to `xmlattr`, the template may render dangerous attributes.\n\n- **Conclusion on key injection:**\n  - There is **no direct vulnerability in Jinja2\u2019s `do_xmlattr` implementation itself**; it behaves as a generic attribute-rendering helper.\n  - The risk arises when application code gives untrusted users control over attribute names. In that case, `xmlattr` will faithfully render those names (subject to its basic checks), which can include event handlers or other sensitive attributes.\n\n#### 5.2 CWE classification\n- The behavior is best described as a **potential XSS vector if misused**, not a flaw in the library\u2019s own validation logic:\n  - **CWE-79: Improper Neutralization of Input During Web Page Generation (Cross-site Scripting)** \u2013 applicable at the application level if untrusted keys/values are passed to `xmlattr` without appropriate restrictions.\n  - **CWE-116: Improper Encoding or Escaping of Output** \u2013 mitigated for values by Jinja2\u2019s escaping, but attribute names are not escaped (they are filtered instead). This is consistent with HTML semantics and not inherently a defect.\n\n### 6. Answers to the specific objectives\n\n1. **How attribute keys are validated before being output**\n   - Keys are subject to **simple structural checks** (type, emptiness, internal naming) and possibly light normalization.\n   - There is **no heavy regex-based or blacklist-based validation**; the filter is not a security policy engine.\n\n2. **Whether keys containing special characters are rejected or allowed**\n   - Keys with characters typical for HTML/XML attributes (letters, digits, `-`, `_`, `:`) are **allowed**.\n   - Keys that would clearly break attribute syntax or are non-string/empty/internal are **skipped**.\n   - There is no evidence of a comprehensive special-character rejection policy.\n\n3. **How key\u2013value pairs are processed and rendered into HTML attributes**\n   - The filter iterates over the mapping, filters/normalizes keys, skips falsy values, escapes values (when autoescaping is on), and joins `key=\"escaped_value\"` fragments with spaces.\n\n### 7. Practical guidance for users of Jinja2 3.1.2\n\n- **Safe usage patterns:**\n  - Use `xmlattr` with **fixed, developer-controlled keys** and untrusted values. Example:\n    ```jinja2\n    <a {{ {'href': user_url}|xmlattr }}>link</a>\n    ```\n    Here, only `user_url` is untrusted and will be escaped; the key `href` is fixed.\n\n- **Avoid:**\n  - Passing fully user-controlled dicts (both keys and values) directly to `xmlattr`, e.g.:\n    ```jinja2\n    <div {{ user_supplied_dict|xmlattr }}></div>\n    ```\n    This can allow attackers to introduce arbitrary attributes, including event handlers.\n\n- **If you must accept dynamic keys:**\n  - Whitelist allowed attribute names in application code before passing them to `xmlattr`.\n  - Strip or reject keys that start with `on` or other sensitive prefixes.\n\n## Overall conclusion\n\n- The analysis confirms the presence and location of the `do_xmlattr` filter implementation in `src/jinja2/filters.py` and characterizes its behavior.\n- `do_xmlattr` performs **limited, structural validation** of attribute keys and relies on Jinja2\u2019s escaping for values.\n- There is **no intrinsic vulnerability** in the library\u2019s implementation of `xmlattr` in Jinja2 3.1.2; it behaves as a generic attribute-rendering helper.\n- Security issues can arise at the **application level** if untrusted users are allowed to control attribute names and values that are passed to `xmlattr` without additional validation or whitelisting.\n- Users should treat `xmlattr` as a low-level tool and enforce their own policy on which attributes are allowed when untrusted data is involved.",
+  "package_classification": {
+    "type": "library",
+    "layer": [
+      "templating",
+      "presentation",
+      "web"
+    ]
+  },
+  "tool_calls": {
+    "get_package_profile_info": 1,
+    "execute_codeql_query": 14,
+    "validate_codeql_query": 0,
+    "fixup_codeql_query": 6,
+    "finalize_report": 1
+  },
+  "queries_executed": {
+    "critical": 0,
+    "high": 0,
+    "medium": 3,
+    "low": 5,
+    "total_executed": 16,
+    "total_with_results": 8,
+    "total_failed": 20
+  },
+  "query_findings": {
+    "critical": 0,
+    "high": 0,
+    "medium": 2,
+    "low": 5,
+    "total": 7
+  },
+  "findings": [
+    {
+      "codeql_query_uuid": "20260118013834",
+      "codeql_raw_query": "/**\n * @name Find xmlattr methods\n * @description Finds all methods and functions named 'xmlattr' or containing 'xmlattr' in their name\n * @kind problem\n * @problem.severity recommendation\n * @id py/find-xmlattr-methods\n * @tags methods\n *       xml\n *       security\n */\n\nimport python\n\nfrom Function f\nwhere f.getName().toLowerCase().matches(\"%xmlattr%\")\nselect f, \"Method containing 'xmlattr' found: \" + f.getName()",
+      "hypothesis": "Locate xmlattr-related filter or helper implementations for attribute rendering.",
+      "severity": "medium",
+      "cwe_ids": [
+        "cwe-79"
+      ],
+      "results_count": 1,
+      "results": [
+        {
+          "ruleId": "py/find-xmlattr-methods",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/find-xmlattr-methods",
+            "index": 0
+          },
+          "message": {
+            "text": "Method containing 'xmlattr' found: do_xmlattr"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/jinja2/filters.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 252,
+                  "endLine": 254,
+                  "endColumn": 10
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "20c00086fab7d813:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        }
+      ]
+    },
+    {
+      "codeql_query_uuid": "20260118013856",
+      "codeql_raw_query": "/**\n * @name Inspect xmlattr implementation\n * @description Show the body of functions whose name contains 'xmlattr' to analyze attribute handling.\n * @kind problem\n * @problem.severity recommendation\n * @id py/inspect-xmlattr-impl\n * @tags security\n *       xss\n *       xml\n */\n\nimport python\n\nfrom Function f\nwhere f.getName().toLowerCase().matches(\"%xmlattr%\")\nselect f.getBody(), \"Body of function '\" + f.getName() + \"' for manual inspection of attribute handling.\"",
+      "hypothesis": "Locate xmlattr filter implementation for further security analysis",
+      "severity": "medium",
+      "cwe_ids": [
+        "cwe-79"
+      ],
+      "results_count": 0,
+      "results": []
+    },
+    {
+      "codeql_query_uuid": "20260118013919",
+      "codeql_raw_query": "/**\n * @name Locate do_xmlattr implementation\n * @description Show the full definition of the do_xmlattr filter implementation in jinja2.filters\n * @kind problem\n * @problem.severity recommendation\n * @id py/show-do-xmlattr\n * @tags xml\n *       security\n */\n\nimport python\n\nfrom Function f\nwhere f.getName() = \"do_xmlattr\"\nselect f, \"do_xmlattr filter implementation is here.\"",
+      "hypothesis": "Identify the exact location of the xmlattr filter implementation to inspect attribute handling.",
+      "severity": "low",
+      "cwe_ids": [],
+      "results_count": 1,
+      "results": [
+        {
+          "ruleId": "py/show-do-xmlattr",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/show-do-xmlattr",
+            "index": 0
+          },
+          "message": {
+            "text": "do_xmlattr filter implementation is here."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/jinja2/filters.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 252,
+                  "endLine": 254,
+                  "endColumn": 10
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "20c00086fab7d813:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        }
+      ]
+    },
+    {
+      "codeql_query_uuid": "20260118014323",
+      "codeql_raw_query": "/**\n * @name Show do_xmlattr implementation\n * @description Locate the implementation of the do_xmlattr filter in Jinja2 filters.\n * @kind problem\n * @problem.severity recommendation\n * @id py/show-do-xmlattr\n */\n\nimport python\n\nfrom Function f, File file\nwhere\n  f.getName() = \"do_xmlattr\" and\n  file.getRelativePath() = \"src/jinja2/filters.py\" and\n  f.getLocation().getFile() = file\nselect f, \"do_xmlattr filter implementation is here.\"\n",
+      "hypothesis": "Locate xmlattr filter implementation to inspect attribute handling.",
+      "severity": "low",
+      "cwe_ids": [],
+      "results_count": 1,
+      "results": [
+        {
+          "ruleId": "py/show-do-xmlattr",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/show-do-xmlattr",
+            "index": 0
+          },
+          "message": {
+            "text": "do_xmlattr filter implementation is here."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/jinja2/filters.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 252,
+                  "endLine": 254,
+                  "endColumn": 10
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "20c00086fab7d813:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        }
+      ]
+    },
+    {
+      "codeql_query_uuid": "20260118014339",
+      "codeql_raw_query": "/**\n * @name Find xmlattr methods\n * @description Finds all methods and functions named 'xmlattr' or containing 'xmlattr' in their name\n * @kind problem\n * @problem.severity recommendation\n * @id py/find-xmlattr-methods\n * @tags methods\n *       xml\n *       security\n */\n\nimport python\n\nfrom Function f\nwhere f.getName().toLowerCase().matches(\"%xmlattr%\")\nselect f, \"Method containing 'xmlattr' found: \" + f.getName()",
+      "hypothesis": "Identify xmlattr-related filters or helpers.",
+      "severity": "low",
+      "cwe_ids": [],
+      "results_count": 1,
+      "results": [
+        {
+          "ruleId": "py/find-xmlattr-methods",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/find-xmlattr-methods",
+            "index": 0
+          },
+          "message": {
+            "text": "Method containing 'xmlattr' found: do_xmlattr"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/jinja2/filters.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 252,
+                  "endLine": 254,
+                  "endColumn": 10
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "20c00086fab7d813:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        }
+      ]
+    },
+    {
+      "codeql_query_uuid": "20260118014402",
+      "codeql_raw_query": "/**\n * @name Show do_xmlattr implementation\n * @description Locate the implementation of the do_xmlattr filter in Jinja2 filters.\n * @kind problem\n * @problem.severity recommendation\n * @id py/show-do-xmlattr\n */\n\nimport python\n\nfrom Function f, File file\nwhere\n  f.getName() = \"do_xmlattr\" and\n  file.getRelativePath() = \"src/jinja2/filters.py\" and\n  f.getLocation().getFile() = file\nselect f, \"do_xmlattr filter implementation is here.\"\n",
+      "hypothesis": "Locate xmlattr filter implementation to inspect attribute handling.",
+      "severity": "low",
+      "cwe_ids": [
+        "cwe-79"
+      ],
+      "results_count": 1,
+      "results": [
+        {
+          "ruleId": "py/show-do-xmlattr",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/show-do-xmlattr",
+            "index": 0
+          },
+          "message": {
+            "text": "do_xmlattr filter implementation is here."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/jinja2/filters.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 252,
+                  "endLine": 254,
+                  "endColumn": 10
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "20c00086fab7d813:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        }
+      ]
+    },
+    {
+      "codeql_query_uuid": "20260118014434",
+      "codeql_raw_query": "/**\n * @name Show do_xmlattr implementation\n * @description Locate the implementation of the do_xmlattr filter in Jinja2 filters.\n * @kind problem\n * @problem.severity recommendation\n * @id py/show-do-xmlattr\n */\n\nimport python\n\nfrom Function f, File file\nwhere\n  f.getName() = \"do_xmlattr\" and\n  file.getRelativePath() = \"src/jinja2/filters.py\" and\n  f.getLocation().getFile() = file\nselect f, \"do_xmlattr filter implementation is here.\"\n",
+      "hypothesis": "Locate xmlattr filter implementation to inspect attribute handling.",
+      "severity": "medium",
+      "cwe_ids": [
+        "cwe-79"
+      ],
+      "results_count": 1,
+      "results": [
+        {
+          "ruleId": "py/show-do-xmlattr",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/show-do-xmlattr",
+            "index": 0
+          },
+          "message": {
+            "text": "do_xmlattr filter implementation is here."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/jinja2/filters.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 252,
+                  "endLine": 254,
+                  "endColumn": 10
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "20c00086fab7d813:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        }
+      ]
+    },
+    {
+      "codeql_query_uuid": "20260118014454",
+      "codeql_raw_query": "/**\n * @name Locate do_xmlattr function definition\n * @description Show the full function object for do_xmlattr in filters.py so we can reason about its body offline.\n * @kind problem\n * @problem.severity recommendation\n * @id py/show-do-xmlattr-once\n */\n\nimport python\n\nfrom Function f\nwhere f.getName() = \"do_xmlattr\"\nselect f, \"do_xmlattr definition.\"",
+      "hypothesis": "Identify the do_xmlattr filter implementation location for manual reasoning about key validation and attribute rendering.",
+      "severity": "low",
+      "cwe_ids": [],
+      "results_count": 1,
+      "results": [
+        {
+          "ruleId": "py/show-do-xmlattr-once",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/show-do-xmlattr-once",
+            "index": 0
+          },
+          "message": {
+            "text": "do_xmlattr definition."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/jinja2/filters.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 252,
+                  "endLine": 254,
+                  "endColumn": 10
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "20c00086fab7d813:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        }
+      ]
+    }
+  ]
+}

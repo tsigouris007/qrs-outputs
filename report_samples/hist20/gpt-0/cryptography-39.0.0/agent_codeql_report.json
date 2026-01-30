@@ -1,0 +1,1099 @@
+{
+  "session_id": "20260118030946",
+  "package_name": "cryptography-39.0.0",
+  "package_path": "packages/cryptography-39.0.0",
+  "database_path": "databases/cryptography-39.0.0-db",
+  "model": "gpt-5.1",
+  "temperature": 0.0,
+  "max_tokens": 8000,
+  "iterations": 13,
+  "total_input_tokens": 165892,
+  "total_output_tokens": 8992,
+  "total_tokens": 174884,
+  "elapsed_time_seconds": 279.73,
+  "estimated_cost_usd": 0.4162,
+  "summary": "Security analysis of cryptography-39.0.0 focused on buffer protocol handling in cipher-related OpenSSL backends, with emphasis on potential missing writability checks (CWE-754).\n\nScope and approach\n- Analyzed the package profile (117 files, ~16.8k LOC) with focus on:\n  - src/cryptography/hazmat/backends/openssl/ciphers.py\n  - src/cryptography/hazmat/backends/openssl/aead.py\n  - Other OpenSSL backend helpers (cmac.py, hmac.py, hashes.py, poly1305.py, backend.py)\n- Used CodeQL to:\n  - Enumerate all uses of cffi.from_buffer in OpenSSL backends.\n  - Narrow down to from_buffer usages in the ciphers backend, where update_into/finalize_into-style APIs are implemented.\n- Primary objective: identify patterns where Python buffer-protocol objects are accepted as output buffers for cipher operations and passed into CFFI from_buffer without explicit writability validation.\n\nKey CodeQL findings\n1. Global from_buffer usage in OpenSSL backends\n   - Query: py/cryptography-from-buffer-locations (problem, severity: warning, CWE-754)\n   - Files/locations flagged (representative):\n     - src/cryptography/hazmat/backends/openssl/aead.py: lines 75, 126\u2013127, 148\n     - src/cryptography/hazmat/backends/openssl/backend.py: lines 472, 630, 1174, 1978, 2026, 2065, 2088\n     - src/cryptography/hazmat/backends/openssl/ciphers.py: lines 63, 67, 69, 71, 112, 159\u2013160, 274\n     - src/cryptography/hazmat/backends/openssl/cmac.py: line 49\n     - src/cryptography/hazmat/backends/openssl/hashes.py: line 56\n     - src/cryptography/hazmat/backends/openssl/hmac.py: lines 41, 67\n     - src/cryptography/hazmat/backends/openssl/poly1305.py: lines 22, 50\n   - Interpretation:\n     - These locations show that the OpenSSL backend uses cffi.from_buffer to obtain raw pointers into Python-managed buffers for various cryptographic operations (AEAD, ciphers, MACs, hashes, Poly1305, etc.).\n     - The query was intentionally broad and did not distinguish between input and output buffers; it served to map all buffer-protocol touchpoints.\n\n2. Focused from_buffer usage in ciphers backend\n   - Query: py/cryptography-ciphers-from-buffer (problem, severity: warning, CWE-754)\n   - File: src/cryptography/hazmat/backends/openssl/ciphers.py\n   - Locations flagged:\n     - Lines 63\u201365: from_buffer call\n     - Line 67: from_buffer call\n     - Line 69: from_buffer call\n     - Line 71: from_buffer call\n     - Line 112: from_buffer call\n     - Line 159: from_buffer call\n     - Line 160: from_buffer call\n     - Line 274: from_buffer call\n   - Interpretation:\n     - These are the core cipher backend implementations where encrypt/decrypt contexts and update/update_into/finalize/finalize_into logic live.\n     - The repeated from_buffer usage indicates that cipher operations are implemented by mapping Python buffers directly into C via CFFI.\n\nAssessment against the target vulnerability pattern (CWE-754)\n- Target pattern: methods that\n  1. Accept a Python object implementing the buffer protocol as an output buffer (e.g., update_into, finalize_into, AEAD encrypt/decrypt into a caller-provided buffer).\n  2. Create a CFFI buffer from that object via from_buffer (or similar).\n  3. Perform write operations through that buffer into the underlying memory.\n  4. Do not explicitly verify that the buffer is writable before using it for writes.\n\n- What the CodeQL results show:\n  - There are multiple from_buffer calls in cipher and AEAD backends, consistent with using Python buffers as input and/or output.\n  - The queries confirm that these calls occur in the OpenSSL backend implementation files, including ciphers.py and aead.py, which are the most likely locations for update_into/finalize_into-style APIs.\n\n- What the CodeQL results do NOT prove by themselves:\n  - The queries used here are structural and do not yet:\n    - Distinguish input-only buffers from output buffers.\n    - Track data flow from specific function parameters (e.g., update_into(self, data, outbuf)) to the from_buffer call.\n    - Inspect the surrounding logic for explicit writability checks (e.g., using memoryview(obj).readonly, type checks, or other guards) before calling from_buffer.\n  - As a result, the findings are best characterized as \u201cpoints of interest\u201d rather than confirmed vulnerabilities.\n\n- Manual reasoning based on typical cryptography backend patterns (informative, not CodeQL-proven):\n  - In cryptography\u2019s OpenSSL backend, update_into/finalize_into and AEAD encrypt/decrypt-into APIs are generally implemented by:\n    - Accepting a Python object expected to be a writable buffer (e.g., bytearray, memoryview of a writable buffer).\n    - Converting it to a CFFI buffer via from_buffer and passing it to OpenSSL functions that write ciphertext or tags.\n  - Historically, the project has relied on Python\u2019s buffer protocol semantics and type expectations rather than explicit, centralized \u201cis this writable?\u201d checks at every call site.\n  - If a caller passes an immutable object (e.g., bytes) where a writable buffer is expected, behavior depends on how from_buffer and the underlying CFFI/OpenSSL code handle it. In many environments this results in an exception rather than silent memory corruption, but the safety guarantees depend on CFFI and CPython behavior.\n\nConclusion and risk characterization\n- Confirmed facts from CodeQL:\n  - The cryptography-39.0.0 OpenSSL backends make extensive use of cffi.from_buffer in cipher, AEAD, MAC, hash, and Poly1305 implementations.\n  - These usages occur in functions that are likely to be involved in encrypt/decrypt/update/update_into/finalize/finalize_into operations.\n\n- Status of the specific CWE-754 concern (improper check for buffer writability):\n  - CodeQL analysis in this run did not conclusively demonstrate a missing writability check that leads to a concrete memory safety vulnerability.\n  - The queries identified all relevant from_buffer call sites but did not, within the iteration budget, implement full data-flow tracking from public APIs to those call sites nor automated detection of explicit writability checks.\n  - Therefore, the current findings should be treated as:\n    - **Medium-confidence indicators** that buffer-protocol objects are used in performance-critical cryptographic paths via from_buffer.\n    - **Not a confirmed exploitable vulnerability** in cryptography-39.0.0 based solely on this analysis.\n\nRecommendations\n- For maintainers / auditors:\n  1. Manually review the flagged locations, especially in:\n     - src/cryptography/hazmat/backends/openssl/ciphers.py (lines around 60\u201375, 110\u2013120, 150\u2013170, 270\u2013280)\n     - src/cryptography/hazmat/backends/openssl/aead.py (lines around 70\u201380, 120\u2013130, 140\u2013150)\n  2. For each public API that accepts an output buffer (e.g., update_into, finalize_into, AEAD encrypt/decrypt-into):\n     - Trace the parameter into the backend implementation and confirm whether:\n       - The object is converted to a memoryview and checked for .readonly or similar.\n       - The code enforces that the object is a known-writable type (e.g., bytearray, writable memoryview) before calling from_buffer.\n  3. If any path allows an arbitrary buffer-protocol object to reach from_buffer without such checks, consider:\n     - Adding explicit writability validation (e.g., via memoryview and readonly checks) and raising a clear exception on immutable buffers.\n     - Documenting the requirement that the buffer must be writable and of sufficient size.\n\n- For users:\n  - When using update_into/finalize_into or AEAD encrypt/decrypt-into APIs in cryptography-39.0.0, ensure that:\n    - You pass a writable buffer (e.g., bytearray, writable memoryview) as the destination.\n    - You do not pass immutable types like bytes as output buffers.\n\nOverall assessment\n- No definitive, exploitable memory safety vulnerability was proven by this CodeQL run.\n- However, the analysis confirms that cryptography-39.0.0\u2019s OpenSSL backends rely heavily on cffi.from_buffer for cipher and AEAD operations, which is exactly the area where improper writability checks could matter.\n- The flagged locations are high-value targets for deeper, possibly manual or more advanced data-flow analysis to conclusively rule in or out CWE-754 issues related to buffer writability.\n",
+  "package_classification": {
+    "type": "library",
+    "layer": [
+      "crypto",
+      "security",
+      "backend",
+      "bindings"
+    ]
+  },
+  "tool_calls": {
+    "get_package_profile_info": 1,
+    "execute_codeql_query": 7,
+    "validate_codeql_query": 0,
+    "fixup_codeql_query": 4,
+    "finalize_report": 1
+  },
+  "queries_executed": {
+    "critical": 0,
+    "high": 1,
+    "medium": 1,
+    "low": 0,
+    "total_executed": 8,
+    "total_with_results": 2,
+    "total_failed": 16
+  },
+  "query_findings": {
+    "critical": 0,
+    "high": 25,
+    "medium": 8,
+    "low": 0,
+    "total": 33
+  },
+  "findings": [
+    {
+      "codeql_query_uuid": "20260118031220",
+      "codeql_raw_query": "/**\n * @name Locate from_buffer usages in OpenSSL backend\n * @description Find all calls to from_buffer in cryptography's OpenSSL backend to inspect buffer handling.\n * @kind problem\n * @problem.severity warning\n * @id py/cryptography-from-buffer-locations\n * @tags security\n *       external/cwe/cwe-754\n */\n\nimport python\n\nfrom Call call, Attribute attr\nwhere\n  call.getFunc() = attr and\n  attr.getAttr() = \"from_buffer\" and\n  call.getLocation().getFile().getRelativePath().matches(\"src/cryptography/hazmat/backends/openssl/%\")\nselect call, \"Call to from_buffer in OpenSSL backend for manual review of buffer writability checks.\"\n",
+      "hypothesis": "from_buffer is used in OpenSSL backend cipher or AEAD code and may not validate buffer writability before writing into it",
+      "severity": "high",
+      "cwe_ids": [
+        "cwe-754"
+      ],
+      "results_count": 25,
+      "results": [
+        {
+          "ruleId": "py/cryptography-from-buffer-locations",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/cryptography-from-buffer-locations",
+            "index": 0
+          },
+          "message": {
+            "text": "Call to from_buffer in OpenSSL backend for manual review of buffer writability checks."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/cryptography/hazmat/backends/openssl/aead.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 75,
+                  "startColumn": 15,
+                  "endColumn": 44
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "7c7e64b0c41c1ab1:1",
+            "primaryLocationStartColumnFingerprint": "10"
+          }
+        },
+        {
+          "ruleId": "py/cryptography-from-buffer-locations",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/cryptography-from-buffer-locations",
+            "index": 0
+          },
+          "message": {
+            "text": "Call to from_buffer in OpenSSL backend for manual review of buffer writability checks."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/cryptography/hazmat/backends/openssl/aead.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 126,
+                  "startColumn": 17,
+                  "endColumn": 48
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "39a813251677584:1",
+            "primaryLocationStartColumnFingerprint": "12"
+          }
+        },
+        {
+          "ruleId": "py/cryptography-from-buffer-locations",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/cryptography-from-buffer-locations",
+            "index": 0
+          },
+          "message": {
+            "text": "Call to from_buffer in OpenSSL backend for manual review of buffer writability checks."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/cryptography/hazmat/backends/openssl/aead.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 127,
+                  "startColumn": 15,
+                  "endColumn": 44
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "821d0f8e093aebb1:1",
+            "primaryLocationStartColumnFingerprint": "10"
+          }
+        },
+        {
+          "ruleId": "py/cryptography-from-buffer-locations",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/cryptography-from-buffer-locations",
+            "index": 0
+          },
+          "message": {
+            "text": "Call to from_buffer in OpenSSL backend for manual review of buffer writability checks."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/cryptography/hazmat/backends/openssl/aead.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 148,
+                  "startColumn": 17,
+                  "endColumn": 48
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "55c7270959e33eb4:1",
+            "primaryLocationStartColumnFingerprint": "12"
+          }
+        },
+        {
+          "ruleId": "py/cryptography-from-buffer-locations",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/cryptography-from-buffer-locations",
+            "index": 0
+          },
+          "message": {
+            "text": "Call to from_buffer in OpenSSL backend for manual review of buffer writability checks."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/cryptography/hazmat/backends/openssl/backend.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 1
+                },
+                "region": {
+                  "startLine": 472,
+                  "startColumn": 28,
+                  "endColumn": 63
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "afd8403c9a9ef82f:1",
+            "primaryLocationStartColumnFingerprint": "19"
+          }
+        },
+        {
+          "ruleId": "py/cryptography-from-buffer-locations",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/cryptography-from-buffer-locations",
+            "index": 0
+          },
+          "message": {
+            "text": "Call to from_buffer in OpenSSL backend for manual review of buffer writability checks."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/cryptography/hazmat/backends/openssl/backend.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 1
+                },
+                "region": {
+                  "startLine": 630,
+                  "startColumn": 20,
+                  "endColumn": 47
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "ba5d5db830bc4f47:1",
+            "primaryLocationStartColumnFingerprint": "11"
+          }
+        },
+        {
+          "ruleId": "py/cryptography-from-buffer-locations",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/cryptography-from-buffer-locations",
+            "index": 0
+          },
+          "message": {
+            "text": "Call to from_buffer in OpenSSL backend for manual review of buffer writability checks."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/cryptography/hazmat/backends/openssl/backend.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 1
+                },
+                "region": {
+                  "startLine": 1174,
+                  "startColumn": 28,
+                  "endColumn": 59
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "cd88d21942c1477b:1",
+            "primaryLocationStartColumnFingerprint": "15"
+          }
+        },
+        {
+          "ruleId": "py/cryptography-from-buffer-locations",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/cryptography-from-buffer-locations",
+            "index": 0
+          },
+          "message": {
+            "text": "Call to from_buffer in OpenSSL backend for manual review of buffer writability checks."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/cryptography/hazmat/backends/openssl/backend.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 1
+                },
+                "region": {
+                  "startLine": 1978,
+                  "startColumn": 20,
+                  "endColumn": 47
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "b03482c955638f3:1",
+            "primaryLocationStartColumnFingerprint": "11"
+          }
+        },
+        {
+          "ruleId": "py/cryptography-from-buffer-locations",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/cryptography-from-buffer-locations",
+            "index": 0
+          },
+          "message": {
+            "text": "Call to from_buffer in OpenSSL backend for manual review of buffer writability checks."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/cryptography/hazmat/backends/openssl/backend.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 1
+                },
+                "region": {
+                  "startLine": 2026,
+                  "startColumn": 20,
+                  "endColumn": 47
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "b03482c955638f3:2",
+            "primaryLocationStartColumnFingerprint": "11"
+          }
+        },
+        {
+          "ruleId": "py/cryptography-from-buffer-locations",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/cryptography-from-buffer-locations",
+            "index": 0
+          },
+          "message": {
+            "text": "Call to from_buffer in OpenSSL backend for manual review of buffer writability checks."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/cryptography/hazmat/backends/openssl/backend.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 1
+                },
+                "region": {
+                  "startLine": 2065,
+                  "startColumn": 20,
+                  "endColumn": 47
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "b03482c955638f3:3",
+            "primaryLocationStartColumnFingerprint": "11"
+          }
+        },
+        {
+          "ruleId": "py/cryptography-from-buffer-locations",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/cryptography-from-buffer-locations",
+            "index": 0
+          },
+          "message": {
+            "text": "Call to from_buffer in OpenSSL backend for manual review of buffer writability checks."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/cryptography/hazmat/backends/openssl/backend.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 1
+                },
+                "region": {
+                  "startLine": 2088,
+                  "startColumn": 28,
+                  "endColumn": 63
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "c5760db10b75a838:1",
+            "primaryLocationStartColumnFingerprint": "19"
+          }
+        },
+        {
+          "ruleId": "py/cryptography-from-buffer-locations",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/cryptography-from-buffer-locations",
+            "index": 0
+          },
+          "message": {
+            "text": "Call to from_buffer in OpenSSL backend for manual review of buffer writability checks."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/cryptography/hazmat/backends/openssl/ciphers.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 2
+                },
+                "region": {
+                  "startLine": 63,
+                  "startColumn": 24,
+                  "endLine": 65,
+                  "endColumn": 14
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "b037c25a98645013:1",
+            "primaryLocationStartColumnFingerprint": "11"
+          }
+        },
+        {
+          "ruleId": "py/cryptography-from-buffer-locations",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/cryptography-from-buffer-locations",
+            "index": 0
+          },
+          "message": {
+            "text": "Call to from_buffer in OpenSSL backend for manual review of buffer writability checks."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/cryptography/hazmat/backends/openssl/ciphers.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 2
+                },
+                "region": {
+                  "startLine": 67,
+                  "startColumn": 24,
+                  "endColumn": 66
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "94c81e894610b65e:1",
+            "primaryLocationStartColumnFingerprint": "11"
+          }
+        },
+        {
+          "ruleId": "py/cryptography-from-buffer-locations",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/cryptography-from-buffer-locations",
+            "index": 0
+          },
+          "message": {
+            "text": "Call to from_buffer in OpenSSL backend for manual review of buffer writability checks."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/cryptography/hazmat/backends/openssl/ciphers.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 2
+                },
+                "region": {
+                  "startLine": 69,
+                  "startColumn": 24,
+                  "endColumn": 66
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "371b5bb4762e15ae:1",
+            "primaryLocationStartColumnFingerprint": "11"
+          }
+        },
+        {
+          "ruleId": "py/cryptography-from-buffer-locations",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/cryptography-from-buffer-locations",
+            "index": 0
+          },
+          "message": {
+            "text": "Call to from_buffer in OpenSSL backend for manual review of buffer writability checks."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/cryptography/hazmat/backends/openssl/ciphers.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 2
+                },
+                "region": {
+                  "startLine": 71,
+                  "startColumn": 24,
+                  "endColumn": 68
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "3bf84292925851b5:1",
+            "primaryLocationStartColumnFingerprint": "11"
+          }
+        },
+        {
+          "ruleId": "py/cryptography-from-buffer-locations",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/cryptography-from-buffer-locations",
+            "index": 0
+          },
+          "message": {
+            "text": "Call to from_buffer in OpenSSL backend for manual review of buffer writability checks."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/cryptography/hazmat/backends/openssl/ciphers.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 2
+                },
+                "region": {
+                  "startLine": 112,
+                  "startColumn": 13,
+                  "endColumn": 55
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "d8ac79d8cefb9290:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "py/cryptography-from-buffer-locations",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/cryptography-from-buffer-locations",
+            "index": 0
+          },
+          "message": {
+            "text": "Call to from_buffer in OpenSSL backend for manual review of buffer writability checks."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/cryptography/hazmat/backends/openssl/ciphers.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 2
+                },
+                "region": {
+                  "startLine": 159,
+                  "startColumn": 22,
+                  "endColumn": 57
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "49a43dd2f150a1ad:1",
+            "primaryLocationStartColumnFingerprint": "13"
+          }
+        },
+        {
+          "ruleId": "py/cryptography-from-buffer-locations",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/cryptography-from-buffer-locations",
+            "index": 0
+          },
+          "message": {
+            "text": "Call to from_buffer in OpenSSL backend for manual review of buffer writability checks."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/cryptography/hazmat/backends/openssl/ciphers.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 2
+                },
+                "region": {
+                  "startLine": 160,
+                  "startColumn": 21,
+                  "endColumn": 57
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "46227e57b615a691:1",
+            "primaryLocationStartColumnFingerprint": "12"
+          }
+        },
+        {
+          "ruleId": "py/cryptography-from-buffer-locations",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/cryptography-from-buffer-locations",
+            "index": 0
+          },
+          "message": {
+            "text": "Call to from_buffer in OpenSSL backend for manual review of buffer writability checks."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/cryptography/hazmat/backends/openssl/ciphers.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 2
+                },
+                "region": {
+                  "startLine": 274,
+                  "startColumn": 13,
+                  "endColumn": 49
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "d63e422c7b7f384a:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "py/cryptography-from-buffer-locations",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/cryptography-from-buffer-locations",
+            "index": 0
+          },
+          "message": {
+            "text": "Call to from_buffer in OpenSSL backend for manual review of buffer writability checks."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/cryptography/hazmat/backends/openssl/cmac.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 3
+                },
+                "region": {
+                  "startLine": 49,
+                  "startColumn": 23,
+                  "endColumn": 64
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "d658cf579a100409:1",
+            "primaryLocationStartColumnFingerprint": "10"
+          }
+        },
+        {
+          "ruleId": "py/cryptography-from-buffer-locations",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/cryptography-from-buffer-locations",
+            "index": 0
+          },
+          "message": {
+            "text": "Call to from_buffer in OpenSSL backend for manual review of buffer writability checks."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/cryptography/hazmat/backends/openssl/hashes.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 4
+                },
+                "region": {
+                  "startLine": 56,
+                  "startColumn": 20,
+                  "endColumn": 56
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "64cf02a2d68ca913:1",
+            "primaryLocationStartColumnFingerprint": "11"
+          }
+        },
+        {
+          "ruleId": "py/cryptography-from-buffer-locations",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/cryptography-from-buffer-locations",
+            "index": 0
+          },
+          "message": {
+            "text": "Call to from_buffer in OpenSSL backend for manual review of buffer writability checks."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/cryptography/hazmat/backends/openssl/hmac.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 5
+                },
+                "region": {
+                  "startLine": 41,
+                  "startColumn": 23,
+                  "endColumn": 58
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "9d987baa31832aee:1",
+            "primaryLocationStartColumnFingerprint": "10"
+          }
+        },
+        {
+          "ruleId": "py/cryptography-from-buffer-locations",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/cryptography-from-buffer-locations",
+            "index": 0
+          },
+          "message": {
+            "text": "Call to from_buffer in OpenSSL backend for manual review of buffer writability checks."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/cryptography/hazmat/backends/openssl/hmac.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 5
+                },
+                "region": {
+                  "startLine": 67,
+                  "startColumn": 20,
+                  "endColumn": 56
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "9e2b995f5cedde95:1",
+            "primaryLocationStartColumnFingerprint": "11"
+          }
+        },
+        {
+          "ruleId": "py/cryptography-from-buffer-locations",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/cryptography-from-buffer-locations",
+            "index": 0
+          },
+          "message": {
+            "text": "Call to from_buffer in OpenSSL backend for manual review of buffer writability checks."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/cryptography/hazmat/backends/openssl/poly1305.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 6
+                },
+                "region": {
+                  "startLine": 22,
+                  "startColumn": 19,
+                  "endColumn": 54
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "eb10735d0d3d2f7c:1",
+            "primaryLocationStartColumnFingerprint": "10"
+          }
+        },
+        {
+          "ruleId": "py/cryptography-from-buffer-locations",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/cryptography-from-buffer-locations",
+            "index": 0
+          },
+          "message": {
+            "text": "Call to from_buffer in OpenSSL backend for manual review of buffer writability checks."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/cryptography/hazmat/backends/openssl/poly1305.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 6
+                },
+                "region": {
+                  "startLine": 50,
+                  "startColumn": 20,
+                  "endColumn": 56
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "565f617820179747:1",
+            "primaryLocationStartColumnFingerprint": "11"
+          }
+        }
+      ]
+    },
+    {
+      "codeql_query_uuid": "20260118031337",
+      "codeql_raw_query": "/**\n * @name All from_buffer usages in OpenSSL ciphers backend\n * @description List all from_buffer calls in ciphers backend for manual inspection of buffer writability checks.\n * @kind problem\n * @problem.severity warning\n * @id py/cryptography-ciphers-from-buffer\n * @tags security\n *       external/cwe/cwe-754\n */\n\nimport python\n\nfrom Call call, Attribute attr\nwhere\n  call.getFunc() = attr and\n  attr.getAttr() = \"from_buffer\" and\n  call.getLocation().getFile().getRelativePath() = \"src/cryptography/hazmat/backends/openssl/ciphers.py\"\nselect call, \"from_buffer call in ciphers backend for manual review of buffer writability handling.\"",
+      "hypothesis": "Locate all from_buffer usages in ciphers backend to inspect how output buffers are validated for writability.",
+      "severity": "medium",
+      "cwe_ids": [
+        "cwe-754"
+      ],
+      "results_count": 8,
+      "results": [
+        {
+          "ruleId": "py/cryptography-ciphers-from-buffer",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/cryptography-ciphers-from-buffer",
+            "index": 0
+          },
+          "message": {
+            "text": "from_buffer call in ciphers backend for manual review of buffer writability handling."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/cryptography/hazmat/backends/openssl/ciphers.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 63,
+                  "startColumn": 24,
+                  "endLine": 65,
+                  "endColumn": 14
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "b037c25a98645013:1",
+            "primaryLocationStartColumnFingerprint": "11"
+          }
+        },
+        {
+          "ruleId": "py/cryptography-ciphers-from-buffer",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/cryptography-ciphers-from-buffer",
+            "index": 0
+          },
+          "message": {
+            "text": "from_buffer call in ciphers backend for manual review of buffer writability handling."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/cryptography/hazmat/backends/openssl/ciphers.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 67,
+                  "startColumn": 24,
+                  "endColumn": 66
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "94c81e894610b65e:1",
+            "primaryLocationStartColumnFingerprint": "11"
+          }
+        },
+        {
+          "ruleId": "py/cryptography-ciphers-from-buffer",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/cryptography-ciphers-from-buffer",
+            "index": 0
+          },
+          "message": {
+            "text": "from_buffer call in ciphers backend for manual review of buffer writability handling."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/cryptography/hazmat/backends/openssl/ciphers.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 69,
+                  "startColumn": 24,
+                  "endColumn": 66
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "371b5bb4762e15ae:1",
+            "primaryLocationStartColumnFingerprint": "11"
+          }
+        },
+        {
+          "ruleId": "py/cryptography-ciphers-from-buffer",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/cryptography-ciphers-from-buffer",
+            "index": 0
+          },
+          "message": {
+            "text": "from_buffer call in ciphers backend for manual review of buffer writability handling."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/cryptography/hazmat/backends/openssl/ciphers.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 71,
+                  "startColumn": 24,
+                  "endColumn": 68
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "3bf84292925851b5:1",
+            "primaryLocationStartColumnFingerprint": "11"
+          }
+        },
+        {
+          "ruleId": "py/cryptography-ciphers-from-buffer",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/cryptography-ciphers-from-buffer",
+            "index": 0
+          },
+          "message": {
+            "text": "from_buffer call in ciphers backend for manual review of buffer writability handling."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/cryptography/hazmat/backends/openssl/ciphers.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 112,
+                  "startColumn": 13,
+                  "endColumn": 55
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "d8ac79d8cefb9290:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "py/cryptography-ciphers-from-buffer",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/cryptography-ciphers-from-buffer",
+            "index": 0
+          },
+          "message": {
+            "text": "from_buffer call in ciphers backend for manual review of buffer writability handling."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/cryptography/hazmat/backends/openssl/ciphers.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 159,
+                  "startColumn": 22,
+                  "endColumn": 57
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "49a43dd2f150a1ad:1",
+            "primaryLocationStartColumnFingerprint": "13"
+          }
+        },
+        {
+          "ruleId": "py/cryptography-ciphers-from-buffer",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/cryptography-ciphers-from-buffer",
+            "index": 0
+          },
+          "message": {
+            "text": "from_buffer call in ciphers backend for manual review of buffer writability handling."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/cryptography/hazmat/backends/openssl/ciphers.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 160,
+                  "startColumn": 21,
+                  "endColumn": 57
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "46227e57b615a691:1",
+            "primaryLocationStartColumnFingerprint": "12"
+          }
+        },
+        {
+          "ruleId": "py/cryptography-ciphers-from-buffer",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/cryptography-ciphers-from-buffer",
+            "index": 0
+          },
+          "message": {
+            "text": "from_buffer call in ciphers backend for manual review of buffer writability handling."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/cryptography/hazmat/backends/openssl/ciphers.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 274,
+                  "startColumn": 13,
+                  "endColumn": 49
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "d63e422c7b7f384a:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,236 @@
+{
+  "session_id": "20251207184231",
+  "package_name": "aiohttp-3.13.2",
+  "package_path": "packages/aiohttp-3.13.2",
+  "database_path": "databases/aiohttp-3.13.2-db",
+  "model": "gpt-5.1",
+  "temperature": 0.0,
+  "max_tokens": 8000,
+  "iterations": 12,
+  "total_input_tokens": 87292,
+  "total_output_tokens": 9181,
+  "total_tokens": 96473,
+  "elapsed_time_seconds": 538.97,
+  "estimated_cost_usd": 0.2009,
+  "summary": "## Overview\n\nPackage analyzed: **aiohttp 3.13.2**  \nType: async HTTP client/server framework for asyncio.\n\nWithin the available CodeQL-based analysis budget, no critical or high-severity, directly exploitable vulnerabilities were identified in the library\u2019s own code. The main noteworthy security-relevant pattern is an **unsafe deserialization helper in `aiohttp.cookiejar` that uses `pickle`**, which is inherently dangerous if ever used on untrusted data. However, in normal aiohttp usage this helper is not wired to remote input by default; it is a **potential footgun for integrators**, not an immediate RCE in the library.\n\nBelow is a concise summary of the key finding and its implications.\n\n---\n\n## Key Finding: Unsafe deserialization helper in `aiohttp.cookiejar`\n\n**Location (from CodeQL results):**\n- File: `aiohttp/cookiejar.py`\n- Line: ~133 (exact span reported by CodeQL)\n\n**What was detected**\n- Two independent CodeQL queries flagged the same location:\n  - `py/aiohttp-unsafe-deserialization`\n  - `py/aiohttp-pickle-deserialization`\n- Both identify a **potentially unsafe deserialization operation using `pickle`** inside the cookie jar implementation.\n\nWhile the exact source snippet is not shown in the SARIF, the pattern is consistent with code that:\n- Serializes cookie data using `pickle.dumps(...)`, and\n- Later restores it using `pickle.loads(...)` or equivalent.\n\n**Security impact**\n- `pickle` deserialization is **inherently unsafe** (CWE-502: Deserialization of Untrusted Data). If an attacker can control the serialized bytes passed into `pickle.loads`, they can typically achieve **arbitrary code execution**.\n- In aiohttp\u2019s case, this helper appears to be an **internal convenience for persisting/restoring cookies**, not something that is automatically fed with network data.\n- Therefore, the **library itself is not obviously vulnerable by default**, but:\n  - Any application that exposes this helper to untrusted input (e.g., storing user-supplied cookie jars, session state, or other data and then restoring it via this API) would be at high risk.\n\n**Risk classification**\n- **CWE:** CWE-502 (Deserialization of Untrusted Data)\n- **Severity (library-internal, as shipped):** Low\u2013Medium\n  - Low in the sense that there is no direct, automatic flow from HTTP request data to `pickle.loads` in the library\u2019s own code paths, based on the CodeQL taint queries run.\n  - Medium as a **dangerous primitive**: if misused by integrators, it becomes a critical RCE vector.\n\n**Recommendations for library maintainers**\n1. **Document the risk clearly**\n   - Explicitly warn in the docstring and user documentation that any `pickle`-based cookie persistence helpers **must never be used with untrusted data**.\n   - State that serialized cookie jars should only be loaded from trusted, integrity-protected storage.\n\n2. **Consider safer defaults**\n   - Prefer a safer, structured format (e.g., JSON) for any public persistence APIs, even if less feature-rich than `pickle`.\n   - If `pickle` is kept for backward compatibility, consider:\n     - Marking the API as **deprecated**.\n     - Requiring an explicit opt-in flag (e.g., `unsafe_pickle=True`) to call it.\n\n3. **Harden the API surface**\n   - Ensure that any function that performs `pickle.loads` is **not automatically reachable from HTTP handlers** and is clearly separated from request processing logic.\n   - Add type checks or integrity checks (e.g., HMAC over serialized data) if there is any chance of data crossing trust boundaries.\n\n**Recommendations for application developers using aiohttp**\n- **Do not deserialize untrusted data with `pickle`**. This includes:\n  - Never loading cookie jars or session objects from user-controlled sources (e.g., request bodies, query parameters, cookies, or untrusted databases) using `pickle`.\n- If you need to persist cookies across runs:\n  - Store the serialized data in a **trusted, server-side-only** location.\n  - Protect it with filesystem permissions and, ideally, integrity checks.\n\n---\n\n## Other hypotheses tested (no issues found)\n\nWithin the remaining budget, several additional CodeQL queries were run to look for common web-framework vulnerabilities in aiohttp\u2019s codebase. These queries either returned **no results** or only benign patterns:\n\n1. **SSRF sinks in aiohttp client usage (CWE-918)**\n   - Query looked for `aiohttp.ClientSession` / `aiohttp.request` / HTTP verb helpers called with non-literal URLs that are dataflow-connected to local sources.\n   - Result: **No problematic flows found** in the library code itself.\n   - Interpretation: aiohttp exposes powerful HTTP client primitives, but the library does not itself construct attacker-controlled URLs in a way that would constitute an SSRF in its own logic. SSRF remains an application-level risk depending on how developers use the client.\n\n2. **Open redirect in web handlers (CWE-601)**\n   - Path-problem query tracked remote input (`RemoteFlowSource`) to redirect constructors like `aiohttp.web.HTTPFound`, `HTTPMovedPermanently`, etc.\n   - Result: **No flows from remote input to redirect targets** in aiohttp\u2019s own handlers.\n   - Interpretation: The core framework does not implement redirect logic that directly trusts user input as the redirect destination. Open redirect remains a risk for user code that constructs redirects from request parameters.\n\n3. **Subprocess command injection (CWE-78)**\n   - Attempted to track remote input to `subprocess` calls (`Popen`, `run`, etc.).\n   - After fixing one query and discarding another that could not be auto-corrected, the executed query found **no tainted flows** in aiohttp\u2019s code.\n   - Interpretation: aiohttp does not appear to spawn subprocesses based on request data in its own implementation.\n\n4. **Additional generic security checks**\n   - Several other CodeQL queries (not all detailed here due to budget) were run to look for:\n     - Dangerous uses of `eval`/`exec` or dynamic code execution.\n     - Obvious path traversal or unsafe file handling in `web_fileresponse` and related modules.\n   - Result: **No critical or high-severity issues surfaced** in these areas.\n\n---\n\n## Overall assessment\n\n- **No direct, high-impact vulnerabilities** (like immediate RCE, SSRF, or open redirect) were found in aiohttp 3.13.2\u2019s own code paths using the CodeQL queries executed.\n- The main security-relevant concern is the **presence of a `pickle`-based deserialization helper in `aiohttp.cookiejar`**, which is safe only under strict trust assumptions about the serialized data source.\n- As with most frameworks, **the majority of security risk lies in how applications use aiohttp**, particularly:\n  - Constructing outbound HTTP requests from unvalidated user input (SSRF).\n  - Building redirects from user-controlled URLs.\n  - Using `pickle` or other unsafe mechanisms on untrusted data.\n\nWithin the constraints of the automated analysis, aiohttp 3.13.2 appears **reasonably robust**, with the caveat that the `pickle`-based cookie deserialization helper should be treated as a **dangerous primitive** and documented/used accordingly.\n",
+  "package_classification": {
+    "type": "library",
+    "layer": [
+      "networking",
+      "web",
+      "asyncio",
+      "http-client",
+      "http-server"
+    ]
+  },
+  "tool_calls": {
+    "get_package_profile_info": 1,
+    "execute_codeql_query": 14,
+    "validate_codeql_query": 0,
+    "fixup_codeql_query": 3,
+    "finalize_report": 1
+  },
+  "queries_executed": {
+    "critical": 2,
+    "high": 6,
+    "medium": 3,
+    "low": 0,
+    "total_executed": 16,
+    "total_with_results": 11,
+    "total_failed": 6
+  },
+  "query_findings": {
+    "critical": 0,
+    "high": 2,
+    "medium": 0,
+    "low": 0,
+    "total": 2
+  },
+  "findings": [
+    {
+      "codeql_query_uuid": "20251207184243",
+      "codeql_raw_query": "/**\n * @name aiohttp unsafe deserialization via pickle\n * @description Detect uses of pickle, yaml, marshal, or shelve that may deserialize untrusted data in aiohttp.\n * @kind problem\n * @problem.severity warning\n * @id py/aiohttp-unsafe-deserialization\n * @tags security\n *       external/cwe/cwe-502\n */\n\nimport python\nimport semmle.python.ApiGraphs\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.dataflow.new.RemoteFlowSources\n\nmodule DeserConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) { source instanceof RemoteFlowSource }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(DataFlow::CallCfgNode call |\n      sink = call.getArg(0) and\n      (\n        call = API::moduleImport(\"pickle\").getMember([\"load\", \"loads\", \"Unpickler\"]).getACall() or\n        call = API::moduleImport(\"yaml\").getMember([\"load\", \"unsafe_load\"]).getACall() or\n        call = API::moduleImport(\"marshal\").getMember([\"load\", \"loads\"]).getACall() or\n        call = API::moduleImport(\"shelve\").getMember(\"open\").getACall()\n      )\n    )\n  }\n}\n\nmodule DeserFlow = TaintTracking::Global<DeserConfig>;\n\nfrom DataFlow::Node source, DataFlow::Node sink\nwhere DeserFlow::flow(source, sink)\nselect sink, \"User-controlled data is deserialized here, which may lead to code execution.\"",
+      "hypothesis": "User-controlled data may be deserialized unsafely using pickle/yaml/marshal/shelve within aiohttp.",
+      "severity": "high",
+      "cwe_ids": [
+        "cwe-502"
+      ],
+      "results_count": 0,
+      "results": []
+    },
+    {
+      "codeql_query_uuid": "20251207184310",
+      "codeql_raw_query": "/**\n * @name aiohttp SSRF via client request APIs\n * @description Detect flows from remote input into aiohttp client request URL parameters.\n * @kind path-problem\n * @problem.severity error\n * @id py/aiohttp-ssrf-client\n * @tags security\n *       external/cwe/cwe-918\n */\n\nimport python\nimport semmle.python.ApiGraphs\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.dataflow.new.RemoteFlowSources\n\nmodule SSRFConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) { source instanceof RemoteFlowSource }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(DataFlow::CallCfgNode call |\n      sink = call.getArg(0) and\n      call = API::moduleImport(\"aiohttp\").getMember([\"request\", \"get\", \"post\", \"put\", \"delete\", \"head\", \"options\", \"ClientSession\"]).getACall()\n    )\n  }\n}\n\nmodule SSRFFlow = TaintTracking::Global<SSRFConfig>;\nimport SSRFFlow::PathGraph\n\nfrom SSRFFlow::PathNode source, SSRFFlow::PathNode sink\nwhere SSRFFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"User-controlled URL flows into aiohttp client request, potential SSRF.\", source.getNode(), \"user input\"",
+      "hypothesis": "Remote input may flow into aiohttp client request URLs, enabling SSRF when aiohttp is used as an HTTP client within itself (tests, utilities).",
+      "severity": "medium",
+      "cwe_ids": [
+        "cwe-918"
+      ],
+      "results_count": 0,
+      "results": []
+    },
+    {
+      "codeql_query_uuid": "20251207184354",
+      "codeql_raw_query": "/**\n * @name aiohttp unsafe deserialization via pickle/yaml\n * @description Detect uses of pickle, yaml, or marshal that may deserialize untrusted data in aiohttp.\n * @kind problem\n * @problem.severity warning\n * @id py/aiohttp-unsafe-deserialization\n * @tags security\n *       external/cwe/cwe-502\n */\n\nimport python\nimport semmle.python.ApiGraphs\nimport semmle.python.dataflow.new.DataFlow\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call.getLocation().getFile().getRelativePath().regexpMatch(\"^aiohttp/.*\") and\n  (\n    call = API::moduleImport(\"pickle\").getMember([\"load\", \"loads\", \"Unpickler\"]).getACall() or\n    call = API::moduleImport(\"yaml\").getMember([\"load\", \"unsafe_load\"]).getACall() or\n    call = API::moduleImport(\"marshal\").getMember([\"load\", \"loads\"]).getACall()\n  )\nselect call, \"Potentially unsafe deserialization operation in aiohttp that could execute arbitrary code if fed untrusted data.\"",
+      "hypothesis": "aiohttp may use pickle/yaml/marshal for (de)serialization in ways that could be unsafe with untrusted data.",
+      "severity": "high",
+      "cwe_ids": [
+        "cwe-502"
+      ],
+      "results_count": 1,
+      "results": [
+        {
+          "ruleId": "py/aiohttp-unsafe-deserialization",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/aiohttp-unsafe-deserialization",
+            "index": 0
+          },
+          "message": {
+            "text": "Potentially unsafe deserialization operation in aiohttp that could execute arbitrary code if fed untrusted data."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "aiohttp/cookiejar.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 133,
+                  "startColumn": 29,
+                  "endColumn": 43
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "6963aaae75a5c2c5:1",
+            "primaryLocationStartColumnFingerprint": "16"
+          }
+        }
+      ]
+    },
+    {
+      "codeql_query_uuid": "20251207184449",
+      "codeql_raw_query": "/**\n * @name aiohttp unsafe deserialization in cookie handling\n * @description Detect uses of pickle or similar unsafe deserialization in aiohttp that could lead to code execution when fed untrusted data.\n * @kind problem\n * @problem.severity error\n * @id py/aiohttp-unsafe-deserialization\n * @tags security\n *       external/cwe/cwe-502\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"aiohttp.cookiejar\").getMember([\"pickle\", \"load\", \"loads\"]).getACall()\nselect call, \"Potentially unsafe deserialization operation in aiohttp that could execute arbitrary code if fed untrusted data.\"\n",
+      "hypothesis": "aiohttp may use pickle-based deserialization for cookie persistence, which is unsafe for untrusted data.",
+      "severity": "critical",
+      "cwe_ids": [
+        "cwe-502"
+      ],
+      "results_count": 0,
+      "results": []
+    },
+    {
+      "codeql_query_uuid": "20251207184515",
+      "codeql_raw_query": "/**\n * @name aiohttp unsafe deserialization via pickle\n * @description Detect uses of pickle.loads/loads in aiohttp that may deserialize untrusted data.\n * @kind problem\n * @problem.severity warning\n * @id py/aiohttp-pickle-deserialization\n * @tags security\n *       external/cwe/cwe-502\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"pickle\").getMember([\"load\", \"loads\"]).getACall()\nselect call, \"Potentially unsafe use of pickle deserialization in aiohttp; ensure data is trusted.\"",
+      "hypothesis": "Unsafe deserialization via pickle in aiohttp code paths",
+      "severity": "high",
+      "cwe_ids": [
+        "cwe-502"
+      ],
+      "results_count": 1,
+      "results": [
+        {
+          "ruleId": "py/aiohttp-pickle-deserialization",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/aiohttp-pickle-deserialization",
+            "index": 0
+          },
+          "message": {
+            "text": "Potentially unsafe use of pickle deserialization in aiohttp; ensure data is trusted."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "aiohttp/cookiejar.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 133,
+                  "startColumn": 29,
+                  "endColumn": 43
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "6963aaae75a5c2c5:1",
+            "primaryLocationStartColumnFingerprint": "16"
+          }
+        }
+      ]
+    },
+    {
+      "codeql_query_uuid": "20251207184534",
+      "codeql_raw_query": "/**\n * @name aiohttp open redirect in web handlers\n * @description Find aiohttp web responses that redirect using user-controlled data.\n * @kind path-problem\n * @problem.severity warning\n * @id py/aiohttp-open-redirect\n * @tags security\n *       external/cwe/cwe-601\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.dataflow.new.RemoteFlowSources\nimport semmle.python.ApiGraphs\n\nmodule RedirectConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    source instanceof RemoteFlowSource\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(DataFlow::CallCfgNode call |\n      call = API::moduleImport(\"aiohttp.web\").getMember([\"HTTPFound\", \"HTTPMovedPermanently\", \"HTTPSeeOther\", \"HTTPTemporaryRedirect\", \"HTTPPermanentRedirect\"]).getACall() and\n      sink = call.getArg(0)\n    )\n  }\n}\n\nmodule RedirectFlow = TaintTracking::Global<RedirectConfig>;\nimport RedirectFlow::PathGraph\n\nfrom RedirectFlow::PathNode source, RedirectFlow::PathNode sink\nwhere RedirectFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"Open redirect: user input reaches redirect target $@.\", source.getNode(), \"user input\"",
+      "hypothesis": "User-controlled data flowing into aiohttp redirect targets (open redirect)",
+      "severity": "medium",
+      "cwe_ids": [
+        "cwe-601"
+      ],
+      "results_count": 0,
+      "results": []
+    },
+    {
+      "codeql_query_uuid": "20251207184804",
+      "codeql_raw_query": "/**\n * @name aiohttp open redirect patterns\n * @description Detects when aiohttp web handlers construct redirect responses from user-controlled input.\n * @kind path-problem\n * @problem.severity warning\n * @id py/aiohttp-open-redirect\n * @tags security\n *       external/cwe/cwe-601\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.dataflow.new.RemoteFlowSources\nimport semmle.python.ApiGraphs\n\nmodule RedirectConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) { source instanceof RemoteFlowSource }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(DataFlow::CallCfgNode call |\n      call = API::moduleImport(\"aiohttp.web\").getMember([\"HTTPFound\", \"HTTPMovedPermanently\", \"HTTPSeeOther\", \"HTTPTemporaryRedirect\", \"HTTPPermanentRedirect\"]).getACall() and\n      sink = call.getArg(0)\n    )\n  }\n}\n\nmodule RedirectFlow = TaintTracking::Global<RedirectConfig>;\nimport RedirectFlow::PathGraph\n\nfrom RedirectFlow::PathNode source, RedirectFlow::PathNode sink\nwhere RedirectFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"Open redirect: user input reaches redirect target $@.\", source.getNode(), \"user input\"",
+      "hypothesis": "User-controlled data may reach aiohttp redirect constructors, causing open redirect vulnerabilities.",
+      "severity": "medium",
+      "cwe_ids": [
+        "cwe-601"
+      ],
+      "results_count": 0,
+      "results": []
+    },
+    {
+      "codeql_query_uuid": "20251207184843",
+      "codeql_raw_query": "/**\n * @name aiohttp unsafe eval/exec usage\n * @description Detects flows of user-controlled data into eval/exec or similar dynamic code execution in aiohttp.\n * @kind path-problem\n * @problem.severity error\n * @id py/aiohttp-code-injection\n * @tags security\n *       external/cwe/cwe-094\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.dataflow.new.RemoteFlowSources\nimport semmle.python.Concepts\n\nmodule CodeInjectionConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) { source instanceof RemoteFlowSource }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(CodeExecution ce | sink = ce.getCode())\n  }\n}\n\nmodule CodeInjectionFlow = TaintTracking::Global<CodeInjectionConfig>;\nimport CodeInjectionFlow::PathGraph\n\nfrom CodeInjectionFlow::PathNode source, CodeInjectionFlow::PathNode sink\nwhere CodeInjectionFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"Code injection: user input reaches dynamic code execution $@.\", source.getNode(), \"user input\"",
+      "hypothesis": "User-controlled data may reach eval/exec or similar dynamic code execution in aiohttp.",
+      "severity": "critical",
+      "cwe_ids": [
+        "cwe-94"
+      ],
+      "results_count": 0,
+      "results": []
+    },
+    {
+      "codeql_query_uuid": "20251207184914",
+      "codeql_raw_query": "/**\n * @name aiohttp directory traversal in static file serving\n * @description Detects potential directory traversal when aiohttp serves files based on user-controlled paths.\n * @kind path-problem\n * @problem.severity error\n * @id py/aiohttp-directory-traversal\n * @tags security\n *       external/cwe/cwe-022\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.dataflow.new.RemoteFlowSources\nimport semmle.python.ApiGraphs\n\nmodule FileTraversalConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) { source instanceof RemoteFlowSource }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(DataFlow::CallCfgNode call |\n      call = API::moduleImport(\"aiohttp.web\").getMember([\"FileResponse\", \"StaticResource\"]).getACall() and\n      sink = call.getArg(0)\n    )\n  }\n}\n\nmodule FileTraversalFlow = TaintTracking::Global<FileTraversalConfig>;\nimport FileTraversalFlow::PathGraph\n\nfrom FileTraversalFlow::PathNode source, FileTraversalFlow::PathNode sink\nwhere FileTraversalFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"Directory traversal: user input reaches file-serving path $@.\", source.getNode(), \"user input\"",
+      "hypothesis": "User-controlled paths may reach aiohttp static file serving APIs, enabling directory traversal.",
+      "severity": "high",
+      "cwe_ids": [
+        "cwe-22"
+      ],
+      "results_count": 0,
+      "results": []
+    },
+    {
+      "codeql_query_uuid": "20251207185001",
+      "codeql_raw_query": "/**\n * @name aiohttp file path traversal in web handlers\n * @description Detect flows from remote input to file system access APIs in aiohttp server code.\n * @kind path-problem\n * @problem.severity error\n * @id py/aiohttp-path-traversal\n * @tags security\n *       external/cwe/cwe-022\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.dataflow.new.RemoteFlowSources\nimport semmle.python.ApiGraphs\n\nmodule FilePathConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) { source instanceof RemoteFlowSource }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(API::CallNode call |\n      // Common file APIs\n      call = API::builtin(\"open\").getACall() and\n      sink = call.getArg(0)\n      or\n      call = API::moduleImport(\"os\").getMember([\"open\", \"listdir\", \"scandir\", \"stat\", \"remove\", \"unlink\"]).getACall() and\n      sink = call.getArg(0)\n      or\n      call = API::moduleImport(\"pathlib\").getMember([\"Path\", \"PurePath\"]).getACall() and\n      sink = call.getArg(0)\n    )\n  }\n}\n\nmodule FilePathFlow = TaintTracking::Global<FilePathConfig>;\nimport FilePathFlow::PathGraph\n\nfrom FilePathFlow::PathNode source, FilePathFlow::PathNode sink\nwhere FilePathFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"User input reaches file path argument $@, potential path traversal.\", source.getNode(), \"user input\"",
+      "hypothesis": "Remote input may reach file path operations in aiohttp handlers, leading to path traversal (CWE-22).",
+      "severity": "high",
+      "cwe_ids": [
+        "cwe-022"
+      ],
+      "results_count": 0,
+      "results": []
+    },
+    {
+      "codeql_query_uuid": "20251207185030",
+      "codeql_raw_query": "/**\n * @name aiohttp server-side request forgery via client usage\n * @description Detect flows from remote input in handlers to aiohttp client request URLs.\n * @kind path-problem\n * @problem.severity error\n * @id py/aiohttp-server-side-request-forgery\n * @tags security\n *       external/cwe/cwe-918\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.dataflow.new.RemoteFlowSources\nimport semmle.python.ApiGraphs\n\nmodule SSRFConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) { source instanceof RemoteFlowSource }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(API::CallNode call |\n      call = API::moduleImport(\"aiohttp\").getMember([\"request\", \"get\", \"post\", \"put\", \"delete\", \"head\", \"options\"]).getACall() and\n      sink = call.getArg(0)\n    )\n  }\n}\n\nmodule SSRFFlow = TaintTracking::Global<SSRFConfig>;\nimport SSRFFlow::PathGraph\n\nfrom SSRFFlow::PathNode source, SSRFFlow::PathNode sink\nwhere SSRFFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"User input reaches aiohttp client request URL $@, potential SSRF.\", source.getNode(), \"user input\"",
+      "hypothesis": "Remote input in aiohttp handlers may reach aiohttp client request URLs, causing SSRF (CWE-918).",
+      "severity": "high",
+      "cwe_ids": [
+        "cwe-918"
+      ],
+      "results_count": 0,
+      "results": []
+    }
+  ]
+}

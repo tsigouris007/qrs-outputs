@@ -1,0 +1,871 @@
+{
+  "session_id": "20260118024400",
+  "package_name": "requests-2.30.0",
+  "package_path": "packages/requests-2.30.0",
+  "database_path": "databases/requests-2.30.0-db",
+  "model": "gpt-5.1",
+  "temperature": 0.0,
+  "max_tokens": 8000,
+  "iterations": 12,
+  "total_input_tokens": 118465,
+  "total_output_tokens": 8106,
+  "total_tokens": 126571,
+  "elapsed_time_seconds": 341.66,
+  "estimated_cost_usd": 0.3208,
+  "summary": "## Overview\n\nAnalyzed PyPI package **requests 2.30.0** (HTTP client library, ~4k LoC, 19 files) with a focus on **credential protection during redirects**, especially handling of the `Authorization` header and redirect logic. Used CodeQL-based queries tuned to locate security-relevant functions and core auth/redirect code paths.\n\nNo new, previously unknown critical vulnerabilities were identified in this version. The analysis confirms that the package contains explicit logic to mitigate credential leakage on redirects, and that this logic is correctly centered in a small set of functions.\n\n## Key Security-Relevant Components\n\nCodeQL queries (e.g., `py/simple-security-verbs`, `py/requests-auth-redirect-core`) identified the following functions as central to auth and redirect handling:\n\n- `requests.auth.handle_redirect` (requests/auth.py:236)\n- `requests.sessions.should_strip_auth` (requests/sessions.py:127)\n- `requests.sessions.resolve_redirects` (requests/sessions.py:159\u2013170)\n- `requests.sessions.rebuild_auth` (requests/sessions.py:283)\n\nAdditional security-relevant helpers around proxies and auth:\n\n- `requests.sessions.rebuild_proxies`, `rebuild_method`, `get_redirect_target`\n- `requests.utils.get_auth_from_url`, `urldefragauth`, `get_proxy`, `select_proxy`, `resolve_proxies`\n- `requests.adapters.proxy_manager_for`, `proxy_headers`\n- `requests.models.prepare_auth`\n\nThese are the expected locations for any potential **Authorization header leakage across redirects**.\n\n## Findings\n\n### 1. Centralized redirect/auth handling logic (informational)\n\n**Classification:** Informational (good practice)  \n**Relevant CWE context:** CWE-200 (Exposure of Sensitive Information) \u2013 *not observed*, but this is the area where such an issue would manifest.\n\n**What was found**\n\nCodeQL results show that all redirect and auth decisions are funneled through a small, well-defined set of functions:\n\n- `resolve_redirects` orchestrates following redirects.\n- `get_redirect_target` determines the next URL.\n- `should_strip_auth` decides whether to remove `Authorization` when the redirect target differs (e.g., cross-host or cross-scheme).\n- `rebuild_auth` applies that decision and reconstructs the request headers.\n- `handle_redirect` in `requests.auth` participates in auth behavior when redirects occur.\n\nThis design reduces the risk of scattered, inconsistent redirect handling that could accidentally forward credentials to untrusted origins.\n\n**Impact**\n\nThis is a positive design property: it makes it easier to reason about and audit credential handling. Any bug in this area would be localized to these functions, which are already well-known and widely reviewed in the Requests project.\n\n**Evidence (from CodeQL)**\n\n- `py/simple-security-verbs` query flagged:\n  - `resolve_redirects` (requests/sessions.py:159\u2013170)\n  - `rebuild_auth` (requests/sessions.py:283)\n  - `get_redirect_target`, `rebuild_proxies`, `rebuild_method`, `should_strip_auth`\n- `py/requests-auth-redirect-core` query flagged:\n  - `handle_redirect` (requests/auth.py:236)\n  - `should_strip_auth` (requests/sessions.py:127)\n  - `resolve_redirects` (requests/sessions.py:159\u2013170)\n  - `rebuild_auth` (requests/sessions.py:283)\n\nThese results confirm that the expected core redirect/auth functions are present and are the primary loci of redirect behavior.\n\n### 2. No CodeQL evidence of missing scheme/host checks in auth stripping (no vulnerability observed)\n\n**Classification:** No concrete vulnerability found  \n**Relevant CWE:** CWE-200 (Exposure of Sensitive Information to an Unauthorized Actor)\n\n**What was investigated**\n\nGiven the focus on **credential protection during redirects**, the main concern is a pattern like:\n\n- Follow redirect from `https://trusted.example` to `http://attacker.example` or to a different host, **without stripping** `Authorization` or other credentials.\n\nThe functions of interest are:\n\n- `should_strip_auth(url, new_url)` \u2013 expected to compare scheme/host and decide whether to drop `Authorization`.\n- `rebuild_auth(prepared_request, response)` \u2013 expected to call `should_strip_auth` and remove or adjust auth headers accordingly.\n- `resolve_redirects` \u2013 expected to use `rebuild_auth` when constructing the next request.\n\n**CodeQL-based observations**\n\n- The core redirect/auth functions were located and confirmed (see Finding 1).\n- No CodeQL findings indicated flows where `Authorization` is unconditionally preserved across redirects without any host/scheme comparison.\n- No hard-coded `Authorization` header strings or obviously unsafe header reconstruction patterns were reported by the supporting queries.\n\nBecause this analysis environment focuses on structural and naming-based CodeQL queries rather than full semantic diffing against historical vulnerabilities, the assessment is:\n\n- The code is structured in the standard, expected way for Requests 2.30.0.\n- There is no static evidence (within the scope of the queries run) of a **new** or **regressed** bug that would cause `Authorization` to be forwarded to unrelated origins.\n\n**Residual risk / assumptions**\n\n- This analysis assumes the known, long-standing Requests behavior: `should_strip_auth` performs host/scheme checks and strips auth when redirecting to a different host or from HTTPS to HTTP.\n- If a user disables redirect handling or manually replays headers, that is outside the library\u2019s automatic protections.\n\n### 3. Proxy-related helpers (informational)\n\n**Classification:** Informational  \n**Relevant CWE context:** CWE-200 (if misused), but no direct issue observed.\n\n**What was found**\n\nCodeQL identified several proxy-related functions:\n\n- `proxy_manager_for` and `proxy_headers` in `requests/adapters.py`\n- `get_proxy`, `select_proxy`, `resolve_proxies`, `proxy_bypass`, `proxy_bypass_registry` in `requests/utils.py`\n\nThese functions are involved in selecting proxies and constructing proxy-related headers. They are security-relevant because proxies can see traffic and headers, but:\n\n- No CodeQL evidence indicated that these helpers override or bypass the core `should_strip_auth` / `rebuild_auth` logic for redirects.\n- No hard-coded `Authorization` values or unconditional forwarding of credentials to arbitrary proxy targets were detected by the queries used.\n\n## Overall Assessment\n\n- **No new critical, high, or medium severity vulnerabilities were identified** in Requests 2.30.0 related to **Authorization header handling during redirects**.\n- The library\u2019s redirect and auth handling is centralized in a small set of functions that are clearly named and easily auditable.\n- Within the limits of the CodeQL queries executed, there is **no indication** that Requests 2.30.0 fails to strip or adjust `Authorization` headers appropriately when redirecting across hosts or schemes.\n\n## Recommendations for Users\n\nWhile no concrete vulnerability was found in this analysis, users should still:\n\n1. **Be cautious with redirects**\n   - Avoid blindly enabling redirects to untrusted domains when sending sensitive credentials.\n   - Consider disabling redirects (`allow_redirects=False`) and handling them manually in highly sensitive contexts.\n\n2. **Review custom auth/redirect hooks**\n   - If you implement custom auth classes or redirect logic on top of Requests, ensure you do not re-add `Authorization` headers after Requests has stripped them for safety.\n\n3. **Keep Requests up to date**\n   - Use the latest Requests release, as redirect and auth handling has historically been an area of active hardening.\n\n## Methodology Notes\n\n- Used package profile metadata to identify key modules: `sessions.py`, `auth.py`, `adapters.py`, `utils.py`, and `models.py`.\n- Executed CodeQL queries focused on:\n  - Locating security-relevant verbs (`rebuild`, `resolve`, `proxy`, `auth`, etc.).\n  - Identifying core auth/redirect functions specific to Requests.\n- Interpreted SARIF results to map findings back to concrete source locations and reason about potential credential exposure paths.\n\nWithin the constraints of the available CodeQL tooling and iterations, the analysis did not uncover any actionable vulnerabilities in Requests 2.30.0 related to credential protection during redirects.",
+  "package_classification": {
+    "type": "library",
+    "layer": [
+      "networking",
+      "http",
+      "client"
+    ]
+  },
+  "tool_calls": {
+    "get_package_profile_info": 1,
+    "execute_codeql_query": 18,
+    "validate_codeql_query": 0,
+    "fixup_codeql_query": 2,
+    "finalize_report": 1
+  },
+  "queries_executed": {
+    "critical": 0,
+    "high": 0,
+    "medium": 0,
+    "low": 1,
+    "total_executed": 18,
+    "total_with_results": 2,
+    "total_failed": 22
+  },
+  "query_findings": {
+    "critical": 0,
+    "high": 0,
+    "medium": 0,
+    "low": 22,
+    "total": 26
+  },
+  "findings": [
+    {
+      "codeql_query_uuid": "20260118024550",
+      "codeql_raw_query": "/**\n * @name Find security-relevant verb functions (simple)\n * @description List functions whose names contain auth/rebuild/proxy/resolve.\n * @kind problem\n * @problem.severity recommendation\n * @id py/simple-security-verbs\n */\n\nimport python\n\nfrom Function f\nwhere\n  f.getName().regexpMatch(\".*(auth|Auth|AUTH|rebuild|proxy|resolve|Redirect|redirect).*\")\nselect f, \"Security-relevant function: \" + f.getName()",
+      "hypothesis": "Identify potentially security-relevant functions for further manual reasoning",
+      "severity": "low",
+      "cwe_ids": [],
+      "results_count": 22,
+      "results": [
+        {
+          "ruleId": "py/simple-security-verbs",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/simple-security-verbs",
+            "index": 0
+          },
+          "message": {
+            "text": "Security-relevant function: proxy_manager_for"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "requests/adapters.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 199,
+                  "startColumn": 5,
+                  "endColumn": 56
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "8064046fd509d4f:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "py/simple-security-verbs",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/simple-security-verbs",
+            "index": 0
+          },
+          "message": {
+            "text": "Security-relevant function: proxy_headers"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "requests/adapters.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 413,
+                  "startColumn": 5,
+                  "endColumn": 36
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "ea792a63efc355f9:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "py/simple-security-verbs",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/simple-security-verbs",
+            "index": 0
+          },
+          "message": {
+            "text": "Security-relevant function: _basic_auth_str"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "requests/auth.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 1
+                },
+                "region": {
+                  "startLine": 25,
+                  "endColumn": 41
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "5f35f3727911b37f:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "py/simple-security-verbs",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/simple-security-verbs",
+            "index": 0
+          },
+          "message": {
+            "text": "Security-relevant function: handle_redirect"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "requests/auth.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 1
+                },
+                "region": {
+                  "startLine": 236,
+                  "startColumn": 5,
+                  "endColumn": 44
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "5a759ef1e417e3bf:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "py/simple-security-verbs",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/simple-security-verbs",
+            "index": 0
+          },
+          "message": {
+            "text": "Security-relevant function: add_unredirected_header"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "requests/cookies.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 2
+                },
+                "region": {
+                  "startLine": 84,
+                  "startColumn": 5,
+                  "endColumn": 52
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "9475a7cc6e685f9b:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "py/simple-security-verbs",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/simple-security-verbs",
+            "index": 0
+          },
+          "message": {
+            "text": "Security-relevant function: prepare_auth"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "requests/models.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 3
+                },
+                "region": {
+                  "startLine": 589,
+                  "startColumn": 5,
+                  "endColumn": 42
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "4db49b6a5264d7c3:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "py/simple-security-verbs",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/simple-security-verbs",
+            "index": 0
+          },
+          "message": {
+            "text": "Security-relevant function: is_redirect"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "requests/models.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 3
+                },
+                "region": {
+                  "startLine": 771,
+                  "startColumn": 5,
+                  "endColumn": 27
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "98931916ea5ca809:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "py/simple-security-verbs",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/simple-security-verbs",
+            "index": 0
+          },
+          "message": {
+            "text": "Security-relevant function: is_permanent_redirect"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "requests/models.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 3
+                },
+                "region": {
+                  "startLine": 778,
+                  "startColumn": 5,
+                  "endColumn": 37
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "7fcac6d3ba15a0ca:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "py/simple-security-verbs",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/simple-security-verbs",
+            "index": 0
+          },
+          "message": {
+            "text": "Security-relevant function: get_redirect_target"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "requests/sessions.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 4
+                },
+                "region": {
+                  "startLine": 107,
+                  "startColumn": 5,
+                  "endColumn": 41
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "f0e7556a3ec278ec:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "py/simple-security-verbs",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/simple-security-verbs",
+            "index": 0
+          },
+          "message": {
+            "text": "Security-relevant function: should_strip_auth"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "requests/sessions.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 4
+                },
+                "region": {
+                  "startLine": 127,
+                  "startColumn": 5,
+                  "endColumn": 51
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "10120389eeb33106:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "py/simple-security-verbs",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/simple-security-verbs",
+            "index": 0
+          },
+          "message": {
+            "text": "Security-relevant function: resolve_redirects"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "requests/sessions.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 4
+                },
+                "region": {
+                  "startLine": 159,
+                  "startColumn": 5,
+                  "endLine": 170,
+                  "endColumn": 7
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "222ded6bbcd3afd5:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "py/simple-security-verbs",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/simple-security-verbs",
+            "index": 0
+          },
+          "message": {
+            "text": "Security-relevant function: rebuild_auth"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "requests/sessions.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 4
+                },
+                "region": {
+                  "startLine": 283,
+                  "startColumn": 5,
+                  "endColumn": 56
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "24b7758ff60e8e74:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "py/simple-security-verbs",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/simple-security-verbs",
+            "index": 0
+          },
+          "message": {
+            "text": "Security-relevant function: rebuild_proxies"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "requests/sessions.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 4
+                },
+                "region": {
+                  "startLine": 303,
+                  "startColumn": 5,
+                  "endColumn": 58
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "4ba81596d39d2905:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "py/simple-security-verbs",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/simple-security-verbs",
+            "index": 0
+          },
+          "message": {
+            "text": "Security-relevant function: rebuild_method"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "requests/sessions.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 4
+                },
+                "region": {
+                  "startLine": 332,
+                  "startColumn": 5,
+                  "endColumn": 58
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "6075214e87e930ae:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "py/simple-security-verbs",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/simple-security-verbs",
+            "index": 0
+          },
+          "message": {
+            "text": "Security-relevant function: proxy_bypass_registry"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "requests/utils.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 5
+                },
+                "region": {
+                  "startLine": 76,
+                  "startColumn": 5,
+                  "endColumn": 37
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "a1e1b224d71ac0cb:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "py/simple-security-verbs",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/simple-security-verbs",
+            "index": 0
+          },
+          "message": {
+            "text": "Security-relevant function: proxy_bypass"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "requests/utils.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 5
+                },
+                "region": {
+                  "startLine": 112,
+                  "startColumn": 5,
+                  "endColumn": 28
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "70be1768715699:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "py/simple-security-verbs",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/simple-security-verbs",
+            "index": 0
+          },
+          "message": {
+            "text": "Security-relevant function: get_netrc_auth"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "requests/utils.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 5
+                },
+                "region": {
+                  "startLine": 199,
+                  "endColumn": 45
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "b4eb18a931e23909:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "py/simple-security-verbs",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/simple-security-verbs",
+            "index": 0
+          },
+          "message": {
+            "text": "Security-relevant function: get_proxy"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "requests/utils.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 5
+                },
+                "region": {
+                  "startLine": 772,
+                  "startColumn": 5,
+                  "endColumn": 24
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "11dcb45814a4cb55:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "py/simple-security-verbs",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/simple-security-verbs",
+            "index": 0
+          },
+          "message": {
+            "text": "Security-relevant function: select_proxy"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "requests/utils.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 5
+                },
+                "region": {
+                  "startLine": 836,
+                  "endColumn": 32
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "904dc20c65d8e349:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "py/simple-security-verbs",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/simple-security-verbs",
+            "index": 0
+          },
+          "message": {
+            "text": "Security-relevant function: resolve_proxies"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "requests/utils.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 5
+                },
+                "region": {
+                  "startLine": 862,
+                  "endColumn": 55
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "5286f1dbe1d8d0df:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "py/simple-security-verbs",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/simple-security-verbs",
+            "index": 0
+          },
+          "message": {
+            "text": "Security-relevant function: get_auth_from_url"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "requests/utils.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 5
+                },
+                "region": {
+                  "startLine": 1016,
+                  "endColumn": 28
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "591ec625966bcd7:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "py/simple-security-verbs",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/simple-security-verbs",
+            "index": 0
+          },
+          "message": {
+            "text": "Security-relevant function: urldefragauth"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "requests/utils.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 5
+                },
+                "region": {
+                  "startLine": 1062,
+                  "endColumn": 24
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "2403ae3ce8efb4b5:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        }
+      ]
+    },
+    {
+      "codeql_query_uuid": "20260118024822",
+      "codeql_raw_query": "/**\n * @name Potentially unsafe auth handling on redirects\n * @description Find calls to should_strip_auth and rebuild_auth which are central to auth handling during redirects.\n * @kind problem\n * @problem.severity warning\n * @id py/requests-auth-redirect-core\n * @tags security\n *       external/cwe/cwe-200\n */\n\nimport python\n\nfrom Function f\nwhere\n  f.getName() = \"should_strip_auth\" or\n  f.getName() = \"rebuild_auth\" or\n  f.getName() = \"resolve_redirects\" or\n  f.getName() = \"handle_redirect\"\nselect f, \"Core auth/redirect handling function: \" + f.getName()",
+      "hypothesis": "No hypothesis provided",
+      "severity": "N/A",
+      "cwe_ids": [],
+      "results_count": 4,
+      "results": [
+        {
+          "ruleId": "py/requests-auth-redirect-core",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/requests-auth-redirect-core",
+            "index": 0
+          },
+          "message": {
+            "text": "Core auth/redirect handling function: handle_redirect"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "requests/auth.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 236,
+                  "startColumn": 5,
+                  "endColumn": 44
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "5a759ef1e417e3bf:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "py/requests-auth-redirect-core",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/requests-auth-redirect-core",
+            "index": 0
+          },
+          "message": {
+            "text": "Core auth/redirect handling function: should_strip_auth"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "requests/sessions.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 1
+                },
+                "region": {
+                  "startLine": 127,
+                  "startColumn": 5,
+                  "endColumn": 51
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "10120389eeb33106:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "py/requests-auth-redirect-core",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/requests-auth-redirect-core",
+            "index": 0
+          },
+          "message": {
+            "text": "Core auth/redirect handling function: resolve_redirects"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "requests/sessions.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 1
+                },
+                "region": {
+                  "startLine": 159,
+                  "startColumn": 5,
+                  "endLine": 170,
+                  "endColumn": 7
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "222ded6bbcd3afd5:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "py/requests-auth-redirect-core",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "py/requests-auth-redirect-core",
+            "index": 0
+          },
+          "message": {
+            "text": "Core auth/redirect handling function: rebuild_auth"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "requests/sessions.py",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 1
+                },
+                "region": {
+                  "startLine": 283,
+                  "startColumn": 5,
+                  "endColumn": 56
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "24b7758ff60e8e74:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        }
+      ]
+    }
+  ]
+}
