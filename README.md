@@ -16,7 +16,8 @@ Includes the minimal configurations of all scans.
 
 ## Instructions
 
-The instructions loaded on Hist20 dataset. No instructions for Top100.
+The preprompt strategy instructions loaded on Hist20 dataset. \
+Agent instructions on Top100 dataset.
 
 ## Report Samples
 
