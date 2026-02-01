@@ -29,3 +29,7 @@ Note: Regarding Top100 we include public knowledge that has already been address
 ## Visualizations
 
 Includes extended metrics on QRS.
+
+## Tools
+
+Includes a few of the tools used in QRS.
