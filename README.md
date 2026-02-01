@@ -1,4 +1,4 @@
-# qrs-outputs
+# About
 
 This repository contains artifacts produced by QRS.
 
