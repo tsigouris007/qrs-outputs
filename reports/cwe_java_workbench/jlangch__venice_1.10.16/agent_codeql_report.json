@@ -1,0 +1,2012 @@
+{
+  "session_id": "20260330214308",
+  "package_name": "jlangch__venice_1.10.16",
+  "package_path": "packages/jlangch__venice_1.10.16",
+  "database_path": "databases/jlangch__venice_1.10.16-db",
+  "model": "claude-sonnet-4-6",
+  "temperature": 1.0,
+  "max_tokens": 25000,
+  "iterations": 18,
+  "total_input_tokens": 736631,
+  "total_output_tokens": 9485,
+  "total_tokens": 746116,
+  "elapsed_time_seconds": 615.33,
+  "estimated_cost_usd": 2.3522,
+  "summary": "## Security Analysis Report: jlangch/venice 1.10.16\n\n### Package Overview\nVenice is a Lisp/Clojure-like scripting language embedded in Java. It includes a sandbox mechanism (`SandboxInterceptor`) intended to restrict file system access to configured \"load paths\". The package processes file I/O, zip archives, classpath resources, and exposes scripting functionality.\n\n---\n\n### Findings Summary\n\n#### \ud83d\udd34 CRITICAL: Path Traversal via `getAbsoluteFile()` in `isFileWithinDirectory()` (CWE-022)\n\n**File:** `src/main/java/com/github/jlangch/venice/impl/util/io/LoadPaths.java` \u2014 lines 257\u2013261\n\n**Description:**  \nThe `isFileWithinDirectory()` method performs a directory containment check using `getAbsoluteFile()` followed by `getPath()` and `String.startsWith()`. **This is a classic path traversal vulnerability**: `getAbsoluteFile()` resolves relative paths against the working directory but does **not** canonicalize the path \u2014 it does not resolve `..` sequences or symbolic links. An attacker can provide a path such as `/allowed-dir/../../etc/passwd`, which after `getAbsoluteFile()` still contains `..` and can fool the `startsWith()` check.\n\n**Attack Chain:**  \n1. User provides a file path to the Venice scripting engine (via `io/` functions or Java interop)  \n2. `SandboxInterceptor.validateFileRead()` (line 198) or `validateFileWrite()` (line 207) calls `LoadPaths.isOnLoadPath()`  \n3. `isOnLoadPath()` delegates to `LoadPaths.loadFileFromDir()` (line 213), which calls `isFileWithinDirectory()`  \n4. `isFileWithinDirectory()` uses `getAbsoluteFile()` (NOT `getCanonicalFile()`) \u2192 `getPath()` \u2192 `String.startsWith()` \u2014 the `..` sequences are never resolved, allowing sandbox escape\n\n**Note:** `isOnLoadPath()` itself calls a `canonical()` helper (line 121), but `isFileWithinDirectory()` does NOT \u2014 making path construction in `loadFileFromDir()` the bypass point.\n\n**Fix:** Replace `getAbsoluteFile()` with `getCanonicalFile()` in `isFileWithinDirectory()`.\n\n---\n\n#### \ud83d\udd34 HIGH: Zip Slip in `Zipper.unzipAll()` (CWE-022)\n\n**File:** `src/main/java/com/github/jlangch/venice/impl/util/io/zip/Zipper.java` \u2014 lines 477\u2013482\n\n**Description:**  \nThe `unzipAll()` method calls `ZipEntry.getName()` and passes the result directly to a `File` constructor (confirmed by local data flow analysis). The class **does** have a `newFile()` helper method (lines 841\u2013849) that properly validates zip entry names using `getCanonicalPath()` and `startsWith()`. However, `unzipAll()` does **not** call `newFile()` \u2014 it bypasses the protection entirely.\n\nThis allows a maliciously crafted ZIP file with entry names like `../../etc/cron.d/evil` to write files outside the intended extraction directory (zip slip attack).\n\n**Fix:** Replace direct `new File(destDir, entry.getName())` in `unzipAll()` with calls to the existing `newFile(destDir, entry)` helper.\n\n---\n\n#### \ud83d\udfe1 MEDIUM: `ClassPathResource` Exposes Multiple `getResourceAsStream()` Code Paths (CWE-073)\n\n**File:** `src/main/java/com/github/jlangch/venice/impl/util/io/ClassPathResource.java` \u2014 lines 62\u2013104\n\n**Description:**  \n`ClassPathResource` exposes multiple classpath resource loading paths (lines 62, 65, 69, 75, 90, 93, 97, 103) via `ClassLoader.getResourceAsStream()` and `ClassLoader.getResource()`. The `getResourceAsBinary()` method uses a `startsWith()` check (line 123) which may be bypassable. If user-controlled strings reach these classpath loaders with `file:` or `jar:` prefix injections, they could escape the classpath context to access arbitrary filesystem paths.\n\n---\n\n### Summary Table\n\n| Severity | CWE | Location | Description |\n|----------|-----|----------|-------------|\n| Critical | CWE-022 | `LoadPaths.java:257` | `isFileWithinDirectory()` uses `getAbsoluteFile()` not `getCanonicalFile()` \u2014 sandbox bypass |\n| Critical | CWE-022 | `SandboxInterceptor.java:198,207` | `validateFileRead/Write()` depends on the broken `isFileWithinDirectory()` check |\n| High | CWE-022 | `Zipper.java:481` | `unzipAll()` passes `ZipEntry.getName()` directly to `File` constructor \u2014 zip slip |\n| Medium | CWE-073 | `ClassPathResource.java:123` | `startsWith()` check on classpath resource path may be bypassable |\n",
+  "package_classification": {
+    "type": [
+      "library",
+      "framework"
+    ],
+    "layer": [
+      "application",
+      "runtime"
+    ]
+  },
+  "tool_calls": {
+    "get_package_profile_info": 1,
+    "execute_codeql_query": 16,
+    "validate_codeql_query": 0,
+    "fixup_codeql_query": 0,
+    "finalize_report": 1
+  },
+  "queries_executed": {
+    "critical": 4,
+    "high": 9,
+    "medium": 0,
+    "low": 0,
+    "total_executed": 16,
+    "total_with_results": 13,
+    "total_failed": 3
+  },
+  "query_findings": {
+    "critical": 20,
+    "high": 39,
+    "medium": 0,
+    "low": 0,
+    "total": 59
+  },
+  "findings": [
+    {
+      "codeql_query_uuid": "20260330214355",
+      "codeql_raw_query": "/**\n * @name Path containment check in IO/LoadPaths without canonicalization\n * @description Finds startsWith path checks in IO and LoadPaths files without canonicalization\n * @kind problem\n * @problem.severity error\n * @id java/load-paths-startswith\n * @tags security\n *       external/cwe/cwe-022\n */\nimport java\n\nfrom MethodCall mc\nwhere\n  mc.getMethod().hasName(\"startsWith\") and\n  mc.getMethod().getDeclaringType().hasQualifiedName(\"java.lang\", \"String\") and\n  mc.getEnclosingCallable().getDeclaringType().getName().matches(\"LoadPaths\")\nselect mc, \"String.startsWith() path check in LoadPaths - verify canonicalization occurs before this check\"\n",
+      "hypothesis": "LoadPaths uses String.startsWith() for path containment without proper canonicalization",
+      "severity": "high",
+      "cwe_ids": [],
+      "results_count": 1,
+      "results": [
+        {
+          "ruleId": "java/load-paths-startswith",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/load-paths-startswith",
+            "index": 0
+          },
+          "message": {
+            "text": "String.startsWith() path check in LoadPaths - verify canonicalization occurs before this check"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/github/jlangch/venice/impl/util/io/LoadPaths.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 261,
+                  "startColumn": 21,
+                  "endColumn": 78
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "ed2a3e980f7e733c:1",
+            "primaryLocationStartColumnFingerprint": "4"
+          }
+        }
+      ]
+    },
+    {
+      "codeql_query_uuid": "20260330214428",
+      "codeql_raw_query": "/**\n * @name LoadPaths path canonicalization analysis\n * @description Check if getCanonicalPath or normalize is called before startsWith in LoadPaths\n * @kind problem\n * @problem.severity error\n * @id java/load-paths-canon-analysis\n * @tags security\n *       external/cwe/cwe-022\n */\nimport java\n\n// Find all method calls in LoadPaths class\nfrom MethodCall mc\nwhere\n  mc.getEnclosingCallable().getDeclaringType().getName() = \"LoadPaths\"\n  and (\n    mc.getMethod().hasName(\"startsWith\") or\n    mc.getMethod().hasName(\"getCanonicalPath\") or\n    mc.getMethod().hasName(\"getAbsolutePath\") or\n    mc.getMethod().hasName(\"toRealPath\") or\n    mc.getMethod().hasName(\"normalize\") or\n    mc.getMethod().hasName(\"cleanPath\") or\n    mc.getMethod().hasName(\"canonical\") or\n    mc.getMethod().hasName(\"getCanonicalFile\") or\n    mc.getMethod().hasName(\"toAbsolutePath\")\n  )\nselect mc, mc.getEnclosingCallable().getName() + \" - line \" + mc.getLocation().getStartLine() + \" - call: \" + mc.getMethod().getName()\n",
+      "hypothesis": "Analyzing whether canonicalization happens before startsWith in LoadPaths",
+      "severity": "high",
+      "cwe_ids": [],
+      "results_count": 7,
+      "results": [
+        {
+          "ruleId": "java/load-paths-canon-analysis",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/load-paths-canon-analysis",
+            "index": 0
+          },
+          "message": {
+            "text": "of - line 63 - call: canonical"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/github/jlangch/venice/impl/util/io/LoadPaths.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 63,
+                  "startColumn": 39,
+                  "endColumn": 69
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "b94622880a290d3b:1",
+            "primaryLocationStartColumnFingerprint": "14"
+          }
+        },
+        {
+          "ruleId": "java/load-paths-canon-analysis",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/load-paths-canon-analysis",
+            "index": 0
+          },
+          "message": {
+            "text": "isOnLoadPath - line 121 - call: canonical"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/github/jlangch/venice/impl/util/io/LoadPaths.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 121,
+                  "startColumn": 28,
+                  "endColumn": 43
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "b4284a42d4320d9f:1",
+            "primaryLocationStartColumnFingerprint": "15"
+          }
+        },
+        {
+          "ruleId": "java/load-paths-canon-analysis",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/load-paths-canon-analysis",
+            "index": 0
+          },
+          "message": {
+            "text": "loadFromLoadPath - line 173 - call: canonical"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/github/jlangch/venice/impl/util/io/LoadPaths.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 173,
+                  "startColumn": 28,
+                  "endColumn": 43
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "29694dadff427594:1",
+            "primaryLocationStartColumnFingerprint": "15"
+          }
+        },
+        {
+          "ruleId": "java/load-paths-canon-analysis",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/load-paths-canon-analysis",
+            "index": 0
+          },
+          "message": {
+            "text": "canonical - line 233 - call: getCanonicalFile"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/github/jlangch/venice/impl/util/io/LoadPaths.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 233,
+                  "startColumn": 20,
+                  "endColumn": 43
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "bd63714368c55a0d:1",
+            "primaryLocationStartColumnFingerprint": "7"
+          }
+        },
+        {
+          "ruleId": "java/load-paths-canon-analysis",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/load-paths-canon-analysis",
+            "index": 0
+          },
+          "message": {
+            "text": "isFileWithinDirectory - line 261 - call: startsWith"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/github/jlangch/venice/impl/util/io/LoadPaths.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 261,
+                  "startColumn": 21,
+                  "endColumn": 78
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "ed2a3e980f7e733c:1",
+            "primaryLocationStartColumnFingerprint": "4"
+          }
+        },
+        {
+          "ruleId": "java/load-paths-canon-analysis",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/load-paths-canon-analysis",
+            "index": 0
+          },
+          "message": {
+            "text": "isFileWithinDirectory - line 261 - call: getCanonicalPath"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/github/jlangch/venice/impl/util/io/LoadPaths.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 261,
+                  "startColumn": 21,
+                  "endColumn": 42
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "ed2a3e980f7e733c:1",
+            "primaryLocationStartColumnFingerprint": "4"
+          }
+        },
+        {
+          "ruleId": "java/load-paths-canon-analysis",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/load-paths-canon-analysis",
+            "index": 0
+          },
+          "message": {
+            "text": "isFileWithinDirectory - line 261 - call: getCanonicalPath"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/github/jlangch/venice/impl/util/io/LoadPaths.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 261,
+                  "startColumn": 54,
+                  "endColumn": 77
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "ed2a3e980f7e733c:1",
+            "primaryLocationStartColumnFingerprint": "37"
+          }
+        }
+      ]
+    },
+    {
+      "codeql_query_uuid": "20260330214503",
+      "codeql_raw_query": "/**\n * @name Detailed analysis of isFileWithinDirectory method in LoadPaths\n * @description Examine what operations happen in isFileWithinDirectory and surrounding methods\n * @kind problem\n * @problem.severity error\n * @id java/load-paths-isfilewithin\n * @tags security\n *       external/cwe/cwe-022\n */\nimport java\n\nfrom MethodCall mc\nwhere\n  mc.getEnclosingCallable().getName() = \"isFileWithinDirectory\" and\n  mc.getEnclosingCallable().getDeclaringType().getName() = \"LoadPaths\"\nselect mc, \"In isFileWithinDirectory: \" + mc.getMethod().getName() + \"() at line \" + mc.getLocation().getStartLine()\n",
+      "hypothesis": "Understanding what isFileWithinDirectory does - is path canonicalized before startsWith check?",
+      "severity": "high",
+      "cwe_ids": [],
+      "results_count": 7,
+      "results": [
+        {
+          "ruleId": "java/load-paths-isfilewithin",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/load-paths-isfilewithin",
+            "index": 0
+          },
+          "message": {
+            "text": "In isFileWithinDirectory: getAbsoluteFile() at line 257"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/github/jlangch/venice/impl/util/io/LoadPaths.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 257,
+                  "startColumn": 27,
+                  "endColumn": 48
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "7a770f67f59ca3fb:1",
+            "primaryLocationStartColumnFingerprint": "18"
+          }
+        },
+        {
+          "ruleId": "java/load-paths-isfilewithin",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/load-paths-isfilewithin",
+            "index": 0
+          },
+          "message": {
+            "text": "In isFileWithinDirectory: isDirectory() at line 258"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/github/jlangch/venice/impl/util/io/LoadPaths.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 258,
+                  "startColumn": 13,
+                  "endColumn": 31
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "c917c8026698ed47:1",
+            "primaryLocationStartColumnFingerprint": "4"
+          }
+        },
+        {
+          "ruleId": "java/load-paths-isfilewithin",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/load-paths-isfilewithin",
+            "index": 0
+          },
+          "message": {
+            "text": "In isFileWithinDirectory: getPath() at line 259"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/github/jlangch/venice/impl/util/io/LoadPaths.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 259,
+                  "startColumn": 44,
+                  "endColumn": 58
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "bbfacf4d139cd0fd:1",
+            "primaryLocationStartColumnFingerprint": "31"
+          }
+        },
+        {
+          "ruleId": "java/load-paths-isfilewithin",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/load-paths-isfilewithin",
+            "index": 0
+          },
+          "message": {
+            "text": "In isFileWithinDirectory: isFile() at line 260"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/github/jlangch/venice/impl/util/io/LoadPaths.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 260,
+                  "startColumn": 17,
+                  "endColumn": 28
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "5cff34fa6d13ee4:1",
+            "primaryLocationStartColumnFingerprint": "4"
+          }
+        },
+        {
+          "ruleId": "java/load-paths-isfilewithin",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/load-paths-isfilewithin",
+            "index": 0
+          },
+          "message": {
+            "text": "In isFileWithinDirectory: startsWith() at line 261"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/github/jlangch/venice/impl/util/io/LoadPaths.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 261,
+                  "startColumn": 21,
+                  "endColumn": 78
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "ed2a3e980f7e733c:1",
+            "primaryLocationStartColumnFingerprint": "4"
+          }
+        },
+        {
+          "ruleId": "java/load-paths-isfilewithin",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/load-paths-isfilewithin",
+            "index": 0
+          },
+          "message": {
+            "text": "In isFileWithinDirectory: getCanonicalPath() at line 261"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/github/jlangch/venice/impl/util/io/LoadPaths.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 261,
+                  "startColumn": 21,
+                  "endColumn": 42
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "ed2a3e980f7e733c:1",
+            "primaryLocationStartColumnFingerprint": "4"
+          }
+        },
+        {
+          "ruleId": "java/load-paths-isfilewithin",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/load-paths-isfilewithin",
+            "index": 0
+          },
+          "message": {
+            "text": "In isFileWithinDirectory: getCanonicalPath() at line 261"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/github/jlangch/venice/impl/util/io/LoadPaths.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 261,
+                  "startColumn": 54,
+                  "endColumn": 77
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "ed2a3e980f7e733c:1",
+            "primaryLocationStartColumnFingerprint": "37"
+          }
+        }
+      ]
+    },
+    {
+      "codeql_query_uuid": "20260330214539",
+      "codeql_raw_query": "/**\n * @name ClassPathResource analysis for protocol/scheme injection\n * @description Examine ClassPathResource for URL scheme injection vulnerabilities\n * @kind problem\n * @problem.severity error\n * @id java/classpath-resource-protocol\n * @tags security\n *       external/cwe/cwe-022\n *       external/cwe/cwe-073\n */\nimport java\n\nfrom MethodCall mc\nwhere\n  mc.getEnclosingCallable().getDeclaringType().getName() = \"ClassPathResource\"\n  and (\n    mc.getMethod().hasName(\"startsWith\") or\n    mc.getMethod().hasName(\"getResource\") or\n    mc.getMethod().hasName(\"getResourceAsStream\") or\n    mc.getMethod().hasName(\"contains\") or\n    mc.getMethod().hasName(\"cleanPath\") or\n    mc.getMethod().hasName(\"normalize\") or\n    mc.getMethod().hasName(\"getPath\") or\n    mc.getMethod().hasName(\"toURL\") or\n    mc.getMethod().hasName(\"toURI\")\n  )\nselect mc, \"ClassPathResource.\" + mc.getEnclosingCallable().getName() + \"() calls \" + mc.getMethod().getName() + \"() at line \" + mc.getLocation().getStartLine()\n",
+      "hypothesis": "ClassPathResource may have protocol injection or path traversal vulnerabilities",
+      "severity": "high",
+      "cwe_ids": [],
+      "results_count": 9,
+      "results": [
+        {
+          "ruleId": "java/classpath-resource-protocol",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/classpath-resource-protocol",
+            "index": 0
+          },
+          "message": {
+            "text": "ClassPathResource.getInputStream() calls getResourceAsStream() at line 62"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/github/jlangch/venice/impl/util/io/ClassPathResource.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 62,
+                  "startColumn": 18,
+                  "endColumn": 59
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "fb5f489689e46b15:1",
+            "primaryLocationStartColumnFingerprint": "5"
+          }
+        },
+        {
+          "ruleId": "java/classpath-resource-protocol",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/classpath-resource-protocol",
+            "index": 0
+          },
+          "message": {
+            "text": "ClassPathResource.getInputStream() calls getResourceAsStream() at line 65"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/github/jlangch/venice/impl/util/io/ClassPathResource.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 65,
+                  "startColumn": 18,
+                  "endColumn": 65
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "890cb3589d761b58:1",
+            "primaryLocationStartColumnFingerprint": "5"
+          }
+        },
+        {
+          "ruleId": "java/classpath-resource-protocol",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/classpath-resource-protocol",
+            "index": 0
+          },
+          "message": {
+            "text": "ClassPathResource.getInputStream() calls getResourceAsStream() at line 69"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/github/jlangch/venice/impl/util/io/ClassPathResource.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 69,
+                  "startColumn": 18,
+                  "endLine": 71,
+                  "endColumn": 55
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "607bebf9f6c172c8:1",
+            "primaryLocationStartColumnFingerprint": "5"
+          }
+        },
+        {
+          "ruleId": "java/classpath-resource-protocol",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/classpath-resource-protocol",
+            "index": 0
+          },
+          "message": {
+            "text": "ClassPathResource.getInputStream() calls getResourceAsStream() at line 75"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/github/jlangch/venice/impl/util/io/ClassPathResource.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 75,
+                  "startColumn": 18,
+                  "endLine": 76,
+                  "endColumn": 60
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "3af72164a7348f36:1",
+            "primaryLocationStartColumnFingerprint": "5"
+          }
+        },
+        {
+          "ruleId": "java/classpath-resource-protocol",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/classpath-resource-protocol",
+            "index": 0
+          },
+          "message": {
+            "text": "ClassPathResource.getResource() calls getResource() at line 90"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/github/jlangch/venice/impl/util/io/ClassPathResource.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 90,
+                  "startColumn": 19,
+                  "endColumn": 52
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "e859d6d9d9b7e071:1",
+            "primaryLocationStartColumnFingerprint": "6"
+          }
+        },
+        {
+          "ruleId": "java/classpath-resource-protocol",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/classpath-resource-protocol",
+            "index": 0
+          },
+          "message": {
+            "text": "ClassPathResource.getResource() calls getResource() at line 93"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/github/jlangch/venice/impl/util/io/ClassPathResource.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 93,
+                  "startColumn": 19,
+                  "endColumn": 58
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "6d921b4623d15967:1",
+            "primaryLocationStartColumnFingerprint": "6"
+          }
+        },
+        {
+          "ruleId": "java/classpath-resource-protocol",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/classpath-resource-protocol",
+            "index": 0
+          },
+          "message": {
+            "text": "ClassPathResource.getResource() calls getResource() at line 97"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/github/jlangch/venice/impl/util/io/ClassPathResource.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 97,
+                  "startColumn": 19,
+                  "endLine": 99,
+                  "endColumn": 48
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "f18b85da90f1063b:1",
+            "primaryLocationStartColumnFingerprint": "6"
+          }
+        },
+        {
+          "ruleId": "java/classpath-resource-protocol",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/classpath-resource-protocol",
+            "index": 0
+          },
+          "message": {
+            "text": "ClassPathResource.getResource() calls getResource() at line 103"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/github/jlangch/venice/impl/util/io/ClassPathResource.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 103,
+                  "startColumn": 19,
+                  "endLine": 104,
+                  "endColumn": 53
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "bb59e0fc9658fde5:1",
+            "primaryLocationStartColumnFingerprint": "6"
+          }
+        },
+        {
+          "ruleId": "java/classpath-resource-protocol",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/classpath-resource-protocol",
+            "index": 0
+          },
+          "message": {
+            "text": "ClassPathResource.getResourceAsBinary() calls startsWith() at line 123"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/github/jlangch/venice/impl/util/io/ClassPathResource.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 123,
+                  "startColumn": 17,
+                  "endColumn": 66
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "7d26cf96a775e029:1",
+            "primaryLocationStartColumnFingerprint": "4"
+          }
+        }
+      ]
+    },
+    {
+      "codeql_query_uuid": "20260330214616",
+      "codeql_raw_query": "/**\n * @name isFileWithinDirectory uses getAbsoluteFile instead of getCanonicalFile\n * @description Path containment check uses getAbsoluteFile which doesn't resolve .. sequences\n * @kind problem\n * @problem.severity error\n * @id java/absolute-not-canonical-path\n * @tags security\n *       external/cwe/cwe-022\n */\nimport java\n\n// Find the isFileWithinDirectory method and look for getAbsoluteFile WITHOUT getCanonicalFile\nfrom Method m, MethodCall absoluteCall\nwhere\n  m.getName() = \"isFileWithinDirectory\" and\n  m.getDeclaringType().getName() = \"LoadPaths\" and\n  absoluteCall.getMethod().hasName(\"getAbsoluteFile\") and\n  absoluteCall.getEnclosingCallable() = m and\n  // Confirm no getCanonicalFile is also called in the same method\n  not exists(MethodCall canonCall |\n    canonCall.getMethod().hasName(\"getCanonicalFile\") and\n    canonCall.getEnclosingCallable() = m\n  )\nselect absoluteCall, \"isFileWithinDirectory uses getAbsoluteFile() instead of getCanonicalFile() - does not resolve '..' sequences, enabling path traversal\"\n",
+      "hypothesis": "isFileWithinDirectory uses getAbsoluteFile() instead of getCanonicalFile(), making the startsWith check bypassable with '..' sequences",
+      "severity": "critical",
+      "cwe_ids": [],
+      "results_count": 1,
+      "results": [
+        {
+          "ruleId": "java/absolute-not-canonical-path",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/absolute-not-canonical-path",
+            "index": 0
+          },
+          "message": {
+            "text": "isFileWithinDirectory uses getAbsoluteFile() instead of getCanonicalFile() - does not resolve '..' sequences, enabling path traversal"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/github/jlangch/venice/impl/util/io/LoadPaths.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 257,
+                  "startColumn": 27,
+                  "endColumn": 48
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "7a770f67f59ca3fb:1",
+            "primaryLocationStartColumnFingerprint": "18"
+          }
+        }
+      ]
+    },
+    {
+      "codeql_query_uuid": "20260330214649",
+      "codeql_raw_query": "/**\n * @name Callers of isFileWithinDirectory and loadFromLoadPath\n * @description Find what methods call isFileWithinDirectory and the broader call chain\n * @kind problem\n * @problem.severity error\n * @id java/load-paths-callers\n * @tags security\n *       external/cwe/cwe-022\n */\nimport java\n\n// Find all call sites of isFileWithinDirectory and isOnLoadPath and loadFromLoadPath\nfrom MethodCall mc\nwhere\n  mc.getMethod().getName() = \"isFileWithinDirectory\" or\n  mc.getMethod().getName() = \"isOnLoadPath\" or\n  mc.getMethod().getName() = \"loadFromLoadPath\" or\n  mc.getMethod().getName() = \"getFile\"\nselect mc, mc.getEnclosingCallable().getDeclaringType().getName() + \".\" + mc.getEnclosingCallable().getName() + \"() -> \" + mc.getMethod().getName() + \"() at line \" + mc.getLocation().getStartLine()\n",
+      "hypothesis": "Understanding the call chain into isFileWithinDirectory to assess attack surface",
+      "severity": "critical",
+      "cwe_ids": [],
+      "results_count": 16,
+      "results": [
+        {
+          "ruleId": "java/load-paths-callers",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/load-paths-callers",
+            "index": 0
+          },
+          "message": {
+            "text": "VncException.callFrameToString() -> getFile() at line 158"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/github/jlangch/venice/VncException.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 158,
+                  "startColumn": 25,
+                  "endColumn": 44
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "d463437d7229ca58:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "java/load-paths-callers",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/load-paths-callers",
+            "index": 0
+          },
+          "message": {
+            "text": "VncException.callFrameToString() -> getFile() at line 164"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/github/jlangch/venice/VncException.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 164,
+                  "startColumn": 25,
+                  "endColumn": 44
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "aead7cb76d37644f:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "java/load-paths-callers",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/load-paths-callers",
+            "index": 0
+          },
+          "message": {
+            "text": "Break.getBreakFnInfo() -> getFile() at line 142"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/github/jlangch/venice/impl/debug/agent/Break.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 1
+                },
+                "region": {
+                  "startLine": 142,
+                  "startColumn": 25,
+                  "endColumn": 55
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "c584d68835523781:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "java/load-paths-callers",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/load-paths-callers",
+            "index": 0
+          },
+          "message": {
+            "text": "Break.getBreakFnInfo() -> getFile() at line 156"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/github/jlangch/venice/impl/debug/agent/Break.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 1
+                },
+                "region": {
+                  "startLine": 156,
+                  "startColumn": 25,
+                  "endColumn": 55
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "cfd27b0a255d6dba:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "java/load-paths-callers",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/load-paths-callers",
+            "index": 0
+          },
+          "message": {
+            "text": ".apply() -> getFile() at line 413"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/github/jlangch/venice/impl/functions/ExceptionFunctions.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 2
+                },
+                "region": {
+                  "startLine": 413,
+                  "startColumn": 87,
+                  "endColumn": 98
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "40fd852cee633865:1",
+            "primaryLocationStartColumnFingerprint": "38"
+          }
+        },
+        {
+          "ruleId": "java/load-paths-callers",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/load-paths-callers",
+            "index": 0
+          },
+          "message": {
+            "text": ".apply() -> getFile() at line 681"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/github/jlangch/venice/impl/functions/SystemFunctions.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 3
+                },
+                "region": {
+                  "startLine": 681,
+                  "startColumn": 79,
+                  "endColumn": 90
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "45626f8398a635c4:1",
+            "primaryLocationStartColumnFingerprint": "34"
+          }
+        },
+        {
+          "ruleId": "java/load-paths-callers",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/load-paths-callers",
+            "index": 0
+          },
+          "message": {
+            "text": "CallFrame.getFile() -> getFile() at line 93"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/github/jlangch/venice/impl/util/CallFrame.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 4
+                },
+                "region": {
+                  "startLine": 93,
+                  "startColumn": 29,
+                  "endColumn": 51
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "169c867e5386f88e:1",
+            "primaryLocationStartColumnFingerprint": "20"
+          }
+        },
+        {
+          "ruleId": "java/load-paths-callers",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/load-paths-callers",
+            "index": 0
+          },
+          "message": {
+            "text": "CallFrame.toStackFrame() -> getFile() at line 110"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/github/jlangch/venice/impl/util/CallFrame.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 4
+                },
+                "region": {
+                  "startLine": 110,
+                  "startColumn": 44,
+                  "endColumn": 53
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "c646dbcd12b70b9b:1",
+            "primaryLocationStartColumnFingerprint": "35"
+          }
+        },
+        {
+          "ruleId": "java/load-paths-callers",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/load-paths-callers",
+            "index": 0
+          },
+          "message": {
+            "text": "CallFrame.getSourcePosInfo() -> getFile() at line 114"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/github/jlangch/venice/impl/util/CallFrame.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 4
+                },
+                "region": {
+                  "startLine": 114,
+                  "startColumn": 53,
+                  "endColumn": 62
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "54a79098cae6b175:1",
+            "primaryLocationStartColumnFingerprint": "44"
+          }
+        },
+        {
+          "ruleId": "java/load-paths-callers",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/load-paths-callers",
+            "index": 0
+          },
+          "message": {
+            "text": "ErrorMessage.buildErrLocation() -> getFile() at line 45"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/github/jlangch/venice/impl/util/ErrorMessage.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 5
+                },
+                "region": {
+                  "startLine": 45,
+                  "startColumn": 25,
+                  "endColumn": 40
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "a3654bff030e248c:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "java/load-paths-callers",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/load-paths-callers",
+            "index": 0
+          },
+          "message": {
+            "text": "ErrorMessage.buildErrLocation() -> getFile() at line 54"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/github/jlangch/venice/impl/util/ErrorMessage.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 5
+                },
+                "region": {
+                  "startLine": 54,
+                  "startColumn": 29,
+                  "endColumn": 51
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "fb11dc7db7155f91:1",
+            "primaryLocationStartColumnFingerprint": "20"
+          }
+        },
+        {
+          "ruleId": "java/load-paths-callers",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/load-paths-callers",
+            "index": 0
+          },
+          "message": {
+            "text": "MetaUtil.toMeta() -> getFile() at line 58"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/github/jlangch/venice/impl/util/MetaUtil.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 6
+                },
+                "region": {
+                  "startLine": 58,
+                  "startColumn": 41,
+                  "endColumn": 56
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "5457ecc8b752f3b3:1",
+            "primaryLocationStartColumnFingerprint": "20"
+          }
+        },
+        {
+          "ruleId": "java/load-paths-callers",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/load-paths-callers",
+            "index": 0
+          },
+          "message": {
+            "text": ".apply() -> loadFromLoadPath() at line 146"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/github/jlangch/venice/impl/util/io/LoadPaths.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 7
+                },
+                "region": {
+                  "startLine": 146,
+                  "startColumn": 60,
+                  "endColumn": 85
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "e62024a0f86ccb3a:1",
+            "primaryLocationStartColumnFingerprint": "10"
+          }
+        },
+        {
+          "ruleId": "java/load-paths-callers",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/load-paths-callers",
+            "index": 0
+          },
+          "message": {
+            "text": "LoadPaths.loadFileFromDir() -> isFileWithinDirectory() at line 213"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/github/jlangch/venice/impl/util/io/LoadPaths.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 7
+                },
+                "region": {
+                  "startLine": 213,
+                  "startColumn": 24,
+                  "endColumn": 61
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "a818f6378b0275a9:1",
+            "primaryLocationStartColumnFingerprint": "7"
+          }
+        },
+        {
+          "ruleId": "java/load-paths-callers",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/load-paths-callers",
+            "index": 0
+          },
+          "message": {
+            "text": "SandboxInterceptor.validateFileRead() -> isOnLoadPath() at line 198"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/github/jlangch/venice/javainterop/SandboxInterceptor.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 8
+                },
+                "region": {
+                  "startLine": 198,
+                  "startColumn": 14,
+                  "endColumn": 47
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "13467572705c6e40:1",
+            "primaryLocationStartColumnFingerprint": "5"
+          }
+        },
+        {
+          "ruleId": "java/load-paths-callers",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/load-paths-callers",
+            "index": 0
+          },
+          "message": {
+            "text": "SandboxInterceptor.validateFileWrite() -> isOnLoadPath() at line 207"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/github/jlangch/venice/javainterop/SandboxInterceptor.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 8
+                },
+                "region": {
+                  "startLine": 207,
+                  "startColumn": 14,
+                  "endColumn": 47
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "13467572705c6f06:1",
+            "primaryLocationStartColumnFingerprint": "5"
+          }
+        }
+      ]
+    },
+    {
+      "codeql_query_uuid": "20260330214804",
+      "codeql_raw_query": "/**\n * @name loadFileFromDir uses isFileWithinDirectory with getAbsoluteFile\n * @description The loadFileFromDir method calls isFileWithinDirectory which uses getAbsoluteFile not getCanonicalFile\n * @kind problem\n * @problem.severity error\n * @id java/loadfilefromdir-absolute\n * @tags security\n *       external/cwe/cwe-022\n */\nimport java\n\n// Look at operations in loadFileFromDir specifically\nfrom MethodCall mc\nwhere\n  mc.getEnclosingCallable().getDeclaringType().getName() = \"LoadPaths\" and\n  mc.getEnclosingCallable().getName() = \"loadFileFromDir\" and\n  (\n    mc.getMethod().hasName(\"getAbsoluteFile\") or\n    mc.getMethod().hasName(\"getCanonicalFile\") or\n    mc.getMethod().hasName(\"getAbsolutePath\") or\n    mc.getMethod().hasName(\"getCanonicalPath\") or\n    mc.getMethod().hasName(\"isFileWithinDirectory\") or\n    mc.getMethod().hasName(\"normalize\") or\n    mc.getMethod().hasName(\"canonical\")\n  )\nselect mc, \"loadFileFromDir calls \" + mc.getMethod().getName() + \"() at line \" + mc.getLocation().getStartLine()\n",
+      "hypothesis": "loadFileFromDir passes paths to isFileWithinDirectory which uses getAbsoluteFile not getCanonicalFile",
+      "severity": "critical",
+      "cwe_ids": [],
+      "results_count": 1,
+      "results": [
+        {
+          "ruleId": "java/loadfilefromdir-absolute",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/loadfilefromdir-absolute",
+            "index": 0
+          },
+          "message": {
+            "text": "loadFileFromDir calls isFileWithinDirectory() at line 213"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/github/jlangch/venice/impl/util/io/LoadPaths.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 213,
+                  "startColumn": 24,
+                  "endColumn": 61
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "a818f6378b0275a9:1",
+            "primaryLocationStartColumnFingerprint": "7"
+          }
+        }
+      ]
+    },
+    {
+      "codeql_query_uuid": "20260330214854",
+      "codeql_raw_query": "/**\n * @name Zip slip - ZipEntry name used to construct file paths without validation\n * @description ZipEntry.getName() used in File constructor without checking for path traversal\n * @kind problem\n * @problem.severity error\n * @id java/zip-slip\n * @tags security\n *       external/cwe/cwe-022\n */\nimport java\nimport semmle.code.java.dataflow.DataFlow\n\nfrom MethodCall getName, ClassInstanceExpr fileNew\nwhere\n  getName.getMethod().hasName(\"getName\") and\n  getName.getMethod().getDeclaringType().hasQualifiedName(\"java.util.zip\", \"ZipEntry\") and\n  fileNew.getConstructor().getDeclaringType().hasQualifiedName(\"java.io\", \"File\") and\n  DataFlow::localFlow(DataFlow::exprNode(getName), DataFlow::exprNode(fileNew.getAnArgument()))\nselect fileNew, \"ZipEntry.getName() flows to File constructor - potential zip slip vulnerability\"\n",
+      "hypothesis": "Zip slip - ZipEntry getName flowing to File constructor without traversal check",
+      "severity": "high",
+      "cwe_ids": [],
+      "results_count": 2,
+      "results": [
+        {
+          "ruleId": "java/zip-slip",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/zip-slip",
+            "index": 0
+          },
+          "message": {
+            "text": "ZipEntry.getName() flows to File constructor - potential zip slip vulnerability"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/github/jlangch/venice/impl/util/io/zip/Zipper.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 481,
+                  "startColumn": 41,
+                  "endColumn": 66
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "a50bb26f989c8f40:1",
+            "primaryLocationStartColumnFingerprint": "20"
+          }
+        },
+        {
+          "ruleId": "java/zip-slip",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/zip-slip",
+            "index": 0
+          },
+          "message": {
+            "text": "ZipEntry.getName() flows to File constructor - potential zip slip vulnerability"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/github/jlangch/venice/impl/util/io/zip/Zipper.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 841,
+                  "startColumn": 31,
+                  "endColumn": 75
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "8610096012907772:1",
+            "primaryLocationStartColumnFingerprint": "22"
+          }
+        }
+      ]
+    },
+    {
+      "codeql_query_uuid": "20260330215006",
+      "codeql_raw_query": "/**\n * @name Zipper zip slip - check if containment validation exists around ZipEntry.getName() to File\n * @description Check what validation exists near the zip slip locations\n * @kind problem\n * @problem.severity error\n * @id java/zipper-validation-check\n * @tags security\n *       external/cwe/cwe-022\n */\nimport java\n\n// Find all method calls in the methods containing zip slip\nfrom MethodCall mc\nwhere\n  mc.getEnclosingCallable().getDeclaringType().getName() = \"Zipper\" and\n  (\n    mc.getMethod().hasName(\"getCanonicalPath\") or\n    mc.getMethod().hasName(\"getCanonicalFile\") or\n    mc.getMethod().hasName(\"startsWith\") or\n    mc.getMethod().hasName(\"contains\") or\n    mc.getMethod().hasName(\"normalize\") or\n    mc.getMethod().hasName(\"getName\") or\n    mc.getMethod().hasName(\"toRealPath\") or\n    mc.getMethod().hasName(\"getAbsolutePath\") or\n    mc.getMethod().hasName(\"getAbsoluteFile\")\n  ) and\n  (\n    mc.getEnclosingCallable().getName().matches(\"%nzip%\") or\n    mc.getEnclosingCallable().getName().matches(\"%unzip%\") or\n    mc.getEnclosingCallable().getName().matches(\"%extract%\") or\n    mc.getEnclosingCallable().getName().matches(\"%Unzip%\") or\n    mc.getEnclosingCallable().getName().matches(\"%inflate%\") or\n    mc.getLocation().getStartLine() >= 470 and mc.getLocation().getStartLine() <= 500 or\n    mc.getLocation().getStartLine() >= 830 and mc.getLocation().getStartLine() <= 860\n  )\nselect mc, \"Zipper.\" + mc.getEnclosingCallable().getName() + \"() calls \" + mc.getMethod().getName() + \"() at line \" + mc.getLocation().getStartLine()\n",
+      "hypothesis": "Checking whether zip extraction in Zipper.java has path traversal protection around the vulnerable spots",
+      "severity": "high",
+      "cwe_ids": [],
+      "results_count": 10,
+      "results": [
+        {
+          "ruleId": "java/zipper-validation-check",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/zipper-validation-check",
+            "index": 0
+          },
+          "message": {
+            "text": "Zipper.unzip() calls getName() at line 303"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/github/jlangch/venice/impl/util/io/zip/Zipper.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 303,
+                  "startColumn": 33,
+                  "endColumn": 48
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "adeb86223297fed2:1",
+            "primaryLocationStartColumnFingerprint": "16"
+          }
+        },
+        {
+          "ruleId": "java/zipper-validation-check",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/zipper-validation-check",
+            "index": 0
+          },
+          "message": {
+            "text": "Zipper.unzipToStream() calls getName() at line 388"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/github/jlangch/venice/impl/util/io/zip/Zipper.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 388,
+                  "startColumn": 33,
+                  "endColumn": 48
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "35889ebad22faa43:1",
+            "primaryLocationStartColumnFingerprint": "16"
+          }
+        },
+        {
+          "ruleId": "java/zipper-validation-check",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/zipper-validation-check",
+            "index": 0
+          },
+          "message": {
+            "text": "Zipper.unzipAll() calls getName() at line 477"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/github/jlangch/venice/impl/util/io/zip/Zipper.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 477,
+                  "startColumn": 25,
+                  "endColumn": 40
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "bff07f669c59ac8:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "java/zipper-validation-check",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/zipper-validation-check",
+            "index": 0
+          },
+          "message": {
+            "text": "Zipper.unzipAll() calls getName() at line 481"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/github/jlangch/venice/impl/util/io/zip/Zipper.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 481,
+                  "startColumn": 50,
+                  "endColumn": 65
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "a50bb26f989c8f40:1",
+            "primaryLocationStartColumnFingerprint": "29"
+          }
+        },
+        {
+          "ruleId": "java/zipper-validation-check",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/zipper-validation-check",
+            "index": 0
+          },
+          "message": {
+            "text": "Zipper.unzipAll() calls getName() at line 482"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/github/jlangch/venice/impl/util/io/zip/Zipper.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 482,
+                  "startColumn": 35,
+                  "endColumn": 50
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "6872d0b006f8db3c:1",
+            "primaryLocationStartColumnFingerprint": "10"
+          }
+        },
+        {
+          "ruleId": "java/zipper-validation-check",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/zipper-validation-check",
+            "index": 0
+          },
+          "message": {
+            "text": "Zipper.newFile() calls getName() at line 841"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/github/jlangch/venice/impl/util/io/zip/Zipper.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 841,
+                  "startColumn": 56,
+                  "endColumn": 74
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "8610096012907772:1",
+            "primaryLocationStartColumnFingerprint": "47"
+          }
+        },
+        {
+          "ruleId": "java/zipper-validation-check",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/zipper-validation-check",
+            "index": 0
+          },
+          "message": {
+            "text": "Zipper.newFile() calls getCanonicalPath() at line 843"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/github/jlangch/venice/impl/util/io/zip/Zipper.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 843,
+                  "startColumn": 36,
+                  "endColumn": 69
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "fc9313d1b6821bed:1",
+            "primaryLocationStartColumnFingerprint": "27"
+          }
+        },
+        {
+          "ruleId": "java/zipper-validation-check",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/zipper-validation-check",
+            "index": 0
+          },
+          "message": {
+            "text": "Zipper.newFile() calls getCanonicalPath() at line 844"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/github/jlangch/venice/impl/util/io/zip/Zipper.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 844,
+                  "startColumn": 37,
+                  "endColumn": 64
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "81e81c1328b37d2c:1",
+            "primaryLocationStartColumnFingerprint": "28"
+          }
+        },
+        {
+          "ruleId": "java/zipper-validation-check",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/zipper-validation-check",
+            "index": 0
+          },
+          "message": {
+            "text": "Zipper.newFile() calls startsWith() at line 849"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/github/jlangch/venice/impl/util/io/zip/Zipper.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 849,
+                  "startColumn": 14,
+                  "endColumn": 67
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "fdfa4c51ecd01852:1",
+            "primaryLocationStartColumnFingerprint": "5"
+          }
+        },
+        {
+          "ruleId": "java/zipper-validation-check",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/zipper-validation-check",
+            "index": 0
+          },
+          "message": {
+            "text": "Zipper.newFile() calls getName() at line 850"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/github/jlangch/venice/impl/util/io/zip/Zipper.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 850,
+                  "startColumn": 76,
+                  "endColumn": 94
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "377e0ba3d283def5:1",
+            "primaryLocationStartColumnFingerprint": "63"
+          }
+        }
+      ]
+    },
+    {
+      "codeql_query_uuid": "20260330215042",
+      "codeql_raw_query": "/**\n * @name unzipAll calls newFile protection check\n * @description Check whether unzipAll properly routes through the newFile protection\n * @kind problem\n * @problem.severity error\n * @id java/unzipall-newfile-check\n * @tags security\n *       external/cwe/cwe-022\n */\nimport java\n\nfrom MethodCall mc\nwhere\n  mc.getEnclosingCallable().getDeclaringType().getName() = \"Zipper\" and\n  mc.getEnclosingCallable().getName() = \"unzipAll\" and\n  (\n    mc.getMethod().hasName(\"newFile\") or\n    mc.getMethod().hasName(\"getName\") or\n    mc.getMethod().hasName(\"getCanonicalPath\") or\n    mc.getMethod().hasName(\"getCanonicalFile\") or\n    mc.getMethod().hasName(\"startsWith\")\n  )\nselect mc, \"unzipAll() -> \" + mc.getMethod().getName() + \"() at line \" + mc.getLocation().getStartLine()\n",
+      "hypothesis": "Does unzipAll use the newFile() protection or does it bypass it?",
+      "severity": "high",
+      "cwe_ids": [],
+      "results_count": 3,
+      "results": [
+        {
+          "ruleId": "java/unzipall-newfile-check",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/unzipall-newfile-check",
+            "index": 0
+          },
+          "message": {
+            "text": "unzipAll() -> getName() at line 477"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/github/jlangch/venice/impl/util/io/zip/Zipper.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 477,
+                  "startColumn": 25,
+                  "endColumn": 40
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "bff07f669c59ac8:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "java/unzipall-newfile-check",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/unzipall-newfile-check",
+            "index": 0
+          },
+          "message": {
+            "text": "unzipAll() -> getName() at line 481"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/github/jlangch/venice/impl/util/io/zip/Zipper.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 481,
+                  "startColumn": 50,
+                  "endColumn": 65
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "a50bb26f989c8f40:1",
+            "primaryLocationStartColumnFingerprint": "29"
+          }
+        },
+        {
+          "ruleId": "java/unzipall-newfile-check",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/unzipall-newfile-check",
+            "index": 0
+          },
+          "message": {
+            "text": "unzipAll() -> getName() at line 482"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/github/jlangch/venice/impl/util/io/zip/Zipper.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 482,
+                  "startColumn": 35,
+                  "endColumn": 50
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "6872d0b006f8db3c:1",
+            "primaryLocationStartColumnFingerprint": "10"
+          }
+        }
+      ]
+    },
+    {
+      "codeql_query_uuid": "20260330215118",
+      "codeql_raw_query": "/**\n * @name Path traversal in ModuleLoader - classpath resource with user-controlled path\n * @description Check how ModuleLoader loads resources and whether paths are validated\n * @kind problem\n * @problem.severity error\n * @id java/moduleloader-path\n * @tags security\n *       external/cwe/cwe-022\n */\nimport java\n\n// Look at all method calls in ModuleLoader\nfrom MethodCall mc\nwhere\n  mc.getEnclosingCallable().getDeclaringType().getName() = \"ModuleLoader\"\n  and (\n    mc.getMethod().hasName(\"getInputStream\") or\n    mc.getMethod().hasName(\"getResource\") or\n    mc.getMethod().hasName(\"getResourceAsStream\") or\n    mc.getMethod().hasName(\"startsWith\") or\n    mc.getMethod().hasName(\"contains\") or\n    mc.getMethod().hasName(\"isAllowed\") or\n    mc.getMethod().hasName(\"isOnLoadPath\") or\n    mc.getMethod().hasName(\"loadFromLoadPath\") or\n    mc.getMethod().hasName(\"canonical\")\n  )\nselect mc, \"ModuleLoader.\" + mc.getEnclosingCallable().getName() + \"() -> \" + mc.getMethod().getName() + \"() at line \" + mc.getLocation().getStartLine()\n",
+      "hypothesis": "ModuleLoader loads classpath resources - checking for path validation",
+      "severity": "high",
+      "cwe_ids": [],
+      "results_count": 0,
+      "results": []
+    },
+    {
+      "codeql_query_uuid": "20260330215154",
+      "codeql_raw_query": "/**\n * @name SandboxInterceptor validateFileRead uses isOnLoadPath which calls isFileWithinDirectory with getAbsoluteFile\n * @description Full chain: SandboxInterceptor.validateFileRead -> isOnLoadPath -> isFileWithinDirectory (getAbsoluteFile + startsWith)\n * @kind problem\n * @problem.severity error\n * @id java/sandbox-loadpath-traversal\n * @tags security\n *       external/cwe/cwe-022\n */\nimport java\n\n// Find methods in SandboxInterceptor that call isOnLoadPath\nfrom MethodCall mc\nwhere\n  mc.getEnclosingCallable().getDeclaringType().getName() = \"SandboxInterceptor\" and\n  (\n    mc.getMethod().hasName(\"isOnLoadPath\") or\n    mc.getMethod().hasName(\"validateFileRead\") or\n    mc.getMethod().hasName(\"validateFileWrite\") or\n    mc.getMethod().hasName(\"loadFromLoadPath\") or\n    mc.getMethod().hasName(\"getCanonicalFile\") or\n    mc.getMethod().hasName(\"getCanonicalPath\") or\n    mc.getMethod().hasName(\"getAbsoluteFile\") or\n    mc.getMethod().hasName(\"startsWith\")\n  )\nselect mc, \"SandboxInterceptor.\" + mc.getEnclosingCallable().getName() + \"() -> \" + mc.getMethod().getName() + \"() at line \" + mc.getLocation().getStartLine()\n",
+      "hypothesis": "SandboxInterceptor file validation uses isOnLoadPath which has the getAbsoluteFile vulnerability",
+      "severity": "critical",
+      "cwe_ids": [],
+      "results_count": 2,
+      "results": [
+        {
+          "ruleId": "java/sandbox-loadpath-traversal",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/sandbox-loadpath-traversal",
+            "index": 0
+          },
+          "message": {
+            "text": "SandboxInterceptor.validateFileRead() -> isOnLoadPath() at line 198"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/github/jlangch/venice/javainterop/SandboxInterceptor.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 198,
+                  "startColumn": 14,
+                  "endColumn": 47
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "13467572705c6e40:1",
+            "primaryLocationStartColumnFingerprint": "5"
+          }
+        },
+        {
+          "ruleId": "java/sandbox-loadpath-traversal",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/sandbox-loadpath-traversal",
+            "index": 0
+          },
+          "message": {
+            "text": "SandboxInterceptor.validateFileWrite() -> isOnLoadPath() at line 207"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/github/jlangch/venice/javainterop/SandboxInterceptor.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 207,
+                  "startColumn": 14,
+                  "endColumn": 47
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "13467572705c6f06:1",
+            "primaryLocationStartColumnFingerprint": "5"
+          }
+        }
+      ]
+    },
+    {
+      "codeql_query_uuid": "20260330215229",
+      "codeql_raw_query": "/**\n * @name IOFunctions path traversal - File operations without canonicalization\n * @description File/Path construction in IOFunctions that reaches filesystem without canonical check\n * @kind problem\n * @problem.severity error\n * @id java/iofunctions-path-traversal\n * @tags security\n *       external/cwe/cwe-022\n */\nimport java\n\n// Find File constructions in IOFunctions that use string arguments without canonicalization\nfrom ClassInstanceExpr fileNew, Method enclosing\nwhere\n  fileNew.getConstructor().getDeclaringType().hasQualifiedName(\"java.io\", \"File\") and\n  enclosing = fileNew.getEnclosingCallable() and\n  enclosing.getDeclaringType().getName() = \"IOFunctions\" and\n  // No getCanonicalFile/Path call on the constructed file in the same method\n  not exists(MethodCall canon |\n    canon.getEnclosingCallable() = enclosing and\n    (canon.getMethod().hasName(\"getCanonicalFile\") or canon.getMethod().hasName(\"getCanonicalPath\"))\n  ) and\n  // And there IS a startsWith or no path boundary check\n  exists(MethodCall mc |\n    mc.getEnclosingCallable() = enclosing and\n    mc.getMethod().hasName(\"startsWith\")\n  )\nselect fileNew, \"IOFunctions: File constructed in \" + enclosing.getName() + \"() at line \" + fileNew.getLocation().getStartLine() + \" - method uses startsWith but no canonical path check\"\n",
+      "hypothesis": "IOFunctions constructs File objects with startsWith checks but no canonicalization",
+      "severity": "high",
+      "cwe_ids": [],
+      "results_count": 0,
+      "results": []
+    }
+  ]
+}

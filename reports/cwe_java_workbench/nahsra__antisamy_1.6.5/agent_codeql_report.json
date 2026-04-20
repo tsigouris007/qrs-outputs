@@ -1,0 +1,2909 @@
+{
+  "session_id": "20260401025313",
+  "package_name": "nahsra__antisamy_1.6.5",
+  "package_path": "packages/nahsra__antisamy_1.6.5",
+  "database_path": "databases/nahsra__antisamy_1.6.5-db",
+  "model": "eu.anthropic.claude-sonnet-4-6",
+  "temperature": 1.0,
+  "max_tokens": 25000,
+  "iterations": 18,
+  "total_input_tokens": 502376,
+  "total_output_tokens": 17112,
+  "total_tokens": 519488,
+  "elapsed_time_seconds": 1116.22,
+  "estimated_cost_usd": 1.7638,
+  "summary": "## Security Analysis: OWASP AntiSamy 1.6.5\n\n### Package Overview\nOWASP AntiSamy (`org.owasp.antisamy:antisamy:1.6.5`) is an HTML sanitization library designed to clean untrusted HTML input. Despite its security-focused purpose, the analysis identified several significant vulnerabilities that can allow XSS bypass.\n\n---\n\n### Finding 1 \u2014 **HIGH**: `CssHandler.importStyle()` Allows `javascript:` URIs via CSS `@import` (CWE-079, CWE-116)\n\n**Location:** `src/main/java/org/owasp/validator/css/CssHandler.java`, method `importStyle()` at line 286\n\n**Description:**  \n`CssHandler.importStyle()` validates CSS `@import` URLs by calling `java.net.URI.normalize()` followed by `URI.isAbsolute()`. However, `javascript:` URIs satisfy `isAbsolute()` because they have a scheme component. The method **never calls `URI.getScheme()`** to validate that the scheme is an allowed protocol (e.g., `http`, `https`). This allows a crafted payload like:\n```css\n@import url('javascript:alert(document.cookie)');\n```\nto pass the URL validation and be classified as either an `offsiteURL` or `onsiteURL`, potentially being included in the sanitized output. This is a URI scheme validation bypass.\n\n**Evidence:** CodeQL confirmed `URI.isAbsolute()` is called at line 323 within `importStyle()` with no `getScheme()` call present in the same method.\n\n---\n\n### Finding 2 \u2014 **HIGH**: CSS Scan Exception Handling May Expose Unsafe Inline Styles (CWE-079)\n\n**Locations:**\n- `src/main/java/org/owasp/validator/html/scan/AntiSamyDOMScanner.java` \u2014 catch blocks at lines 434 and 521 (after `scanStyleSheet()` at line 414 and `scanInlineStyle()` at line 516)\n- `src/main/java/org/owasp/validator/html/scan/MagicSAXFilter.java` \u2014 catch blocks at lines 192 and 307 (after `scanStyleSheet()` at line 167 and `scanInlineStyle()` at line 303)\n\n**Description:**  \nBoth the DOM scanner and SAX filter wrap CSS scanning calls in try-catch blocks. When a CSS scanning exception occurs:\n- The DOM scanner's **`scanStyleSheet()` catch block** calls `removeChild()` (safe \u2014 node is removed).\n- The DOM scanner's **`scanInlineStyle()` catch block** calls `htmlEntityEncode()` at line 524 then `removeAttribute()` at line 525. The `htmlEntityEncode()` call on the exception path before removal is suspicious \u2014 if the encoding result is used elsewhere or if the remove is conditional, the original unsafe CSS could be exposed.\n- The SAX filter's catch blocks call `htmlEntityEncode()` at lines 196 and 309 \u2014 if this encoded value is then written to output, it may not properly neutralize CSS-based XSS (HTML-encoding CSS does not prevent CSS injection).\n\nAn attacker may be able to craft CSS that triggers a parsing exception while still being executable by a browser.\n\n---\n\n### Finding 3 \u2014 **MEDIUM**: `AntiSamyDOMScanner` Pattern Compiled Without `CASE_INSENSITIVE` Flag (CWE-079)\n\n**Location:** `src/main/java/org/owasp/validator/html/scan/AntiSamyDOMScanner.java`, lines 76-77\n\n**Description:**  \nTwo `Pattern.compile()` calls at lines 76 and 77 in `AntiSamyDOMScanner` use no regex flags. The patterns at these lines are used for stripping null characters/control characters (`[\\u0000-\\u001F...]`) and conditional comments (`<?!?\\[...\\]>`). While the null-byte pattern is not case-sensitive, the conditional comment stripper pattern could potentially be bypassed with mixed-case or whitespace variations. Missing `DOTALL` flag could allow multi-line bypass of the conditional comment stripping regex.\n\n**Evidence:** CodeQL confirmed `Pattern.compile(pattern)` with only 1 argument (no flags) at lines 76 and 77.\n\n---\n\n### Finding 4 \u2014 **MEDIUM**: `MagicSAXFilter` Pattern Compiled Without Flags (CWE-079)\n\n**Location:** `src/main/java/org/owasp/validator/html/scan/MagicSAXFilter.java`, line 118\n\n**Description:**  \n`MagicSAXFilter` compiles a pattern at line 118 without any regex flags. If this pattern is used to detect or strip dangerous HTML constructs (such as script tags or event handlers), the lack of `CASE_INSENSITIVE` flag could allow bypasses using mixed-case inputs (e.g., `<ScRiPt>`, `onLOAD=`).\n\n---\n\n### Finding 5 \u2014 **LOW**: `CssScanner` CDATA Handling May Allow Bypass (CWE-079)\n\n**Location:** `src/main/java/org/owasp/validator/css/CssScanner.java`, lines 155-159\n\n**Description:**  \n`CssScanner` strips CDATA markers (`<![CDATA[...]]>`) from CSS content using regex matching before scanning (lines 155-159). If an attacker crafts malformed CDATA nesting or uses Unicode variants of CDATA delimiters, the CDATA stripping could be bypassed, causing the underlying CSS content (which may contain `expression()` or other dangerous values) to be parsed differently by the CSS validator versus the browser.\n\n---\n\n### Summary Table\n\n| # | Severity | Location | Issue |\n|---|----------|----------|-------|\n| 1 | HIGH | `CssHandler.java:286-323` | `importStyle()` uses `URI.isAbsolute()` without scheme validation \u2014 `javascript:` URIs bypass CSS `@import` validation |\n| 2 | HIGH | `AntiSamyDOMScanner.java:434,521` / `MagicSAXFilter.java:192,307` | CSS scan exception handlers may not fully sanitize \u2014 `htmlEntityEncode()` called before or instead of proper removal |\n| 3 | MEDIUM | `AntiSamyDOMScanner.java:76-77` | `Pattern.compile()` without `CASE_INSENSITIVE`/`DOTALL` \u2014 conditional comment stripping may be bypassed |\n| 4 | MEDIUM | `MagicSAXFilter.java:118` | `Pattern.compile()` without flags \u2014 dangerous pattern detection may be case-sensitive bypass |\n| 5 | LOW | `CssScanner.java:155-159` | CDATA stripping via regex may be bypassable with malformed/nested CDATA |\n\n",
+  "package_classification": {
+    "type": [
+      "library"
+    ],
+    "layer": [
+      "security",
+      "application"
+    ]
+  },
+  "tool_calls": {
+    "get_package_profile_info": 1,
+    "execute_codeql_query": 30,
+    "validate_codeql_query": 0,
+    "fixup_codeql_query": 1,
+    "finalize_report": 1
+  },
+  "queries_executed": {
+    "critical": 1,
+    "high": 15,
+    "medium": 3,
+    "low": 0,
+    "total_executed": 31,
+    "total_with_results": 19,
+    "total_failed": 13
+  },
+  "query_findings": {
+    "critical": 23,
+    "high": 47,
+    "medium": 16,
+    "low": 0,
+    "total": 86
+  },
+  "findings": [
+    {
+      "codeql_query_uuid": "20260401025328",
+      "codeql_raw_query": "/**\n * @name CSS expression() injection bypass in AntiSamy\n * @description Check if CSS expression() or other dangerous CSS values pass through the validator\n * @kind problem\n * @problem.severity error\n * @id java/antisamy-css-expression-bypass\n * @tags security\n *       external/cwe/cwe-079\n */\n\nimport java\n\n// Find places in CssValidator where dangerous CSS patterns are checked\nfrom MethodCall mc\nwhere\n  mc.getMethod().getDeclaringType().hasQualifiedName(\"org.owasp.validator.css\", \"CssValidator\") and\n  mc.getMethod().hasName(\"isValidProperty\")\nselect mc, \"CssValidator.isValidProperty call - check if expression() and other dangerous CSS values are properly blocked\"\n",
+      "hypothesis": "CSS expression() injection bypass in AntiSamy CSS validator",
+      "severity": "high",
+      "cwe_ids": [],
+      "results_count": 1,
+      "results": [
+        {
+          "ruleId": "java/antisamy-css-expression-bypass",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/antisamy-css-expression-bypass",
+            "index": 0
+          },
+          "message": {
+            "text": "CssValidator.isValidProperty call - check if expression() and other dangerous CSS values are properly blocked"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/owasp/validator/css/CssHandler.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 550,
+                  "startColumn": 7,
+                  "endColumn": 45
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "27272eee037ba317:1",
+            "primaryLocationStartColumnFingerprint": "4"
+          }
+        }
+      ]
+    },
+    {
+      "codeql_query_uuid": "20260401025354",
+      "codeql_raw_query": "/**\n * @name Dangerous string literals in CSS validation\n * @description Check for presence or absence of checks for dangerous CSS patterns like expression(), javascript:, behavior\n * @kind problem\n * @problem.severity error\n * @id java/antisamy-missing-css-checks\n * @tags security\n *       external/cwe/cwe-079\n */\n\nimport java\n\n// Look for string literals related to CSS attack patterns in the codebase\nfrom StringLiteral sl\nwhere\n  sl.getValue().toLowerCase().matches(\"%expression%\") or\n  sl.getValue().toLowerCase().matches(\"%javascript%\") or\n  sl.getValue().toLowerCase().matches(\"%behavior%\") or\n  sl.getValue().toLowerCase().matches(\"%-moz-binding%\") or\n  sl.getValue().toLowerCase().matches(\"%vbscript%\") or\n  sl.getValue().toLowerCase().matches(\"%@import%\") or\n  sl.getValue().toLowerCase().matches(\"%data:%\")\nselect sl, \"Security-sensitive CSS string literal: '\" + sl.getValue() + \"'\"\n",
+      "hypothesis": "Missing CSS dangerous pattern checks in AntiSamy",
+      "severity": "high",
+      "cwe_ids": [],
+      "results_count": 2,
+      "results": [
+        {
+          "ruleId": "java/antisamy-missing-css-checks",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/antisamy-missing-css-checks",
+            "index": 0
+          },
+          "message": {
+            "text": "Security-sensitive CSS string literal: 'Regular expression ''"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/owasp/validator/html/Policy.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 818,
+                  "startColumn": 50,
+                  "endColumn": 72
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "e157ce4fb9c331b6:1",
+            "primaryLocationStartColumnFingerprint": "33"
+          }
+        },
+        {
+          "ruleId": "java/antisamy-missing-css-checks",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/antisamy-missing-css-checks",
+            "index": 0
+          },
+          "message": {
+            "text": "Security-sensitive CSS string literal: 'Regular expression ''"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/owasp/validator/html/Policy.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 842,
+                  "startColumn": 46,
+                  "endColumn": 68
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "e157ce4fb9c331b6:2",
+            "primaryLocationStartColumnFingerprint": "33"
+          }
+        }
+      ]
+    },
+    {
+      "codeql_query_uuid": "20260401025506",
+      "codeql_raw_query": "/**\n * @name URL attribute validation - javascript: and data: URI bypass\n * @description Check how URIUtils validates URLs to detect potential javascript: or data: URI bypass\n * @kind problem\n * @problem.severity error\n * @id java/antisamy-url-validation-bypass\n * @tags security\n *       external/cwe/cwe-079\n */\n\nimport java\n\n// Find string literals in URIUtils and Attribute validation related to URL schemes\nfrom StringLiteral sl\nwhere\n  sl.getCompilationUnit().getFile().getBaseName() = \"URIUtils.java\" or\n  sl.getCompilationUnit().getFile().getBaseName() = \"Attribute.java\"\nselect sl, sl.getCompilationUnit().getFile().getBaseName() + \":\" + sl.getLocation().getStartLine() + \" - '\" + sl.getValue() + \"'\"\n",
+      "hypothesis": "URL validation bypass allowing javascript: or data: URIs in href/src attributes",
+      "severity": "critical",
+      "cwe_ids": [],
+      "results_count": 23,
+      "results": [
+        {
+          "ruleId": "java/antisamy-url-validation-bypass",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/antisamy-url-validation-bypass",
+            "index": 0
+          },
+          "message": {
+            "text": "Attribute.java:102 - '\"'"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/owasp/validator/html/model/Attribute.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 102,
+                  "startColumn": 120,
+                  "endColumn": 124
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "fa81b451917fba41:1",
+            "primaryLocationStartColumnFingerprint": "111"
+          }
+        },
+        {
+          "ruleId": "java/antisamy-url-validation-bypass",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/antisamy-url-validation-bypass",
+            "index": 0
+          },
+          "message": {
+            "text": "Attribute.java:102 - '='"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/owasp/validator/html/model/Attribute.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 102,
+                  "startColumn": 77,
+                  "endColumn": 80
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "fa81b451917fba41:1",
+            "primaryLocationStartColumnFingerprint": "68"
+          }
+        },
+        {
+          "ruleId": "java/antisamy-url-validation-bypass",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/antisamy-url-validation-bypass",
+            "index": 0
+          },
+          "message": {
+            "text": "Attribute.java:139 - '\"'"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/owasp/validator/html/model/Attribute.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 139,
+                  "startColumn": 27,
+                  "endColumn": 31
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "15d0578da165786c:1",
+            "primaryLocationStartColumnFingerprint": "14"
+          }
+        },
+        {
+          "ruleId": "java/antisamy-url-validation-bypass",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/antisamy-url-validation-bypass",
+            "index": 0
+          },
+          "message": {
+            "text": "Attribute.java:160 - ''"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/owasp/validator/html/model/Attribute.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 160,
+                  "startColumn": 30,
+                  "endColumn": 32
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "ac631e3c94b14512:1",
+            "primaryLocationStartColumnFingerprint": "21"
+          }
+        },
+        {
+          "ruleId": "java/antisamy-url-validation-bypass",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/antisamy-url-validation-bypass",
+            "index": 0
+          },
+          "message": {
+            "text": "Attribute.java:162 - 'nofollow'"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/owasp/validator/html/model/Attribute.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 162,
+                  "startColumn": 44,
+                  "endColumn": 54
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "b34f0e9c8c82f7d3:1",
+            "primaryLocationStartColumnFingerprint": "31"
+          }
+        },
+        {
+          "ruleId": "java/antisamy-url-validation-bypass",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/antisamy-url-validation-bypass",
+            "index": 0
+          },
+          "message": {
+            "text": "Attribute.java:163 - ' noopener noreferrer'"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/owasp/validator/html/model/Attribute.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 163,
+                  "startColumn": 58,
+                  "endColumn": 80
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "167d5ab365d615a0:1",
+            "primaryLocationStartColumnFingerprint": "45"
+          }
+        },
+        {
+          "ruleId": "java/antisamy-url-validation-bypass",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/antisamy-url-validation-bypass",
+            "index": 0
+          },
+          "message": {
+            "text": "Attribute.java:167 - ' '"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/owasp/validator/html/model/Attribute.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 167,
+                  "startColumn": 54,
+                  "endColumn": 57
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "407161e444873a33:1",
+            "primaryLocationStartColumnFingerprint": "41"
+          }
+        },
+        {
+          "ruleId": "java/antisamy-url-validation-bypass",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/antisamy-url-validation-bypass",
+            "index": 0
+          },
+          "message": {
+            "text": "Attribute.java:171 - 'nofollow'"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/owasp/validator/html/model/Attribute.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 171,
+                  "startColumn": 52,
+                  "endColumn": 62
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "80897df6f9d15e4f:1",
+            "primaryLocationStartColumnFingerprint": "39"
+          }
+        },
+        {
+          "ruleId": "java/antisamy-url-validation-bypass",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/antisamy-url-validation-bypass",
+            "index": 0
+          },
+          "message": {
+            "text": "Attribute.java:172 - ' nofollow'"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/owasp/validator/html/model/Attribute.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 172,
+                  "startColumn": 32,
+                  "endColumn": 43
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "93858de673f000a7:1",
+            "primaryLocationStartColumnFingerprint": "15"
+          }
+        },
+        {
+          "ruleId": "java/antisamy-url-validation-bypass",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/antisamy-url-validation-bypass",
+            "index": 0
+          },
+          "message": {
+            "text": "Attribute.java:176 - 'noopener'"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/owasp/validator/html/model/Attribute.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 176,
+                  "startColumn": 41,
+                  "endColumn": 51
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "79e46945b71fc378:1",
+            "primaryLocationStartColumnFingerprint": "24"
+          }
+        },
+        {
+          "ruleId": "java/antisamy-url-validation-bypass",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/antisamy-url-validation-bypass",
+            "index": 0
+          },
+          "message": {
+            "text": "Attribute.java:177 - ' noopener'"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/owasp/validator/html/model/Attribute.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 177,
+                  "startColumn": 36,
+                  "endColumn": 47
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "da330e2fab7adbe1:1",
+            "primaryLocationStartColumnFingerprint": "15"
+          }
+        },
+        {
+          "ruleId": "java/antisamy-url-validation-bypass",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/antisamy-url-validation-bypass",
+            "index": 0
+          },
+          "message": {
+            "text": "Attribute.java:179 - 'noreferrer'"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/owasp/validator/html/model/Attribute.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 179,
+                  "startColumn": 41,
+                  "endColumn": 53
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "185cb183c8c2c8ec:1",
+            "primaryLocationStartColumnFingerprint": "24"
+          }
+        },
+        {
+          "ruleId": "java/antisamy-url-validation-bypass",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/antisamy-url-validation-bypass",
+            "index": 0
+          },
+          "message": {
+            "text": "Attribute.java:180 - ' noreferrer'"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/owasp/validator/html/model/Attribute.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 180,
+                  "startColumn": 36,
+                  "endColumn": 49
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "abe7d70ccf038577:1",
+            "primaryLocationStartColumnFingerprint": "15"
+          }
+        },
+        {
+          "ruleId": "java/antisamy-url-validation-bypass",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/antisamy-url-validation-bypass",
+            "index": 0
+          },
+          "message": {
+            "text": "URIUtils.java:45 - 'file:///'"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/owasp/validator/html/util/URIUtils.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 1
+                },
+                "region": {
+                  "startLine": 45,
+                  "startColumn": 53,
+                  "endColumn": 63
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "a430d2d32f1618f:1",
+            "primaryLocationStartColumnFingerprint": "51"
+          }
+        },
+        {
+          "ruleId": "java/antisamy-url-validation-bypass",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/antisamy-url-validation-bypass",
+            "index": 0
+          },
+          "message": {
+            "text": "URIUtils.java:53 - '/'"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/owasp/validator/html/util/URIUtils.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 1
+                },
+                "region": {
+                  "startLine": 53,
+                  "startColumn": 49,
+                  "endColumn": 52
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "a40b9a065876f800:1",
+            "primaryLocationStartColumnFingerprint": "47"
+          }
+        },
+        {
+          "ruleId": "java/antisamy-url-validation-bypass",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/antisamy-url-validation-bypass",
+            "index": 0
+          },
+          "message": {
+            "text": "URIUtils.java:57 - '.'"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/owasp/validator/html/util/URIUtils.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 1
+                },
+                "region": {
+                  "startLine": 57,
+                  "startColumn": 47,
+                  "endColumn": 50
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "6e5126f1b160e8b7:1",
+            "primaryLocationStartColumnFingerprint": "45"
+          }
+        },
+        {
+          "ruleId": "java/antisamy-url-validation-bypass",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/antisamy-url-validation-bypass",
+            "index": 0
+          },
+          "message": {
+            "text": "URIUtils.java:61 - '..'"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/owasp/validator/html/util/URIUtils.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 1
+                },
+                "region": {
+                  "startLine": 61,
+                  "startColumn": 46,
+                  "endColumn": 50
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "7bb35d0861ba053a:1",
+            "primaryLocationStartColumnFingerprint": "44"
+          }
+        },
+        {
+          "ruleId": "java/antisamy-url-validation-bypass",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/antisamy-url-validation-bypass",
+            "index": 0
+          },
+          "message": {
+            "text": "URIUtils.java:63 - 'SECURITY'"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/owasp/validator/html/util/URIUtils.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 1
+                },
+                "region": {
+                  "startLine": 63,
+                  "startColumn": 30,
+                  "endColumn": 40
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "2351802af5d13dca:1",
+            "primaryLocationStartColumnFingerprint": "28"
+          }
+        },
+        {
+          "ruleId": "java/antisamy-url-validation-bypass",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/antisamy-url-validation-bypass",
+            "index": 0
+          },
+          "message": {
+            "text": "URIUtils.java:63 - 'The 2x Path Traversal warnings related to the use of new File(href) are not vulnerabilities as no data is read or written.'"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/owasp/validator/html/util/URIUtils.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 1
+                },
+                "region": {
+                  "startLine": 63,
+                  "startColumn": 55,
+                  "endLine": 64,
+                  "endColumn": 78
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "2351802af5d13dca:1",
+            "primaryLocationStartColumnFingerprint": "53"
+          }
+        },
+        {
+          "ruleId": "java/antisamy-url-validation-bypass",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/antisamy-url-validation-bypass",
+            "index": 0
+          },
+          "message": {
+            "text": "URIUtils.java:93 - './'"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/owasp/validator/html/util/URIUtils.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 1
+                },
+                "region": {
+                  "startLine": 93,
+                  "startColumn": 25,
+                  "endColumn": 29
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "cbf28334eae4bfa0:1",
+            "primaryLocationStartColumnFingerprint": "21"
+          }
+        },
+        {
+          "ruleId": "java/antisamy-url-validation-bypass",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/antisamy-url-validation-bypass",
+            "index": 0
+          },
+          "message": {
+            "text": "URIUtils.java:105 - 'unknown protocol: '"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/owasp/validator/html/util/URIUtils.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 1
+                },
+                "region": {
+                  "startLine": 105,
+                  "startColumn": 20,
+                  "endColumn": 40
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "2252e47ef4098179:1",
+            "primaryLocationStartColumnFingerprint": "15"
+          }
+        },
+        {
+          "ruleId": "java/antisamy-url-validation-bypass",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/antisamy-url-validation-bypass",
+            "index": 0
+          },
+          "message": {
+            "text": "URIUtils.java:168 - ''"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/owasp/validator/html/util/URIUtils.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 1
+                },
+                "region": {
+                  "startLine": 168,
+                  "startColumn": 18,
+                  "endColumn": 20
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "759ff73db3c471e1:1",
+            "primaryLocationStartColumnFingerprint": "12"
+          }
+        },
+        {
+          "ruleId": "java/antisamy-url-validation-bypass",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/antisamy-url-validation-bypass",
+            "index": 0
+          },
+          "message": {
+            "text": "URIUtils.java:173 - 'invalid absolute URL: '"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/owasp/validator/html/util/URIUtils.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 1
+                },
+                "region": {
+                  "startLine": 173,
+                  "startColumn": 38,
+                  "endColumn": 62
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "51ef9ff94abe2083:1",
+            "primaryLocationStartColumnFingerprint": "32"
+          }
+        }
+      ]
+    },
+    {
+      "codeql_query_uuid": "20260401025850",
+      "codeql_raw_query": "/**\n * @name AntiSamy DOM scanner processStyleTag and CSS in style attributes\n * @description Find how AntiSamyDOMScanner processes style tags/attributes to identify bypasses\n * @kind problem\n * @problem.severity error\n * @id java/antisamy-style-processing\n * @tags security\n *       external/cwe/cwe-079\n */\n\nimport java\n\n// Find calls to CssScanner or CssValidator in DOM scanner\nfrom MethodCall mc\nwhere\n  mc.getEnclosingCallable().getDeclaringType().hasQualifiedName(\"org.owasp.validator.html.scan\", \"AntiSamyDOMScanner\") and\n  (\n    mc.getMethod().getDeclaringType().hasQualifiedName(\"org.owasp.validator.css\", \"CssScanner\") or\n    mc.getMethod().getDeclaringType().hasQualifiedName(\"org.owasp.validator.css\", \"CssValidator\") or\n    mc.getMethod().getDeclaringType().hasQualifiedName(\"org.owasp.validator.css\", \"CssHandler\") or\n    mc.getMethod().hasName(\"scanInlineStyle\") or\n    mc.getMethod().hasName(\"scanStyleSheet\") or\n    mc.getMethod().hasName(\"processAttributes\") or\n    mc.getMethod().hasName(\"checkForProhibitedAttributeValue\")\n  )\nselect mc, \"DOM scanner CSS call: \" + mc.getMethod().getDeclaringType().getName() + \".\" + mc.getMethod().getName() + \"() at line \" + mc.getLocation().getStartLine()\n",
+      "hypothesis": "AntiSamy DOM scanner may not properly validate CSS in style attributes",
+      "severity": "high",
+      "cwe_ids": [],
+      "results_count": 3,
+      "results": [
+        {
+          "ruleId": "java/antisamy-style-processing",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/antisamy-style-processing",
+            "index": 0
+          },
+          "message": {
+            "text": "DOM scanner CSS call: AntiSamyDOMScanner.processAttributes() at line 369"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/owasp/validator/html/scan/AntiSamyDOMScanner.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 369,
+                  "startColumn": 13,
+                  "endColumn": 68
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "8460e145e1743de8:1",
+            "primaryLocationStartColumnFingerprint": "4"
+          }
+        },
+        {
+          "ruleId": "java/antisamy-style-processing",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/antisamy-style-processing",
+            "index": 0
+          },
+          "message": {
+            "text": "DOM scanner CSS call: CssScanner.scanStyleSheet() at line 414"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/owasp/validator/html/scan/AntiSamyDOMScanner.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 414,
+                  "startColumn": 35,
+                  "endColumn": 96
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "59a62b760ad9fbac:1",
+            "primaryLocationStartColumnFingerprint": "18"
+          }
+        },
+        {
+          "ruleId": "java/antisamy-style-processing",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/antisamy-style-processing",
+            "index": 0
+          },
+          "message": {
+            "text": "DOM scanner CSS call: CssScanner.scanInlineStyle() at line 516"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/owasp/validator/html/scan/AntiSamyDOMScanner.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 516,
+                  "startColumn": 39,
+                  "endColumn": 109
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "3f8d4cfe2533b10c:1",
+            "primaryLocationStartColumnFingerprint": "18"
+          }
+        }
+      ]
+    },
+    {
+      "codeql_query_uuid": "20260401025937",
+      "codeql_raw_query": "/**\n * @name CssHandler URI/URL value processing - potential javascript: bypass\n * @description Check how CssHandler handles URI values in CSS properties - could allow javascript: bypass\n * @kind problem\n * @problem.severity error\n * @id java/antisamy-css-uri-handling\n * @tags security\n *       external/cwe/cwe-079\n */\n\nimport java\n\n// Find calls to URIUtils or URL-related methods from within CssHandler\nfrom MethodCall mc\nwhere\n  mc.getEnclosingCallable().getDeclaringType().hasQualifiedName(\"org.owasp.validator.css\", \"CssHandler\")\n  and (\n    mc.getMethod().getDeclaringType().hasQualifiedName(\"org.owasp.validator.html.util\", \"URIUtils\") or\n    mc.getMethod().hasName(\"isValidUri\") or\n    mc.getMethod().hasName(\"makeAbsolute\") or\n    mc.getMethod().hasName(\"getScheme\") or\n    mc.getMethod().hasName(\"getProtocol\") or\n    mc.getMethod().getDeclaringType().hasQualifiedName(\"java.net\", \"URI\") or\n    mc.getMethod().getDeclaringType().hasQualifiedName(\"java.net\", \"URL\")\n  )\nselect mc, \"CssHandler URL handling at line \" + mc.getLocation().getStartLine() + \": \" + mc.getMethod().getDeclaringType().getName() + \".\" + mc.getMethod().getName()\n",
+      "hypothesis": "CssHandler may not properly validate URI schemes, allowing javascript: URI bypass in CSS url() values",
+      "severity": "high",
+      "cwe_ids": [],
+      "results_count": 4,
+      "results": [
+        {
+          "ruleId": "java/antisamy-css-uri-handling",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/antisamy-css-uri-handling",
+            "index": 0
+          },
+          "message": {
+            "text": "CssHandler URL handling at line 310: URI.normalize"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/owasp/validator/css/CssHandler.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 310,
+                  "startColumn": 4,
+                  "endColumn": 34
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "30adf97e6caa466a:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "java/antisamy-css-uri-handling",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/antisamy-css-uri-handling",
+            "index": 0
+          },
+          "message": {
+            "text": "CssHandler URL handling at line 314: URI.toString"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/owasp/validator/css/CssHandler.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 314,
+                  "startColumn": 66,
+                  "endColumn": 95
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "5b8f294f27a87fed:1",
+            "primaryLocationStartColumnFingerprint": "62"
+          }
+        },
+        {
+          "ruleId": "java/antisamy-css-uri-handling",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/antisamy-css-uri-handling",
+            "index": 0
+          },
+          "message": {
+            "text": "CssHandler URL handling at line 315: URI.toString"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/owasp/validator/css/CssHandler.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 315,
+                  "startColumn": 65,
+                  "endColumn": 94
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "728177598eae75af:1",
+            "primaryLocationStartColumnFingerprint": "60"
+          }
+        },
+        {
+          "ruleId": "java/antisamy-css-uri-handling",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/antisamy-css-uri-handling",
+            "index": 0
+          },
+          "message": {
+            "text": "CssHandler URL handling at line 323: URI.isAbsolute"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/owasp/validator/css/CssHandler.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 323,
+                  "startColumn": 9,
+                  "endColumn": 40
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "6f833d09b4b92f06:1",
+            "primaryLocationStartColumnFingerprint": "5"
+          }
+        }
+      ]
+    },
+    {
+      "codeql_query_uuid": "20260401030102",
+      "codeql_raw_query": "/**\n * @name CssHandler missing URI scheme validation - javascript: bypass\n * @description CssHandler calls URI.isAbsolute() but may not check the scheme, allowing javascript: URIs\n * @kind problem\n * @problem.severity error\n * @id java/antisamy-css-missing-scheme-check\n * @tags security\n *       external/cwe/cwe-079\n */\n\nimport java\n\n// Find calls to URI.isAbsolute() in CssHandler without nearby getScheme() check\nfrom MethodCall isAbsoluteCall\nwhere\n  isAbsoluteCall.getMethod().hasName(\"isAbsolute\") and\n  isAbsoluteCall.getMethod().getDeclaringType().hasQualifiedName(\"java.net\", \"URI\") and\n  isAbsoluteCall.getEnclosingCallable().getDeclaringType().hasQualifiedName(\"org.owasp.validator.css\", \"CssHandler\") and\n  // Verify there's no getScheme check in the same callable\n  not exists(MethodCall schemeCheck |\n    schemeCheck.getMethod().hasName(\"getScheme\") and\n    schemeCheck.getEnclosingCallable() = isAbsoluteCall.getEnclosingCallable()\n  )\nselect isAbsoluteCall, \"CssHandler calls URI.isAbsolute() at line \" + isAbsoluteCall.getLocation().getStartLine() + \" but does NOT call getScheme() - may allow javascript: URIs in CSS url() values\"\n",
+      "hypothesis": "CssHandler uses URI.isAbsolute() without checking URI scheme - allows javascript: URIs in CSS",
+      "severity": "high",
+      "cwe_ids": [],
+      "results_count": 1,
+      "results": [
+        {
+          "ruleId": "java/antisamy-css-missing-scheme-check",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/antisamy-css-missing-scheme-check",
+            "index": 0
+          },
+          "message": {
+            "text": "CssHandler calls URI.isAbsolute() at line 323 but does NOT call getScheme() - may allow javascript: URIs in CSS url() values"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/owasp/validator/css/CssHandler.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 323,
+                  "startColumn": 9,
+                  "endColumn": 40
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "6f833d09b4b92f06:1",
+            "primaryLocationStartColumnFingerprint": "5"
+          }
+        }
+      ]
+    },
+    {
+      "codeql_query_uuid": "20260401030128",
+      "codeql_raw_query": "/**\n * @name AntiSamy DOM scanner CSS scan result error handling\n * @description Check if DOM scanner properly handles errors from CSS scanning - bypasses when exception swallowed\n * @kind problem\n * @problem.severity error\n * @id java/antisamy-css-scan-exception-bypass\n * @tags security\n *       external/cwe/cwe-079\n */\n\nimport java\n\n// Find try-catch blocks in DOM scanner that call CSS scanning methods\nfrom TryStmt tryStmt, MethodCall cssCall, CatchClause catchClause\nwhere\n  tryStmt.getEnclosingCallable().getDeclaringType().hasQualifiedName(\"org.owasp.validator.html.scan\", \"AntiSamyDOMScanner\") and\n  cssCall.getEnclosingStmt().getParent*() = tryStmt.getBlock() and\n  (\n    cssCall.getMethod().hasName(\"scanInlineStyle\") or\n    cssCall.getMethod().hasName(\"scanStyleSheet\") or\n    cssCall.getMethod().hasName(\"scan\")\n  ) and\n  catchClause = tryStmt.getACatchClause()\nselect catchClause, \"DOM scanner catches exception from CSS scan at line \" + catchClause.getLocation().getStartLine() + \" after call to \" + cssCall.getMethod().getName() + \"() at line \" + cssCall.getLocation().getStartLine() + \" - verify unsafe CSS is not passed through on error\"\n",
+      "hypothesis": "DOM scanner may pass through unvalidated CSS when exception occurs during CSS scanning",
+      "severity": "high",
+      "cwe_ids": [],
+      "results_count": 2,
+      "results": [
+        {
+          "ruleId": "java/antisamy-css-scan-exception-bypass",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/antisamy-css-scan-exception-bypass",
+            "index": 0
+          },
+          "message": {
+            "text": "DOM scanner catches exception from CSS scan at line 434 after call to scanStyleSheet() at line 414 - verify unsafe CSS is not passed through on error"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/owasp/validator/html/scan/AntiSamyDOMScanner.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 434,
+                  "startColumn": 11,
+                  "endColumn": 90
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "bad2dc7efe652e13:1",
+            "primaryLocationStartColumnFingerprint": "2"
+          }
+        },
+        {
+          "ruleId": "java/antisamy-css-scan-exception-bypass",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/antisamy-css-scan-exception-bypass",
+            "index": 0
+          },
+          "message": {
+            "text": "DOM scanner catches exception from CSS scan at line 521 after call to scanInlineStyle() at line 516 - verify unsafe CSS is not passed through on error"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/owasp/validator/html/scan/AntiSamyDOMScanner.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 521,
+                  "startColumn": 19,
+                  "endColumn": 57
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "4db6b706c091d9d6:1",
+            "primaryLocationStartColumnFingerprint": "2"
+          }
+        }
+      ]
+    },
+    {
+      "codeql_query_uuid": "20260401030209",
+      "codeql_raw_query": "/**\n * @name AntiSamy DOM scanner CSS exception - original value kept\n * @description Check if after a CSS scanning exception, the original unvalidated CSS value is kept in output\n * @kind problem\n * @problem.severity error\n * @id java/antisamy-css-exception-original-value-kept\n * @tags security\n *       external/cwe/cwe-079\n */\n\nimport java\n\n// Check the catch blocks - do they set the attribute value to empty or keep original?\nfrom CatchClause cc, TryStmt tryStmt, MethodCall cssCall\nwhere\n  tryStmt.getEnclosingCallable().getDeclaringType().hasQualifiedName(\"org.owasp.validator.html.scan\", \"AntiSamyDOMScanner\") and\n  cssCall.getEnclosingStmt().getParent*() = tryStmt.getBlock() and\n  (cssCall.getMethod().hasName(\"scanInlineStyle\") or cssCall.getMethod().hasName(\"scanStyleSheet\")) and\n  cc = tryStmt.getACatchClause() and\n  // Check for setAttribute calls within the catch block\n  exists(MethodCall setAttr |\n    setAttr.getMethod().hasName(\"setAttribute\") or setAttr.getMethod().hasName(\"removeAttribute\") or\n    setAttr.getMethod().hasName(\"setNodeValue\") or setAttr.getMethod().hasName(\"setTextContent\")\n    |\n    setAttr.getEnclosingStmt().getParent*() = cc.getBlock()\n  )\nselect cc, \"After CSS scan exception at line \" + cc.getLocation().getStartLine() + \", attribute manipulation occurs - verify original CSS is not reused\"\n",
+      "hypothesis": "After CSS scanning exception, original unvalidated CSS value may be kept in output",
+      "severity": "high",
+      "cwe_ids": [],
+      "results_count": 1,
+      "results": [
+        {
+          "ruleId": "java/antisamy-css-exception-original-value-kept",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/antisamy-css-exception-original-value-kept",
+            "index": 0
+          },
+          "message": {
+            "text": "After CSS scan exception at line 521, attribute manipulation occurs - verify original CSS is not reused"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/owasp/validator/html/scan/AntiSamyDOMScanner.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 521,
+                  "startColumn": 19,
+                  "endColumn": 57
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "4db6b706c091d9d6:1",
+            "primaryLocationStartColumnFingerprint": "2"
+          }
+        }
+      ]
+    },
+    {
+      "codeql_query_uuid": "20260401030234",
+      "codeql_raw_query": "/**\n * @name AntiSamy CDATA section bypass in CSS scanner\n * @description CssScanner strips CDATA markers before scanning - check if this can be exploited\n * @kind problem\n * @problem.severity error\n * @id java/antisamy-cdata-css-bypass\n * @tags security\n *       external/cwe/cwe-079\n */\n\nimport java\n\n// Find CDATA-related string manipulation in CssScanner\nfrom MethodCall mc\nwhere\n  mc.getEnclosingCallable().getDeclaringType().hasQualifiedName(\"org.owasp.validator.css\", \"CssScanner\") and\n  (\n    mc.getMethod().hasName(\"replaceAll\") or\n    mc.getMethod().hasName(\"replace\") or\n    mc.getMethod().hasName(\"matches\") or\n    mc.getMethod().hasName(\"find\") or\n    mc.getMethod().hasName(\"group\") or\n    mc.getMethod().hasName(\"matcher\")\n  )\nselect mc, \"CssScanner string manipulation at line \" + mc.getLocation().getStartLine() + \": \" + mc.getMethod().getName() + \"()\"\n",
+      "hypothesis": "CDATA stripping in CssScanner may allow bypass of CSS validation",
+      "severity": "medium",
+      "cwe_ids": [],
+      "results_count": 3,
+      "results": [
+        {
+          "ruleId": "java/antisamy-cdata-css-bypass",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/antisamy-cdata-css-bypass",
+            "index": 0
+          },
+          "message": {
+            "text": "CssScanner string manipulation at line 155: matcher()"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/owasp/validator/css/CssScanner.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 155,
+                  "startColumn": 21,
+                  "endColumn": 58
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "fed0d3ace94b5d7a:1",
+            "primaryLocationStartColumnFingerprint": "12"
+          }
+        },
+        {
+          "ruleId": "java/antisamy-cdata-css-bypass",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/antisamy-cdata-css-bypass",
+            "index": 0
+          },
+          "message": {
+            "text": "CssScanner string manipulation at line 156: matches()"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/owasp/validator/css/CssScanner.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 156,
+                  "startColumn": 27,
+                  "endColumn": 38
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "53ee6ff0baab31c6:1",
+            "primaryLocationStartColumnFingerprint": "18"
+          }
+        },
+        {
+          "ruleId": "java/antisamy-cdata-css-bypass",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/antisamy-cdata-css-bypass",
+            "index": 0
+          },
+          "message": {
+            "text": "CssScanner string manipulation at line 159: group()"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/owasp/validator/css/CssScanner.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 159,
+                  "startColumn": 26,
+                  "endColumn": 36
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "b7101946af3ecb6d:1",
+            "primaryLocationStartColumnFingerprint": "13"
+          }
+        }
+      ]
+    },
+    {
+      "codeql_query_uuid": "20260401030314",
+      "codeql_raw_query": "/**\n * @name AntiSamy inline style exception handling - unsafe value preserved\n * @description After scanInlineStyle exception, check if unsafe original CSS value is set back on element\n * @kind problem\n * @problem.severity error\n * @id java/antisamy-inline-style-exception-keeps-value\n * @tags security\n *       external/cwe/cwe-079\n */\n\nimport java\n\n// Track what value is passed to setAttribute in the catch block after scanInlineStyle fails\n// The key question: is the original unscanned value being re-set?\nfrom CatchClause cc, MethodCall setAttr, TryStmt tryStmt, MethodCall scanCall\nwhere\n  tryStmt.getEnclosingCallable().getDeclaringType().hasQualifiedName(\"org.owasp.validator.html.scan\", \"AntiSamyDOMScanner\") and\n  scanCall.getEnclosingStmt().getParent*() = tryStmt.getBlock() and\n  scanCall.getMethod().hasName(\"scanInlineStyle\") and\n  cc = tryStmt.getACatchClause() and\n  setAttr.getEnclosingStmt().getParent*() = cc.getBlock() and\n  (setAttr.getMethod().hasName(\"setAttribute\") or setAttr.getMethod().hasName(\"setNodeValue\"))\nselect setAttr, \"setAttribute/setNodeValue call in catch block at line \" + setAttr.getLocation().getStartLine() + \" after scanInlineStyle failure - argument: \" + setAttr.getArgument(0)\n",
+      "hypothesis": "After scanInlineStyle exception, unsafe CSS may be set back on DOM element",
+      "severity": "high",
+      "cwe_ids": [],
+      "results_count": 0,
+      "results": []
+    },
+    {
+      "codeql_query_uuid": "20260401030339",
+      "codeql_raw_query": "/**\n * @name AntiSamy SVG and namespace handling - mutation XSS\n * @description Check how AntiSamy handles SVG elements and namespace confusion that could lead to mutation XSS\n * @kind problem\n * @problem.severity error\n * @id java/antisamy-svg-namespace-bypass\n * @tags security\n *       external/cwe/cwe-079\n */\n\nimport java\n\n// Find string literals related to SVG, namespace, or MathML handling\nfrom StringLiteral sl\nwhere\n  (\n    sl.getValue().toLowerCase().matches(\"%svg%\") or\n    sl.getValue().toLowerCase().matches(\"%mathml%\") or\n    sl.getValue().toLowerCase().matches(\"%math%\") or\n    sl.getValue().toLowerCase().matches(\"%namespace%\") or\n    sl.getValue().toLowerCase().matches(\"%xmlns%\") or\n    sl.getValue().toLowerCase().matches(\"%xlink%\") or\n    sl.getValue().toLowerCase().matches(\"%noscript%\") or\n    sl.getValue().toLowerCase().matches(\"%style%\") or\n    sl.getValue().toLowerCase().matches(\"%script%\")\n  ) and\n  (\n    sl.getCompilationUnit().getFile().getBaseName() = \"MagicSAXFilter.java\" or\n    sl.getCompilationUnit().getFile().getBaseName() = \"AntiSamyDOMScanner.java\"\n  )\nselect sl, sl.getCompilationUnit().getFile().getBaseName() + \":\" + sl.getLocation().getStartLine() + \" - '\" + sl.getValue() + \"'\"\n",
+      "hypothesis": "SVG/namespace/MathML handling may allow mutation XSS bypass",
+      "severity": "high",
+      "cwe_ids": [],
+      "results_count": 5,
+      "results": [
+        {
+          "ruleId": "java/antisamy-svg-namespace-bypass",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/antisamy-svg-namespace-bypass",
+            "index": 0
+          },
+          "message": {
+            "text": "AntiSamyDOMScanner.java:214 - 'http://cyberneko.org/html/features/scanner/style/strip-cdata-delims'"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/owasp/validator/html/scan/AntiSamyDOMScanner.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 214,
+                  "startColumn": 27,
+                  "endColumn": 96
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "7555fc085ffcef7f:1",
+            "primaryLocationStartColumnFingerprint": "18"
+          }
+        },
+        {
+          "ruleId": "java/antisamy-svg-namespace-bypass",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/antisamy-svg-namespace-bypass",
+            "index": 0
+          },
+          "message": {
+            "text": "AntiSamyDOMScanner.java:357 - 'style'"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/owasp/validator/html/scan/AntiSamyDOMScanner.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 357,
+                  "startColumn": 13,
+                  "endColumn": 20
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "d1c213acf59249d1:1",
+            "primaryLocationStartColumnFingerprint": "4"
+          }
+        },
+        {
+          "ruleId": "java/antisamy-svg-namespace-bypass",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/antisamy-svg-namespace-bypass",
+            "index": 0
+          },
+          "message": {
+            "text": "AntiSamyDOMScanner.java:508 - 'style'"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/owasp/validator/html/scan/AntiSamyDOMScanner.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 508,
+                  "startColumn": 17,
+                  "endColumn": 24
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "c93b2a5997b98e66:1",
+            "primaryLocationStartColumnFingerprint": "4"
+          }
+        },
+        {
+          "ruleId": "java/antisamy-svg-namespace-bypass",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/antisamy-svg-namespace-bypass",
+            "index": 0
+          },
+          "message": {
+            "text": "MagicSAXFilter.java:280 - 'style'"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/owasp/validator/html/scan/MagicSAXFilter.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 1
+                },
+                "region": {
+                  "startLine": 280,
+                  "startColumn": 22,
+                  "endColumn": 29
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "ba02b708c51053df:1",
+            "primaryLocationStartColumnFingerprint": "18"
+          }
+        },
+        {
+          "ruleId": "java/antisamy-svg-namespace-bypass",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/antisamy-svg-namespace-bypass",
+            "index": 0
+          },
+          "message": {
+            "text": "MagicSAXFilter.java:300 - 'style'"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/owasp/validator/html/scan/MagicSAXFilter.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 1
+                },
+                "region": {
+                  "startLine": 300,
+                  "startColumn": 10,
+                  "endColumn": 17
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "d4028d8432004cc2:1",
+            "primaryLocationStartColumnFingerprint": "4"
+          }
+        }
+      ]
+    },
+    {
+      "codeql_query_uuid": "20260401030417",
+      "codeql_raw_query": "/**\n * @name MagicSAXFilter style attribute handling - CSS exception bypass\n * @description Examine how MagicSAXFilter handles CSS scanning exceptions in style attributes\n * @kind problem\n * @problem.severity error\n * @id java/antisamy-sax-style-exception\n * @tags security\n *       external/cwe/cwe-079\n */\n\nimport java\n\n// Find try-catch around CSS scanning in MagicSAXFilter\nfrom TryStmt tryStmt, MethodCall cssCall, CatchClause cc\nwhere\n  tryStmt.getEnclosingCallable().getDeclaringType().hasQualifiedName(\"org.owasp.validator.html.scan\", \"MagicSAXFilter\") and\n  cssCall.getEnclosingStmt().getParent*() = tryStmt.getBlock() and\n  (\n    cssCall.getMethod().hasName(\"scanInlineStyle\") or\n    cssCall.getMethod().hasName(\"scanStyleSheet\") or\n    cssCall.getMethod().hasName(\"scan\")\n  ) and\n  cc = tryStmt.getACatchClause()\nselect cc, \"MagicSAXFilter catches exception from \" + cssCall.getMethod().getName() + \"() at line \" + cssCall.getLocation().getStartLine() + \", catch at line \" + cc.getLocation().getStartLine()\n",
+      "hypothesis": "MagicSAXFilter may pass through unsafe CSS on exception",
+      "severity": "high",
+      "cwe_ids": [],
+      "results_count": 2,
+      "results": [
+        {
+          "ruleId": "java/antisamy-sax-style-exception",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/antisamy-sax-style-exception",
+            "index": 0
+          },
+          "message": {
+            "text": "MagicSAXFilter catches exception from scanStyleSheet() at line 167, catch at line 192"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/owasp/validator/html/scan/MagicSAXFilter.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 192,
+                  "startColumn": 6,
+                  "endColumn": 29
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "b08d528a81844842:1",
+            "primaryLocationStartColumnFingerprint": "2"
+          }
+        },
+        {
+          "ruleId": "java/antisamy-sax-style-exception",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/antisamy-sax-style-exception",
+            "index": 0
+          },
+          "message": {
+            "text": "MagicSAXFilter catches exception from scanInlineStyle() at line 303, catch at line 307"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/owasp/validator/html/scan/MagicSAXFilter.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 307,
+                  "startColumn": 9,
+                  "endColumn": 32
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "d6ff6e40e354de78:1",
+            "primaryLocationStartColumnFingerprint": "2"
+          }
+        }
+      ]
+    },
+    {
+      "codeql_query_uuid": "20260401030538",
+      "codeql_raw_query": "/**\n * @name AntiSamy catch blocks after CSS scan - what happens to style value\n * @description Trace what value gets written to style attribute after CSS scan exception\n * @kind problem\n * @problem.severity error\n * @id java/antisamy-css-catch-block-output\n * @tags security\n *       external/cwe/cwe-079\n */\n\nimport java\n\n// Find what methods are called in catch blocks after CSS scan exception in both scanners\nfrom CatchClause cc, MethodCall mc\nwhere\n  (\n    cc.getEnclosingStmt().getEnclosingCallable().getDeclaringType().hasQualifiedName(\"org.owasp.validator.html.scan\", \"AntiSamyDOMScanner\") or\n    cc.getEnclosingStmt().getEnclosingCallable().getDeclaringType().hasQualifiedName(\"org.owasp.validator.html.scan\", \"MagicSAXFilter\")\n  ) and\n  mc.getEnclosingStmt().getParent*() = cc.getBlock() and\n  cc.getLocation().getStartLine() in [192, 307, 434, 521]\nselect mc, cc.getEnclosingStmt().getEnclosingCallable().getDeclaringType().getName() + \n  \" catch block at line \" + cc.getLocation().getStartLine() + \n  \" -> \" + mc.getMethod().getName() + \"() at line \" + mc.getLocation().getStartLine()\n",
+      "hypothesis": "CSS scan exception catch blocks may write back original unsafe value to style attribute",
+      "severity": "high",
+      "cwe_ids": [],
+      "results_count": 15,
+      "results": [
+        {
+          "ruleId": "java/antisamy-css-catch-block-output",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/antisamy-css-catch-block-output",
+            "index": 0
+          },
+          "message": {
+            "text": "AntiSamyDOMScanner catch block at line 434 -> addError() at line 442"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/owasp/validator/html/scan/AntiSamyDOMScanner.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 442,
+                  "startColumn": 13,
+                  "endColumn": 149
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "1edf226cd9971a0b:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "java/antisamy-css-catch-block-output",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/antisamy-css-catch-block-output",
+            "index": 0
+          },
+          "message": {
+            "text": "AntiSamyDOMScanner catch block at line 434 -> htmlEntityEncode() at line 442"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/owasp/validator/html/scan/AntiSamyDOMScanner.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 442,
+                  "startColumn": 77,
+                  "endColumn": 147
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "1edf226cd9971a0b:1",
+            "primaryLocationStartColumnFingerprint": "64"
+          }
+        },
+        {
+          "ruleId": "java/antisamy-css-catch-block-output",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/antisamy-css-catch-block-output",
+            "index": 0
+          },
+          "message": {
+            "text": "AntiSamyDOMScanner catch block at line 434 -> getNodeValue() at line 442"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/owasp/validator/html/scan/AntiSamyDOMScanner.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 442,
+                  "startColumn": 112,
+                  "endColumn": 146
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "1edf226cd9971a0b:1",
+            "primaryLocationStartColumnFingerprint": "99"
+          }
+        },
+        {
+          "ruleId": "java/antisamy-css-catch-block-output",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/antisamy-css-catch-block-output",
+            "index": 0
+          },
+          "message": {
+            "text": "AntiSamyDOMScanner catch block at line 434 -> getFirstChild() at line 442"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/owasp/validator/html/scan/AntiSamyDOMScanner.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 442,
+                  "startColumn": 112,
+                  "endColumn": 131
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "1edf226cd9971a0b:1",
+            "primaryLocationStartColumnFingerprint": "99"
+          }
+        },
+        {
+          "ruleId": "java/antisamy-css-catch-block-output",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/antisamy-css-catch-block-output",
+            "index": 0
+          },
+          "message": {
+            "text": "AntiSamyDOMScanner catch block at line 434 -> removeChild() at line 443"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/owasp/validator/html/scan/AntiSamyDOMScanner.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 443,
+                  "startColumn": 13,
+                  "endColumn": 40
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "50ad034b357d7060:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "java/antisamy-css-catch-block-output",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/antisamy-css-catch-block-output",
+            "index": 0
+          },
+          "message": {
+            "text": "AntiSamyDOMScanner catch block at line 521 -> addError() at line 523"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/owasp/validator/html/scan/AntiSamyDOMScanner.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 523,
+                  "startColumn": 21,
+                  "endLine": 524,
+                  "endColumn": 103
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "e6f6a28b33ecb92e:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "java/antisamy-css-catch-block-output",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/antisamy-css-catch-block-output",
+            "index": 0
+          },
+          "message": {
+            "text": "AntiSamyDOMScanner catch block at line 521 -> htmlEntityEncode() at line 524"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/owasp/validator/html/scan/AntiSamyDOMScanner.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 524,
+                  "startColumn": 47,
+                  "endColumn": 101
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "79496ddeaefc5c88:1",
+            "primaryLocationStartColumnFingerprint": "22"
+          }
+        },
+        {
+          "ruleId": "java/antisamy-css-catch-block-output",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/antisamy-css-catch-block-output",
+            "index": 0
+          },
+          "message": {
+            "text": "AntiSamyDOMScanner catch block at line 521 -> getNodeValue() at line 524"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/owasp/validator/html/scan/AntiSamyDOMScanner.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 524,
+                  "startColumn": 82,
+                  "endColumn": 100
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "79496ddeaefc5c88:1",
+            "primaryLocationStartColumnFingerprint": "57"
+          }
+        },
+        {
+          "ruleId": "java/antisamy-css-catch-block-output",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/antisamy-css-catch-block-output",
+            "index": 0
+          },
+          "message": {
+            "text": "AntiSamyDOMScanner catch block at line 521 -> removeAttribute() at line 525"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/owasp/validator/html/scan/AntiSamyDOMScanner.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 525,
+                  "startColumn": 21,
+                  "endColumn": 65
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "90ccefc6c2fb90ec:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "java/antisamy-css-catch-block-output",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/antisamy-css-catch-block-output",
+            "index": 0
+          },
+          "message": {
+            "text": "AntiSamyDOMScanner catch block at line 521 -> getNodeName() at line 525"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/owasp/validator/html/scan/AntiSamyDOMScanner.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 525,
+                  "startColumn": 41,
+                  "endColumn": 64
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "90ccefc6c2fb90ec:1",
+            "primaryLocationStartColumnFingerprint": "20"
+          }
+        },
+        {
+          "ruleId": "java/antisamy-css-catch-block-output",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/antisamy-css-catch-block-output",
+            "index": 0
+          },
+          "message": {
+            "text": "MagicSAXFilter catch block at line 192 -> addError() at line 195"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/owasp/validator/html/scan/MagicSAXFilter.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 1
+                },
+                "region": {
+                  "startLine": 195,
+                  "startColumn": 5,
+                  "endLine": 197,
+                  "endColumn": 7
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "89106a495381dd81:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "java/antisamy-css-catch-block-output",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/antisamy-css-catch-block-output",
+            "index": 0
+          },
+          "message": {
+            "text": "MagicSAXFilter catch block at line 192 -> htmlEntityEncode() at line 196"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/owasp/validator/html/scan/MagicSAXFilter.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 1
+                },
+                "region": {
+                  "startLine": 196,
+                  "startColumn": 6,
+                  "endColumn": 63
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "4160589d740e2932:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "java/antisamy-css-catch-block-output",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/antisamy-css-catch-block-output",
+            "index": 0
+          },
+          "message": {
+            "text": "MagicSAXFilter catch block at line 192 -> toString() at line 196"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/owasp/validator/html/scan/MagicSAXFilter.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 1
+                },
+                "region": {
+                  "startLine": 196,
+                  "startColumn": 41,
+                  "endColumn": 62
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "4160589d740e2932:1",
+            "primaryLocationStartColumnFingerprint": "35"
+          }
+        },
+        {
+          "ruleId": "java/antisamy-css-catch-block-output",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/antisamy-css-catch-block-output",
+            "index": 0
+          },
+          "message": {
+            "text": "MagicSAXFilter catch block at line 307 -> addError() at line 308"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/owasp/validator/html/scan/MagicSAXFilter.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 1
+                },
+                "region": {
+                  "startLine": 308,
+                  "startColumn": 8,
+                  "endLine": 310,
+                  "endColumn": 10
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "2e59c667e945a9e5:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "java/antisamy-css-catch-block-output",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/antisamy-css-catch-block-output",
+            "index": 0
+          },
+          "message": {
+            "text": "MagicSAXFilter catch block at line 307 -> htmlEntityEncode() at line 309"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/owasp/validator/html/scan/MagicSAXFilter.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 1
+                },
+                "region": {
+                  "startLine": 309,
+                  "startColumn": 29,
+                  "endColumn": 70
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "947e1b121374fb6b:1",
+            "primaryLocationStartColumnFingerprint": "19"
+          }
+        }
+      ]
+    },
+    {
+      "codeql_query_uuid": "20260401030746",
+      "codeql_raw_query": "/**\n * @name AntiSamy Pattern.compile flags - missing DOTALL or case-insensitive flags\n * @description Check if Pattern.compile calls in AntiSamy use proper flags to prevent regex bypass\n * @kind problem\n * @problem.severity warning\n * @id java/antisamy-pattern-compile-flags\n * @tags security\n *       external/cwe/cwe-079\n */\n\nimport java\n\n// Find Pattern.compile calls with no flags argument\nfrom MethodCall mc\nwhere\n  mc.getMethod().hasName(\"compile\") and\n  mc.getMethod().getDeclaringType().hasQualifiedName(\"java.util.regex\", \"Pattern\") and\n  mc.getNumArgument() = 1\nselect mc,\n  \"Pattern.compile call with NO FLAGS - possible regex bypass (missing CASE_INSENSITIVE or DOTALL)\"\n",
+      "hypothesis": "Pattern.compile calls missing CASE_INSENSITIVE or DOTALL flags allowing regex bypass",
+      "severity": "medium",
+      "cwe_ids": [],
+      "results_count": 11,
+      "results": [
+        {
+          "ruleId": "java/antisamy-pattern-compile-flags",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/antisamy-pattern-compile-flags",
+            "index": 0
+          },
+          "message": {
+            "text": "Pattern.compile call with NO FLAGS - possible regex bypass (missing CASE_INSENSITIVE or DOTALL)"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/owasp/validator/html/scan/AntiSamyDOMScanner.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 76,
+                  "startColumn": 13,
+                  "endColumn": 105
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "1b64b1906f3a5b0d:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "java/antisamy-pattern-compile-flags",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/antisamy-pattern-compile-flags",
+            "index": 0
+          },
+          "message": {
+            "text": "Pattern.compile call with NO FLAGS - possible regex bypass (missing CASE_INSENSITIVE or DOTALL)"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/owasp/validator/html/scan/AntiSamyDOMScanner.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 77,
+                  "startColumn": 58,
+                  "endColumn": 108
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "30362d306546c924:1",
+            "primaryLocationStartColumnFingerprint": "53"
+          }
+        },
+        {
+          "ruleId": "java/antisamy-pattern-compile-flags",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/antisamy-pattern-compile-flags",
+            "index": 0
+          },
+          "message": {
+            "text": "Pattern.compile call with NO FLAGS - possible regex bypass (missing CASE_INSENSITIVE or DOTALL)"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/owasp/validator/html/scan/MagicSAXFilter.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 1
+                },
+                "region": {
+                  "startLine": 118,
+                  "startColumn": 13,
+                  "endColumn": 63
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "afb1f2655f86de18:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "java/antisamy-pattern-compile-flags",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/antisamy-pattern-compile-flags",
+            "index": 0
+          },
+          "message": {
+            "text": "Pattern.compile call with NO FLAGS - possible regex bypass (missing CASE_INSENSITIVE or DOTALL)"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/owasp/validator/html/util/XMLUtil.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 2
+                },
+                "region": {
+                  "startLine": 35,
+                  "startColumn": 42,
+                  "endColumn": 65
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "5597718909444a6e:1",
+            "primaryLocationStartColumnFingerprint": "37"
+          }
+        },
+        {
+          "ruleId": "java/antisamy-pattern-compile-flags",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/antisamy-pattern-compile-flags",
+            "index": 0
+          },
+          "message": {
+            "text": "Pattern.compile call with NO FLAGS - possible regex bypass (missing CASE_INSENSITIVE or DOTALL)"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/owasp/validator/html/util/XMLUtil.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 2
+                },
+                "region": {
+                  "startLine": 36,
+                  "startColumn": 42,
+                  "endColumn": 65
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "6fa392400fa29e8c:1",
+            "primaryLocationStartColumnFingerprint": "37"
+          }
+        },
+        {
+          "ruleId": "java/antisamy-pattern-compile-flags",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/antisamy-pattern-compile-flags",
+            "index": 0
+          },
+          "message": {
+            "text": "Pattern.compile call with NO FLAGS - possible regex bypass (missing CASE_INSENSITIVE or DOTALL)"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/owasp/validator/html/util/XMLUtil.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 2
+                },
+                "region": {
+                  "startLine": 37,
+                  "startColumn": 44,
+                  "endColumn": 69
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "41ec624c1701c78c:1",
+            "primaryLocationStartColumnFingerprint": "39"
+          }
+        },
+        {
+          "ruleId": "java/antisamy-pattern-compile-flags",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/antisamy-pattern-compile-flags",
+            "index": 0
+          },
+          "message": {
+            "text": "Pattern.compile call with NO FLAGS - possible regex bypass (missing CASE_INSENSITIVE or DOTALL)"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/owasp/validator/html/util/XMLUtil.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 2
+                },
+                "region": {
+                  "startLine": 38,
+                  "startColumn": 43,
+                  "endColumn": 67
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "b9f73694c540a017:1",
+            "primaryLocationStartColumnFingerprint": "38"
+          }
+        },
+        {
+          "ruleId": "java/antisamy-pattern-compile-flags",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/antisamy-pattern-compile-flags",
+            "index": 0
+          },
+          "message": {
+            "text": "Pattern.compile call with NO FLAGS - possible regex bypass (missing CASE_INSENSITIVE or DOTALL)"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/owasp/validator/html/util/XMLUtil.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 2
+                },
+                "region": {
+                  "startLine": 40,
+                  "startColumn": 39,
+                  "endColumn": 59
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "4d2cd24eb20bc60b:1",
+            "primaryLocationStartColumnFingerprint": "34"
+          }
+        },
+        {
+          "ruleId": "java/antisamy-pattern-compile-flags",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/antisamy-pattern-compile-flags",
+            "index": 0
+          },
+          "message": {
+            "text": "Pattern.compile call with NO FLAGS - possible regex bypass (missing CASE_INSENSITIVE or DOTALL)"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/owasp/validator/html/util/XMLUtil.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 2
+                },
+                "region": {
+                  "startLine": 41,
+                  "startColumn": 39,
+                  "endColumn": 59
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "abcffb2934ab20d3:1",
+            "primaryLocationStartColumnFingerprint": "34"
+          }
+        },
+        {
+          "ruleId": "java/antisamy-pattern-compile-flags",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/antisamy-pattern-compile-flags",
+            "index": 0
+          },
+          "message": {
+            "text": "Pattern.compile call with NO FLAGS - possible regex bypass (missing CASE_INSENSITIVE or DOTALL)"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/owasp/validator/html/util/XMLUtil.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 2
+                },
+                "region": {
+                  "startLine": 42,
+                  "startColumn": 41,
+                  "endColumn": 62
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "ff1c3bac82a539f1:1",
+            "primaryLocationStartColumnFingerprint": "36"
+          }
+        },
+        {
+          "ruleId": "java/antisamy-pattern-compile-flags",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/antisamy-pattern-compile-flags",
+            "index": 0
+          },
+          "message": {
+            "text": "Pattern.compile call with NO FLAGS - possible regex bypass (missing CASE_INSENSITIVE or DOTALL)"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/owasp/validator/html/util/XMLUtil.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 2
+                },
+                "region": {
+                  "startLine": 43,
+                  "startColumn": 40,
+                  "endColumn": 60
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "44b56d7ebd09ab2c:1",
+            "primaryLocationStartColumnFingerprint": "35"
+          }
+        }
+      ]
+    },
+    {
+      "codeql_query_uuid": "20260401030810",
+      "codeql_raw_query": "/**\n * @name CssHandler URI scheme - isAbsolute without scheme whitelist check\n * @description CssHandler calls URI.isAbsolute() but uses getScheme() nowhere in the URI handling method\n *              This can allow javascript: URIs through as they are absolute URIs\n * @kind problem\n * @problem.severity error\n * @id java/antisamy-css-absolute-uri-no-scheme-whitelist\n * @tags security\n *       external/cwe/cwe-079\n */\n\nimport java\n\n// Find all calls related to URI validation in CssHandler and see if getScheme is called\nfrom Callable uriMethod\nwhere\n  uriMethod.getDeclaringType().hasQualifiedName(\"org.owasp.validator.css\", \"CssHandler\") and\n  // Method contains a call to URI.isAbsolute()\n  exists(MethodCall isAbs |\n    isAbs.getEnclosingCallable() = uriMethod and\n    isAbs.getMethod().hasName(\"isAbsolute\") and\n    isAbs.getMethod().getDeclaringType().hasQualifiedName(\"java.net\", \"URI\")\n  ) and\n  // But does NOT call getScheme() anywhere\n  not exists(MethodCall getScheme |\n    getScheme.getEnclosingCallable() = uriMethod and\n    getScheme.getMethod().hasName(\"getScheme\")\n  ) and\n  // And does NOT check against allowed protocols list\n  not exists(MethodCall getAllowedProtocols |\n    getAllowedProtocols.getEnclosingCallable() = uriMethod and\n    (\n      getAllowedProtocols.getMethod().hasName(\"getAllowedScheme\") or\n      getAllowedProtocols.getMethod().hasName(\"getAllowedProtocols\") or\n      getAllowedProtocols.getMethod().hasName(\"contains\") or\n      getAllowedProtocols.getMethod().hasName(\"startsWith\")\n    )\n  )\nselect uriMethod, \"CssHandler method '\" + uriMethod.getName() + \"' uses URI.isAbsolute() without checking the URI scheme - javascript: URIs are absolute and may pass this check\"\n",
+      "hypothesis": "CssHandler accepts javascript: URIs because it only checks URI.isAbsolute() without validating the scheme",
+      "severity": "high",
+      "cwe_ids": [],
+      "results_count": 1,
+      "results": [
+        {
+          "ruleId": "java/antisamy-css-absolute-uri-no-scheme-whitelist",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/antisamy-css-absolute-uri-no-scheme-whitelist",
+            "index": 0
+          },
+          "message": {
+            "text": "CssHandler method 'importStyle' uses URI.isAbsolute() without checking the URI scheme - javascript: URIs are absolute and may pass this check"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/owasp/validator/css/CssHandler.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 286,
+                  "startColumn": 14,
+                  "endColumn": 25
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "3f2b49e5e598b4b8:1",
+            "primaryLocationStartColumnFingerprint": "12"
+          }
+        }
+      ]
+    },
+    {
+      "codeql_query_uuid": "20260401030907",
+      "codeql_raw_query": "/**\n * @name CssHandler importStyle - javascript: URI allowed as absolute URI\n * @description CssHandler.importStyle calls URI.isAbsolute() to check if a stylesheet URL is absolute,\n *              but javascript: URIs are also absolute, meaning they pass this check without scheme validation\n * @kind problem\n * @problem.severity error\n * @id java/antisamy-import-style-javascript-uri\n * @tags security\n *       external/cwe/cwe-079\n */\n\nimport java\n\n// Find the importStyle method and confirm it constructs/uses the URI without scheme checking\nfrom Method importStyle, MethodCall isAbsoluteCall, MethodCall addCall\nwhere\n  importStyle.getDeclaringType().hasQualifiedName(\"org.owasp.validator.css\", \"CssHandler\") and\n  importStyle.hasName(\"importStyle\") and\n  isAbsoluteCall.getEnclosingCallable() = importStyle and\n  isAbsoluteCall.getMethod().hasName(\"isAbsolute\") and\n  addCall.getEnclosingCallable() = importStyle and\n  (addCall.getMethod().hasName(\"add\") or addCall.getMethod().hasName(\"put\"))\nselect isAbsoluteCall, \"CssHandler.importStyle() at line \" + isAbsoluteCall.getLocation().getStartLine() + \n  \": uses URI.isAbsolute() to classify URL as 'offsiteURL' or 'onsiteURL' without checking scheme - \" +\n  \"javascript: URIs (e.g., javascript:alert(1)) are absolute and would be included in output as-is\"\n",
+      "hypothesis": "CssHandler.importStyle() allows javascript: URIs through as they satisfy URI.isAbsolute() check",
+      "severity": "high",
+      "cwe_ids": [],
+      "results_count": 1,
+      "results": [
+        {
+          "ruleId": "java/antisamy-import-style-javascript-uri",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/antisamy-import-style-javascript-uri",
+            "index": 0
+          },
+          "message": {
+            "text": "CssHandler.importStyle() at line 323: uses URI.isAbsolute() to classify URL as 'offsiteURL' or 'onsiteURL' without checking scheme - javascript: URIs (e.g., javascript:alert(1)) are absolute and would be included in output as-is"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/owasp/validator/css/CssHandler.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 323,
+                  "startColumn": 9,
+                  "endColumn": 40
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "6f833d09b4b92f06:1",
+            "primaryLocationStartColumnFingerprint": "5"
+          }
+        }
+      ]
+    },
+    {
+      "codeql_query_uuid": "20260401030947",
+      "codeql_raw_query": "/**\n * @name XMLUtil case-sensitive dangerous pattern stripping - bypass via uppercase\n * @description XMLUtil uses Pattern.compile without CASE_INSENSITIVE on content-stripping regexes\n *              allowing attackers to bypass filtering using uppercase characters\n * @kind problem\n * @problem.severity error\n * @id java/antisamy-xmlutil-case-insensitive-bypass\n * @tags security\n *       external/cwe/cwe-079\n */\n\nimport java\n\n// Find all Pattern.compile calls in XMLUtil without CASE_INSENSITIVE flag\n// And check the pattern string for dangerous keywords\nfrom MethodCall mc, StringLiteral patternStr\nwhere\n  mc.getMethod().hasName(\"compile\") and\n  mc.getMethod().getDeclaringType().hasQualifiedName(\"java.util.regex\", \"Pattern\") and\n  mc.getNumArgument() = 1 and\n  mc.getEnclosingCallable().getDeclaringType().hasQualifiedName(\"org.owasp.validator.html.util\", \"XMLUtil\") and\n  patternStr = mc.getArgument(0)\nselect mc, \"XMLUtil Pattern.compile at line \" + mc.getLocation().getStartLine() + \n  \" with pattern: '\" + patternStr.getValue() + \"' - NO CASE_INSENSITIVE FLAG (bypass with uppercase)\"\n",
+      "hypothesis": "XMLUtil uses case-sensitive regex patterns for dangerous content stripping, allowing bypass via uppercase",
+      "severity": "high",
+      "cwe_ids": [],
+      "results_count": 8,
+      "results": [
+        {
+          "ruleId": "java/antisamy-xmlutil-case-insensitive-bypass",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/antisamy-xmlutil-case-insensitive-bypass",
+            "index": 0
+          },
+          "message": {
+            "text": "XMLUtil Pattern.compile at line 35 with pattern: '&gt;' - NO CASE_INSENSITIVE FLAG (bypass with uppercase)"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/owasp/validator/html/util/XMLUtil.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 35,
+                  "startColumn": 42,
+                  "endColumn": 65
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "5597718909444a6e:1",
+            "primaryLocationStartColumnFingerprint": "37"
+          }
+        },
+        {
+          "ruleId": "java/antisamy-xmlutil-case-insensitive-bypass",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/antisamy-xmlutil-case-insensitive-bypass",
+            "index": 0
+          },
+          "message": {
+            "text": "XMLUtil Pattern.compile at line 36 with pattern: '&lt;' - NO CASE_INSENSITIVE FLAG (bypass with uppercase)"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/owasp/validator/html/util/XMLUtil.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 36,
+                  "startColumn": 42,
+                  "endColumn": 65
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "6fa392400fa29e8c:1",
+            "primaryLocationStartColumnFingerprint": "37"
+          }
+        },
+        {
+          "ruleId": "java/antisamy-xmlutil-case-insensitive-bypass",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/antisamy-xmlutil-case-insensitive-bypass",
+            "index": 0
+          },
+          "message": {
+            "text": "XMLUtil Pattern.compile at line 37 with pattern: '&quot;' - NO CASE_INSENSITIVE FLAG (bypass with uppercase)"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/owasp/validator/html/util/XMLUtil.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 37,
+                  "startColumn": 44,
+                  "endColumn": 69
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "41ec624c1701c78c:1",
+            "primaryLocationStartColumnFingerprint": "39"
+          }
+        },
+        {
+          "ruleId": "java/antisamy-xmlutil-case-insensitive-bypass",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/antisamy-xmlutil-case-insensitive-bypass",
+            "index": 0
+          },
+          "message": {
+            "text": "XMLUtil Pattern.compile at line 38 with pattern: '&amp;' - NO CASE_INSENSITIVE FLAG (bypass with uppercase)"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/owasp/validator/html/util/XMLUtil.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 38,
+                  "startColumn": 43,
+                  "endColumn": 67
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "b9f73694c540a017:1",
+            "primaryLocationStartColumnFingerprint": "38"
+          }
+        },
+        {
+          "ruleId": "java/antisamy-xmlutil-case-insensitive-bypass",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/antisamy-xmlutil-case-insensitive-bypass",
+            "index": 0
+          },
+          "message": {
+            "text": "XMLUtil Pattern.compile at line 40 with pattern: '>' - NO CASE_INSENSITIVE FLAG (bypass with uppercase)"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/owasp/validator/html/util/XMLUtil.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 40,
+                  "startColumn": 39,
+                  "endColumn": 59
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "4d2cd24eb20bc60b:1",
+            "primaryLocationStartColumnFingerprint": "34"
+          }
+        },
+        {
+          "ruleId": "java/antisamy-xmlutil-case-insensitive-bypass",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/antisamy-xmlutil-case-insensitive-bypass",
+            "index": 0
+          },
+          "message": {
+            "text": "XMLUtil Pattern.compile at line 41 with pattern: '<' - NO CASE_INSENSITIVE FLAG (bypass with uppercase)"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/owasp/validator/html/util/XMLUtil.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 41,
+                  "startColumn": 39,
+                  "endColumn": 59
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "abcffb2934ab20d3:1",
+            "primaryLocationStartColumnFingerprint": "34"
+          }
+        },
+        {
+          "ruleId": "java/antisamy-xmlutil-case-insensitive-bypass",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/antisamy-xmlutil-case-insensitive-bypass",
+            "index": 0
+          },
+          "message": {
+            "text": "XMLUtil Pattern.compile at line 42 with pattern: '\"' - NO CASE_INSENSITIVE FLAG (bypass with uppercase)"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/owasp/validator/html/util/XMLUtil.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 42,
+                  "startColumn": 41,
+                  "endColumn": 62
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "ff1c3bac82a539f1:1",
+            "primaryLocationStartColumnFingerprint": "36"
+          }
+        },
+        {
+          "ruleId": "java/antisamy-xmlutil-case-insensitive-bypass",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/antisamy-xmlutil-case-insensitive-bypass",
+            "index": 0
+          },
+          "message": {
+            "text": "XMLUtil Pattern.compile at line 43 with pattern: '&' - NO CASE_INSENSITIVE FLAG (bypass with uppercase)"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/owasp/validator/html/util/XMLUtil.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 43,
+                  "startColumn": 40,
+                  "endColumn": 60
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "44b56d7ebd09ab2c:1",
+            "primaryLocationStartColumnFingerprint": "35"
+          }
+        }
+      ]
+    },
+    {
+      "codeql_query_uuid": "20260401031012",
+      "codeql_raw_query": "/**\n * @name AntiSamy DOM scanner - processAttributes missing style check in certain paths\n * @description Look for places where processAttributes might skip style attribute scanning\n * @kind problem\n * @problem.severity error\n * @id java/antisamy-process-attributes-style-skip\n * @tags security\n *       external/cwe/cwe-079\n */\n\nimport java\n\n// Find conditional logic around \"style\" attribute processing in DOM scanner\nfrom IfStmt ifStmt, StringLiteral styleLiteral\nwhere\n  ifStmt.getEnclosingCallable().getDeclaringType().hasQualifiedName(\"org.owasp.validator.html.scan\", \"AntiSamyDOMScanner\") and\n  styleLiteral.getValue() = \"style\" and\n  styleLiteral.getEnclosingStmt().getParent*() = ifStmt\nselect ifStmt, \"DOM scanner 'style' conditional at line \" + ifStmt.getLocation().getStartLine() + \n  \" - verify all paths through this condition properly sanitize CSS content\"\n",
+      "hypothesis": "processAttributes may skip style attribute sanitization in certain code paths",
+      "severity": "medium",
+      "cwe_ids": [],
+      "results_count": 2,
+      "results": [
+        {
+          "ruleId": "java/antisamy-process-attributes-style-skip",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/antisamy-process-attributes-style-skip",
+            "index": 0
+          },
+          "message": {
+            "text": "DOM scanner 'style' conditional at line 357 - verify all paths through this condition properly sanitize CSS content"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/owasp/validator/html/scan/AntiSamyDOMScanner.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 357,
+                  "startColumn": 9,
+                  "endColumn": 78
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "d1c213acf59249d1:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "java/antisamy-process-attributes-style-skip",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/antisamy-process-attributes-style-skip",
+            "index": 0
+          },
+          "message": {
+            "text": "DOM scanner 'style' conditional at line 508 - verify all paths through this condition properly sanitize CSS content"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/owasp/validator/html/scan/AntiSamyDOMScanner.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 508,
+                  "startColumn": 13,
+                  "endColumn": 68
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "c93b2a5997b98e66:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        }
+      ]
+    },
+    {
+      "codeql_query_uuid": "20260401031054",
+      "codeql_raw_query": "/**\n * @name AntiSamy CssHandler importStyle - @import with javascript: URI bypass\n * @description CssHandler.importStyle uses URI.isAbsolute() to validate CSS @import URLs\n *              but javascript: URIs are absolute (have a scheme), so they pass this check\n *              This allows an attacker to inject @import url(javascript:...) into CSS\n * @kind problem\n * @problem.severity error\n * @id java/antisamy-css-import-javascript-uri-bypass\n * @tags security\n *       external/cwe/cwe-079\n */\n\nimport java\n\n// Confirm the importStyle method structure: normalize() then isAbsolute() without getScheme()\nfrom Method m, MethodCall normalizeCall, MethodCall isAbsoluteCall\nwhere\n  m.getDeclaringType().hasQualifiedName(\"org.owasp.validator.css\", \"CssHandler\") and\n  m.hasName(\"importStyle\") and\n  normalizeCall.getEnclosingCallable() = m and\n  normalizeCall.getMethod().hasName(\"normalize\") and\n  normalizeCall.getMethod().getDeclaringType().hasQualifiedName(\"java.net\", \"URI\") and\n  isAbsoluteCall.getEnclosingCallable() = m and\n  isAbsoluteCall.getMethod().hasName(\"isAbsolute\") and\n  isAbsoluteCall.getMethod().getDeclaringType().hasQualifiedName(\"java.net\", \"URI\") and\n  // Confirm no scheme check exists\n  not exists(MethodCall schemeCall |\n    schemeCall.getEnclosingCallable() = m and\n    schemeCall.getMethod().hasName(\"getScheme\")\n  )\nselect m, \"CssHandler.importStyle() [lines \" + m.getLocation().getStartLine() + \"-\" + m.getLocation().getEndLine() + \"]: \" +\n  \"validates CSS @import URLs using URI.normalize() + URI.isAbsolute() WITHOUT checking the URI scheme. \" +\n  \"javascript: URIs satisfy isAbsolute() since they have a scheme component, allowing \" +\n  \"@import url('javascript:alert(1)') to pass validation and be included in sanitized output. \" +\n  \"Related to CVE-2022-28367 / bypass in AntiSamy CSS @import handling.\"\n",
+      "hypothesis": "CssHandler.importStyle() allows javascript: URIs via CSS @import because URI.isAbsolute() returns true for javascript: scheme",
+      "severity": "high",
+      "cwe_ids": [],
+      "results_count": 1,
+      "results": [
+        {
+          "ruleId": "java/antisamy-css-import-javascript-uri-bypass",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/antisamy-css-import-javascript-uri-bypass",
+            "index": 0
+          },
+          "message": {
+            "text": "CssHandler.importStyle() \\[lines 286-286\\]: validates CSS @import URLs using URI.normalize() + URI.isAbsolute() WITHOUT checking the URI scheme. javascript: URIs satisfy isAbsolute() since they have a scheme component, allowing @import url('javascript:alert(1)') to pass validation and be included in sanitized output. Related to CVE-2022-28367 / bypass in AntiSamy CSS @import handling."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/owasp/validator/css/CssHandler.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 286,
+                  "startColumn": 14,
+                  "endColumn": 25
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "3f2b49e5e598b4b8:1",
+            "primaryLocationStartColumnFingerprint": "12"
+          }
+        }
+      ]
+    }
+  ]
+}

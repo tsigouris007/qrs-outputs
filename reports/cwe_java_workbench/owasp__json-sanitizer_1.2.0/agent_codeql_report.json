@@ -1,0 +1,4219 @@
+{
+  "session_id": "20260403000439",
+  "package_name": "owasp__json-sanitizer_1.2.0",
+  "package_path": "packages/owasp__json-sanitizer_1.2.0",
+  "database_path": "databases/owasp__json-sanitizer_1.2.0-db",
+  "model": "claude-sonnet-4-6",
+  "temperature": 1.0,
+  "max_tokens": 25000,
+  "iterations": 18,
+  "total_input_tokens": 429598,
+  "total_output_tokens": 15360,
+  "total_tokens": 444958,
+  "elapsed_time_seconds": 1070.36,
+  "estimated_cost_usd": 1.5192,
+  "summary": "## Security Analysis: OWASP JSON Sanitizer 1.2.0 (com.mikesamuel:json-sanitizer)\n\n### Overview\n\nThe OWASP JSON Sanitizer converts JSON-like content into valid JSON. It is commonly embedded in HTML `<script>` blocks to safely pass JSON data to JavaScript. Version 1.2.0 contains a **critical XSS vulnerability** (CVE-2021-23899) due to incomplete escaping of HTML-significant character sequences.\n\n---\n\n### Critical Finding: Incomplete HTML/Script Context Escaping (CWE-079, CWE-116)\n\n**Severity: Critical**\n\n#### Evidence from Code Analysis\n\n**1. No HTML Entity Encoding**\nThe sanitizer performs zero HTML entity encoding. A comprehensive search for `&lt;`, `&gt;`, `&amp;`, `\\u003c`, `\\u003e`, `\\u0026` and similar HTML-safe representations found **no matches** in the entire codebase. This means angle brackets and ampersands are **never encoded as HTML entities**.\n\n**2. Partial and Bypassable `</script>` Detection**\nThe character-level escape logic (lines 547\u2013553 of `JsonSanitizer.java`) for the `/` case checks:\n- Whether the character 2 positions back is `<` (detecting `</`)\n- Whether the next character is `'s'` (detecting `</s`)\n- Whether the character after that is `'c'` (detecting `</sc`)\n\nThis only covers the specific prefix `</sc`, inserting a backslash to produce `<\\/sc...`. However:\n- It does **not** cover `</SCRIPT>`, `</Style>`, or other case variants\n- It does **not** cover `</style>` or other dangerous closing tags\n- The detection is based on character-by-character lookahead/lookbehind, not a full pattern match\n\n**3. No `<!--` (HTML Comment) Escaping**\nThere is **no handling whatsoever** for the HTML comment opening sequence `<!--`. If user-controlled input produces a string value containing `<!--`, it will appear verbatim in sanitizer output, allowing HTML comment injection that can hide subsequent page content or enable conditional comment attacks in older browsers.\n\n**4. `]]>` CDATA Sequence Is Escaped (Correct)**\nThe `>` case (lines 556\u2013559) does escape `]]>` by replacing it with `\\u005d]>`, which is correct for CDATA close sequence prevention. However this only covers CDATA and not other dangerous sequences.\n\n**5. Line Terminators Are Escaped (Correct)**\nThe sanitizer correctly escapes `\\u2028` and `\\u2029` (Unicode line/paragraph separators), `\\n`, and `\\r` in string values, which prevents JS string literal injection via newlines.\n\n**6. `EvalMinifier` Generates Unencoded JavaScript Output**\n`EvalMinifier.java` (lines 219\u2013222) generates JavaScript IIFE wrappers like `(function(...){{return...}}(...))` from sanitized JSON. This output is not HTML-safe and can be vulnerable when embedded in HTML pages if the underlying JSON contains exploitable sequences.\n\n---\n\n### Attack Scenario\n\nWhen `JsonSanitizer.sanitize()` output is embedded directly into an HTML `<script>` block:\n\n```html\n<script>\n  var data = /*JSON*/ SANITIZER_OUTPUT_HERE;\n</script>\n```\n\nA crafted input such as:\n```\n\"</script><script>alert(1)</script>\"\n```\n\nMay survive through the partial detection (e.g., using uppercase `</SCRIPT>` or targeting `</style>` instead), allowing the attacker to break out of the `<script>` tag context and inject arbitrary HTML/JavaScript.\n\nSimilarly, input producing `<!--` can cause HTML comment injection.\n\n---\n\n### Affected Components\n\n| File | Lines | Issue |\n|------|-------|-------|\n| `src/main/java/com/google/json/JsonSanitizer.java` | 547\u2013565 | Partial `</sc` detection only; no `<!--` handling; no HTML entity encoding |\n| `src/main/java/com/google/json/EvalMinifier.java` | 219\u2013222 | IIFE wrapper generation not HTML-safe |\n\n---\n\n### Remediation\n\nUpgrade to **json-sanitizer version 1.2.1 or later**, which fixes CVE-2021-23899 by implementing proper handling of all dangerous HTML sequences in JSON string output.\n\nIf embedding JSON in HTML is required, always apply a secondary layer of encoding (e.g., replacing `<` with `\\u003c`, `>` with `\\u003e`, `&` with `\\u0026`, and `'` with `\\u0027`) on the sanitizer output before embedding in HTML contexts.",
+  "package_classification": {
+    "type": [
+      "library"
+    ],
+    "layer": [
+      "security",
+      "data"
+    ]
+  },
+  "tool_calls": {
+    "get_package_profile_info": 1,
+    "execute_codeql_query": 26,
+    "validate_codeql_query": 0,
+    "fixup_codeql_query": 1,
+    "finalize_report": 1
+  },
+  "queries_executed": {
+    "critical": 8,
+    "high": 8,
+    "medium": 1,
+    "low": 0,
+    "total_executed": 27,
+    "total_with_results": 17,
+    "total_failed": 11
+  },
+  "query_findings": {
+    "critical": 52,
+    "high": 57,
+    "medium": 20,
+    "low": 0,
+    "total": 129
+  },
+  "findings": [
+    {
+      "codeql_query_uuid": "20260403000452",
+      "codeql_raw_query": "/**\n * @name XSS bypass in JSON sanitizer output - HTML special chars\n * @description Find places where JSON sanitizer output may not properly escape HTML special characters,\n *              allowing XSS when embedded in HTML contexts\n * @kind problem\n * @problem.severity error\n * @id java/json-sanitizer-xss-bypass\n * @tags security\n *       external/cwe/cwe-079\n */\n\nimport java\n\n// Find string appends/replacements that handle special HTML characters in JsonSanitizer\nfrom MethodCall mc, Method m\nwhere\n  m = mc.getMethod() and\n  m.getDeclaringType().hasQualifiedName(\"com.google.json\", \"JsonSanitizer\") and\n  (\n    m.hasName(\"sanitize\") or\n    m.hasName(\"toString\")\n  )\nselect mc, \"Call to JsonSanitizer method: \" + m.getName()\n",
+      "hypothesis": "Identify where JsonSanitizer produces output and whether HTML special characters are properly escaped",
+      "severity": "high",
+      "cwe_ids": [],
+      "results_count": 5,
+      "results": [
+        {
+          "ruleId": "java/json-sanitizer-xss-bypass",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/json-sanitizer-xss-bypass",
+            "index": 0
+          },
+          "message": {
+            "text": "Call to JsonSanitizer method: sanitize"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/google/json/EvalMinifier.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 52,
+                  "startColumn": 5,
+                  "endColumn": 17
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "126124e1bae288a1:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "java/json-sanitizer-xss-bypass",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/json-sanitizer-xss-bypass",
+            "index": 0
+          },
+          "message": {
+            "text": "Call to JsonSanitizer method: sanitize"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/google/json/EvalMinifier.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 65,
+                  "startColumn": 5,
+                  "endColumn": 17
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "5572a068afef165d:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "java/json-sanitizer-xss-bypass",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/json-sanitizer-xss-bypass",
+            "index": 0
+          },
+          "message": {
+            "text": "Call to JsonSanitizer method: sanitize"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/google/json/JsonSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 1
+                },
+                "region": {
+                  "startLine": 109,
+                  "startColumn": 12,
+                  "endColumn": 52
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "b586e81c6100ff5a:1",
+            "primaryLocationStartColumnFingerprint": "7"
+          }
+        },
+        {
+          "ruleId": "java/json-sanitizer-xss-bypass",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/json-sanitizer-xss-bypass",
+            "index": 0
+          },
+          "message": {
+            "text": "Call to JsonSanitizer method: sanitize"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/google/json/JsonSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 1
+                },
+                "region": {
+                  "startLine": 122,
+                  "startColumn": 5,
+                  "endColumn": 17
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "c917bf128b6c70bb:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "java/json-sanitizer-xss-bypass",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/json-sanitizer-xss-bypass",
+            "index": 0
+          },
+          "message": {
+            "text": "Call to JsonSanitizer method: toString"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/google/json/JsonSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 1
+                },
+                "region": {
+                  "startLine": 123,
+                  "startColumn": 12,
+                  "endColumn": 24
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "305e4655aef5bddc:1",
+            "primaryLocationStartColumnFingerprint": "7"
+          }
+        }
+      ]
+    },
+    {
+      "codeql_query_uuid": "20260403000534",
+      "codeql_raw_query": "/**\n * @name HTML special character handling in JsonSanitizer\n * @description Find string literals related to HTML special characters in JsonSanitizer\n * @kind problem\n * @problem.severity error\n * @id java/json-sanitizer-html-chars\n * @tags security\n *       external/cwe/cwe-079\n */\n\nimport java\n\nfrom StringLiteral sl, CompilationUnit cu\nwhere\n  cu = sl.getCompilationUnit() and\n  cu.getPackage().hasName(\"com.google.json\") and\n  (\n    sl.getValue().matches(\"%<%\") or\n    sl.getValue().matches(\"%>%\") or\n    sl.getValue().matches(\"%&%\") or\n    sl.getValue().matches(\"%script%\") or\n    sl.getValue().matches(\"%\\\\u%\") or\n    sl.getValue().matches(\"%\\\\x%\") or\n    sl.getValue().matches(\"%<!%\") or\n    sl.getValue().matches(\"%]]>%\") or\n    sl.getValue() = \"<\" or\n    sl.getValue() = \">\" or\n    sl.getValue() = \"&\" or\n    sl.getValue() = \"</\" or\n    sl.getValue().matches(\"%</script%\")\n  )\nselect sl, \"String literal related to HTML special characters: '\" + sl.getValue() + \"'\"\n",
+      "hypothesis": "Identify how JSON sanitizer handles HTML special characters like angle brackets, script tags",
+      "severity": "high",
+      "cwe_ids": [],
+      "results_count": 6,
+      "results": [
+        {
+          "ruleId": "java/json-sanitizer-html-chars",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/json-sanitizer-html-chars",
+            "index": 0
+          },
+          "message": {
+            "text": "String literal related to HTML special characters: '\\u2028'"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/google/json/JsonSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 520,
+                  "startColumn": 42,
+                  "endColumn": 51
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "a32f5b6973c32934:1",
+            "primaryLocationStartColumnFingerprint": "33"
+          }
+        },
+        {
+          "ruleId": "java/json-sanitizer-html-chars",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/json-sanitizer-html-chars",
+            "index": 0
+          },
+          "message": {
+            "text": "String literal related to HTML special characters: '\\u2029'"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/google/json/JsonSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 521,
+                  "startColumn": 42,
+                  "endColumn": 51
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "857ca68d49c3637c:1",
+            "primaryLocationStartColumnFingerprint": "33"
+          }
+        },
+        {
+          "ruleId": "java/json-sanitizer-html-chars",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/json-sanitizer-html-chars",
+            "index": 0
+          },
+          "message": {
+            "text": "String literal related to HTML special characters: '\\u005d'"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/google/json/JsonSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 559,
+                  "startColumn": 31,
+                  "endColumn": 40
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "5fdb17026fdf0215:1",
+            "primaryLocationStartColumnFingerprint": "18"
+          }
+        },
+        {
+          "ruleId": "java/json-sanitizer-html-chars",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/json-sanitizer-html-chars",
+            "index": 0
+          },
+          "message": {
+            "text": "String literal related to HTML special characters: '\\u0008'"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/google/json/JsonSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 575,
+                  "startColumn": 33,
+                  "endColumn": 42
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "9b23f7fc7bb1ac7e:1",
+            "primaryLocationStartColumnFingerprint": "18"
+          }
+        },
+        {
+          "ruleId": "java/json-sanitizer-html-chars",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/json-sanitizer-html-chars",
+            "index": 0
+          },
+          "message": {
+            "text": "String literal related to HTML special characters: '\\u00'"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/google/json/JsonSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 580,
+                  "startColumn": 35,
+                  "endColumn": 42
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "bff665abc24fa5a1:1",
+            "primaryLocationStartColumnFingerprint": "18"
+          }
+        },
+        {
+          "ruleId": "java/json-sanitizer-html-chars",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/json-sanitizer-html-chars",
+            "index": 0
+          },
+          "message": {
+            "text": "String literal related to HTML special characters: '\\u'"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/google/json/JsonSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 637,
+                  "startColumn": 29,
+                  "endColumn": 34
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "2c2cf33572b1d5f4:1",
+            "primaryLocationStartColumnFingerprint": "18"
+          }
+        }
+      ]
+    },
+    {
+      "codeql_query_uuid": "20260403000746",
+      "codeql_raw_query": "/**\n * @name Check for missing HTML angle bracket escaping in JsonSanitizer\n * @description Look for character comparisons with '<' and '>' to see if angle brackets are properly handled\n * @kind problem\n * @problem.severity error\n * @id java/json-sanitizer-angle-brackets\n * @tags security\n *       external/cwe/cwe-079\n *       external/cwe/cwe-116\n */\n\nimport java\n\nfrom CompilationUnit cu, CharacterLiteral cl\nwhere\n  cu = cl.getCompilationUnit() and\n  cu.getPackage().hasName(\"com.google.json\") and\n  (\n    cl.getValue() = \"<\" or\n    cl.getValue() = \">\" or\n    cl.getValue() = \"&\" or\n    cl.getValue() = \"!\" or\n    cl.getValue() = \"-\"\n  )\nselect cl, \"Character literal '\" + cl.getValue() + \"' in \" + cu.getName()\n",
+      "hypothesis": "Check whether angle brackets and HTML special chars are handled in the sanitizer via character comparisons",
+      "severity": "high",
+      "cwe_ids": [],
+      "results_count": 9,
+      "results": [
+        {
+          "ruleId": "java/json-sanitizer-angle-brackets",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/json-sanitizer-angle-brackets",
+            "index": 0
+          },
+          "message": {
+            "text": "Character literal '-' in EvalMinifier"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/google/json/EvalMinifier.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 233,
+                  "startColumn": 44,
+                  "endColumn": 47
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "9bfe94f24b0e97:1",
+            "primaryLocationStartColumnFingerprint": "39"
+          }
+        },
+        {
+          "ruleId": "java/json-sanitizer-angle-brackets",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/json-sanitizer-angle-brackets",
+            "index": 0
+          },
+          "message": {
+            "text": "Character literal '-' in JsonSanitizer"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/google/json/JsonSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 1
+                },
+                "region": {
+                  "startLine": 400,
+                  "startColumn": 51,
+                  "endColumn": 54
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "cf15f885b63caff7:1",
+            "primaryLocationStartColumnFingerprint": "35"
+          }
+        },
+        {
+          "ruleId": "java/json-sanitizer-angle-brackets",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/json-sanitizer-angle-brackets",
+            "index": 0
+          },
+          "message": {
+            "text": "Character literal '-' in JsonSanitizer"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/google/json/JsonSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 1
+                },
+                "region": {
+                  "startLine": 385,
+                  "startColumn": 43,
+                  "endColumn": 46
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "aec64f0990a6e52b:1",
+            "primaryLocationStartColumnFingerprint": "24"
+          }
+        },
+        {
+          "ruleId": "java/json-sanitizer-angle-brackets",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/json-sanitizer-angle-brackets",
+            "index": 0
+          },
+          "message": {
+            "text": "Character literal '<' in JsonSanitizer"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/google/json/JsonSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 1
+                },
+                "region": {
+                  "startLine": 550,
+                  "startColumn": 43,
+                  "endColumn": 46
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "e7ed65ef5479299c:1",
+            "primaryLocationStartColumnFingerprint": "32"
+          }
+        },
+        {
+          "ruleId": "java/json-sanitizer-angle-brackets",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/json-sanitizer-angle-brackets",
+            "index": 0
+          },
+          "message": {
+            "text": "Character literal '>' in JsonSanitizer"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/google/json/JsonSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 1
+                },
+                "region": {
+                  "startLine": 558,
+                  "startColumn": 18,
+                  "endColumn": 21
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "d19cdebe5c7ab64b:1",
+            "primaryLocationStartColumnFingerprint": "3"
+          }
+        },
+        {
+          "ruleId": "java/json-sanitizer-angle-brackets",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/json-sanitizer-angle-brackets",
+            "index": 0
+          },
+          "message": {
+            "text": "Character literal '-' in JsonSanitizer"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/google/json/JsonSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 1
+                },
+                "region": {
+                  "startLine": 780,
+                  "startColumn": 14,
+                  "endColumn": 17
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "f15291e49ac9cc34:1",
+            "primaryLocationStartColumnFingerprint": "5"
+          }
+        },
+        {
+          "ruleId": "java/json-sanitizer-angle-brackets",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/json-sanitizer-angle-brackets",
+            "index": 0
+          },
+          "message": {
+            "text": "Character literal '-' in JsonSanitizer"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/google/json/JsonSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 1
+                },
+                "region": {
+                  "startLine": 842,
+                  "startColumn": 26,
+                  "endColumn": 29
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "570965b3602c1909:1",
+            "primaryLocationStartColumnFingerprint": "15"
+          }
+        },
+        {
+          "ruleId": "java/json-sanitizer-angle-brackets",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/json-sanitizer-angle-brackets",
+            "index": 0
+          },
+          "message": {
+            "text": "Character literal '-' in JsonSanitizer"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/google/json/JsonSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 1
+                },
+                "region": {
+                  "startLine": 897,
+                  "startColumn": 62,
+                  "endColumn": 65
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "cf82cf1a073ebf62:1",
+            "primaryLocationStartColumnFingerprint": "57"
+          }
+        },
+        {
+          "ruleId": "java/json-sanitizer-angle-brackets",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/json-sanitizer-angle-brackets",
+            "index": 0
+          },
+          "message": {
+            "text": "Character literal '-' in JsonSanitizer"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/google/json/JsonSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 1
+                },
+                "region": {
+                  "startLine": 1061,
+                  "startColumn": 53,
+                  "endColumn": 56
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "bec1286ed4aed68f:1",
+            "primaryLocationStartColumnFingerprint": "46"
+          }
+        }
+      ]
+    },
+    {
+      "codeql_query_uuid": "20260403000913",
+      "codeql_raw_query": "/**\n * @name Examine escaping logic around angle brackets in JsonSanitizer\n * @description Look at the methods and blocks containing angle bracket handling\n * @kind problem\n * @problem.severity error\n * @id java/json-sanitizer-escape-logic\n * @tags security\n *       external/cwe/cwe-079\n *       external/cwe/cwe-116\n */\n\nimport java\n\n// Find all string append operations in JsonSanitizer that may construct output\nfrom MethodCall mc, CompilationUnit cu\nwhere\n  cu = mc.getCompilationUnit() and\n  cu.getPackage().hasName(\"com.google.json\") and\n  cu.getName() = \"JsonSanitizer\" and\n  (\n    mc.getMethod().hasName(\"append\") or\n    mc.getMethod().hasName(\"insert\") or\n    mc.getMethod().hasName(\"replace\") or\n    mc.getMethod().hasName(\"delete\")\n  ) and\n  mc.getMethod().getDeclaringType().hasQualifiedName(\"java.lang\", \"StringBuilder\")\nselect mc, \"StringBuilder operation at line \" + mc.getLocation().getStartLine() + \": \" + mc.getMethod().getName()\n",
+      "hypothesis": "Examine how the sanitizer builds its output via StringBuilder operations to find unescaped HTML characters",
+      "severity": "high",
+      "cwe_ids": [],
+      "results_count": 19,
+      "results": [
+        {
+          "ruleId": "java/json-sanitizer-escape-logic",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/json-sanitizer-escape-logic",
+            "index": 0
+          },
+          "message": {
+            "text": "StringBuilder operation at line 472: append"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/google/json/JsonSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 472,
+                  "startColumn": 7,
+                  "endColumn": 48
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "9010784d3371cb0c:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "java/json-sanitizer-escape-logic",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/json-sanitizer-escape-logic",
+            "index": 0
+          },
+          "message": {
+            "text": "StringBuilder operation at line 480: append"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/google/json/JsonSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 480,
+                  "startColumn": 11,
+                  "endColumn": 40
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "486ae2017a8376da:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "java/json-sanitizer-escape-logic",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/json-sanitizer-escape-logic",
+            "index": 0
+          },
+          "message": {
+            "text": "StringBuilder operation at line 483: append"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/google/json/JsonSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 483,
+                  "startColumn": 11,
+                  "endColumn": 39
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "8a46291bd5326f58:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "java/json-sanitizer-escape-logic",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/json-sanitizer-escape-logic",
+            "index": 0
+          },
+          "message": {
+            "text": "StringBuilder operation at line 490: append"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/google/json/JsonSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 490,
+                  "startColumn": 9,
+                  "endColumn": 64
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "456f9ffa55392fa3:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "java/json-sanitizer-escape-logic",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/json-sanitizer-escape-logic",
+            "index": 0
+          },
+          "message": {
+            "text": "StringBuilder operation at line 639: append"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/google/json/JsonSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 639,
+                  "startColumn": 13,
+                  "endColumn": 70
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "9a19eea50e4e9a69:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "java/json-sanitizer-escape-logic",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/json-sanitizer-escape-logic",
+            "index": 0
+          },
+          "message": {
+            "text": "StringBuilder operation at line 692: append"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/google/json/JsonSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 692,
+                  "startColumn": 5,
+                  "endColumn": 50
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "d2751eab3f66d779:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "java/json-sanitizer-escape-logic",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/json-sanitizer-escape-logic",
+            "index": 0
+          },
+          "message": {
+            "text": "StringBuilder operation at line 698: append"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/google/json/JsonSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 698,
+                  "startColumn": 5,
+                  "endColumn": 29
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "2ed1c7fd01def9de:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "java/json-sanitizer-escape-logic",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/json-sanitizer-escape-logic",
+            "index": 0
+          },
+          "message": {
+            "text": "StringBuilder operation at line 703: append"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/google/json/JsonSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 703,
+                  "startColumn": 5,
+                  "endColumn": 28
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "19ae9d3f82658113:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "java/json-sanitizer-escape-logic",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/json-sanitizer-escape-logic",
+            "index": 0
+          },
+          "message": {
+            "text": "StringBuilder operation at line 812: append"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/google/json/JsonSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 812,
+                  "startColumn": 9,
+                  "endColumn": 36
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "9d686bc6f80c8c7:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "java/json-sanitizer-escape-logic",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/json-sanitizer-escape-logic",
+            "index": 0
+          },
+          "message": {
+            "text": "StringBuilder operation at line 819: append"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/google/json/JsonSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 819,
+                  "startColumn": 9,
+                  "endColumn": 36
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "bb0784fd361bd6b5:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "java/json-sanitizer-escape-logic",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/json-sanitizer-escape-logic",
+            "index": 0
+          },
+          "message": {
+            "text": "StringBuilder operation at line 1014: append"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/google/json/JsonSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 1014,
+                  "startColumn": 7,
+                  "endColumn": 32
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "5ea943a929a3b37a:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "java/json-sanitizer-escape-logic",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/json-sanitizer-escape-logic",
+            "index": 0
+          },
+          "message": {
+            "text": "StringBuilder operation at line 1023: append"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/google/json/JsonSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 1023,
+                  "startColumn": 9,
+                  "endColumn": 34
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "850ce3d151682136:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "java/json-sanitizer-escape-logic",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/json-sanitizer-escape-logic",
+            "index": 0
+          },
+          "message": {
+            "text": "StringBuilder operation at line 1031: insert"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/google/json/JsonSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 1031,
+                  "startColumn": 7,
+                  "endColumn": 46
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "3fa23b83618bf90f:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "java/json-sanitizer-escape-logic",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/json-sanitizer-escape-logic",
+            "index": 0
+          },
+          "message": {
+            "text": "StringBuilder operation at line 1038: insert"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/google/json/JsonSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 1038,
+                  "startColumn": 7,
+                  "endColumn": 69
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "f34d5cf21bfb719c:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "java/json-sanitizer-escape-logic",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/json-sanitizer-escape-logic",
+            "index": 0
+          },
+          "message": {
+            "text": "StringBuilder operation at line 1058: insert"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/google/json/JsonSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 1058,
+                  "startColumn": 9,
+                  "endColumn": 48
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "2f7c92ec670bb8c2:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "java/json-sanitizer-escape-logic",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/json-sanitizer-escape-logic",
+            "index": 0
+          },
+          "message": {
+            "text": "StringBuilder operation at line 1061: append"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/google/json/JsonSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 1061,
+                  "startColumn": 7,
+                  "endLine": 1062,
+                  "endColumn": 36
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "bec1286ed4aed68f:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "java/json-sanitizer-escape-logic",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/json-sanitizer-escape-logic",
+            "index": 0
+          },
+          "message": {
+            "text": "StringBuilder operation at line 1061: append"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/google/json/JsonSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 1061,
+                  "startColumn": 7,
+                  "endColumn": 63
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "bec1286ed4aed68f:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "java/json-sanitizer-escape-logic",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/json-sanitizer-escape-logic",
+            "index": 0
+          },
+          "message": {
+            "text": "StringBuilder operation at line 1061: append"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/google/json/JsonSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 1061,
+                  "startColumn": 7,
+                  "endColumn": 32
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "bec1286ed4aed68f:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "java/json-sanitizer-escape-logic",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/json-sanitizer-escape-logic",
+            "index": 0
+          },
+          "message": {
+            "text": "StringBuilder operation at line 1107: append"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/google/json/JsonSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 1107,
+                  "startColumn": 7,
+                  "endColumn": 71
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "cafd0e3c19e3efea:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        }
+      ]
+    },
+    {
+      "codeql_query_uuid": "20260403000941",
+      "codeql_raw_query": "/**\n * @name Find switch/case handling of special chars in JsonSanitizer\n * @description Look at switch statements that handle characters for escaping\n * @kind problem\n * @problem.severity error\n * @id java/json-sanitizer-switch-cases\n * @tags security\n *       external/cwe/cwe-079\n *       external/cwe/cwe-116\n */\n\nimport java\n\n// Look for integer literals that match character codes for < (60), > (62), & (38), / (47), = (61)\nfrom IntegerLiteral il, CompilationUnit cu\nwhere\n  cu = il.getCompilationUnit() and\n  cu.getPackage().hasName(\"com.google.json\") and\n  (\n    il.getIntValue() = 60 or   // '<'\n    il.getIntValue() = 62 or   // '>'\n    il.getIntValue() = 38 or   // '&'\n    il.getIntValue() = 47 or   // '/'\n    il.getIntValue() = 61      // '='\n  )\nselect il, \"Integer literal \" + il.getIntValue() + \" (char: \" + il.getIntValue() + \") at line \" + il.getLocation().getStartLine()\n",
+      "hypothesis": "Look for character code comparisons for HTML special characters in switch/case logic",
+      "severity": "high",
+      "cwe_ids": [],
+      "results_count": 0,
+      "results": []
+    },
+    {
+      "codeql_query_uuid": "20260403001100",
+      "codeql_raw_query": "/**\n * @name Check for XSS bypass via unescaped angle brackets in string values\n * @description Look for code paths where '<' and '>' characters from input may pass through without escaping\n * @kind problem\n * @problem.severity error\n * @id java/json-sanitizer-unescaped-output\n * @tags security\n *       external/cwe/cwe-079\n *       external/cwe/cwe-116\n */\n\nimport java\n\n// Find the sanitizeString or equivalent method and look for what replacements it does NOT do\n// Key: look for string append with a variable that may contain '<' or '>'\nfrom MethodCall appendCall, CompilationUnit cu, Method enclosingMethod\nwhere\n  cu = appendCall.getCompilationUnit() and\n  cu.getPackage().hasName(\"com.google.json\") and\n  cu.getName() = \"JsonSanitizer\" and\n  appendCall.getMethod().hasName(\"append\") and\n  appendCall.getMethod().getDeclaringType().hasQualifiedName(\"java.lang\", \"StringBuilder\") and\n  enclosingMethod = appendCall.getEnclosingCallable() and\n  // Focus on appends that use charAt or substring from input  \n  (\n    appendCall.getArgument(0).(MethodCall).getMethod().hasName(\"charAt\") or\n    appendCall.getArgument(0).(MethodCall).getMethod().hasName(\"substring\") or\n    appendCall.getArgument(0).(MethodCall).getMethod().hasName(\"subSequence\")\n  )\nselect appendCall, \"Append of input character/substring in method \" + enclosingMethod.getName() + \" at line \" + appendCall.getLocation().getStartLine()\n",
+      "hypothesis": "Find append operations that directly use input characters without escaping, potential XSS bypass",
+      "severity": "high",
+      "cwe_ids": [],
+      "results_count": 0,
+      "results": []
+    },
+    {
+      "codeql_query_uuid": "20260403001142",
+      "codeql_raw_query": "/**\n * @name Find string literals that look like escape sequences in JsonSanitizer\n * @description Look for unicode escape sequences used to replace dangerous characters\n * @kind problem\n * @problem.severity error\n * @id java/json-sanitizer-escape-sequences\n * @tags security\n *       external/cwe/cwe-079\n *       external/cwe/cwe-116\n */\n\nimport java\n\n// Look for all string literals in JsonSanitizer related to escaping\nfrom StringLiteral sl, CompilationUnit cu\nwhere\n  cu = sl.getCompilationUnit() and\n  cu.getPackage().hasName(\"com.google.json\") and\n  cu.getName() = \"JsonSanitizer\" and\n  sl.getLocation().getStartLine() >= 500 and\n  sl.getLocation().getStartLine() <= 650\nselect sl, \"Line \" + sl.getLocation().getStartLine() + \": '\" + sl.getValue() + \"'\"\n",
+      "hypothesis": "Look at the specific escape sequences used in the critical escaping section of JsonSanitizer (lines 500-650)",
+      "severity": "high",
+      "cwe_ids": [],
+      "results_count": 9,
+      "results": [
+        {
+          "ruleId": "java/json-sanitizer-escape-sequences",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/json-sanitizer-escape-sequences",
+            "index": 0
+          },
+          "message": {
+            "text": "Line 517: '\\n'"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/google/json/JsonSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 517,
+                  "startColumn": 38,
+                  "endColumn": 43
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "412ac09d8d4bf4c:1",
+            "primaryLocationStartColumnFingerprint": "29"
+          }
+        },
+        {
+          "ruleId": "java/json-sanitizer-escape-sequences",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/json-sanitizer-escape-sequences",
+            "index": 0
+          },
+          "message": {
+            "text": "Line 518: '\\r'"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/google/json/JsonSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 518,
+                  "startColumn": 38,
+                  "endColumn": 43
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "76e0008a5fcf4913:1",
+            "primaryLocationStartColumnFingerprint": "29"
+          }
+        },
+        {
+          "ruleId": "java/json-sanitizer-escape-sequences",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/json-sanitizer-escape-sequences",
+            "index": 0
+          },
+          "message": {
+            "text": "Line 520: '\\u2028'"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/google/json/JsonSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 520,
+                  "startColumn": 42,
+                  "endColumn": 51
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "a32f5b6973c32934:1",
+            "primaryLocationStartColumnFingerprint": "33"
+          }
+        },
+        {
+          "ruleId": "java/json-sanitizer-escape-sequences",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/json-sanitizer-escape-sequences",
+            "index": 0
+          },
+          "message": {
+            "text": "Line 521: '\\u2029'"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/google/json/JsonSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 521,
+                  "startColumn": 42,
+                  "endColumn": 51
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "857ca68d49c3637c:1",
+            "primaryLocationStartColumnFingerprint": "33"
+          }
+        },
+        {
+          "ruleId": "java/json-sanitizer-escape-sequences",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/json-sanitizer-escape-sequences",
+            "index": 0
+          },
+          "message": {
+            "text": "Line 559: '\\u005d'"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/google/json/JsonSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 559,
+                  "startColumn": 31,
+                  "endColumn": 40
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "5fdb17026fdf0215:1",
+            "primaryLocationStartColumnFingerprint": "18"
+          }
+        },
+        {
+          "ruleId": "java/json-sanitizer-escape-sequences",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/json-sanitizer-escape-sequences",
+            "index": 0
+          },
+          "message": {
+            "text": "Line 575: '\\u0008'"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/google/json/JsonSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 575,
+                  "startColumn": 33,
+                  "endColumn": 42
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "9b23f7fc7bb1ac7e:1",
+            "primaryLocationStartColumnFingerprint": "18"
+          }
+        },
+        {
+          "ruleId": "java/json-sanitizer-escape-sequences",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/json-sanitizer-escape-sequences",
+            "index": 0
+          },
+          "message": {
+            "text": "Line 580: '\\u00'"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/google/json/JsonSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 580,
+                  "startColumn": 35,
+                  "endColumn": 42
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "bff665abc24fa5a1:1",
+            "primaryLocationStartColumnFingerprint": "18"
+          }
+        },
+        {
+          "ruleId": "java/json-sanitizer-escape-sequences",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/json-sanitizer-escape-sequences",
+            "index": 0
+          },
+          "message": {
+            "text": "Line 606: 'u00'"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/google/json/JsonSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 606,
+                  "startColumn": 42,
+                  "endColumn": 47
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "6fb9696e42640733:1",
+            "primaryLocationStartColumnFingerprint": "25"
+          }
+        },
+        {
+          "ruleId": "java/json-sanitizer-escape-sequences",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/json-sanitizer-escape-sequences",
+            "index": 0
+          },
+          "message": {
+            "text": "Line 637: '\\u'"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/google/json/JsonSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 637,
+                  "startColumn": 29,
+                  "endColumn": 34
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "2c2cf33572b1d5f4:1",
+            "primaryLocationStartColumnFingerprint": "18"
+          }
+        }
+      ]
+    },
+    {
+      "codeql_query_uuid": "20260403001252",
+      "codeql_raw_query": "/**\n * @name Check EvalMinifier for script-breaking sequences\n * @description EvalMinifier wraps JSON in JavaScript eval context - check if it handles </script> and <!-- sequences\n * @kind problem\n * @problem.severity error\n * @id java/evalminifier-script-injection\n * @tags security\n *       external/cwe/cwe-079\n *       external/cwe/cwe-116\n */\n\nimport java\n\nfrom StringLiteral sl, CompilationUnit cu\nwhere\n  cu = sl.getCompilationUnit() and\n  cu.getPackage().hasName(\"com.google.json\") and\n  cu.getName() = \"EvalMinifier\" and\n  sl.getLocation().getStartLine() >= 210 and\n  sl.getLocation().getStartLine() <= 256\nselect sl, \"EvalMinifier line \" + sl.getLocation().getStartLine() + \": '\" + sl.getValue() + \"'\"\n",
+      "hypothesis": "EvalMinifier wraps content in JavaScript eval - check if output handles script-breaking sequences",
+      "severity": "critical",
+      "cwe_ids": [],
+      "results_count": 5,
+      "results": [
+        {
+          "ruleId": "java/evalminifier-script-injection",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/evalminifier-script-injection",
+            "index": 0
+          },
+          "message": {
+            "text": "EvalMinifier line 219: '(function('"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/google/json/EvalMinifier.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 219,
+                  "startColumn": 45,
+                  "endColumn": 57
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "b368abf2779aa1a1:1",
+            "primaryLocationStartColumnFingerprint": "42"
+          }
+        },
+        {
+          "ruleId": "java/evalminifier-script-injection",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/evalminifier-script-injection",
+            "index": 0
+          },
+          "message": {
+            "text": "EvalMinifier line 220: '){{return'"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/google/json/EvalMinifier.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 220,
+                  "startColumn": 45,
+                  "endColumn": 55
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "716658d6a70aa2c3:1",
+            "primaryLocationStartColumnFingerprint": "42"
+          }
+        },
+        {
+          "ruleId": "java/evalminifier-script-injection",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/evalminifier-script-injection",
+            "index": 0
+          },
+          "message": {
+            "text": "EvalMinifier line 221: '}}('"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/google/json/EvalMinifier.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 221,
+                  "startColumn": 45,
+                  "endColumn": 49
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "d95ad5e2fc42fba4:1",
+            "primaryLocationStartColumnFingerprint": "42"
+          }
+        },
+        {
+          "ruleId": "java/evalminifier-script-injection",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/evalminifier-script-injection",
+            "index": 0
+          },
+          "message": {
+            "text": "EvalMinifier line 222: '))'"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/google/json/EvalMinifier.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 222,
+                  "startColumn": 45,
+                  "endColumn": 49
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "320f8243b9b969fc:1",
+            "primaryLocationStartColumnFingerprint": "42"
+          }
+        },
+        {
+          "ruleId": "java/evalminifier-script-injection",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/evalminifier-script-injection",
+            "index": 0
+          },
+          "message": {
+            "text": "EvalMinifier line 226: ',,'"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/google/json/EvalMinifier.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 226,
+                  "startColumn": 48,
+                  "endColumn": 52
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "49167634981eff34:1",
+            "primaryLocationStartColumnFingerprint": "45"
+          }
+        }
+      ]
+    },
+    {
+      "codeql_query_uuid": "20260403001319",
+      "codeql_raw_query": "/**\n * @name Look for missing </script> and <!-- escaping in JsonSanitizer\n * @description Check if the sanitizer properly handles </script> and <!-- sequences in string values\n * @kind problem\n * @problem.severity error\n * @id java/json-sanitizer-script-tag-bypass\n * @tags security\n *       external/cwe/cwe-079\n *       external/cwe/cwe-116\n */\n\nimport java\n\n// Look at string literals around lines 540-580 where < and > are handled\nfrom StringLiteral sl, CompilationUnit cu\nwhere\n  cu = sl.getCompilationUnit() and\n  cu.getPackage().hasName(\"com.google.json\") and\n  cu.getName() = \"JsonSanitizer\" and\n  sl.getLocation().getStartLine() >= 540 and\n  sl.getLocation().getStartLine() <= 600\nselect sl, \"Line \" + sl.getLocation().getStartLine() + \": '\" + sl.getValue() + \"'\"\n",
+      "hypothesis": "Check if </script> and <!-- sequences are escaped in the angle bracket handling logic around lines 540-600",
+      "severity": "critical",
+      "cwe_ids": [],
+      "results_count": 3,
+      "results": [
+        {
+          "ruleId": "java/json-sanitizer-script-tag-bypass",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/json-sanitizer-script-tag-bypass",
+            "index": 0
+          },
+          "message": {
+            "text": "Line 559: '\\u005d'"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/google/json/JsonSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 559,
+                  "startColumn": 31,
+                  "endColumn": 40
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "5fdb17026fdf0215:1",
+            "primaryLocationStartColumnFingerprint": "18"
+          }
+        },
+        {
+          "ruleId": "java/json-sanitizer-script-tag-bypass",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/json-sanitizer-script-tag-bypass",
+            "index": 0
+          },
+          "message": {
+            "text": "Line 575: '\\u0008'"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/google/json/JsonSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 575,
+                  "startColumn": 33,
+                  "endColumn": 42
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "9b23f7fc7bb1ac7e:1",
+            "primaryLocationStartColumnFingerprint": "18"
+          }
+        },
+        {
+          "ruleId": "java/json-sanitizer-script-tag-bypass",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/json-sanitizer-script-tag-bypass",
+            "index": 0
+          },
+          "message": {
+            "text": "Line 580: '\\u00'"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/google/json/JsonSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 580,
+                  "startColumn": 35,
+                  "endColumn": 42
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "bff665abc24fa5a1:1",
+            "primaryLocationStartColumnFingerprint": "18"
+          }
+        }
+      ]
+    },
+    {
+      "codeql_query_uuid": "20260403001419",
+      "codeql_raw_query": "/**\n * @name JsonSanitizer output can contain unescaped HTML - look for direct char output\n * @description Check if characters are written to output without going through escape logic\n * @kind problem\n * @problem.severity error\n * @id java/json-sanitizer-direct-char-output\n * @tags security\n *       external/cwe/cwe-079\n *       external/cwe/cwe-116\n */\n\nimport java\n\n// Look at what happens at the insert operations (lines 1031, 1038, 1058) \n// and the append at lines 1014, 1023 - these may be fixing up the output\nfrom MethodCall mc, CompilationUnit cu\nwhere\n  cu = mc.getCompilationUnit() and\n  cu.getPackage().hasName(\"com.google.json\") and\n  cu.getName() = \"JsonSanitizer\" and\n  (\n    mc.getMethod().hasName(\"insert\") or\n    mc.getMethod().hasName(\"append\") or\n    mc.getMethod().hasName(\"replace\") or\n    mc.getMethod().hasName(\"delete\") or\n    mc.getMethod().hasName(\"deleteCharAt\")\n  ) and\n  mc.getMethod().getDeclaringType().hasQualifiedName(\"java.lang\", \"StringBuilder\") and\n  mc.getLocation().getStartLine() >= 1000 and\n  mc.getLocation().getStartLine() <= 1120\nselect mc, \"SB operation at line \" + mc.getLocation().getStartLine() + \": \" + mc.getMethod().getName() + \"(\" + mc.getArgument(0).toString() + \")\"\n",
+      "hypothesis": "Check insert/append operations in post-processing section of JsonSanitizer for unescaped output patterns",
+      "severity": "high",
+      "cwe_ids": [],
+      "results_count": 9,
+      "results": [
+        {
+          "ruleId": "java/json-sanitizer-direct-char-output",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/json-sanitizer-direct-char-output",
+            "index": 0
+          },
+          "message": {
+            "text": "SB operation at line 1014: append('0')"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/google/json/JsonSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 1014,
+                  "startColumn": 7,
+                  "endColumn": 32
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "5ea943a929a3b37a:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "java/json-sanitizer-direct-char-output",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/json-sanitizer-direct-char-output",
+            "index": 0
+          },
+          "message": {
+            "text": "SB operation at line 1023: append('0')"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/google/json/JsonSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 1023,
+                  "startColumn": 9,
+                  "endColumn": 34
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "850ce3d151682136:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "java/json-sanitizer-direct-char-output",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/json-sanitizer-direct-char-output",
+            "index": 0
+          },
+          "message": {
+            "text": "SB operation at line 1031: insert(... + ...)"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/google/json/JsonSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 1031,
+                  "startColumn": 7,
+                  "endColumn": 46
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "3fa23b83618bf90f:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "java/json-sanitizer-direct-char-output",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/json-sanitizer-direct-char-output",
+            "index": 0
+          },
+          "message": {
+            "text": "SB operation at line 1038: insert(intStart)"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/google/json/JsonSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 1038,
+                  "startColumn": 7,
+                  "endColumn": 69
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "f34d5cf21bfb719c:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "java/json-sanitizer-direct-char-output",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/json-sanitizer-direct-char-output",
+            "index": 0
+          },
+          "message": {
+            "text": "SB operation at line 1058: insert(... + ...)"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/google/json/JsonSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 1058,
+                  "startColumn": 9,
+                  "endColumn": 48
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "2f7c92ec670bb8c2:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "java/json-sanitizer-direct-char-output",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/json-sanitizer-direct-char-output",
+            "index": 0
+          },
+          "message": {
+            "text": "SB operation at line 1061: append(abs(...))"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/google/json/JsonSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 1061,
+                  "startColumn": 7,
+                  "endLine": 1062,
+                  "endColumn": 36
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "bec1286ed4aed68f:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "java/json-sanitizer-direct-char-output",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/json-sanitizer-direct-char-output",
+            "index": 0
+          },
+          "message": {
+            "text": "SB operation at line 1061: append(...?...:...)"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/google/json/JsonSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 1061,
+                  "startColumn": 7,
+                  "endColumn": 63
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "bec1286ed4aed68f:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "java/json-sanitizer-direct-char-output",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/json-sanitizer-direct-char-output",
+            "index": 0
+          },
+          "message": {
+            "text": "SB operation at line 1061: append('e')"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/google/json/JsonSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 1061,
+                  "startColumn": 7,
+                  "endColumn": 32
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "bec1286ed4aed68f:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "java/json-sanitizer-direct-char-output",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/json-sanitizer-direct-char-output",
+            "index": 0
+          },
+          "message": {
+            "text": "SB operation at line 1107: append(... + ...)"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/google/json/JsonSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 1107,
+                  "startColumn": 7,
+                  "endColumn": 71
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "cafd0e3c19e3efea:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        }
+      ]
+    },
+    {
+      "codeql_query_uuid": "20260403001511",
+      "codeql_raw_query": "/**\n * @name Find methods that check for script-breaking sequences\n * @description Check if JsonSanitizer has any logic to detect/escape </script> or <!-- sequences\n * @kind problem\n * @problem.severity error\n * @id java/json-sanitizer-script-break-check\n * @tags security\n *       external/cwe/cwe-079\n *       external/cwe/cwe-116\n */\n\nimport java\n\n// Look for any string comparisons or indexOf/contains calls for dangerous HTML sequences\nfrom MethodCall mc, CompilationUnit cu\nwhere\n  cu = mc.getCompilationUnit() and\n  cu.getPackage().hasName(\"com.google.json\") and\n  (\n    mc.getMethod().hasName(\"indexOf\") or\n    mc.getMethod().hasName(\"contains\") or\n    mc.getMethod().hasName(\"startsWith\") or\n    mc.getMethod().hasName(\"endsWith\") or\n    mc.getMethod().hasName(\"matches\") or\n    mc.getMethod().hasName(\"regionMatches\")\n  ) and\n  mc.getMethod().getDeclaringType().getASupertype*().hasQualifiedName(\"java.lang\", \"CharSequence\")\nselect mc, \"String search at line \" + mc.getLocation().getStartLine() + \" in \" + cu.getName() + \": \" + mc.getMethod().getName() + \"(\" + mc.getArgument(0).toString() + \")\"\n",
+      "hypothesis": "Check if the sanitizer searches for dangerous HTML sequences like </script> or <!-- in the input",
+      "severity": "critical",
+      "cwe_ids": [],
+      "results_count": 5,
+      "results": [
+        {
+          "ruleId": "java/json-sanitizer-script-break-check",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/json-sanitizer-script-break-check",
+            "index": 0
+          },
+          "message": {
+            "text": "String search at line 354 in JsonSanitizer: indexOf('/')"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/google/json/JsonSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 354,
+                  "startColumn": 31,
+                  "endColumn": 58
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "edcc32dc10f3433:1",
+            "primaryLocationStartColumnFingerprint": "5"
+          }
+        },
+        {
+          "ruleId": "java/json-sanitizer-script-break-check",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/json-sanitizer-script-break-check",
+            "index": 0
+          },
+          "message": {
+            "text": "String search at line 713 in JsonSanitizer: indexOf(quote)"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/google/json/JsonSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 713,
+                  "startColumn": 30,
+                  "endColumn": 53
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "b3f74694a0b1ea92:1",
+            "primaryLocationStartColumnFingerprint": "25"
+          }
+        },
+        {
+          "ruleId": "java/json-sanitizer-script-break-check",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/json-sanitizer-script-break-check",
+            "index": 0
+          },
+          "message": {
+            "text": "String search at line 1070 in JsonSanitizer: regionMatches(0)"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/google/json/JsonSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 1070,
+                  "startColumn": 14,
+                  "endColumn": 57
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "95b1cc8f6a2d2f99:1",
+            "primaryLocationStartColumnFingerprint": "7"
+          }
+        },
+        {
+          "ruleId": "java/json-sanitizer-script-break-check",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/json-sanitizer-script-break-check",
+            "index": 0
+          },
+          "message": {
+            "text": "String search at line 1072 in JsonSanitizer: regionMatches(0)"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/google/json/JsonSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 1072,
+                  "startColumn": 14,
+                  "endColumn": 56
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "a10c338fec21fc8c:1",
+            "primaryLocationStartColumnFingerprint": "7"
+          }
+        },
+        {
+          "ruleId": "java/json-sanitizer-script-break-check",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/json-sanitizer-script-break-check",
+            "index": 0
+          },
+          "message": {
+            "text": "String search at line 1073 in JsonSanitizer: regionMatches(0)"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/google/json/JsonSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 1073,
+                  "startColumn": 14,
+                  "endColumn": 56
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "50ed90a783d79a29:1",
+            "primaryLocationStartColumnFingerprint": "3"
+          }
+        }
+      ]
+    },
+    {
+      "codeql_query_uuid": "20260403001538",
+      "codeql_raw_query": "/**\n * @name Find all fields in JsonSanitizer that represent the output buffer\n * @description Examine the output buffer fields to understand what gets written to output\n * @kind problem\n * @problem.severity warning\n * @id java/json-sanitizer-fields\n * @tags security\n *       external/cwe/cwe-079\n */\n\nimport java\n\nfrom Field f, CompilationUnit cu\nwhere\n  cu = f.getCompilationUnit() and\n  cu.getPackage().hasName(\"com.google.json\") and\n  cu.getName() = \"JsonSanitizer\"\nselect f, \"Field: \" + f.getType().getName() + \" \" + f.getName() + \" at line \" + f.getLocation().getStartLine()\n",
+      "hypothesis": "Understand the data model of JsonSanitizer - what fields hold the output buffer and sanitized state",
+      "severity": "medium",
+      "cwe_ids": [],
+      "results_count": 20,
+      "results": [
+        {
+          "ruleId": "java/json-sanitizer-fields",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/json-sanitizer-fields",
+            "index": 0
+          },
+          "message": {
+            "text": "Field: State AFTER_VALUE at line 155"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/google/json/JsonSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 155,
+                  "startColumn": 5,
+                  "endColumn": 16
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "4a9dd06e4bd47278:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "java/json-sanitizer-fields",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/json-sanitizer-fields",
+            "index": 0
+          },
+          "message": {
+            "text": "Field: State BEFORE_VALUE at line 150"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/google/json/JsonSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 150,
+                  "startColumn": 5,
+                  "endColumn": 17
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "2f693c15ac18c22b:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "java/json-sanitizer-fields",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/json-sanitizer-fields",
+            "index": 0
+          },
+          "message": {
+            "text": "Field: State AFTER_KEY at line 148"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/google/json/JsonSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 148,
+                  "startColumn": 5,
+                  "endColumn": 14
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "9c4e0b5d8c0a2232:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "java/json-sanitizer-fields",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/json-sanitizer-fields",
+            "index": 0
+          },
+          "message": {
+            "text": "Field: State BEFORE_KEY at line 146"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/google/json/JsonSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 146,
+                  "startColumn": 5,
+                  "endColumn": 15
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "6ac0cfdc92d345ee:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "java/json-sanitizer-fields",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/json-sanitizer-fields",
+            "index": 0
+          },
+          "message": {
+            "text": "Field: State START_MAP at line 144"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/google/json/JsonSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 144,
+                  "startColumn": 5,
+                  "endColumn": 14
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "8fa3619d4072c18f:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "java/json-sanitizer-fields",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/json-sanitizer-fields",
+            "index": 0
+          },
+          "message": {
+            "text": "Field: State AFTER_ELEMENT at line 142"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/google/json/JsonSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 142,
+                  "startColumn": 5,
+                  "endColumn": 18
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "ce2b3b380a5412c0:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "java/json-sanitizer-fields",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/json-sanitizer-fields",
+            "index": 0
+          },
+          "message": {
+            "text": "Field: State BEFORE_ELEMENT at line 137"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/google/json/JsonSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 137,
+                  "startColumn": 5,
+                  "endColumn": 19
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "f6d99ed189476f11:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "java/json-sanitizer-fields",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/json-sanitizer-fields",
+            "index": 0
+          },
+          "message": {
+            "text": "Field: State START_ARRAY at line 135"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/google/json/JsonSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 135,
+                  "startColumn": 5,
+                  "endColumn": 16
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "7b4da7bb12b40d0d:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "java/json-sanitizer-fields",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/json-sanitizer-fields",
+            "index": 0
+          },
+          "message": {
+            "text": "Field: int MAXIMUM_NESTING_DEPTH at line 99"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/google/json/JsonSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 99,
+                  "startColumn": 27,
+                  "endColumn": 48
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "ec87dcedfd962d88:1",
+            "primaryLocationStartColumnFingerprint": "24"
+          }
+        },
+        {
+          "ruleId": "java/json-sanitizer-fields",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/json-sanitizer-fields",
+            "index": 0
+          },
+          "message": {
+            "text": "Field: int DEFAULT_NESTING_DEPTH at line 96"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/google/json/JsonSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 96,
+                  "startColumn": 27,
+                  "endColumn": 48
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "f70429625d4bf474:1",
+            "primaryLocationStartColumnFingerprint": "24"
+          }
+        },
+        {
+          "ruleId": "java/json-sanitizer-fields",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/json-sanitizer-fields",
+            "index": 0
+          },
+          "message": {
+            "text": "Field: char\\[\\] HEX_DIGITS at line 1145"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/google/json/JsonSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 1145,
+                  "startColumn": 31,
+                  "endColumn": 41
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "3a9c2c311350383f:1",
+            "primaryLocationStartColumnFingerprint": "28"
+          }
+        },
+        {
+          "ruleId": "java/json-sanitizer-fields",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/json-sanitizer-fields",
+            "index": 0
+          },
+          "message": {
+            "text": "Field: UnbracketedComma UNBRACKETED_COMMA at line 1130"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/google/json/JsonSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 1130,
+                  "startColumn": 41,
+                  "endColumn": 58
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "d582069032d2b0f2:1",
+            "primaryLocationStartColumnFingerprint": "38"
+          }
+        },
+        {
+          "ruleId": "java/json-sanitizer-fields",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/json-sanitizer-fields",
+            "index": 0
+          },
+          "message": {
+            "text": "Field: boolean SUPER_VERBOSE_AND_SLOW_LOGGING at line 189"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/google/json/JsonSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 189,
+                  "startColumn": 32,
+                  "endColumn": 62
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "bc37b5bb0b258678:1",
+            "primaryLocationStartColumnFingerprint": "29"
+          }
+        },
+        {
+          "ruleId": "java/json-sanitizer-fields",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/json-sanitizer-fields",
+            "index": 0
+          },
+          "message": {
+            "text": "Field: int cleaned at line 187"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/google/json/JsonSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 187,
+                  "startColumn": 15,
+                  "endColumn": 22
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "85fa40e5790a7297:1",
+            "primaryLocationStartColumnFingerprint": "12"
+          }
+        },
+        {
+          "ruleId": "java/json-sanitizer-fields",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/json-sanitizer-fields",
+            "index": 0
+          },
+          "message": {
+            "text": "Field: StringBuilder sanitizedJson at line 182"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/google/json/JsonSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 182,
+                  "startColumn": 25,
+                  "endColumn": 38
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "9ab3d1ce76de8357:1",
+            "primaryLocationStartColumnFingerprint": "22"
+          }
+        },
+        {
+          "ruleId": "java/json-sanitizer-fields",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/json-sanitizer-fields",
+            "index": 0
+          },
+          "message": {
+            "text": "Field: boolean\\[\\] isMap at line 175"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/google/json/JsonSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 175,
+                  "startColumn": 21,
+                  "endColumn": 26
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "ee41d7ebf562a56d:1",
+            "primaryLocationStartColumnFingerprint": "18"
+          }
+        },
+        {
+          "ruleId": "java/json-sanitizer-fields",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/json-sanitizer-fields",
+            "index": 0
+          },
+          "message": {
+            "text": "Field: int bracketDepth at line 170"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/google/json/JsonSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 170,
+                  "startColumn": 15,
+                  "endColumn": 27
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "767d9f5e62b8f089:1",
+            "primaryLocationStartColumnFingerprint": "12"
+          }
+        },
+        {
+          "ruleId": "java/json-sanitizer-fields",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/json-sanitizer-fields",
+            "index": 0
+          },
+          "message": {
+            "text": "Field: String jsonish at line 164"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/google/json/JsonSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 164,
+                  "startColumn": 24,
+                  "endColumn": 31
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "792e80dca0bf2cea:1",
+            "primaryLocationStartColumnFingerprint": "21"
+          }
+        },
+        {
+          "ruleId": "java/json-sanitizer-fields",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/json-sanitizer-fields",
+            "index": 0
+          },
+          "message": {
+            "text": "Field: int maximumNestingDepth at line 162"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/google/json/JsonSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 162,
+                  "startColumn": 21,
+                  "endColumn": 40
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "e933b8a10300c8cd:1",
+            "primaryLocationStartColumnFingerprint": "18"
+          }
+        },
+        {
+          "ruleId": "java/json-sanitizer-fields",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/json-sanitizer-fields",
+            "index": 0
+          },
+          "message": {
+            "text": "Field: long serialVersionUID at line 1113"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/google/json/JsonSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 1113,
+                  "startColumn": 31,
+                  "endColumn": 47
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "7a71b6040cb39a27:1",
+            "primaryLocationStartColumnFingerprint": "26"
+          }
+        }
+      ]
+    },
+    {
+      "codeql_query_uuid": "20260403001621",
+      "codeql_raw_query": "/**\n * @name Examine post-processing region matching logic in JsonSanitizer\n * @description Look at regionMatches calls at lines 1070-1073 to understand what sequences are being checked\n * @kind problem\n * @problem.severity error\n * @id java/json-sanitizer-region-matches\n * @tags security\n *       external/cwe/cwe-079\n *       external/cwe/cwe-116\n */\n\nimport java\n\n// Get the full context of the regionMatches calls and surrounding code\nfrom MethodCall mc, CompilationUnit cu\nwhere\n  cu = mc.getCompilationUnit() and\n  cu.getPackage().hasName(\"com.google.json\") and\n  cu.getName() = \"JsonSanitizer\" and\n  mc.getLocation().getStartLine() >= 1060 and\n  mc.getLocation().getStartLine() <= 1115\nselect mc, \"Call at line \" + mc.getLocation().getStartLine() + \": \" + mc.getMethod().getDeclaringType().getName() + \".\" + mc.getMethod().getName() + \"(\" + \n  concat(Expr arg, int i | arg = mc.getArgument(i) | arg.toString(), \", \" order by i) + \")\"\n",
+      "hypothesis": "Examine what HTML sequences are being checked/replaced in the post-processing section - key for XSS bypass detection",
+      "severity": "critical",
+      "cwe_ids": [],
+      "results_count": 11,
+      "results": [
+        {
+          "ruleId": "java/json-sanitizer-region-matches",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/json-sanitizer-region-matches",
+            "index": 0
+          },
+          "message": {
+            "text": "Call at line 1061: StringBuilder.append(abs(...))"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/google/json/JsonSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 1061,
+                  "startColumn": 7,
+                  "endLine": 1062,
+                  "endColumn": 36
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "bec1286ed4aed68f:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "java/json-sanitizer-region-matches",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/json-sanitizer-region-matches",
+            "index": 0
+          },
+          "message": {
+            "text": "Call at line 1061: StringBuilder.append(...?...:...)"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/google/json/JsonSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 1061,
+                  "startColumn": 7,
+                  "endColumn": 63
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "bec1286ed4aed68f:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "java/json-sanitizer-region-matches",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/json-sanitizer-region-matches",
+            "index": 0
+          },
+          "message": {
+            "text": "Call at line 1062: Math.abs(nLess1)"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/google/json/JsonSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 1062,
+                  "startColumn": 19,
+                  "endColumn": 35
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "c4f3e7a85771cc93:1",
+            "primaryLocationStartColumnFingerprint": "8"
+          }
+        },
+        {
+          "ruleId": "java/json-sanitizer-region-matches",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/json-sanitizer-region-matches",
+            "index": 0
+          },
+          "message": {
+            "text": "Call at line 1061: StringBuilder.append('e')"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/google/json/JsonSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 1061,
+                  "startColumn": 7,
+                  "endColumn": 32
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "bec1286ed4aed68f:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "java/json-sanitizer-region-matches",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/json-sanitizer-region-matches",
+            "index": 0
+          },
+          "message": {
+            "text": "Call at line 1070: String.regionMatches(0, jsonish, start, n)"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/google/json/JsonSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 1070,
+                  "startColumn": 14,
+                  "endColumn": 57
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "95b1cc8f6a2d2f99:1",
+            "primaryLocationStartColumnFingerprint": "7"
+          }
+        },
+        {
+          "ruleId": "java/json-sanitizer-region-matches",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/json-sanitizer-region-matches",
+            "index": 0
+          },
+          "message": {
+            "text": "Call at line 1072: String.regionMatches(0, jsonish, start, n)"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/google/json/JsonSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 1072,
+                  "startColumn": 14,
+                  "endColumn": 56
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "a10c338fec21fc8c:1",
+            "primaryLocationStartColumnFingerprint": "7"
+          }
+        },
+        {
+          "ruleId": "java/json-sanitizer-region-matches",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/json-sanitizer-region-matches",
+            "index": 0
+          },
+          "message": {
+            "text": "Call at line 1073: String.regionMatches(0, jsonish, start, n)"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/google/json/JsonSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 1073,
+                  "startColumn": 14,
+                  "endColumn": 56
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "50ed90a783d79a29:1",
+            "primaryLocationStartColumnFingerprint": "3"
+          }
+        },
+        {
+          "ruleId": "java/json-sanitizer-region-matches",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/json-sanitizer-region-matches",
+            "index": 0
+          },
+          "message": {
+            "text": "Call at line 1079: String.charAt(i)"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/google/json/JsonSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 1079,
+                  "startColumn": 15,
+                  "endColumn": 32
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "aae18d3db82d7dea:1",
+            "primaryLocationStartColumnFingerprint": "10"
+          }
+        },
+        {
+          "ruleId": "java/json-sanitizer-region-matches",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/json-sanitizer-region-matches",
+            "index": 0
+          },
+          "message": {
+            "text": "Call at line 1084: String.charAt(i)"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/google/json/JsonSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 1084,
+                  "startColumn": 15,
+                  "endColumn": 32
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "99e419e8c61d159b:1",
+            "primaryLocationStartColumnFingerprint": "10"
+          }
+        },
+        {
+          "ruleId": "java/json-sanitizer-region-matches",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/json-sanitizer-region-matches",
+            "index": 0
+          },
+          "message": {
+            "text": "Call at line 1091: String.charAt(i)"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/google/json/JsonSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 1091,
+                  "startColumn": 15,
+                  "endColumn": 32
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "b5fc3c04886bc439:1",
+            "primaryLocationStartColumnFingerprint": "10"
+          }
+        },
+        {
+          "ruleId": "java/json-sanitizer-region-matches",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/json-sanitizer-region-matches",
+            "index": 0
+          },
+          "message": {
+            "text": "Call at line 1107: StringBuilder.append(... + ...)"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/google/json/JsonSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 1107,
+                  "startColumn": 7,
+                  "endColumn": 71
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "cafd0e3c19e3efea:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        }
+      ]
+    },
+    {
+      "codeql_query_uuid": "20260403001647",
+      "codeql_raw_query": "/**\n * @name Find string literals in post-processing section of JsonSanitizer\n * @description Look at string literals around lines 1060-1120 to understand what dangerous sequences are replaced\n * @kind problem\n * @problem.severity error\n * @id java/json-sanitizer-postprocess-strings\n * @tags security\n *       external/cwe/cwe-079\n *       external/cwe/cwe-116\n */\n\nimport java\n\nfrom StringLiteral sl, CompilationUnit cu\nwhere\n  cu = sl.getCompilationUnit() and\n  cu.getPackage().hasName(\"com.google.json\") and\n  cu.getName() = \"JsonSanitizer\" and\n  sl.getLocation().getStartLine() >= 1050 and\n  sl.getLocation().getStartLine() <= 1120\nselect sl, \"Line \" + sl.getLocation().getStartLine() + \": '\" + sl.getValue() + \"'\"\n",
+      "hypothesis": "Understand what string sequences are being checked in the post-processing escape logic",
+      "severity": "critical",
+      "cwe_ids": [],
+      "results_count": 3,
+      "results": [
+        {
+          "ruleId": "java/json-sanitizer-postprocess-strings",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/json-sanitizer-postprocess-strings",
+            "index": 0
+          },
+          "message": {
+            "text": "Line 1070: 'false'"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/google/json/JsonSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 1070,
+                  "startColumn": 14,
+                  "endColumn": 21
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "95b1cc8f6a2d2f99:1",
+            "primaryLocationStartColumnFingerprint": "7"
+          }
+        },
+        {
+          "ruleId": "java/json-sanitizer-postprocess-strings",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/json-sanitizer-postprocess-strings",
+            "index": 0
+          },
+          "message": {
+            "text": "Line 1072: 'null'"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/google/json/JsonSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 1072,
+                  "startColumn": 14,
+                  "endColumn": 20
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "a10c338fec21fc8c:1",
+            "primaryLocationStartColumnFingerprint": "7"
+          }
+        },
+        {
+          "ruleId": "java/json-sanitizer-postprocess-strings",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/json-sanitizer-postprocess-strings",
+            "index": 0
+          },
+          "message": {
+            "text": "Line 1073: 'true'"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/google/json/JsonSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 1073,
+                  "startColumn": 14,
+                  "endColumn": 20
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "50ed90a783d79a29:1",
+            "primaryLocationStartColumnFingerprint": "3"
+          }
+        }
+      ]
+    },
+    {
+      "codeql_query_uuid": "20260403001915",
+      "codeql_raw_query": "/**\n * @name Check if JsonSanitizer sanitize() uses appendReplacement for HTML escaping \n * @description Look for key replacement strings that would indicate HTML escaping\n * @kind problem\n * @problem.severity error\n * @id java/json-sanitizer-replacement-strings\n * @tags security\n *       external/cwe/cwe-079\n *       external/cwe/cwe-116\n */\n\nimport java\n\n// Check for string literals that look like HTML entities or JS escape sequences for < and >\nfrom StringLiteral sl, CompilationUnit cu\nwhere\n  cu = sl.getCompilationUnit() and\n  cu.getPackage().hasName(\"com.google.json\") and\n  (\n    sl.getValue() = \"\\\\u003c\" or\n    sl.getValue() = \"\\\\u003e\" or\n    sl.getValue() = \"\\\\u0026\" or\n    sl.getValue() = \"&lt;\" or\n    sl.getValue() = \"&gt;\" or\n    sl.getValue() = \"&amp;\" or\n    sl.getValue() = \"\\\\u003C\" or\n    sl.getValue() = \"\\\\u003E\" or\n    sl.getValue().matches(\"%003c%\") or\n    sl.getValue().matches(\"%003e%\") or\n    sl.getValue().matches(\"%003C%\") or\n    sl.getValue().matches(\"%003E%\") or\n    sl.getValue().matches(\"%lt;%\") or\n    sl.getValue().matches(\"%gt;%\") or\n    sl.getValue().matches(\"%amp;%\") or\n    sl.getValue() = \"<\\\\/script>\" or\n    sl.getValue().matches(\"%script%\") or\n    sl.getValue().matches(\"%!--%\") or\n    sl.getValue().matches(\"%CDATA%\")\n  )\nselect sl, \"Replacement/escape string at line \" + sl.getLocation().getStartLine() + \" in \" + cu.getName() + \": '\" + sl.getValue() + \"'\"\n",
+      "hypothesis": "Find if JsonSanitizer uses HTML entity encoding or unicode escaping for dangerous characters like < > &",
+      "severity": "critical",
+      "cwe_ids": [],
+      "results_count": 0,
+      "results": []
+    },
+    {
+      "codeql_query_uuid": "20260403002001",
+      "codeql_raw_query": "/**\n * @name Confirm absence of HTML encoding for < > & in JsonSanitizer output\n * @description Verify the sanitizer has no mechanism to escape HTML-significant characters\n * @kind problem\n * @problem.severity error\n * @id java/json-sanitizer-no-html-encoding\n * @tags security\n *       external/cwe/cwe-079\n *       external/cwe/cwe-116\n */\n\nimport java\n\n// Check for '/' case in the switch (line 547) and what '< >' case does\n// Look at what character is in the case at line 547 and what the conditions at 550-552 check\nfrom EQExpr eq, CompilationUnit cu\nwhere\n  cu = eq.getCompilationUnit() and\n  cu.getPackage().hasName(\"com.google.json\") and\n  cu.getName() = \"JsonSanitizer\" and\n  eq.getLocation().getStartLine() >= 548 and\n  eq.getLocation().getStartLine() <= 555\nselect eq, \"Equality check at line \" + eq.getLocation().getStartLine() + \": [\" + eq.getLeftOperand().toString() + \"] == [\" + eq.getRightOperand().toString() + \"]\"\n",
+      "hypothesis": "Confirm what conditions the '<' handling checks - verifying if it only escapes in specific contexts like </script>",
+      "severity": "critical",
+      "cwe_ids": [],
+      "results_count": 3,
+      "results": [
+        {
+          "ruleId": "java/json-sanitizer-no-html-encoding",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/json-sanitizer-no-html-encoding",
+            "index": 0
+          },
+          "message": {
+            "text": "Equality check at line 552: \\['c'\\] == \\[... | ...\\]"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/google/json/JsonSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 552,
+                  "startColumn": 18,
+                  "endColumn": 53
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "b84734840c845a47:1",
+            "primaryLocationStartColumnFingerprint": "3"
+          }
+        },
+        {
+          "ruleId": "java/json-sanitizer-no-html-encoding",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/json-sanitizer-no-html-encoding",
+            "index": 0
+          },
+          "message": {
+            "text": "Equality check at line 551: \\['s'\\] == \\[... | ...\\]"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/google/json/JsonSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 551,
+                  "startColumn": 18,
+                  "endColumn": 53
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "23cdb04d56f8db6b:1",
+            "primaryLocationStartColumnFingerprint": "3"
+          }
+        },
+        {
+          "ruleId": "java/json-sanitizer-no-html-encoding",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/json-sanitizer-no-html-encoding",
+            "index": 0
+          },
+          "message": {
+            "text": "Equality check at line 550: \\['<'\\] == \\[charAt(...)\\]"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/google/json/JsonSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 550,
+                  "startColumn": 43,
+                  "endColumn": 71
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "e7ed65ef5479299c:1",
+            "primaryLocationStartColumnFingerprint": "32"
+          }
+        }
+      ]
+    },
+    {
+      "codeql_query_uuid": "20260403002118",
+      "codeql_raw_query": "/**\n * @name XSS bypass via crafted JSON input that produces </script> or <!-- in output\n * @description Verify that the sanitizer's partial </script> check can be bypassed and <!-- is not handled\n * @kind problem\n * @problem.severity error\n * @id java/json-sanitizer-xss-bypass-confirmed\n * @tags security\n *       external/cwe/cwe-079\n *       external/cwe/cwe-116\n */\n\nimport java\n\n// Check for ALL character literals used in comparisons in the </script> checking logic (lines 547-565)\n// and see what exact patterns are being matched\nfrom Expr e, CompilationUnit cu\nwhere\n  cu = e.getCompilationUnit() and\n  cu.getPackage().hasName(\"com.google.json\") and\n  cu.getName() = \"JsonSanitizer\" and\n  e.getLocation().getStartLine() >= 547 and\n  e.getLocation().getStartLine() <= 565 and\n  (e instanceof CharacterLiteral or e instanceof StringLiteral or e instanceof IntegerLiteral)\nselect e, \"Literal at line \" + e.getLocation().getStartLine() + \": [\" + e.getType().getName() + \"] = '\" + e.toString() + \"'\"\n",
+      "hypothesis": "Confirm the exact characters being checked in the script tag bypass detection to identify if <!-- and other XSS vectors are unhandled",
+      "severity": "critical",
+      "cwe_ids": [],
+      "results_count": 22,
+      "results": [
+        {
+          "ruleId": "java/json-sanitizer-xss-bypass-confirmed",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/json-sanitizer-xss-bypass-confirmed",
+            "index": 0
+          },
+          "message": {
+            "text": "Literal at line 547: \\[char\\] = ''/''"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/google/json/JsonSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 547,
+                  "startColumn": 14,
+                  "endColumn": 17
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "3c45ffe4c47d79e9:1",
+            "primaryLocationStartColumnFingerprint": "5"
+          }
+        },
+        {
+          "ruleId": "java/json-sanitizer-xss-bypass-confirmed",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/json-sanitizer-xss-bypass-confirmed",
+            "index": 0
+          },
+          "message": {
+            "text": "Literal at line 550: \\[int\\] = '2'"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/google/json/JsonSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 550,
+                  "startColumn": 32,
+                  "endColumn": 33
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "e7ed65ef5479299c:1",
+            "primaryLocationStartColumnFingerprint": "21"
+          }
+        },
+        {
+          "ruleId": "java/json-sanitizer-xss-bypass-confirmed",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/json-sanitizer-xss-bypass-confirmed",
+            "index": 0
+          },
+          "message": {
+            "text": "Literal at line 550: \\[char\\] = ''<''"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/google/json/JsonSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 550,
+                  "startColumn": 43,
+                  "endColumn": 46
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "e7ed65ef5479299c:1",
+            "primaryLocationStartColumnFingerprint": "32"
+          }
+        },
+        {
+          "ruleId": "java/json-sanitizer-xss-bypass-confirmed",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/json-sanitizer-xss-bypass-confirmed",
+            "index": 0
+          },
+          "message": {
+            "text": "Literal at line 550: \\[int\\] = '1'"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/google/json/JsonSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 550,
+                  "startColumn": 69,
+                  "endColumn": 70
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "e7ed65ef5479299c:1",
+            "primaryLocationStartColumnFingerprint": "58"
+          }
+        },
+        {
+          "ruleId": "java/json-sanitizer-xss-bypass-confirmed",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/json-sanitizer-xss-bypass-confirmed",
+            "index": 0
+          },
+          "message": {
+            "text": "Literal at line 551: \\[char\\] = ''s''"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/google/json/JsonSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 551,
+                  "startColumn": 18,
+                  "endColumn": 21
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "23cdb04d56f8db6b:1",
+            "primaryLocationStartColumnFingerprint": "3"
+          }
+        },
+        {
+          "ruleId": "java/json-sanitizer-xss-bypass-confirmed",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/json-sanitizer-xss-bypass-confirmed",
+            "index": 0
+          },
+          "message": {
+            "text": "Literal at line 551: \\[int\\] = '32'"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/google/json/JsonSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 551,
+                  "startColumn": 50,
+                  "endColumn": 52
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "23cdb04d56f8db6b:1",
+            "primaryLocationStartColumnFingerprint": "35"
+          }
+        },
+        {
+          "ruleId": "java/json-sanitizer-xss-bypass-confirmed",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/json-sanitizer-xss-bypass-confirmed",
+            "index": 0
+          },
+          "message": {
+            "text": "Literal at line 551: \\[int\\] = '1'"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/google/json/JsonSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 551,
+                  "startColumn": 45,
+                  "endColumn": 46
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "23cdb04d56f8db6b:1",
+            "primaryLocationStartColumnFingerprint": "30"
+          }
+        },
+        {
+          "ruleId": "java/json-sanitizer-xss-bypass-confirmed",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/json-sanitizer-xss-bypass-confirmed",
+            "index": 0
+          },
+          "message": {
+            "text": "Literal at line 552: \\[char\\] = ''c''"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/google/json/JsonSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 552,
+                  "startColumn": 18,
+                  "endColumn": 21
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "b84734840c845a47:1",
+            "primaryLocationStartColumnFingerprint": "3"
+          }
+        },
+        {
+          "ruleId": "java/json-sanitizer-xss-bypass-confirmed",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/json-sanitizer-xss-bypass-confirmed",
+            "index": 0
+          },
+          "message": {
+            "text": "Literal at line 552: \\[int\\] = '32'"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/google/json/JsonSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 552,
+                  "startColumn": 50,
+                  "endColumn": 52
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "b84734840c845a47:1",
+            "primaryLocationStartColumnFingerprint": "35"
+          }
+        },
+        {
+          "ruleId": "java/json-sanitizer-xss-bypass-confirmed",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/json-sanitizer-xss-bypass-confirmed",
+            "index": 0
+          },
+          "message": {
+            "text": "Literal at line 552: \\[int\\] = '2'"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/google/json/JsonSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 552,
+                  "startColumn": 45,
+                  "endColumn": 46
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "b84734840c845a47:1",
+            "primaryLocationStartColumnFingerprint": "30"
+          }
+        },
+        {
+          "ruleId": "java/json-sanitizer-xss-bypass-confirmed",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/json-sanitizer-xss-bypass-confirmed",
+            "index": 0
+          },
+          "message": {
+            "text": "Literal at line 553: \\[char\\] = ''\\\\''"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/google/json/JsonSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 553,
+                  "startColumn": 23,
+                  "endColumn": 27
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "654b9f82e0067388:1",
+            "primaryLocationStartColumnFingerprint": "10"
+          }
+        },
+        {
+          "ruleId": "java/json-sanitizer-xss-bypass-confirmed",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/json-sanitizer-xss-bypass-confirmed",
+            "index": 0
+          },
+          "message": {
+            "text": "Literal at line 556: \\[char\\] = ''\\]''"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/google/json/JsonSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 556,
+                  "startColumn": 14,
+                  "endColumn": 17
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "2235fb040cbd57fd:1",
+            "primaryLocationStartColumnFingerprint": "5"
+          }
+        },
+        {
+          "ruleId": "java/json-sanitizer-xss-bypass-confirmed",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/json-sanitizer-xss-bypass-confirmed",
+            "index": 0
+          },
+          "message": {
+            "text": "Literal at line 557: \\[int\\] = '2'"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/google/json/JsonSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 557,
+                  "startColumn": 19,
+                  "endColumn": 20
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "6ef2884d5cd7bd17:1",
+            "primaryLocationStartColumnFingerprint": "8"
+          }
+        },
+        {
+          "ruleId": "java/json-sanitizer-xss-bypass-confirmed",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/json-sanitizer-xss-bypass-confirmed",
+            "index": 0
+          },
+          "message": {
+            "text": "Literal at line 557: \\[char\\] = ''\\]''"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/google/json/JsonSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 557,
+                  "startColumn": 30,
+                  "endColumn": 33
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "6ef2884d5cd7bd17:1",
+            "primaryLocationStartColumnFingerprint": "19"
+          }
+        },
+        {
+          "ruleId": "java/json-sanitizer-xss-bypass-confirmed",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/json-sanitizer-xss-bypass-confirmed",
+            "index": 0
+          },
+          "message": {
+            "text": "Literal at line 557: \\[int\\] = '1'"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/google/json/JsonSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 557,
+                  "startColumn": 56,
+                  "endColumn": 57
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "6ef2884d5cd7bd17:1",
+            "primaryLocationStartColumnFingerprint": "45"
+          }
+        },
+        {
+          "ruleId": "java/json-sanitizer-xss-bypass-confirmed",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/json-sanitizer-xss-bypass-confirmed",
+            "index": 0
+          },
+          "message": {
+            "text": "Literal at line 558: \\[char\\] = ''>''"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/google/json/JsonSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 558,
+                  "startColumn": 18,
+                  "endColumn": 21
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "d19cdebe5c7ab64b:1",
+            "primaryLocationStartColumnFingerprint": "3"
+          }
+        },
+        {
+          "ruleId": "java/json-sanitizer-xss-bypass-confirmed",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/json-sanitizer-xss-bypass-confirmed",
+            "index": 0
+          },
+          "message": {
+            "text": "Literal at line 558: \\[int\\] = '2'"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/google/json/JsonSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 558,
+                  "startColumn": 44,
+                  "endColumn": 45
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "d19cdebe5c7ab64b:1",
+            "primaryLocationStartColumnFingerprint": "29"
+          }
+        },
+        {
+          "ruleId": "java/json-sanitizer-xss-bypass-confirmed",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/json-sanitizer-xss-bypass-confirmed",
+            "index": 0
+          },
+          "message": {
+            "text": "Literal at line 559: \\[String\\] = '\"\\\\u005d\"'"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/google/json/JsonSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 559,
+                  "startColumn": 31,
+                  "endColumn": 40
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "5fdb17026fdf0215:1",
+            "primaryLocationStartColumnFingerprint": "18"
+          }
+        },
+        {
+          "ruleId": "java/json-sanitizer-xss-bypass-confirmed",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/json-sanitizer-xss-bypass-confirmed",
+            "index": 0
+          },
+          "message": {
+            "text": "Literal at line 559: \\[int\\] = '1'"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/google/json/JsonSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 559,
+                  "startColumn": 28,
+                  "endColumn": 29
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "5fdb17026fdf0215:1",
+            "primaryLocationStartColumnFingerprint": "15"
+          }
+        },
+        {
+          "ruleId": "java/json-sanitizer-xss-bypass-confirmed",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/json-sanitizer-xss-bypass-confirmed",
+            "index": 0
+          },
+          "message": {
+            "text": "Literal at line 563: \\[char\\] = ''\\\\''"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/google/json/JsonSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 563,
+                  "startColumn": 14,
+                  "endColumn": 18
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "21453173b77cf01b:1",
+            "primaryLocationStartColumnFingerprint": "5"
+          }
+        },
+        {
+          "ruleId": "java/json-sanitizer-xss-bypass-confirmed",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/json-sanitizer-xss-bypass-confirmed",
+            "index": 0
+          },
+          "message": {
+            "text": "Literal at line 564: \\[int\\] = '1'"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/google/json/JsonSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 564,
+                  "startColumn": 19,
+                  "endColumn": 20
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "2e24a14d278948d3:1",
+            "primaryLocationStartColumnFingerprint": "8"
+          }
+        },
+        {
+          "ruleId": "java/json-sanitizer-xss-bypass-confirmed",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/json-sanitizer-xss-bypass-confirmed",
+            "index": 0
+          },
+          "message": {
+            "text": "Literal at line 565: \\[int\\] = '1'"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/com/google/json/JsonSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 565,
+                  "startColumn": 26,
+                  "endColumn": 27
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "e42a5c8efa647ba4:1",
+            "primaryLocationStartColumnFingerprint": "13"
+          }
+        }
+      ]
+    }
+  ]
+}

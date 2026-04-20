@@ -1,0 +1,4369 @@
+{
+  "session_id": "20260330220521",
+  "package_name": "jenkinsci__workflow-multibranch-plugin_706.vd43c65dec013",
+  "package_path": "packages/jenkinsci__workflow-multibranch-plugin_706.vd43c65dec013",
+  "database_path": "databases/jenkinsci__workflow-multibranch-plugin_706.vd43c65dec013-db",
+  "model": "claude-sonnet-4-6",
+  "temperature": 1.0,
+  "max_tokens": 25000,
+  "iterations": 16,
+  "total_input_tokens": 380961,
+  "total_output_tokens": 16417,
+  "total_tokens": 397378,
+  "elapsed_time_seconds": 962.56,
+  "estimated_cost_usd": 1.3891,
+  "summary": "## Security Analysis: jenkinsci/workflow-multibranch-plugin\n\n### Overview\nThe `workflow-multibranch` Jenkins plugin (Pipeline: Multibranch) handles branch-based pipelines by binding pipeline scripts from SCM sources. The analysis focused on OS command injection and argument injection vulnerabilities (CWE-078, CWE-088) in how user-controlled strings are passed to SCM file system operations.\n\n---\n\n### Findings\n\n#### Finding 1 \u2014 Argument/Command Injection via `path` in `ReadTrustedStep` (CWE-078 / CWE-088)\n**File:** `src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java`  \n**Severity:** High  \n**Lines:** 105, 135, 184, 186\n\nThe `readTrusted(path)` Pipeline step accepts a user-controlled `path` argument (set via `@DataBoundConstructor`) and passes it **unsanitized** to:\n- `FilePath.child(step.path)` at **line 135**\n- `SCMFileSystem.child(path)` at **lines 105, 184, 186**\n\nA `startsWith` check exists at **line 136**, but it appears to be a post-hoc check applied *after* the `child()` call rather than a pre-validation guard. It does not filter shell metacharacters (`;`, `|`, `&&`, `$()`, `--flags`, etc.).\n\n`SCMFileSystem.child()` and `FilePath.child()` are ultimately backed by SCM tool invocations (e.g., `git show <path>`, `svn cat <path>`). A maliciously crafted path argument containing shell metacharacters or flag-like prefixes (e.g., `--upload-pack`, `; cmd`, `$(cmd)`) could enable argument injection or OS command injection into those underlying tool invocations.\n\n**Data flow confirmed by CodeQL:**\n- Source: `ReadTrustedStep` constructor parameter `path` (line 105) \u2192 field access `step.path`\n- Sink: `FilePath.child(step.path)` (line 135), `SCMFileSystem.child(path)` (lines 105, 184, 186)\n\n---\n\n#### Finding 2 \u2014 Argument/Command Injection via `scriptPath` in `SCMBinder` (CWE-078 / CWE-088)\n**File:** `src/main/java/org/jenkinsci/plugins/workflow/multibranch/SCMBinder.java`  \n**Severity:** High  \n**Lines:** 110, 124\n\nThe `SCMBinder` class uses a `scriptPath` field (derived from the project's SCM configuration / user input) and passes it **completely unsanitized** \u2014 with **no validation checks at all** \u2014 to:\n- `SCMFileSystem.child(scriptPath)` at **line 110**\n- `SCMFileSystem.child(scriptPath)` at **line 124** (with additional tainted intermediate value from line 111)\n\nThis is more severe than Finding 1 because there is absolutely no sanitization or validation applied before the `child()` call. The `scriptPath` value controls which file is read from the SCM filesystem, and if the underlying SCM implementation (git, svn, etc.) invokes shell commands with this value as an argument, shell metacharacters could enable command injection.\n\n**Data flow confirmed by CodeQL:**\n- Source: `SCMBinder.scriptPath` field access\n- Sink: `SCMFileSystem.child(scriptPath)` at lines 110 and 124 in the `create()` method\n\n---\n\n### Context and Impact\nBoth vulnerabilities exist in the trusted-content reading path of the plugin, which is supposed to be a security boundary between trusted Jenkinsfiles and untrusted branch content. An attacker who can influence the `path`/`scriptPath` parameter (e.g., via a crafted branch name, Jenkinsfile argument, or SCM configuration) could potentially:\n1. Traverse to unauthorized files (path traversal)\n2. Inject shell metacharacters into underlying SCM tool invocations (OS command injection)\n3. Inject option flags into git/svn commands (argument injection, e.g., `--upload-pack`)\n\nThe severity is high because this is a Jenkins CI/CD system where arbitrary command execution could compromise the build infrastructure and potentially production systems.\n",
+  "package_classification": {
+    "type": [
+      "plugin"
+    ],
+    "layer": [
+      "application",
+      "framework"
+    ]
+  },
+  "tool_calls": {
+    "get_package_profile_info": 1,
+    "execute_codeql_query": 20,
+    "validate_codeql_query": 0,
+    "fixup_codeql_query": 1,
+    "finalize_report": 1
+  },
+  "queries_executed": {
+    "critical": 3,
+    "high": 10,
+    "medium": 2,
+    "low": 0,
+    "total_executed": 21,
+    "total_with_results": 15,
+    "total_failed": 5
+  },
+  "query_findings": {
+    "critical": 0,
+    "high": 29,
+    "medium": 3,
+    "low": 0,
+    "total": 32
+  },
+  "findings": [
+    {
+      "codeql_query_uuid": "20260330220539",
+      "codeql_raw_query": "/**\n * @name Taint flow from remote input to OS command execution\n * @description Tracks user-controlled input flowing to Runtime.exec() or ProcessBuilder\n * @kind path-problem\n * @problem.severity error\n * @id java/os-command-injection\n * @tags security\n *       external/cwe/cwe-078\n */\n\nimport java\nimport semmle.code.java.dataflow.TaintTracking\nimport semmle.code.java.dataflow.FlowSources\n\nmodule CmdInjectionConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    source instanceof RemoteFlowSource\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    // Runtime.exec() sinks\n    exists(MethodCall mc |\n      mc.getMethod().hasName(\"exec\") and\n      mc.getMethod().getDeclaringType().hasQualifiedName(\"java.lang\", \"Runtime\") and\n      sink.asExpr() = mc.getAnArgument()\n    )\n    or\n    // ProcessBuilder constructor\n    exists(ClassInstanceExpr ce |\n      ce.getConstructor().getDeclaringType().hasQualifiedName(\"java.lang\", \"ProcessBuilder\") and\n      sink.asExpr() = ce.getAnArgument()\n    )\n    or\n    // ProcessBuilder.command()\n    exists(MethodCall mc |\n      mc.getMethod().hasName(\"command\") and\n      mc.getMethod().getDeclaringType().hasQualifiedName(\"java.lang\", \"ProcessBuilder\") and\n      sink.asExpr() = mc.getAnArgument()\n    )\n  }\n}\n\nmodule CmdInjectionFlow = TaintTracking::Global<CmdInjectionConfig>;\nimport CmdInjectionFlow::PathGraph\n\nfrom CmdInjectionFlow::PathNode source, CmdInjectionFlow::PathNode sink\nwhere CmdInjectionFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"OS command injection from $@.\", source.getNode(), \"user input\"\n",
+      "hypothesis": "Remote user input flows to OS command execution via Runtime.exec() or ProcessBuilder",
+      "severity": "critical",
+      "cwe_ids": [
+        "cwe-078"
+      ],
+      "results_count": 0,
+      "results": []
+    },
+    {
+      "codeql_query_uuid": "20260330220637",
+      "codeql_raw_query": "/**\n * @name SCM branch name or path flowing to command execution\n * @description SCM-derived values like branch names or file paths reaching OS command execution\n * @kind path-problem\n * @problem.severity error\n * @id java/scm-command-injection\n * @tags security\n *       external/cwe/cwe-078\n */\n\nimport java\nimport semmle.code.java.dataflow.TaintTracking\nimport semmle.code.java.dataflow.FlowSources\n\nmodule ScmCmdConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    // SCM-related sources: branch names, paths, etc.\n    exists(MethodCall mc |\n      (\n        mc.getMethod().hasName(\"getName\") or\n        mc.getMethod().hasName(\"getDisplayName\") or\n        mc.getMethod().hasName(\"getHead\") or\n        mc.getMethod().hasName(\"getBranch\") or\n        mc.getMethod().hasName(\"getScm\") or\n        mc.getMethod().hasName(\"getSCM\") or\n        mc.getMethod().hasName(\"getSourceId\") or\n        mc.getMethod().hasName(\"getPath\") or\n        mc.getMethod().hasName(\"getFullName\") or\n        mc.getMethod().hasName(\"getUrl\") or\n        mc.getMethod().hasName(\"getRemote\")\n      ) and\n      source.asExpr() = mc\n    )\n    or\n    // Remote flow sources\n    source instanceof RemoteFlowSource\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    // Runtime.exec() sinks\n    exists(MethodCall mc |\n      mc.getMethod().hasName(\"exec\") and\n      mc.getMethod().getDeclaringType().hasQualifiedName(\"java.lang\", \"Runtime\") and\n      sink.asExpr() = mc.getAnArgument()\n    )\n    or\n    // ProcessBuilder constructor\n    exists(ClassInstanceExpr ce |\n      ce.getConstructor().getDeclaringType().hasQualifiedName(\"java.lang\", \"ProcessBuilder\") and\n      sink.asExpr() = ce.getAnArgument()\n    )\n    or\n    // ProcessBuilder.command()\n    exists(MethodCall mc |\n      mc.getMethod().hasName(\"command\") and\n      mc.getMethod().getDeclaringType().hasQualifiedName(\"java.lang\", \"ProcessBuilder\") and\n      sink.asExpr() = mc.getAnArgument()\n    )\n  }\n}\n\nmodule ScmCmdFlow = TaintTracking::Global<ScmCmdConfig>;\nimport ScmCmdFlow::PathGraph\n\nfrom ScmCmdFlow::PathNode source, ScmCmdFlow::PathNode sink\nwhere ScmCmdFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"Possible command injection from SCM-derived value $@.\", source.getNode(), \"SCM/remote input\"\n",
+      "hypothesis": "SCM branch names or paths flowing to OS command execution",
+      "severity": "critical",
+      "cwe_ids": [
+        "cwe-078"
+      ],
+      "results_count": 0,
+      "results": []
+    },
+    {
+      "codeql_query_uuid": "20260330220723",
+      "codeql_raw_query": "/**\n * @name Script execution with user-controlled content\n * @description User-controlled content reaching script or eval execution\n * @kind path-problem\n * @problem.severity error\n * @id java/script-injection\n * @tags security\n *       external/cwe/cwe-078\n */\n\nimport java\nimport semmle.code.java.dataflow.TaintTracking\nimport semmle.code.java.dataflow.FlowSources\n\nmodule ScriptInjectionConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    source instanceof RemoteFlowSource\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    // ScriptEngine.eval()\n    exists(MethodCall mc |\n      mc.getMethod().hasName(\"eval\") and\n      mc.getMethod().getDeclaringType().getASupertype*().hasQualifiedName(\"javax.script\", \"ScriptEngine\") and\n      sink.asExpr() = mc.getArgument(0)\n    )\n    or\n    // GroovyShell.evaluate/parse/run\n    exists(MethodCall mc |\n      (mc.getMethod().hasName(\"evaluate\") or mc.getMethod().hasName(\"parse\") or mc.getMethod().hasName(\"run\")) and\n      mc.getMethod().getDeclaringType().hasQualifiedName(\"groovy.lang\", \"GroovyShell\") and\n      sink.asExpr() = mc.getArgument(0)\n    )\n    or\n    // Jenkins CpsFlowExecution\n    exists(ClassInstanceExpr ce |\n      ce.getConstructor().getDeclaringType().getASupertype*().hasName(\"CpsFlowExecution\") and\n      sink.asExpr() = ce.getAnArgument()\n    )\n  }\n}\n\nmodule ScriptInjectionFlow = TaintTracking::Global<ScriptInjectionConfig>;\nimport ScriptInjectionFlow::PathGraph\n\nfrom ScriptInjectionFlow::PathNode source, ScriptInjectionFlow::PathNode sink\nwhere ScriptInjectionFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"Script injection from $@.\", source.getNode(), \"user input\"\n",
+      "hypothesis": "User-controlled content reaching script/eval execution (Groovy/CPS pipeline)",
+      "severity": "critical",
+      "cwe_ids": [
+        "cwe-078"
+      ],
+      "results_count": 0,
+      "results": []
+    },
+    {
+      "codeql_query_uuid": "20260330220828",
+      "codeql_raw_query": "/**\n * @name Branch name or SCM path used in command construction\n * @description Branch names or SCM-derived paths used in string concatenation for commands\n * @kind problem\n * @problem.severity error\n * @id java/branch-name-command-injection\n * @tags security\n *       external/cwe/cwe-078\n */\n\nimport java\nimport semmle.code.java.dataflow.TaintTracking\nimport semmle.code.java.dataflow.DataFlow\n\n// Find all string concatenation or format operations involving SCM-derived names\n// that end up in command execution contexts\n\nfrom MethodCall exec, Expr arg\nwhere\n  (\n    exec.getMethod().hasName(\"exec\") and\n    exec.getMethod().getDeclaringType().hasQualifiedName(\"java.lang\", \"Runtime\")\n    or\n    exec.getMethod().hasName(\"command\") and\n    exec.getMethod().getDeclaringType().hasQualifiedName(\"java.lang\", \"ProcessBuilder\")\n  ) and\n  arg = exec.getAnArgument() and\n  (\n    // Direct string concatenation involving branch/SCM names\n    exists(AddExpr add | DataFlow::localExprFlow(add, arg)) or\n    // String.format\n    exists(MethodCall fmt |\n      fmt.getMethod().hasName(\"format\") and\n      fmt.getMethod().getDeclaringType().hasQualifiedName(\"java.lang\", \"String\") and\n      DataFlow::localExprFlow(fmt, arg)\n    ) or\n    arg instanceof AddExpr\n  )\nselect exec, \"Potential command injection: command argument constructed via string concatenation.\"\n",
+      "hypothesis": "String concatenation used to build command strings passed to exec/ProcessBuilder",
+      "severity": "high",
+      "cwe_ids": [
+        "cwe-078"
+      ],
+      "results_count": 0,
+      "results": []
+    },
+    {
+      "codeql_query_uuid": "20260330220905",
+      "codeql_raw_query": "/**\n * @name ReadTrustedStep file path injection\n * @description User-controlled file paths in ReadTrustedStep reaching SCM read operations\n * @kind problem\n * @problem.severity warning\n * @id java/read-trusted-path-injection\n * @tags security\n *       external/cwe/cwe-078\n */\n\nimport java\nimport semmle.code.java.dataflow.DataFlow\nimport semmle.code.java.dataflow.TaintTracking\nimport semmle.code.java.dataflow.FlowSources\n\n// Look for all method calls in the workflow-multibranch package that involve\n// file paths or branch names being used\nfrom MethodCall mc, Method m\nwhere\n  mc.getMethod() = m and\n  m.getDeclaringType().getPackage().getName().matches(\"org.jenkinsci.plugins.workflow.multibranch%\") and\n  (\n    m.hasName(\"getContents\") or\n    m.hasName(\"readFile\") or\n    m.hasName(\"read\") or\n    m.hasName(\"getPath\") or\n    m.hasName(\"withPath\") or\n    m.hasName(\"getTrustedRevision\") or\n    m.hasName(\"checkout\")\n  )\nselect mc, \"SCM file/path operation: \" + m.getName() + \" in \" + m.getDeclaringType().getName()\n",
+      "hypothesis": "Path injection in ReadTrustedStep's SCM file reading operations",
+      "severity": "high",
+      "cwe_ids": [
+        "cwe-078"
+      ],
+      "results_count": 0,
+      "results": []
+    },
+    {
+      "codeql_query_uuid": "20260330221053",
+      "codeql_raw_query": "/**\n * @name User-controlled path in ReadTrustedStep reaching file operations\n * @description The path parameter in ReadTrustedStep flowing to SCM or file read operations\n * @kind path-problem\n * @problem.severity error\n * @id java/read-trusted-path-traversal\n * @tags security\n *       external/cwe/cwe-078\n */\n\nimport java\nimport semmle.code.java.dataflow.TaintTracking\nimport semmle.code.java.dataflow.FlowSources\n\nmodule ReadTrustedPathConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    // Parameters of the step execution (run method, etc.)\n    exists(Parameter p |\n      p.getCallable().getDeclaringType().getName() = \"ReadTrustedStep\" or\n      p.getCallable().getDeclaringType().getName() = \"Execution\" and\n      p.getCallable().getDeclaringType().getEnclosingType().getName() = \"ReadTrustedStep\"\n    |\n      source.asParameter() = p\n    )\n    or\n    // Fields of ReadTrustedStep (path field from @DataBoundConstructor)\n    exists(FieldAccess fa |\n      fa.getField().getDeclaringType().getName() = \"ReadTrustedStep\" and\n      (fa.getField().hasName(\"path\") or fa.getField().hasName(\"file\"))\n    |\n      source.asExpr() = fa\n    )\n    or\n    source instanceof RemoteFlowSource\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    // Runtime.exec()\n    exists(MethodCall mc |\n      mc.getMethod().hasName(\"exec\") and\n      mc.getMethod().getDeclaringType().hasQualifiedName(\"java.lang\", \"Runtime\") and\n      sink.asExpr() = mc.getAnArgument()\n    )\n    or\n    // ProcessBuilder\n    exists(ClassInstanceExpr ce |\n      ce.getConstructor().getDeclaringType().hasQualifiedName(\"java.lang\", \"ProcessBuilder\") and\n      sink.asExpr() = ce.getAnArgument()\n    )\n    or\n    // FilePath operations\n    exists(MethodCall mc |\n      mc.getMethod().getDeclaringType().hasQualifiedName(\"hudson\", \"FilePath\") and\n      (mc.getMethod().hasName(\"act\") or mc.getMethod().hasName(\"child\") or \n       mc.getMethod().hasName(\"readToString\") or mc.getMethod().hasName(\"read\")) and\n      sink.asExpr() = mc.getAnArgument()\n    )\n    or\n    // SCM checkout/read\n    exists(MethodCall mc |\n      (mc.getMethod().hasName(\"checkout\") or mc.getMethod().hasName(\"fetch\")) and\n      sink.asExpr() = mc.getAnArgument()\n    )\n  }\n}\n\nmodule ReadTrustedPathFlow = TaintTracking::Global<ReadTrustedPathConfig>;\nimport ReadTrustedPathFlow::PathGraph\n\nfrom ReadTrustedPathFlow::PathNode source, ReadTrustedPathFlow::PathNode sink\nwhere ReadTrustedPathFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"Path injection from $@.\", source.getNode(), \"user-controlled path\"\n",
+      "hypothesis": "User-controlled path parameter in ReadTrustedStep flowing to file/SCM operations",
+      "severity": "high",
+      "cwe_ids": [
+        "cwe-078",
+        "cwe-088"
+      ],
+      "results_count": 4,
+      "results": [
+        {
+          "ruleId": "java/read-trusted-path-traversal",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/read-trusted-path-traversal",
+            "index": 0
+          },
+          "message": {
+            "text": "Path injection from [user-controlled path](1).\nPath injection from [user-controlled path](2)."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 135,
+                  "startColumn": 39,
+                  "endColumn": 48
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "a1d36f615b787742:1",
+            "primaryLocationStartColumnFingerprint": "26"
+          },
+          "codeFlows": [
+            {
+              "threadFlows": [
+                {
+                  "locations": [
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 105,
+                            "startColumn": 60,
+                            "endColumn": 69
+                          }
+                        },
+                        "message": {
+                          "text": "step.path : String"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 135,
+                            "startColumn": 39,
+                            "endColumn": 48
+                          }
+                        },
+                        "message": {
+                          "text": "step.path"
+                        }
+                      }
+                    }
+                  ]
+                }
+              ]
+            }
+          ],
+          "relatedLocations": [
+            {
+              "id": 1,
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 105,
+                  "startColumn": 60,
+                  "endColumn": 69
+                }
+              },
+              "message": {
+                "text": "user-controlled path"
+              }
+            },
+            {
+              "id": 2,
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 135,
+                  "startColumn": 39,
+                  "endColumn": 48
+                }
+              },
+              "message": {
+                "text": "user-controlled path"
+              }
+            },
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 105,
+                  "startColumn": 60,
+                  "endColumn": 69
+                }
+              }
+            }
+          ]
+        },
+        {
+          "ruleId": "java/read-trusted-path-traversal",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/read-trusted-path-traversal",
+            "index": 0
+          },
+          "message": {
+            "text": "Path injection from [user-controlled path](1)."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 148,
+                  "startColumn": 46,
+                  "endColumn": 49
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "aa3d44221073ddf4:1",
+            "primaryLocationStartColumnFingerprint": "25"
+          },
+          "codeFlows": [
+            {
+              "threadFlows": [
+                {
+                  "locations": [
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 218,
+                            "startColumn": 48,
+                            "endColumn": 70
+                          }
+                        },
+                        "message": {
+                          "text": "baseWorkspace : FilePath"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 219,
+                            "startColumn": 20,
+                            "endColumn": 33
+                          }
+                        },
+                        "message": {
+                          "text": "baseWorkspace : FilePath"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 219,
+                            "startColumn": 20,
+                            "endColumn": 76
+                          }
+                        },
+                        "message": {
+                          "text": "withSuffix(...) : FilePath"
+                        }
+                      },
+                      "taxa": [
+                        {
+                          "index": 0,
+                          "toolComponent": {
+                            "index": 1
+                          },
+                          "properties": {
+                            "CodeQL/DataflowRole": "step"
+                          }
+                        }
+                      ]
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 131,
+                            "startColumn": 23,
+                            "endColumn": 59
+                          }
+                        },
+                        "message": {
+                          "text": "getFilePathWithSuffix(...) : FilePath"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 148,
+                            "startColumn": 46,
+                            "endColumn": 49
+                          }
+                        },
+                        "message": {
+                          "text": "dir"
+                        }
+                      }
+                    }
+                  ]
+                }
+              ]
+            }
+          ],
+          "relatedLocations": [
+            {
+              "id": 1,
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 218,
+                  "startColumn": 48,
+                  "endColumn": 70
+                }
+              },
+              "message": {
+                "text": "user-controlled path"
+              }
+            },
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 218,
+                  "startColumn": 48,
+                  "endColumn": 70
+                }
+              }
+            }
+          ]
+        },
+        {
+          "ruleId": "java/read-trusted-path-traversal",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/read-trusted-path-traversal",
+            "index": 0
+          },
+          "message": {
+            "text": "Path injection from [user-controlled path](1)."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 195,
+                  "startColumn": 54,
+                  "endColumn": 57
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "aa3d44221073ddf4:2",
+            "primaryLocationStartColumnFingerprint": "25"
+          },
+          "codeFlows": [
+            {
+              "threadFlows": [
+                {
+                  "locations": [
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 218,
+                            "startColumn": 48,
+                            "endColumn": 70
+                          }
+                        },
+                        "message": {
+                          "text": "baseWorkspace : FilePath"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 219,
+                            "startColumn": 20,
+                            "endColumn": 33
+                          }
+                        },
+                        "message": {
+                          "text": "baseWorkspace : FilePath"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 219,
+                            "startColumn": 20,
+                            "endColumn": 76
+                          }
+                        },
+                        "message": {
+                          "text": "withSuffix(...) : FilePath"
+                        }
+                      },
+                      "taxa": [
+                        {
+                          "index": 0,
+                          "toolComponent": {
+                            "index": 1
+                          },
+                          "properties": {
+                            "CodeQL/DataflowRole": "step"
+                          }
+                        }
+                      ]
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 131,
+                            "startColumn": 23,
+                            "endColumn": 59
+                          }
+                        },
+                        "message": {
+                          "text": "getFilePathWithSuffix(...) : FilePath"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 195,
+                            "startColumn": 54,
+                            "endColumn": 57
+                          }
+                        },
+                        "message": {
+                          "text": "dir"
+                        }
+                      }
+                    }
+                  ]
+                }
+              ]
+            }
+          ],
+          "relatedLocations": [
+            {
+              "id": 1,
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 218,
+                  "startColumn": 48,
+                  "endColumn": 70
+                }
+              },
+              "message": {
+                "text": "user-controlled path"
+              }
+            },
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 218,
+                  "startColumn": 48,
+                  "endColumn": 70
+                }
+              }
+            }
+          ]
+        },
+        {
+          "ruleId": "java/read-trusted-path-traversal",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/read-trusted-path-traversal",
+            "index": 0
+          },
+          "message": {
+            "text": "Path injection from [user-controlled path](1)."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 204,
+                  "startColumn": 50,
+                  "endColumn": 53
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "aa3d44221073ddf4:3",
+            "primaryLocationStartColumnFingerprint": "25"
+          },
+          "codeFlows": [
+            {
+              "threadFlows": [
+                {
+                  "locations": [
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 218,
+                            "startColumn": 48,
+                            "endColumn": 70
+                          }
+                        },
+                        "message": {
+                          "text": "baseWorkspace : FilePath"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 219,
+                            "startColumn": 20,
+                            "endColumn": 33
+                          }
+                        },
+                        "message": {
+                          "text": "baseWorkspace : FilePath"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 219,
+                            "startColumn": 20,
+                            "endColumn": 76
+                          }
+                        },
+                        "message": {
+                          "text": "withSuffix(...) : FilePath"
+                        }
+                      },
+                      "taxa": [
+                        {
+                          "index": 0,
+                          "toolComponent": {
+                            "index": 1
+                          },
+                          "properties": {
+                            "CodeQL/DataflowRole": "step"
+                          }
+                        }
+                      ]
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 131,
+                            "startColumn": 23,
+                            "endColumn": 59
+                          }
+                        },
+                        "message": {
+                          "text": "getFilePathWithSuffix(...) : FilePath"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 204,
+                            "startColumn": 50,
+                            "endColumn": 53
+                          }
+                        },
+                        "message": {
+                          "text": "dir"
+                        }
+                      }
+                    }
+                  ]
+                }
+              ]
+            }
+          ],
+          "relatedLocations": [
+            {
+              "id": 1,
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 218,
+                  "startColumn": 48,
+                  "endColumn": 70
+                }
+              },
+              "message": {
+                "text": "user-controlled path"
+              }
+            },
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 218,
+                  "startColumn": 48,
+                  "endColumn": 70
+                }
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "codeql_query_uuid": "20260330221140",
+      "codeql_raw_query": "/**\n * @name Git/SCM tool invocations with potentially tainted arguments\n * @description Find invocations of git, svn, or similar tools with user-controlled arguments\n * @kind problem\n * @problem.severity error\n * @id java/git-command-injection\n * @tags security\n *       external/cwe/cwe-078\n */\n\nimport java\n\nfrom MethodCall mc, Expr arg\nwhere\n  (\n    // Runtime.exec with string args\n    mc.getMethod().hasName(\"exec\") and\n    mc.getMethod().getDeclaringType().hasQualifiedName(\"java.lang\", \"Runtime\") and\n    arg = mc.getAnArgument()\n  )\n  or\n  (\n    // ProcessBuilder with list/string args\n    (\n      mc.getMethod().hasName(\"command\") and\n      mc.getMethod().getDeclaringType().hasQualifiedName(\"java.lang\", \"ProcessBuilder\")\n    ) and\n    arg = mc.getAnArgument()\n  )\nselect mc, \"Command execution call at line \" + mc.getLocation().getStartLine() + \n  \" in \" + mc.getEnclosingCallable().getDeclaringType().getName() + \n  \".\" + mc.getEnclosingCallable().getName()\n",
+      "hypothesis": "Find all command execution points in the codebase",
+      "severity": "medium",
+      "cwe_ids": [
+        "cwe-078"
+      ],
+      "results_count": 0,
+      "results": []
+    },
+    {
+      "codeql_query_uuid": "20260330221339",
+      "codeql_raw_query": "/**\n * @name ReadTrustedStep path field flowing to checkout/FilePath operations - precise\n * @description Trace the exact flow from the user-controlled 'path' field in ReadTrustedStep to dangerous operations\n * @kind path-problem\n * @problem.severity error\n * @id java/read-trusted-step-path-injection-precise\n * @tags security\n *       external/cwe/cwe-078\n *       external/cwe/cwe-088\n */\n\nimport java\nimport semmle.code.java.dataflow.TaintTracking\nimport semmle.code.java.dataflow.DataFlow\n\nmodule ReadTrustedPreciseConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    // The 'path' field of ReadTrustedStep (set by @DataBoundConstructor)\n    exists(FieldAccess fa |\n      fa.getField().getDeclaringType().getName() = \"ReadTrustedStep\" and\n      (fa.getField().hasName(\"path\") or fa.getField().hasName(\"file\") or fa.getField().hasName(\"trusted\"))\n    |\n      source.asExpr() = fa\n    )\n    or\n    // Constructor parameters of ReadTrustedStep\n    exists(Parameter p |\n      p.getCallable() instanceof Constructor and\n      p.getCallable().getDeclaringType().getName() = \"ReadTrustedStep\"\n    |\n      source.asParameter() = p\n    )\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    // checkout()\n    exists(MethodCall mc |\n      mc.getMethod().hasName(\"checkout\") and\n      sink.asExpr() = mc.getAnArgument()\n    )\n    or\n    // FilePath.child()\n    exists(MethodCall mc |\n      mc.getMethod().hasName(\"child\") and\n      mc.getMethod().getDeclaringType().hasQualifiedName(\"hudson\", \"FilePath\") and\n      sink.asExpr() = mc.getAnArgument()\n    )\n    or\n    // Any SCM fetch/read\n    exists(MethodCall mc |\n      (mc.getMethod().hasName(\"fetch\") or mc.getMethod().hasName(\"getContents\") or\n       mc.getMethod().hasName(\"withPath\") or mc.getMethod().hasName(\"readFile\")) and\n      sink.asExpr() = mc.getAnArgument()\n    )\n    or\n    // FilePath construction\n    exists(ClassInstanceExpr ce |\n      ce.getConstructor().getDeclaringType().hasQualifiedName(\"hudson\", \"FilePath\") and\n      sink.asExpr() = ce.getAnArgument()\n    )\n    or\n    // Generic method call argument in ReadTrustedStep context  \n    exists(MethodCall mc |\n      mc.getEnclosingCallable().getDeclaringType().getName() = \"ReadTrustedStep\" or\n      (mc.getEnclosingCallable().getDeclaringType().getName() = \"Execution\" and\n       mc.getEnclosingCallable().getDeclaringType().getEnclosingType().getName() = \"ReadTrustedStep\")\n    |\n      sink.asExpr() = mc.getAnArgument()\n    )\n  }\n}\n\nmodule ReadTrustedPreciseFlow = TaintTracking::Global<ReadTrustedPreciseConfig>;\nimport ReadTrustedPreciseFlow::PathGraph\n\nfrom ReadTrustedPreciseFlow::PathNode source, ReadTrustedPreciseFlow::PathNode sink\nwhere ReadTrustedPreciseFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"ReadTrustedStep path injection: user-controlled path from $@ reaches sensitive operation.\", source.getNode(), \"path input\"\n",
+      "hypothesis": "Precise path flow from ReadTrustedStep path field to checkout/FilePath operations",
+      "severity": "high",
+      "cwe_ids": [
+        "cwe-078",
+        "cwe-088"
+      ],
+      "results_count": 9,
+      "results": [
+        {
+          "ruleId": "java/read-trusted-step-path-injection-precise",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/read-trusted-step-path-injection-precise",
+            "index": 0
+          },
+          "message": {
+            "text": "ReadTrustedStep path injection: user-controlled path from [path input](1) reaches sensitive operation.\nReadTrustedStep path injection: user-controlled path from [path input](2) reaches sensitive operation."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 135,
+                  "startColumn": 39,
+                  "endColumn": 48
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "a1d36f615b787742:1",
+            "primaryLocationStartColumnFingerprint": "26"
+          },
+          "codeFlows": [
+            {
+              "threadFlows": [
+                {
+                  "locations": [
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 105,
+                            "startColumn": 60,
+                            "endColumn": 69
+                          }
+                        },
+                        "message": {
+                          "text": "step.path : String"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 135,
+                            "startColumn": 39,
+                            "endColumn": 48
+                          }
+                        },
+                        "message": {
+                          "text": "step.path"
+                        }
+                      }
+                    }
+                  ]
+                }
+              ]
+            }
+          ],
+          "relatedLocations": [
+            {
+              "id": 1,
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 105,
+                  "startColumn": 60,
+                  "endColumn": 69
+                }
+              },
+              "message": {
+                "text": "path input"
+              }
+            },
+            {
+              "id": 2,
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 135,
+                  "startColumn": 39,
+                  "endColumn": 48
+                }
+              },
+              "message": {
+                "text": "path input"
+              }
+            },
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 105,
+                  "startColumn": 60,
+                  "endColumn": 69
+                }
+              }
+            }
+          ]
+        },
+        {
+          "ruleId": "java/read-trusted-step-path-injection-precise",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/read-trusted-step-path-injection-precise",
+            "index": 0
+          },
+          "message": {
+            "text": "ReadTrustedStep path injection: user-controlled path from [path input](1) reaches sensitive operation."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 105,
+                  "startColumn": 60,
+                  "endColumn": 69
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "b4e5350a40719fcf:1",
+            "primaryLocationStartColumnFingerprint": "23"
+          },
+          "relatedLocations": [
+            {
+              "id": 1,
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 105,
+                  "startColumn": 60,
+                  "endColumn": 69
+                }
+              },
+              "message": {
+                "text": "path input"
+              }
+            }
+          ]
+        },
+        {
+          "ruleId": "java/read-trusted-step-path-injection-precise",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/read-trusted-step-path-injection-precise",
+            "index": 0
+          },
+          "message": {
+            "text": "ReadTrustedStep path injection: user-controlled path from [path input](1) reaches sensitive operation.\nReadTrustedStep path injection: user-controlled path from [path input](2) reaches sensitive operation."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 106,
+                  "startColumn": 66,
+                  "endColumn": 125
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "3c9ad9f3f8fd3fc:1",
+            "primaryLocationStartColumnFingerprint": "29"
+          },
+          "codeFlows": [
+            {
+              "threadFlows": [
+                {
+                  "locations": [
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 105,
+                            "startColumn": 60,
+                            "endColumn": 69
+                          }
+                        },
+                        "message": {
+                          "text": "step.path : String"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 106,
+                            "startColumn": 66,
+                            "endColumn": 125
+                          }
+                        },
+                        "message": {
+                          "text": "... + ..."
+                        }
+                      },
+                      "taxa": [
+                        {
+                          "index": 0,
+                          "toolComponent": {
+                            "index": 1
+                          },
+                          "properties": {
+                            "CodeQL/DataflowRole": "sink"
+                          }
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "threadFlows": [
+                {
+                  "locations": [
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 106,
+                            "startColumn": 80,
+                            "endColumn": 89
+                          }
+                        },
+                        "message": {
+                          "text": "step.path : String"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 106,
+                            "startColumn": 66,
+                            "endColumn": 125
+                          }
+                        },
+                        "message": {
+                          "text": "... + ..."
+                        }
+                      },
+                      "taxa": [
+                        {
+                          "index": 0,
+                          "toolComponent": {
+                            "index": 1
+                          },
+                          "properties": {
+                            "CodeQL/DataflowRole": "sink"
+                          }
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            }
+          ],
+          "relatedLocations": [
+            {
+              "id": 1,
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 105,
+                  "startColumn": 60,
+                  "endColumn": 69
+                }
+              },
+              "message": {
+                "text": "path input"
+              }
+            },
+            {
+              "id": 2,
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 106,
+                  "startColumn": 80,
+                  "endColumn": 89
+                }
+              },
+              "message": {
+                "text": "path input"
+              }
+            },
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 105,
+                  "startColumn": 60,
+                  "endColumn": 69
+                }
+              }
+            },
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 106,
+                  "startColumn": 80,
+                  "endColumn": 89
+                }
+              }
+            }
+          ]
+        },
+        {
+          "ruleId": "java/read-trusted-step-path-injection-precise",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/read-trusted-step-path-injection-precise",
+            "index": 0
+          },
+          "message": {
+            "text": "ReadTrustedStep path injection: user-controlled path from [path input](1) reaches sensitive operation.\nReadTrustedStep path injection: user-controlled path from [path input](2) reaches sensitive operation.\nReadTrustedStep path injection: user-controlled path from [path input](3) reaches sensitive operation."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 184,
+                  "startColumn": 53,
+                  "endColumn": 62
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "3fa893dc70202d17:1",
+            "primaryLocationStartColumnFingerprint": "28"
+          },
+          "codeFlows": [
+            {
+              "threadFlows": [
+                {
+                  "locations": [
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 135,
+                            "startColumn": 39,
+                            "endColumn": 48
+                          }
+                        },
+                        "message": {
+                          "text": "step.path : String"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 184,
+                            "startColumn": 53,
+                            "endColumn": 62
+                          }
+                        },
+                        "message": {
+                          "text": "step.path"
+                        }
+                      }
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "threadFlows": [
+                {
+                  "locations": [
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 105,
+                            "startColumn": 60,
+                            "endColumn": 69
+                          }
+                        },
+                        "message": {
+                          "text": "step.path : String"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 184,
+                            "startColumn": 53,
+                            "endColumn": 62
+                          }
+                        },
+                        "message": {
+                          "text": "step.path"
+                        }
+                      }
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "threadFlows": [
+                {
+                  "locations": [
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 105,
+                            "startColumn": 60,
+                            "endColumn": 69
+                          }
+                        },
+                        "message": {
+                          "text": "step.path : String"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 135,
+                            "startColumn": 39,
+                            "endColumn": 48
+                          }
+                        },
+                        "message": {
+                          "text": "step.path : String"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 184,
+                            "startColumn": 53,
+                            "endColumn": 62
+                          }
+                        },
+                        "message": {
+                          "text": "step.path"
+                        }
+                      }
+                    }
+                  ]
+                }
+              ]
+            }
+          ],
+          "relatedLocations": [
+            {
+              "id": 1,
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 135,
+                  "startColumn": 39,
+                  "endColumn": 48
+                }
+              },
+              "message": {
+                "text": "path input"
+              }
+            },
+            {
+              "id": 2,
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 105,
+                  "startColumn": 60,
+                  "endColumn": 69
+                }
+              },
+              "message": {
+                "text": "path input"
+              }
+            },
+            {
+              "id": 3,
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 184,
+                  "startColumn": 53,
+                  "endColumn": 62
+                }
+              },
+              "message": {
+                "text": "path input"
+              }
+            },
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 135,
+                  "startColumn": 39,
+                  "endColumn": 48
+                }
+              }
+            },
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 105,
+                  "startColumn": 60,
+                  "endColumn": 69
+                }
+              }
+            }
+          ]
+        },
+        {
+          "ruleId": "java/read-trusted-step-path-injection-precise",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/read-trusted-step-path-injection-precise",
+            "index": 0
+          },
+          "message": {
+            "text": "ReadTrustedStep path injection: user-controlled path from [path input](1) reaches sensitive operation.\nReadTrustedStep path injection: user-controlled path from [path input](2) reaches sensitive operation.\nReadTrustedStep path injection: user-controlled path from [path input](3) reaches sensitive operation.\nReadTrustedStep path injection: user-controlled path from [path input](4) reaches sensitive operation."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 186,
+                  "startColumn": 47,
+                  "endColumn": 56
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "af5549f834f017c1:1",
+            "primaryLocationStartColumnFingerprint": "26"
+          },
+          "codeFlows": [
+            {
+              "threadFlows": [
+                {
+                  "locations": [
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 135,
+                            "startColumn": 39,
+                            "endColumn": 48
+                          }
+                        },
+                        "message": {
+                          "text": "step.path : String"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 186,
+                            "startColumn": 47,
+                            "endColumn": 56
+                          }
+                        },
+                        "message": {
+                          "text": "step.path"
+                        }
+                      }
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "threadFlows": [
+                {
+                  "locations": [
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 135,
+                            "startColumn": 39,
+                            "endColumn": 48
+                          }
+                        },
+                        "message": {
+                          "text": "step.path : String"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 184,
+                            "startColumn": 53,
+                            "endColumn": 62
+                          }
+                        },
+                        "message": {
+                          "text": "step.path : String"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 186,
+                            "startColumn": 47,
+                            "endColumn": 56
+                          }
+                        },
+                        "message": {
+                          "text": "step.path"
+                        }
+                      }
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "threadFlows": [
+                {
+                  "locations": [
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 105,
+                            "startColumn": 60,
+                            "endColumn": 69
+                          }
+                        },
+                        "message": {
+                          "text": "step.path : String"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 186,
+                            "startColumn": 47,
+                            "endColumn": 56
+                          }
+                        },
+                        "message": {
+                          "text": "step.path"
+                        }
+                      }
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "threadFlows": [
+                {
+                  "locations": [
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 184,
+                            "startColumn": 53,
+                            "endColumn": 62
+                          }
+                        },
+                        "message": {
+                          "text": "step.path : String"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 186,
+                            "startColumn": 47,
+                            "endColumn": 56
+                          }
+                        },
+                        "message": {
+                          "text": "step.path"
+                        }
+                      }
+                    }
+                  ]
+                }
+              ]
+            }
+          ],
+          "relatedLocations": [
+            {
+              "id": 1,
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 135,
+                  "startColumn": 39,
+                  "endColumn": 48
+                }
+              },
+              "message": {
+                "text": "path input"
+              }
+            },
+            {
+              "id": 2,
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 105,
+                  "startColumn": 60,
+                  "endColumn": 69
+                }
+              },
+              "message": {
+                "text": "path input"
+              }
+            },
+            {
+              "id": 3,
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 184,
+                  "startColumn": 53,
+                  "endColumn": 62
+                }
+              },
+              "message": {
+                "text": "path input"
+              }
+            },
+            {
+              "id": 4,
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 186,
+                  "startColumn": 47,
+                  "endColumn": 56
+                }
+              },
+              "message": {
+                "text": "path input"
+              }
+            },
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 135,
+                  "startColumn": 39,
+                  "endColumn": 48
+                }
+              }
+            },
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 105,
+                  "startColumn": 60,
+                  "endColumn": 69
+                }
+              }
+            },
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 184,
+                  "startColumn": 53,
+                  "endColumn": 62
+                }
+              }
+            }
+          ]
+        },
+        {
+          "ruleId": "java/read-trusted-step-path-injection-precise",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/read-trusted-step-path-injection-precise",
+            "index": 0
+          },
+          "message": {
+            "text": "ReadTrustedStep path injection: user-controlled path from [path input](1) reaches sensitive operation.\nReadTrustedStep path injection: user-controlled path from [path input](2) reaches sensitive operation.\nReadTrustedStep path injection: user-controlled path from [path input](3) reaches sensitive operation.\nReadTrustedStep path injection: user-controlled path from [path input](4) reaches sensitive operation.\nReadTrustedStep path injection: user-controlled path from [path input](5) reaches sensitive operation."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 187,
+                  "startColumn": 50,
+                  "endColumn": 94
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "6aae58c51b0a27f0:1",
+            "primaryLocationStartColumnFingerprint": "29"
+          },
+          "codeFlows": [
+            {
+              "threadFlows": [
+                {
+                  "locations": [
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 135,
+                            "startColumn": 39,
+                            "endColumn": 48
+                          }
+                        },
+                        "message": {
+                          "text": "step.path : String"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 187,
+                            "startColumn": 50,
+                            "endColumn": 94
+                          }
+                        },
+                        "message": {
+                          "text": "... + ..."
+                        }
+                      },
+                      "taxa": [
+                        {
+                          "index": 0,
+                          "toolComponent": {
+                            "index": 1
+                          },
+                          "properties": {
+                            "CodeQL/DataflowRole": "sink"
+                          }
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "threadFlows": [
+                {
+                  "locations": [
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 105,
+                            "startColumn": 60,
+                            "endColumn": 69
+                          }
+                        },
+                        "message": {
+                          "text": "step.path : String"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 187,
+                            "startColumn": 50,
+                            "endColumn": 94
+                          }
+                        },
+                        "message": {
+                          "text": "... + ..."
+                        }
+                      },
+                      "taxa": [
+                        {
+                          "index": 0,
+                          "toolComponent": {
+                            "index": 1
+                          },
+                          "properties": {
+                            "CodeQL/DataflowRole": "sink"
+                          }
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "threadFlows": [
+                {
+                  "locations": [
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 184,
+                            "startColumn": 53,
+                            "endColumn": 62
+                          }
+                        },
+                        "message": {
+                          "text": "step.path : String"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 187,
+                            "startColumn": 50,
+                            "endColumn": 94
+                          }
+                        },
+                        "message": {
+                          "text": "... + ..."
+                        }
+                      },
+                      "taxa": [
+                        {
+                          "index": 0,
+                          "toolComponent": {
+                            "index": 1
+                          },
+                          "properties": {
+                            "CodeQL/DataflowRole": "sink"
+                          }
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "threadFlows": [
+                {
+                  "locations": [
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 186,
+                            "startColumn": 47,
+                            "endColumn": 56
+                          }
+                        },
+                        "message": {
+                          "text": "step.path : String"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 187,
+                            "startColumn": 50,
+                            "endColumn": 94
+                          }
+                        },
+                        "message": {
+                          "text": "... + ..."
+                        }
+                      },
+                      "taxa": [
+                        {
+                          "index": 0,
+                          "toolComponent": {
+                            "index": 1
+                          },
+                          "properties": {
+                            "CodeQL/DataflowRole": "sink"
+                          }
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            }
+          ],
+          "relatedLocations": [
+            {
+              "id": 1,
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 135,
+                  "startColumn": 39,
+                  "endColumn": 48
+                }
+              },
+              "message": {
+                "text": "path input"
+              }
+            },
+            {
+              "id": 2,
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 105,
+                  "startColumn": 60,
+                  "endColumn": 69
+                }
+              },
+              "message": {
+                "text": "path input"
+              }
+            },
+            {
+              "id": 3,
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 184,
+                  "startColumn": 53,
+                  "endColumn": 62
+                }
+              },
+              "message": {
+                "text": "path input"
+              }
+            },
+            {
+              "id": 4,
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 186,
+                  "startColumn": 47,
+                  "endColumn": 56
+                }
+              },
+              "message": {
+                "text": "path input"
+              }
+            },
+            {
+              "id": 5,
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 187,
+                  "startColumn": 64,
+                  "endColumn": 73
+                }
+              },
+              "message": {
+                "text": "path input"
+              }
+            },
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 135,
+                  "startColumn": 39,
+                  "endColumn": 48
+                }
+              }
+            },
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 105,
+                  "startColumn": 60,
+                  "endColumn": 69
+                }
+              }
+            },
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 184,
+                  "startColumn": 53,
+                  "endColumn": 62
+                }
+              }
+            },
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 186,
+                  "startColumn": 47,
+                  "endColumn": 56
+                }
+              }
+            }
+          ]
+        },
+        {
+          "ruleId": "java/read-trusted-step-path-injection-precise",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/read-trusted-step-path-injection-precise",
+            "index": 0
+          },
+          "message": {
+            "text": "ReadTrustedStep path injection: user-controlled path from [path input](1) reaches sensitive operation.\nReadTrustedStep path injection: user-controlled path from [path input](2) reaches sensitive operation.\nReadTrustedStep path injection: user-controlled path from [path input](3) reaches sensitive operation."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 189,
+                  "startColumn": 50,
+                  "endColumn": 108
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "47e46adf8a72ce63:1",
+            "primaryLocationStartColumnFingerprint": "29"
+          },
+          "codeFlows": [
+            {
+              "threadFlows": [
+                {
+                  "locations": [
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 135,
+                            "startColumn": 39,
+                            "endColumn": 48
+                          }
+                        },
+                        "message": {
+                          "text": "step.path : String"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 189,
+                            "startColumn": 50,
+                            "endColumn": 108
+                          }
+                        },
+                        "message": {
+                          "text": "... + ..."
+                        }
+                      },
+                      "taxa": [
+                        {
+                          "index": 0,
+                          "toolComponent": {
+                            "index": 1
+                          },
+                          "properties": {
+                            "CodeQL/DataflowRole": "sink"
+                          }
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "threadFlows": [
+                {
+                  "locations": [
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 105,
+                            "startColumn": 60,
+                            "endColumn": 69
+                          }
+                        },
+                        "message": {
+                          "text": "step.path : String"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 189,
+                            "startColumn": 50,
+                            "endColumn": 108
+                          }
+                        },
+                        "message": {
+                          "text": "... + ..."
+                        }
+                      },
+                      "taxa": [
+                        {
+                          "index": 0,
+                          "toolComponent": {
+                            "index": 1
+                          },
+                          "properties": {
+                            "CodeQL/DataflowRole": "sink"
+                          }
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "threadFlows": [
+                {
+                  "locations": [
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 105,
+                            "startColumn": 60,
+                            "endColumn": 69
+                          }
+                        },
+                        "message": {
+                          "text": "step.path : String"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 135,
+                            "startColumn": 39,
+                            "endColumn": 48
+                          }
+                        },
+                        "message": {
+                          "text": "step.path : String"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 189,
+                            "startColumn": 50,
+                            "endColumn": 108
+                          }
+                        },
+                        "message": {
+                          "text": "... + ..."
+                        }
+                      },
+                      "taxa": [
+                        {
+                          "index": 0,
+                          "toolComponent": {
+                            "index": 1
+                          },
+                          "properties": {
+                            "CodeQL/DataflowRole": "sink"
+                          }
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "threadFlows": [
+                {
+                  "locations": [
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 189,
+                            "startColumn": 99,
+                            "endColumn": 108
+                          }
+                        },
+                        "message": {
+                          "text": "step.path : String"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 189,
+                            "startColumn": 50,
+                            "endColumn": 108
+                          }
+                        },
+                        "message": {
+                          "text": "... + ..."
+                        }
+                      },
+                      "taxa": [
+                        {
+                          "index": 0,
+                          "toolComponent": {
+                            "index": 1
+                          },
+                          "properties": {
+                            "CodeQL/DataflowRole": "sink"
+                          }
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            }
+          ],
+          "relatedLocations": [
+            {
+              "id": 1,
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 135,
+                  "startColumn": 39,
+                  "endColumn": 48
+                }
+              },
+              "message": {
+                "text": "path input"
+              }
+            },
+            {
+              "id": 2,
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 105,
+                  "startColumn": 60,
+                  "endColumn": 69
+                }
+              },
+              "message": {
+                "text": "path input"
+              }
+            },
+            {
+              "id": 3,
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 189,
+                  "startColumn": 99,
+                  "endColumn": 108
+                }
+              },
+              "message": {
+                "text": "path input"
+              }
+            },
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 135,
+                  "startColumn": 39,
+                  "endColumn": 48
+                }
+              }
+            },
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 105,
+                  "startColumn": 60,
+                  "endColumn": 69
+                }
+              }
+            },
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 189,
+                  "startColumn": 99,
+                  "endColumn": 108
+                }
+              }
+            }
+          ]
+        },
+        {
+          "ruleId": "java/read-trusted-step-path-injection-precise",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/read-trusted-step-path-injection-precise",
+            "index": 0
+          },
+          "message": {
+            "text": "ReadTrustedStep path injection: user-controlled path from [path input](1) reaches sensitive operation.\nReadTrustedStep path injection: user-controlled path from [path input](2) reaches sensitive operation."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 212,
+                  "startColumn": 53,
+                  "endColumn": 60
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "ac9211efa62b2965:1",
+            "primaryLocationStartColumnFingerprint": "40"
+          },
+          "codeFlows": [
+            {
+              "threadFlows": [
+                {
+                  "locations": [
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 135,
+                            "startColumn": 39,
+                            "endColumn": 48
+                          }
+                        },
+                        "message": {
+                          "text": "step.path : String"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 135,
+                            "startColumn": 29,
+                            "endColumn": 49
+                          }
+                        },
+                        "message": {
+                          "text": "child(...) : FilePath"
+                        }
+                      },
+                      "taxa": [
+                        {
+                          "index": 1,
+                          "toolComponent": {
+                            "index": 1
+                          },
+                          "properties": {
+                            "CodeQL/DataflowRole": "step"
+                          }
+                        }
+                      ]
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 208,
+                            "startColumn": 35,
+                            "endColumn": 39
+                          }
+                        },
+                        "message": {
+                          "text": "file : FilePath"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 208,
+                            "startColumn": 35,
+                            "endColumn": 54
+                          }
+                        },
+                        "message": {
+                          "text": "readToString(...) : String"
+                        }
+                      },
+                      "taxa": [
+                        {
+                          "index": 2,
+                          "toolComponent": {
+                            "index": 1
+                          },
+                          "properties": {
+                            "CodeQL/DataflowRole": "step"
+                          }
+                        }
+                      ]
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 212,
+                            "startColumn": 53,
+                            "endColumn": 60
+                          }
+                        },
+                        "message": {
+                          "text": "content"
+                        }
+                      }
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "threadFlows": [
+                {
+                  "locations": [
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 105,
+                            "startColumn": 60,
+                            "endColumn": 69
+                          }
+                        },
+                        "message": {
+                          "text": "step.path : String"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 135,
+                            "startColumn": 39,
+                            "endColumn": 48
+                          }
+                        },
+                        "message": {
+                          "text": "step.path : String"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 135,
+                            "startColumn": 29,
+                            "endColumn": 49
+                          }
+                        },
+                        "message": {
+                          "text": "child(...) : FilePath"
+                        }
+                      },
+                      "taxa": [
+                        {
+                          "index": 1,
+                          "toolComponent": {
+                            "index": 1
+                          },
+                          "properties": {
+                            "CodeQL/DataflowRole": "step"
+                          }
+                        }
+                      ]
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 208,
+                            "startColumn": 35,
+                            "endColumn": 39
+                          }
+                        },
+                        "message": {
+                          "text": "file : FilePath"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 208,
+                            "startColumn": 35,
+                            "endColumn": 54
+                          }
+                        },
+                        "message": {
+                          "text": "readToString(...) : String"
+                        }
+                      },
+                      "taxa": [
+                        {
+                          "index": 2,
+                          "toolComponent": {
+                            "index": 1
+                          },
+                          "properties": {
+                            "CodeQL/DataflowRole": "step"
+                          }
+                        }
+                      ]
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 212,
+                            "startColumn": 53,
+                            "endColumn": 60
+                          }
+                        },
+                        "message": {
+                          "text": "content"
+                        }
+                      }
+                    }
+                  ]
+                }
+              ]
+            }
+          ],
+          "relatedLocations": [
+            {
+              "id": 1,
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 135,
+                  "startColumn": 39,
+                  "endColumn": 48
+                }
+              },
+              "message": {
+                "text": "path input"
+              }
+            },
+            {
+              "id": 2,
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 105,
+                  "startColumn": 60,
+                  "endColumn": 69
+                }
+              },
+              "message": {
+                "text": "path input"
+              }
+            },
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 135,
+                  "startColumn": 39,
+                  "endColumn": 48
+                }
+              }
+            },
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 105,
+                  "startColumn": 60,
+                  "endColumn": 69
+                }
+              }
+            }
+          ]
+        },
+        {
+          "ruleId": "java/read-trusted-step-path-injection-precise",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/read-trusted-step-path-injection-precise",
+            "index": 0
+          },
+          "message": {
+            "text": "ReadTrustedStep path injection: user-controlled path from [path input](1) reaches sensitive operation.\nReadTrustedStep path injection: user-controlled path from [path input](2) reaches sensitive operation.\nReadTrustedStep path injection: user-controlled path from [path input](3) reaches sensitive operation.\nReadTrustedStep path injection: user-controlled path from [path input](4) reaches sensitive operation.\nReadTrustedStep path injection: user-controlled path from [path input](5) reaches sensitive operation.\nReadTrustedStep path injection: user-controlled path from [path input](6) reaches sensitive operation.\nReadTrustedStep path injection: user-controlled path from [path input](7) reaches sensitive operation."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 213,
+                  "startColumn": 108,
+                  "endColumn": 117
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "360ae1f0f0619bf7:1",
+            "primaryLocationStartColumnFingerprint": "91"
+          },
+          "codeFlows": [
+            {
+              "threadFlows": [
+                {
+                  "locations": [
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 135,
+                            "startColumn": 39,
+                            "endColumn": 48
+                          }
+                        },
+                        "message": {
+                          "text": "step.path : String"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 213,
+                            "startColumn": 108,
+                            "endColumn": 117
+                          }
+                        },
+                        "message": {
+                          "text": "step.path"
+                        }
+                      }
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "threadFlows": [
+                {
+                  "locations": [
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 105,
+                            "startColumn": 60,
+                            "endColumn": 69
+                          }
+                        },
+                        "message": {
+                          "text": "step.path : String"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 213,
+                            "startColumn": 108,
+                            "endColumn": 117
+                          }
+                        },
+                        "message": {
+                          "text": "step.path"
+                        }
+                      }
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "threadFlows": [
+                {
+                  "locations": [
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 184,
+                            "startColumn": 53,
+                            "endColumn": 62
+                          }
+                        },
+                        "message": {
+                          "text": "step.path : String"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 213,
+                            "startColumn": 108,
+                            "endColumn": 117
+                          }
+                        },
+                        "message": {
+                          "text": "step.path"
+                        }
+                      }
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "threadFlows": [
+                {
+                  "locations": [
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 186,
+                            "startColumn": 47,
+                            "endColumn": 56
+                          }
+                        },
+                        "message": {
+                          "text": "step.path : String"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 213,
+                            "startColumn": 108,
+                            "endColumn": 117
+                          }
+                        },
+                        "message": {
+                          "text": "step.path"
+                        }
+                      }
+                    }
+                  ]
+                }
+              ]
+            }
+          ],
+          "relatedLocations": [
+            {
+              "id": 1,
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 135,
+                  "startColumn": 39,
+                  "endColumn": 48
+                }
+              },
+              "message": {
+                "text": "path input"
+              }
+            },
+            {
+              "id": 2,
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 105,
+                  "startColumn": 60,
+                  "endColumn": 69
+                }
+              },
+              "message": {
+                "text": "path input"
+              }
+            },
+            {
+              "id": 3,
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 184,
+                  "startColumn": 53,
+                  "endColumn": 62
+                }
+              },
+              "message": {
+                "text": "path input"
+              }
+            },
+            {
+              "id": 4,
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 186,
+                  "startColumn": 47,
+                  "endColumn": 56
+                }
+              },
+              "message": {
+                "text": "path input"
+              }
+            },
+            {
+              "id": 5,
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 187,
+                  "startColumn": 64,
+                  "endColumn": 73
+                }
+              },
+              "message": {
+                "text": "path input"
+              }
+            },
+            {
+              "id": 6,
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 189,
+                  "startColumn": 99,
+                  "endColumn": 108
+                }
+              },
+              "message": {
+                "text": "path input"
+              }
+            },
+            {
+              "id": 7,
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 213,
+                  "startColumn": 108,
+                  "endColumn": 117
+                }
+              },
+              "message": {
+                "text": "path input"
+              }
+            },
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 135,
+                  "startColumn": 39,
+                  "endColumn": 48
+                }
+              }
+            },
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 105,
+                  "startColumn": 60,
+                  "endColumn": 69
+                }
+              }
+            },
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 184,
+                  "startColumn": 53,
+                  "endColumn": 62
+                }
+              }
+            },
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 186,
+                  "startColumn": 47,
+                  "endColumn": 56
+                }
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "codeql_query_uuid": "20260330221516",
+      "codeql_raw_query": "/**\n * @name ReadTrustedStep path to checkout or SCM command execution\n * @description Check if user-supplied path in readTrusted() flows into SCM checkout/fetch that invokes git/svn commands\n * @kind path-problem\n * @problem.severity error\n * @id java/readtrusted-scm-command\n * @tags security\n *       external/cwe/cwe-078\n *       external/cwe/cwe-088\n */\n\nimport java\nimport semmle.code.java.dataflow.TaintTracking\nimport semmle.code.java.dataflow.DataFlow\n\nmodule ReadTrustedSCMConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    // Constructor parameter of ReadTrustedStep (the path argument)\n    exists(Parameter p |\n      p.getCallable() instanceof Constructor and\n      p.getCallable().getDeclaringType().getName() = \"ReadTrustedStep\"\n    |\n      source.asParameter() = p\n    )\n    or\n    // Field access of path in ReadTrustedStep\n    exists(FieldAccess fa |\n      fa.getField().getDeclaringType().getName() = \"ReadTrustedStep\"\n    |\n      source.asExpr() = fa\n    )\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    // FilePath.child() - path traversal risk\n    exists(MethodCall mc |\n      mc.getMethod().hasName(\"child\") and\n      mc.getMethod().getDeclaringType().hasQualifiedName(\"hudson\", \"FilePath\") and\n      sink.asExpr() = mc.getArgument(0)\n    )\n    or\n    // SCMSource/SCM checkout with path arg\n    exists(MethodCall mc |\n      (mc.getMethod().hasName(\"checkout\") or \n       mc.getMethod().hasName(\"fetch\") or\n       mc.getMethod().hasName(\"getTrustedRevision\")) and\n      sink.asExpr() = mc.getAnArgument()\n    )\n    or\n    // Any method named after common SCM ops\n    exists(MethodCall mc |\n      mc.getMethod().hasName(\"withPath\") and\n      sink.asExpr() = mc.getAnArgument()\n    )\n    or\n    // String concatenation ultimately passed to exec/process\n    exists(MethodCall mc |\n      mc.getMethod().hasName(\"exec\") and\n      mc.getMethod().getDeclaringType().hasQualifiedName(\"java.lang\", \"Runtime\") and\n      sink.asExpr() = mc.getAnArgument()\n    )\n  }\n}\n\nmodule ReadTrustedSCMFlow = TaintTracking::Global<ReadTrustedSCMConfig>;\nimport ReadTrustedSCMFlow::PathGraph\n\nfrom ReadTrustedSCMFlow::PathNode source, ReadTrustedSCMFlow::PathNode sink\nwhere ReadTrustedSCMFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \n  \"ReadTrustedStep: user-supplied path '$@' flows unsanitized to sensitive SCM/file operation.\", \n  source.getNode(), \"user path\"\n",
+      "hypothesis": "User path in readTrusted() step flows into SCM operations that could invoke shell commands with the path as argument",
+      "severity": "high",
+      "cwe_ids": [
+        "cwe-078",
+        "cwe-088"
+      ],
+      "results_count": 1,
+      "results": [
+        {
+          "ruleId": "java/readtrusted-scm-command",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/readtrusted-scm-command",
+            "index": 0
+          },
+          "message": {
+            "text": "ReadTrustedStep: user-supplied path '[user path](1)' flows unsanitized to sensitive SCM/file operation.\nReadTrustedStep: user-supplied path '[user path](2)' flows unsanitized to sensitive SCM/file operation."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 135,
+                  "startColumn": 39,
+                  "endColumn": 48
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "a1d36f615b787742:1",
+            "primaryLocationStartColumnFingerprint": "26"
+          },
+          "codeFlows": [
+            {
+              "threadFlows": [
+                {
+                  "locations": [
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 105,
+                            "startColumn": 60,
+                            "endColumn": 69
+                          }
+                        },
+                        "message": {
+                          "text": "step.path : String"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 135,
+                            "startColumn": 39,
+                            "endColumn": 48
+                          }
+                        },
+                        "message": {
+                          "text": "step.path"
+                        }
+                      }
+                    }
+                  ]
+                }
+              ]
+            }
+          ],
+          "relatedLocations": [
+            {
+              "id": 1,
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 105,
+                  "startColumn": 60,
+                  "endColumn": 69
+                }
+              },
+              "message": {
+                "text": "user path"
+              }
+            },
+            {
+              "id": 2,
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 135,
+                  "startColumn": 39,
+                  "endColumn": 48
+                }
+              },
+              "message": {
+                "text": "user path"
+              }
+            },
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 105,
+                  "startColumn": 60,
+                  "endColumn": 69
+                }
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "codeql_query_uuid": "20260330221600",
+      "codeql_raw_query": "/**\n * @name Argument injection via user-controlled path in SCM operations\n * @description User-controlled path from readTrusted used as argument to tools like git without sanitization\n * @kind problem\n * @problem.severity error\n * @id java/argument-injection-scm\n * @tags security\n *       external/cwe/cwe-088\n */\n\nimport java\nimport semmle.code.java.dataflow.TaintTracking\nimport semmle.code.java.dataflow.DataFlow\n\n// Find all places in ReadTrustedStep where the path field is used\n// in method calls that could be argument injection vectors\nfrom FieldAccess fa, MethodCall mc\nwhere\n  fa.getField().getDeclaringType().getName() = \"ReadTrustedStep\" and\n  fa.getFile().getBaseName() = \"ReadTrustedStep.java\" and\n  (\n    // Direct use as argument  \n    mc.getAnArgument() = fa\n    or\n    // Used as argument after local flow\n    exists(Expr arg |\n      mc.getAnArgument() = arg and\n      DataFlow::localExprFlow(fa, arg)\n    )\n  )\nselect fa, \n  \"ReadTrustedStep field '\" + fa.getField().getName() + \n  \"' used as argument to \" + mc.getMethod().getDeclaringType().getName() + \n  \".\" + mc.getMethod().getName() + \n  \" at line \" + mc.getLocation().getStartLine()\n",
+      "hypothesis": "ReadTrustedStep path field used directly as argument to SCM tool invocations enabling argument injection",
+      "severity": "high",
+      "cwe_ids": [
+        "cwe-088"
+      ],
+      "results_count": 7,
+      "results": [
+        {
+          "ruleId": "java/argument-injection-scm",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/argument-injection-scm",
+            "index": 0
+          },
+          "message": {
+            "text": "ReadTrustedStep field 'path' used as argument to FilePath.child at line 135\nReadTrustedStep field 'path' used as argument to SCMFileSystem.child at line 184\nReadTrustedStep field 'path' used as argument to SCMFileSystem.child at line 186\nReadTrustedStep field 'path' used as argument to Messages.ReadTrustedStep__has_been_modified_in_an_untrusted_revis at line 213"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 135,
+                  "startColumn": 39,
+                  "endColumn": 48
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "a1d36f615b787742:1",
+            "primaryLocationStartColumnFingerprint": "26"
+          }
+        },
+        {
+          "ruleId": "java/argument-injection-scm",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/argument-injection-scm",
+            "index": 0
+          },
+          "message": {
+            "text": "ReadTrustedStep field 'path' used as argument to FilePath.child at line 135\nReadTrustedStep field 'path' used as argument to SCMFileSystem.child at line 105\nReadTrustedStep field 'path' used as argument to SCMFileSystem.child at line 184\nReadTrustedStep field 'path' used as argument to SCMFileSystem.child at line 186\nReadTrustedStep field 'path' used as argument to Messages.ReadTrustedStep__has_been_modified_in_an_untrusted_revis at line 213"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 105,
+                  "startColumn": 60,
+                  "endColumn": 69
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "b4e5350a40719fcf:1",
+            "primaryLocationStartColumnFingerprint": "23"
+          }
+        },
+        {
+          "ruleId": "java/argument-injection-scm",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/argument-injection-scm",
+            "index": 0
+          },
+          "message": {
+            "text": "ReadTrustedStep field 'path' used as argument to SCMFileSystem.child at line 184\nReadTrustedStep field 'path' used as argument to SCMFileSystem.child at line 186\nReadTrustedStep field 'path' used as argument to Messages.ReadTrustedStep__has_been_modified_in_an_untrusted_revis at line 213"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 184,
+                  "startColumn": 53,
+                  "endColumn": 62
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "3fa893dc70202d17:1",
+            "primaryLocationStartColumnFingerprint": "28"
+          }
+        },
+        {
+          "ruleId": "java/argument-injection-scm",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/argument-injection-scm",
+            "index": 0
+          },
+          "message": {
+            "text": "ReadTrustedStep field 'path' used as argument to SCMFileSystem.child at line 186\nReadTrustedStep field 'path' used as argument to Messages.ReadTrustedStep__has_been_modified_in_an_untrusted_revis at line 213"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 186,
+                  "startColumn": 47,
+                  "endColumn": 56
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "af5549f834f017c1:1",
+            "primaryLocationStartColumnFingerprint": "26"
+          }
+        },
+        {
+          "ruleId": "java/argument-injection-scm",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/argument-injection-scm",
+            "index": 0
+          },
+          "message": {
+            "text": "ReadTrustedStep field 'path' used as argument to Messages.ReadTrustedStep__has_been_modified_in_an_untrusted_revis at line 213"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 187,
+                  "startColumn": 64,
+                  "endColumn": 73
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "6aae58c51b0a27f0:1",
+            "primaryLocationStartColumnFingerprint": "43"
+          }
+        },
+        {
+          "ruleId": "java/argument-injection-scm",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/argument-injection-scm",
+            "index": 0
+          },
+          "message": {
+            "text": "ReadTrustedStep field 'path' used as argument to Messages.ReadTrustedStep__has_been_modified_in_an_untrusted_revis at line 213"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 189,
+                  "startColumn": 99,
+                  "endColumn": 108
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "47e46adf8a72ce63:1",
+            "primaryLocationStartColumnFingerprint": "78"
+          }
+        },
+        {
+          "ruleId": "java/argument-injection-scm",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/argument-injection-scm",
+            "index": 0
+          },
+          "message": {
+            "text": "ReadTrustedStep field 'path' used as argument to Messages.ReadTrustedStep__has_been_modified_in_an_untrusted_revis at line 213"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 213,
+                  "startColumn": 108,
+                  "endColumn": 117
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "360ae1f0f0619bf7:1",
+            "primaryLocationStartColumnFingerprint": "91"
+          }
+        }
+      ]
+    },
+    {
+      "codeql_query_uuid": "20260330221657",
+      "codeql_raw_query": "/**\n * @name SCMBinder branch name argument injection\n * @description Branch name in SCMBinder flowing to checkout or command operations\n * @kind problem\n * @problem.severity error\n * @id java/scmbinder-argument-injection\n * @tags security\n *       external/cwe/cwe-078\n *       external/cwe/cwe-088\n */\n\nimport java\nimport semmle.code.java.dataflow.DataFlow\nimport semmle.code.java.dataflow.TaintTracking\n\n// Find all method calls in SCMBinder and what arguments they use\nfrom MethodCall mc, FieldAccess fa\nwhere\n  mc.getEnclosingCallable().getDeclaringType().getName() = \"SCMBinder\" and\n  fa.getEnclosingCallable().getDeclaringType().getName() = \"SCMBinder\" and\n  (\n    mc.getAnArgument() = fa\n    or\n    exists(Expr arg |\n      mc.getAnArgument() = arg and\n      DataFlow::localExprFlow(fa, arg)\n    )\n  )\nselect mc, \n  \"SCMBinder field '\" + fa.getField().getName() + \n  \"' used as argument to \" + mc.getMethod().getDeclaringType().getName() + \n  \".\" + mc.getMethod().getName() + \n  \" at line \" + mc.getLocation().getStartLine()\n",
+      "hypothesis": "SCMBinder branch names flowing to command arguments without sanitization",
+      "severity": "high",
+      "cwe_ids": [
+        "cwe-078",
+        "cwe-088"
+      ],
+      "results_count": 3,
+      "results": [
+        {
+          "ruleId": "java/scmbinder-argument-injection",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/scmbinder-argument-injection",
+            "index": 0
+          },
+          "message": {
+            "text": "SCMBinder field 'scriptPath' used as argument to SCMFileSystem.child at line 110"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/SCMBinder.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 110,
+                  "startColumn": 34,
+                  "endColumn": 54
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "1159819bf019c616:1",
+            "primaryLocationStartColumnFingerprint": "9"
+          }
+        },
+        {
+          "ruleId": "java/scmbinder-argument-injection",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/scmbinder-argument-injection",
+            "index": 0
+          },
+          "message": {
+            "text": "SCMBinder field 'scriptPath' used as argument to SCMFileSystem.child at line 124"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/SCMBinder.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 124,
+                  "startColumn": 49,
+                  "endColumn": 72
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "3ef0fd7e34a6c336:1",
+            "primaryLocationStartColumnFingerprint": "12"
+          }
+        },
+        {
+          "ruleId": "java/scmbinder-argument-injection",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/scmbinder-argument-injection",
+            "index": 0
+          },
+          "message": {
+            "text": "SCMBinder field 'scriptPath' used as argument to Messages.ReadTrustedStep__has_been_modified_in_an_untrusted_revis at line 130"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/SCMBinder.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 130,
+                  "startColumn": 66,
+                  "endColumn": 143
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "8c610d898044e208:1",
+            "primaryLocationStartColumnFingerprint": "29"
+          }
+        }
+      ]
+    },
+    {
+      "codeql_query_uuid": "20260330221733",
+      "codeql_raw_query": "/**\n * @name ResolveScmStep targets argument injection\n * @description User-controlled targets/URLs in ResolveScmStep flowing to SCM operations\n * @kind problem\n * @problem.severity error\n * @id java/resolvescmstep-argument-injection\n * @tags security\n *       external/cwe/cwe-078\n *       external/cwe/cwe-088\n */\n\nimport java\nimport semmle.code.java.dataflow.DataFlow\n\n// Find all method calls in ResolveScmStep and what field arguments they use\nfrom MethodCall mc, FieldAccess fa\nwhere\n  mc.getEnclosingCallable().getDeclaringType().getName() = \"ResolveScmStep\" and\n  fa.getEnclosingCallable().getDeclaringType().getName() = \"ResolveScmStep\" and\n  (\n    mc.getAnArgument() = fa\n    or\n    exists(Expr arg |\n      mc.getAnArgument() = arg and\n      DataFlow::localExprFlow(fa, arg)\n    )\n  )\nselect mc,\n  \"ResolveScmStep field '\" + fa.getField().getName() +\n  \"' used as argument to \" + mc.getMethod().getDeclaringType().getName() +\n  \".\" + mc.getMethod().getName() +\n  \" at line \" + mc.getLocation().getStartLine()\n",
+      "hypothesis": "User-controlled targets/URLs in ResolveScmStep flowing to SCM invocations without sanitization",
+      "severity": "high",
+      "cwe_ids": [
+        "cwe-078",
+        "cwe-088"
+      ],
+      "results_count": 1,
+      "results": [
+        {
+          "ruleId": "java/resolvescmstep-argument-injection",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/resolvescmstep-argument-injection",
+            "index": 0
+          },
+          "message": {
+            "text": "ResolveScmStep field 'targets' used as argument to Collections.unmodifiableList at line 114"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ResolveScmStep.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 114,
+                  "startColumn": 16,
+                  "endColumn": 53
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "99dac1d2019e03e5:1",
+            "primaryLocationStartColumnFingerprint": "7"
+          }
+        }
+      ]
+    },
+    {
+      "codeql_query_uuid": "20260330221835",
+      "codeql_raw_query": "/**\n * @name Argument injection via scriptPath in SCMBinder to SCMFileSystem\n * @description The scriptPath in SCMBinder (set from SCM config) flows unsanitized to SCMFileSystem operations\n * @kind path-problem\n * @problem.severity error\n * @id java/scmbinder-scriptpath-injection\n * @tags security\n *       external/cwe/cwe-078\n *       external/cwe/cwe-088\n */\n\nimport java\nimport semmle.code.java.dataflow.TaintTracking\nimport semmle.code.java.dataflow.DataFlow\n\nmodule SCMBinderConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    // scriptPath field in SCMBinder\n    exists(FieldAccess fa |\n      fa.getField().getDeclaringType().getName() = \"SCMBinder\" and\n      fa.getField().hasName(\"scriptPath\")\n    |\n      source.asExpr() = fa\n    )\n    or\n    // Constructor parameter for scriptPath\n    exists(Parameter p |\n      p.getCallable() instanceof Constructor and\n      p.getCallable().getDeclaringType().getName() = \"SCMBinder\" and\n      p.hasName(\"scriptPath\")\n    |\n      source.asParameter() = p\n    )\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    // SCMFileSystem.child()\n    exists(MethodCall mc |\n      mc.getMethod().hasName(\"child\") and\n      sink.asExpr() = mc.getArgument(0)\n    )\n    or\n    // FilePath.child()  \n    exists(MethodCall mc |\n      mc.getMethod().hasName(\"child\") and\n      mc.getMethod().getDeclaringType().hasQualifiedName(\"hudson\", \"FilePath\") and\n      sink.asExpr() = mc.getArgument(0)\n    )\n    or\n    // checkout\n    exists(MethodCall mc |\n      mc.getMethod().hasName(\"checkout\") and\n      sink.asExpr() = mc.getAnArgument()\n    )\n  }\n}\n\nmodule SCMBinderFlow = TaintTracking::Global<SCMBinderConfig>;\nimport SCMBinderFlow::PathGraph\n\nfrom SCMBinderFlow::PathNode source, SCMBinderFlow::PathNode sink\nwhere SCMBinderFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink,\n  \"SCMBinder: scriptPath '$@' flows unsanitized to file/SCM operation (argument injection risk).\",\n  source.getNode(), \"scriptPath\"\n",
+      "hypothesis": "scriptPath in SCMBinder flows unsanitized to SCMFileSystem.child() enabling path/argument injection",
+      "severity": "high",
+      "cwe_ids": [
+        "cwe-078",
+        "cwe-088"
+      ],
+      "results_count": 2,
+      "results": [
+        {
+          "ruleId": "java/scmbinder-scriptpath-injection",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/scmbinder-scriptpath-injection",
+            "index": 0
+          },
+          "message": {
+            "text": "SCMBinder: scriptPath '[scriptPath](1)' flows unsanitized to file/SCM operation (argument injection risk)."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/SCMBinder.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 110,
+                  "startColumn": 43,
+                  "endColumn": 53
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "1159819bf019c616:1",
+            "primaryLocationStartColumnFingerprint": "18"
+          },
+          "relatedLocations": [
+            {
+              "id": 1,
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/SCMBinder.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 110,
+                  "startColumn": 43,
+                  "endColumn": 53
+                }
+              },
+              "message": {
+                "text": "scriptPath"
+              }
+            }
+          ]
+        },
+        {
+          "ruleId": "java/scmbinder-scriptpath-injection",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/scmbinder-scriptpath-injection",
+            "index": 0
+          },
+          "message": {
+            "text": "SCMBinder: scriptPath '[scriptPath](1)' flows unsanitized to file/SCM operation (argument injection risk).\nSCMBinder: scriptPath '[scriptPath](2)' flows unsanitized to file/SCM operation (argument injection risk).\nSCMBinder: scriptPath '[scriptPath](3)' flows unsanitized to file/SCM operation (argument injection risk)."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/SCMBinder.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 124,
+                  "startColumn": 61,
+                  "endColumn": 71
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "3ef0fd7e34a6c336:1",
+            "primaryLocationStartColumnFingerprint": "24"
+          },
+          "codeFlows": [
+            {
+              "threadFlows": [
+                {
+                  "locations": [
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/SCMBinder.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 110,
+                            "startColumn": 43,
+                            "endColumn": 53
+                          }
+                        },
+                        "message": {
+                          "text": "scriptPath : String"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/SCMBinder.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 124,
+                            "startColumn": 61,
+                            "endColumn": 71
+                          }
+                        },
+                        "message": {
+                          "text": "scriptPath"
+                        }
+                      }
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "threadFlows": [
+                {
+                  "locations": [
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/SCMBinder.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 111,
+                            "startColumn": 68,
+                            "endColumn": 78
+                          }
+                        },
+                        "message": {
+                          "text": "scriptPath : String"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/SCMBinder.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 124,
+                            "startColumn": 61,
+                            "endColumn": 71
+                          }
+                        },
+                        "message": {
+                          "text": "scriptPath"
+                        }
+                      }
+                    }
+                  ]
+                }
+              ]
+            }
+          ],
+          "relatedLocations": [
+            {
+              "id": 1,
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/SCMBinder.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 110,
+                  "startColumn": 43,
+                  "endColumn": 53
+                }
+              },
+              "message": {
+                "text": "scriptPath"
+              }
+            },
+            {
+              "id": 2,
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/SCMBinder.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 111,
+                  "startColumn": 68,
+                  "endColumn": 78
+                }
+              },
+              "message": {
+                "text": "scriptPath"
+              }
+            },
+            {
+              "id": 3,
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/SCMBinder.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 124,
+                  "startColumn": 61,
+                  "endColumn": 71
+                }
+              },
+              "message": {
+                "text": "scriptPath"
+              }
+            },
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/SCMBinder.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 110,
+                  "startColumn": 43,
+                  "endColumn": 53
+                }
+              }
+            },
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/SCMBinder.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 111,
+                  "startColumn": 68,
+                  "endColumn": 78
+                }
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "codeql_query_uuid": "20260330221920",
+      "codeql_raw_query": "/**\n * @name Missing sanitization check for path with shell metacharacters\n * @description Find paths used in SCM file operations without any validation/sanitization\n * @kind problem\n * @problem.severity error\n * @id java/path-no-sanitization\n * @tags security\n *       external/cwe/cwe-078\n *       external/cwe/cwe-088\n */\n\nimport java\n\n// Look for any sanitization/validation logic applied to path or scriptPath\n// in ReadTrustedStep and SCMBinder\nfrom MethodCall mc\nwhere\n  mc.getFile().getBaseName() = \"ReadTrustedStep.java\" and\n  (\n    mc.getMethod().hasName(\"matches\") or\n    mc.getMethod().hasName(\"contains\") or\n    mc.getMethod().hasName(\"startsWith\") or\n    mc.getMethod().hasName(\"normalize\") or\n    mc.getMethod().hasName(\"validate\") or\n    mc.getMethod().hasName(\"sanitize\") or\n    mc.getMethod().hasName(\"replace\") or\n    mc.getMethod().hasName(\"replaceAll\") or\n    mc.getMethod().hasName(\"checkDoesNotContain\") or\n    mc.getMethod().hasName(\"checkPath\") or\n    mc.getMethod().hasName(\"isNormalized\")\n  )\nselect mc, \"Sanitization/validation call at line \" + mc.getLocation().getStartLine() + \": \" + mc.getMethod().getName()\n",
+      "hypothesis": "Check whether any sanitization is applied to the path parameter before use in ReadTrustedStep",
+      "severity": "medium",
+      "cwe_ids": [
+        "cwe-078",
+        "cwe-088"
+      ],
+      "results_count": 3,
+      "results": [
+        {
+          "ruleId": "java/path-no-sanitization",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/path-no-sanitization",
+            "index": 0
+          },
+          "message": {
+            "text": "Sanitization/validation call at line 136: startsWith"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 136,
+                  "startColumn": 18,
+                  "endColumn": 132
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "822a4894480a5b36:1",
+            "primaryLocationStartColumnFingerprint": "5"
+          }
+        },
+        {
+          "ruleId": "java/path-no-sanitization",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/path-no-sanitization",
+            "index": 0
+          },
+          "message": {
+            "text": "Sanitization/validation call at line 136: replace"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 136,
+                  "startColumn": 18,
+                  "endColumn": 66
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "822a4894480a5b36:1",
+            "primaryLocationStartColumnFingerprint": "5"
+          }
+        },
+        {
+          "ruleId": "java/path-no-sanitization",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/path-no-sanitization",
+            "index": 0
+          },
+          "message": {
+            "text": "Sanitization/validation call at line 136: replace"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/ReadTrustedStep.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 136,
+                  "startColumn": 78,
+                  "endColumn": 125
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "822a4894480a5b36:1",
+            "primaryLocationStartColumnFingerprint": "65"
+          }
+        }
+      ]
+    },
+    {
+      "codeql_query_uuid": "20260330222033",
+      "codeql_raw_query": "/**\n * @name SCMBinder scriptPath flows to SCMFileSystem.child without any validation\n * @description Verify no sanitization exists for scriptPath before SCMFileSystem.child() in SCMBinder\n * @kind problem\n * @problem.severity error\n * @id java/scmbinder-no-validation\n * @tags security\n *       external/cwe/cwe-088\n */\n\nimport java\n\n// Check what validation calls exist on scriptPath in SCMBinder\nfrom MethodCall mc\nwhere\n  mc.getFile().getBaseName() = \"SCMBinder.java\" and\n  (\n    mc.getMethod().hasName(\"matches\") or\n    mc.getMethod().hasName(\"contains\") or\n    mc.getMethod().hasName(\"startsWith\") or\n    mc.getMethod().hasName(\"normalize\") or\n    mc.getMethod().hasName(\"validate\") or\n    mc.getMethod().hasName(\"sanitize\") or\n    mc.getMethod().hasName(\"replace\") or\n    mc.getMethod().hasName(\"replaceAll\") or\n    mc.getMethod().hasName(\"checkDoesNotContain\") or\n    mc.getMethod().hasName(\"checkPath\") or\n    mc.getMethod().hasName(\"isNormalized\") or\n    mc.getMethod().hasName(\"child\") or\n    mc.getMethod().hasName(\"checkout\")\n  )\nselect mc,\n  \"SCMBinder.java line \" + mc.getLocation().getStartLine() + \": \" +\n  mc.getMethod().getDeclaringType().getName() + \".\" + mc.getMethod().getName() +\n  \" - in method: \" + mc.getEnclosingCallable().getName()\n",
+      "hypothesis": "SCMBinder scriptPath used without any path validation before SCMFileSystem.child()",
+      "severity": "high",
+      "cwe_ids": [
+        "cwe-088"
+      ],
+      "results_count": 2,
+      "results": [
+        {
+          "ruleId": "java/scmbinder-no-validation",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/scmbinder-no-validation",
+            "index": 0
+          },
+          "message": {
+            "text": "SCMBinder.java line 110: SCMFileSystem.child - in method: create"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/SCMBinder.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 110,
+                  "startColumn": 34,
+                  "endColumn": 54
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "1159819bf019c616:1",
+            "primaryLocationStartColumnFingerprint": "9"
+          }
+        },
+        {
+          "ruleId": "java/scmbinder-no-validation",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/scmbinder-no-validation",
+            "index": 0
+          },
+          "message": {
+            "text": "SCMBinder.java line 124: SCMFileSystem.child - in method: create"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/workflow/multibranch/SCMBinder.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 124,
+                  "startColumn": 49,
+                  "endColumn": 72
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "3ef0fd7e34a6c336:1",
+            "primaryLocationStartColumnFingerprint": "12"
+          }
+        }
+      ]
+    }
+  ]
+}

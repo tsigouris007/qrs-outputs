@@ -1,0 +1,3163 @@
+{
+  "session_id": "20260402140240",
+  "package_name": "jenkinsci__docker-commons-plugin_1.17",
+  "package_path": "packages/jenkinsci__docker-commons-plugin_1.17",
+  "database_path": "databases/jenkinsci__docker-commons-plugin_1.17-db",
+  "model": "claude-sonnet-4-6",
+  "temperature": 1.0,
+  "max_tokens": 25000,
+  "iterations": 17,
+  "total_input_tokens": 399193,
+  "total_output_tokens": 14720,
+  "total_tokens": 413913,
+  "elapsed_time_seconds": 1459.26,
+  "estimated_cost_usd": 1.4184,
+  "summary": "## Security Analysis: Jenkins Docker Commons Plugin 1.17\n\n### Summary\n\nThe analysis of `jenkinsci/docker-commons-plugin` version 1.17 identified a **confirmed argument injection vulnerability** (CWE-088 / CWE-078) in the Docker registry login command construction.\n\n---\n\n### Confirmed Vulnerability: Argument Injection in `docker login` Command\n\n**File:** `src/main/java/org/jenkinsci/plugins/docker/commons/impl/RegistryKeyMaterialFactory.java`  \n**Line:** 101  \n**Severity:** High/Critical  \n**CWEs:** CWE-088 (Argument Delimiter Injection), CWE-078 (OS Command Injection)\n\n#### Description\n\nIn `RegistryKeyMaterialFactory.materialize()`, the plugin constructs and executes a `docker login` command using a Jenkins `ProcStarter`. The command arguments are built by adding items (including `username`, `password`, and `endpoint` URL) to a list which is then passed to `ProcStarter.cmds()`, followed by `join()` (which executes the process).\n\nThe taint flow was confirmed by CodeQL:\n1. **`username`** (String field, line 56) \u2192 added to command list \u2192 `ProcStarter.join()` at line 101\n2. **`password`** (String field, line 57) \u2192 added to command list \u2192 `ProcStarter.join()` at line 101  \n3. **`endpoint`** (URL field, line 58) \u2192 added to command list \u2192 `ProcStarter.join()` at line 101\n\nThese values originate from Docker registry credentials configured in Jenkins (which can be user-controlled). If any of these values contain shell metacharacters or argument delimiters (e.g., spaces, `--flags`, newlines), they could be interpreted as additional command-line flags or commands by the underlying process.\n\n#### Attack Vector\n\n- A user with permission to configure Docker registry credentials in Jenkins could supply a malicious `username`, `password`, or registry URL containing argument injection payloads.\n- For example, a username like `user --config /attacker/path` or a registry URL with embedded arguments could cause unintended flags to be injected into the `docker login` call.\n- This is particularly relevant because `ProcStarter.cmds(List)` passes arguments directly to the OS process; however, if the list items themselves contain spaces or special characters that the docker CLI or underlying shell interprets, argument injection is possible.\n\n#### Supporting Evidence\n\n- CodeQL path-problem query confirmed taint flow: `username`/`password`/`endpoint` fields \u2192 `list.add()` \u2192 `ProcStarter.cmds()` \u2192 `ProcStarter.join()` at line 101\n- There is only **one** `ProcStarter` command execution in the entire plugin codebase\n- No sanitization, validation, or escaping of credential values before they are added to the command list was found\n- The `DockerRegistryEndpoint` class (which populates these fields) accepts user-supplied URLs and credentials without filtering shell metacharacters\n\n#### Recommendation\n\n- Validate and sanitize `username`, `password`, and registry `endpoint` URL values before use in command construction\n- Use argument arrays carefully ensuring each element is a single atomic argument without embedded spaces/special characters\n- Consider using `--password-stdin` for the docker login command to avoid passing passwords as command-line arguments entirely\n- This vulnerability was fixed in later versions (CVE-2021-21621 references this class in docker-commons-plugin)\n",
+  "package_classification": {
+    "type": [
+      "plugin"
+    ],
+    "layer": [
+      "application"
+    ]
+  },
+  "tool_calls": {
+    "get_package_profile_info": 1,
+    "execute_codeql_query": 29,
+    "validate_codeql_query": 0,
+    "fixup_codeql_query": 0,
+    "finalize_report": 1
+  },
+  "queries_executed": {
+    "critical": 4,
+    "high": 11,
+    "medium": 1,
+    "low": 0,
+    "total_executed": 29,
+    "total_with_results": 16,
+    "total_failed": 13
+  },
+  "query_findings": {
+    "critical": 7,
+    "high": 54,
+    "medium": 17,
+    "low": 0,
+    "total": 78
+  },
+  "findings": [
+    {
+      "codeql_query_uuid": "20260402140303",
+      "codeql_raw_query": "/**\n * @name Taint flow from remote input to OS command execution\n * @description Tracks tainted data from remote sources to Runtime.exec() or ProcessBuilder\n * @kind path-problem\n * @problem.severity error\n * @id java/command-injection-remote\n * @tags security\n *       external/cwe/cwe-078\n */\n\nimport java\nimport semmle.code.java.dataflow.TaintTracking\nimport semmle.code.java.dataflow.FlowSources\n\nmodule CmdInjectionConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    source instanceof RemoteFlowSource\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    // Runtime.exec() sinks\n    exists(MethodCall mc |\n      mc.getMethod().hasName(\"exec\") and\n      mc.getMethod().getDeclaringType().hasQualifiedName(\"java.lang\", \"Runtime\") and\n      sink.asExpr() = mc.getAnArgument()\n    )\n    or\n    // ProcessBuilder constructor\n    exists(ClassInstanceExpr ce |\n      ce.getConstructor().getDeclaringType().hasQualifiedName(\"java.lang\", \"ProcessBuilder\") and\n      sink.asExpr() = ce.getAnArgument()\n    )\n    or\n    // ProcessBuilder.command()\n    exists(MethodCall mc |\n      mc.getMethod().hasName(\"command\") and\n      mc.getMethod().getDeclaringType().hasQualifiedName(\"java.lang\", \"ProcessBuilder\") and\n      sink.asExpr() = mc.getAnArgument()\n    )\n  }\n}\n\nmodule CmdInjectionFlow = TaintTracking::Global<CmdInjectionConfig>;\nimport CmdInjectionFlow::PathGraph\n\nfrom CmdInjectionFlow::PathNode source, CmdInjectionFlow::PathNode sink\nwhere CmdInjectionFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"OS command injection from $@.\", source.getNode(), \"user input\"\n",
+      "hypothesis": "Remote user input flows to OS command execution (Runtime.exec or ProcessBuilder)",
+      "severity": "critical",
+      "cwe_ids": [],
+      "results_count": 0,
+      "results": []
+    },
+    {
+      "codeql_query_uuid": "20260402140412",
+      "codeql_raw_query": "/**\n * @name Docker image name used in command construction\n * @description Finds places where Docker image names or tags from user input are used in command strings\n * @kind problem\n * @problem.severity error\n * @id java/docker-image-command-injection\n * @tags security\n *       external/cwe/cwe-078\n */\n\nimport java\n\n// Find all method calls to exec or ProcessBuilder that involve string concatenation\nfrom MethodCall mc, Expr arg\nwhere\n  (\n    mc.getMethod().hasName(\"exec\") and\n    mc.getMethod().getDeclaringType().hasQualifiedName(\"java.lang\", \"Runtime\")\n    or\n    mc.getMethod().hasName(\"command\") and\n    mc.getMethod().getDeclaringType().hasQualifiedName(\"java.lang\", \"ProcessBuilder\")\n  ) and\n  arg = mc.getAnArgument() and\n  (\n    arg instanceof AddExpr or\n    arg instanceof MethodCall\n  )\nselect mc, \"Possible command injection: command built with expression at $@.\", arg, \"this expression\"\n",
+      "hypothesis": "Docker image names or other user-controlled strings are concatenated into OS commands",
+      "severity": "high",
+      "cwe_ids": [],
+      "results_count": 0,
+      "results": []
+    },
+    {
+      "codeql_query_uuid": "20260402140501",
+      "codeql_raw_query": "/**\n * @name All command execution patterns in Jenkins Docker Commons Plugin\n * @description Find all places where OS commands are constructed and executed\n * @kind problem\n * @problem.severity warning\n * @id java/docker-all-exec-patterns\n * @tags security\n *       external/cwe/cwe-078\n */\n\nimport java\n\nfrom MethodCall mc\nwhere\n  // Runtime.exec\n  (mc.getMethod().hasName(\"exec\") and\n   mc.getMethod().getDeclaringType().hasQualifiedName(\"java.lang\", \"Runtime\"))\n  or\n  // ProcessBuilder command\n  (mc.getMethod().hasName(\"command\") and\n   mc.getMethod().getDeclaringType().hasQualifiedName(\"java.lang\", \"ProcessBuilder\"))\n  or\n  // Launcher.ProcStarter cmdAsList / cmds / envs\n  (mc.getMethod().hasName(\"cmdAsList\") or\n   mc.getMethod().hasName(\"cmds\") or\n   mc.getMethod().hasName(\"envs\"))\n  or\n  // Hudson Launcher cmdQuote\n  (mc.getMethod().hasName(\"cmdQuote\"))\nselect mc, \"Command execution at \" + mc.getLocation().toString()\n",
+      "hypothesis": "Find all command execution patterns in the plugin",
+      "severity": "high",
+      "cwe_ids": [],
+      "results_count": 2,
+      "results": [
+        {
+          "ruleId": "java/docker-all-exec-patterns",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/docker-all-exec-patterns",
+            "index": 0
+          },
+          "message": {
+            "text": "Command execution at file:///home/USER_ANONYMIZED/github/USER_ANONYMIZED/phd/penetraitor/packages/jenkinsci__docker-commons-plugin_1.17/src/main/java/org/jenkinsci/plugins/docker/commons/impl/RegistryKeyMaterialFactory.java:101:17:101:166"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/docker/commons/impl/RegistryKeyMaterialFactory.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 101,
+                  "startColumn": 17,
+                  "endColumn": 167
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "addc28f09d6a4eef:1",
+            "primaryLocationStartColumnFingerprint": "4"
+          }
+        },
+        {
+          "ruleId": "java/docker-all-exec-patterns",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/docker-all-exec-patterns",
+            "index": 0
+          },
+          "message": {
+            "text": "Command execution at file:///home/USER_ANONYMIZED/github/USER_ANONYMIZED/phd/penetraitor/packages/jenkinsci__docker-commons-plugin_1.17/src/main/java/org/jenkinsci/plugins/docker/commons/impl/RegistryKeyMaterialFactory.java:101:17:101:146"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/docker/commons/impl/RegistryKeyMaterialFactory.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 101,
+                  "startColumn": 17,
+                  "endColumn": 147
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "addc28f09d6a4eef:1",
+            "primaryLocationStartColumnFingerprint": "4"
+          }
+        }
+      ]
+    },
+    {
+      "codeql_query_uuid": "20260402140744",
+      "codeql_raw_query": "/**\n * @name RegistryKeyMaterialFactory cmds call details\n * @description Examine the cmds() call at line 101 in RegistryKeyMaterialFactory\n * @kind problem\n * @problem.severity error\n * @id java/registry-cmds-call\n * @tags security\n *       external/cwe/cwe-078\n */\n\nimport java\n\nfrom MethodCall mc, Expr arg\nwhere\n  mc.getEnclosingCallable().getDeclaringType().hasQualifiedName(\"org.jenkinsci.plugins.docker.commons.impl\", \"RegistryKeyMaterialFactory\") and\n  (mc.getMethod().hasName(\"cmds\") or mc.getMethod().hasName(\"cmdAsList\") or mc.getMethod().hasName(\"launch\") or mc.getMethod().hasName(\"join\")) and\n  arg = mc.getAnArgument()\nselect mc, \"Command method '\" + mc.getMethod().getName() + \"' at line \" + mc.getLocation().getStartLine() + \" with argument: $@\", arg, arg.toString()\n",
+      "hypothesis": "Examine what arguments are passed to command execution in RegistryKeyMaterialFactory",
+      "severity": "high",
+      "cwe_ids": [],
+      "results_count": 1,
+      "results": [
+        {
+          "ruleId": "java/registry-cmds-call",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/registry-cmds-call",
+            "index": 0
+          },
+          "message": {
+            "text": "Command method 'cmds' at line 101 with argument: [add(...)](1)"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/docker/commons/impl/RegistryKeyMaterialFactory.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 101,
+                  "startColumn": 17,
+                  "endColumn": 147
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "addc28f09d6a4eef:1",
+            "primaryLocationStartColumnFingerprint": "4"
+          },
+          "relatedLocations": [
+            {
+              "id": 1,
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/docker/commons/impl/RegistryKeyMaterialFactory.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 101,
+                  "startColumn": 40,
+                  "endColumn": 146
+                }
+              },
+              "message": {
+                "text": "add(...)"
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "codeql_query_uuid": "20260402140853",
+      "codeql_raw_query": "/**\n * @name Trace data into RegistryKeyMaterialFactory cmds list\n * @description Trace what values are added to the command list used in cmds() call\n * @kind problem\n * @problem.severity error\n * @id java/registry-cmds-list-contents\n * @tags security\n *       external/cwe/cwe-078\n */\n\nimport java\n\nfrom MethodCall addCall, MethodCall cmdsCall\nwhere\n  cmdsCall.getEnclosingCallable().getDeclaringType().hasQualifiedName(\"org.jenkinsci.plugins.docker.commons.impl\", \"RegistryKeyMaterialFactory\") and\n  cmdsCall.getMethod().hasName(\"cmds\") and\n  // Find list.add() calls in the same method\n  addCall.getEnclosingCallable() = cmdsCall.getEnclosingCallable() and\n  addCall.getMethod().hasName(\"add\")\nselect addCall, \"List.add() argument at line \" + addCall.getLocation().getStartLine() + \": \" + addCall.getAnArgument().toString()\n",
+      "hypothesis": "Examine what values are added to the command list in RegistryKeyMaterialFactory",
+      "severity": "high",
+      "cwe_ids": [],
+      "results_count": 2,
+      "results": [
+        {
+          "ruleId": "java/registry-cmds-list-contents",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/registry-cmds-list-contents",
+            "index": 0
+          },
+          "message": {
+            "text": "List.add() argument at line 101: endpoint"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/docker/commons/impl/RegistryKeyMaterialFactory.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 101,
+                  "startColumn": 40,
+                  "endColumn": 146
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "addc28f09d6a4eef:1",
+            "primaryLocationStartColumnFingerprint": "27"
+          }
+        },
+        {
+          "ruleId": "java/registry-cmds-list-contents",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/registry-cmds-list-contents",
+            "index": 0
+          },
+          "message": {
+            "text": "List.add() argument at line 101: true\nList.add() argument at line 101: password"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/docker/commons/impl/RegistryKeyMaterialFactory.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 101,
+                  "startColumn": 40,
+                  "endColumn": 132
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "addc28f09d6a4eef:1",
+            "primaryLocationStartColumnFingerprint": "27"
+          }
+        }
+      ]
+    },
+    {
+      "codeql_query_uuid": "20260402140928",
+      "codeql_raw_query": "/**\n * @name DockerRegistryEndpoint image name injection\n * @description Examine getImageName, getUrl, and related methods for user-controlled values\n * @kind problem\n * @problem.severity warning\n * @id java/docker-registry-endpoint-methods\n * @tags security\n *       external/cwe/cwe-078\n */\n\nimport java\n\nfrom Method m\nwhere\n  m.getDeclaringType().hasQualifiedName(\"org.jenkinsci.plugins.docker.commons.credentials\", \"DockerRegistryEndpoint\")\nselect m, \"Method: \" + m.getName() + \" (line \" + m.getLocation().getStartLine() + \")\"\n",
+      "hypothesis": "Understand what methods DockerRegistryEndpoint exposes that might be user-controlled",
+      "severity": "medium",
+      "cwe_ids": [],
+      "results_count": 17,
+      "results": [
+        {
+          "ruleId": "java/docker-registry-endpoint-methods",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/docker-registry-endpoint-methods",
+            "index": 0
+          },
+          "message": {
+            "text": "Method: equals (line 343)"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/docker/commons/credentials/DockerRegistryEndpoint.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 343,
+                  "startColumn": 20,
+                  "endColumn": 26
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "194484c25ca6fa70:1",
+            "primaryLocationStartColumnFingerprint": "15"
+          }
+        },
+        {
+          "ruleId": "java/docker-registry-endpoint-methods",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/docker-registry-endpoint-methods",
+            "index": 0
+          },
+          "message": {
+            "text": "Method: hashCode (line 335)"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/docker/commons/credentials/DockerRegistryEndpoint.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 335,
+                  "startColumn": 16,
+                  "endColumn": 24
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "893bba863014654f:1",
+            "primaryLocationStartColumnFingerprint": "11"
+          }
+        },
+        {
+          "ruleId": "java/docker-registry-endpoint-methods",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/docker-registry-endpoint-methods",
+            "index": 0
+          },
+          "message": {
+            "text": "Method: toString (line 330)"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/docker/commons/credentials/DockerRegistryEndpoint.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 330,
+                  "startColumn": 29,
+                  "endColumn": 37
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "1c12d30bd89a548d:1",
+            "primaryLocationStartColumnFingerprint": "24"
+          }
+        },
+        {
+          "ruleId": "java/docker-registry-endpoint-methods",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/docker-registry-endpoint-methods",
+            "index": 0
+          },
+          "message": {
+            "text": "Method: imageName (line 311)"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/docker/commons/credentials/DockerRegistryEndpoint.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 311,
+                  "startColumn": 19,
+                  "endColumn": 28
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "62cd1a0d33ed0cf0:1",
+            "primaryLocationStartColumnFingerprint": "14"
+          }
+        },
+        {
+          "ruleId": "java/docker-registry-endpoint-methods",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/docker-registry-endpoint-methods",
+            "index": 0
+          },
+          "message": {
+            "text": "Method: newKeyMaterialFactory (line 291)"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/docker/commons/credentials/DockerRegistryEndpoint.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 291,
+                  "startColumn": 31,
+                  "endColumn": 52
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "1245f8c6cecf5934:1",
+            "primaryLocationStartColumnFingerprint": "26"
+          }
+        },
+        {
+          "ruleId": "java/docker-registry-endpoint-methods",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/docker-registry-endpoint-methods",
+            "index": 0
+          },
+          "message": {
+            "text": "Method: newKeyMaterialFactory (line 273)"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/docker/commons/credentials/DockerRegistryEndpoint.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 273,
+                  "startColumn": 31,
+                  "endColumn": 52
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "7782ec9603663500:2",
+            "primaryLocationStartColumnFingerprint": "26"
+          }
+        },
+        {
+          "ruleId": "java/docker-registry-endpoint-methods",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/docker-registry-endpoint-methods",
+            "index": 0
+          },
+          "message": {
+            "text": "Method: newKeyMaterialFactory (line 265)"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/docker/commons/credentials/DockerRegistryEndpoint.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 265,
+                  "startColumn": 31,
+                  "endColumn": 52
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "7782ec9603663500:1",
+            "primaryLocationStartColumnFingerprint": "26"
+          }
+        },
+        {
+          "ruleId": "java/docker-registry-endpoint-methods",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/docker-registry-endpoint-methods",
+            "index": 0
+          },
+          "message": {
+            "text": "Method: newKeyMaterialFactory (line 250)"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/docker/commons/credentials/DockerRegistryEndpoint.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 250,
+                  "startColumn": 31,
+                  "endColumn": 52
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "f083e01643ed6d1e:1",
+            "primaryLocationStartColumnFingerprint": "26"
+          }
+        },
+        {
+          "ruleId": "java/docker-registry-endpoint-methods",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/docker-registry-endpoint-methods",
+            "index": 0
+          },
+          "message": {
+            "text": "Method: newKeyMaterialFactory (line 242)"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/docker/commons/credentials/DockerRegistryEndpoint.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 242,
+                  "startColumn": 31,
+                  "endColumn": 52
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "3309e4198d7d802f:1",
+            "primaryLocationStartColumnFingerprint": "26"
+          }
+        },
+        {
+          "ruleId": "java/docker-registry-endpoint-methods",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/docker-registry-endpoint-methods",
+            "index": 0
+          },
+          "message": {
+            "text": "Method: newKeyMaterialFactory (line 230)"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/docker/commons/credentials/DockerRegistryEndpoint.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 230,
+                  "startColumn": 31,
+                  "endColumn": 52
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "64f20155ed7a989f:1",
+            "primaryLocationStartColumnFingerprint": "26"
+          }
+        },
+        {
+          "ruleId": "java/docker-registry-endpoint-methods",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/docker-registry-endpoint-methods",
+            "index": 0
+          },
+          "message": {
+            "text": "Method: getToken (line 210)"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/docker/commons/credentials/DockerRegistryEndpoint.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 210,
+                  "startColumn": 39,
+                  "endColumn": 47
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "cdf3c89736da1cbb:1",
+            "primaryLocationStartColumnFingerprint": "34"
+          }
+        },
+        {
+          "ruleId": "java/docker-registry-endpoint-methods",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/docker-registry-endpoint-methods",
+            "index": 0
+          },
+          "message": {
+            "text": "Method: getToken (line 179)"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/docker/commons/credentials/DockerRegistryEndpoint.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 179,
+                  "startColumn": 46,
+                  "endColumn": 54
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "3515b6f7b6b46358:1",
+            "primaryLocationStartColumnFingerprint": "41"
+          }
+        },
+        {
+          "ruleId": "java/docker-registry-endpoint-methods",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/docker-registry-endpoint-methods",
+            "index": 0
+          },
+          "message": {
+            "text": "Method: getCredentialsId (line 160)"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/docker/commons/credentials/DockerRegistryEndpoint.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 160,
+                  "startColumn": 29,
+                  "endColumn": 45
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "91f2f807bf8a2688:1",
+            "primaryLocationStartColumnFingerprint": "24"
+          }
+        },
+        {
+          "ruleId": "java/docker-registry-endpoint-methods",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/docker-registry-endpoint-methods",
+            "index": 0
+          },
+          "message": {
+            "text": "Method: getUrl (line 153)"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/docker/commons/credentials/DockerRegistryEndpoint.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 153,
+                  "startColumn": 29,
+                  "endColumn": 35
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "11037ccb714083e2:1",
+            "primaryLocationStartColumnFingerprint": "24"
+          }
+        },
+        {
+          "ruleId": "java/docker-registry-endpoint-methods",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/docker-registry-endpoint-methods",
+            "index": 0
+          },
+          "message": {
+            "text": "Method: getEffectiveUrl (line 142)"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/docker/commons/credentials/DockerRegistryEndpoint.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 142,
+                  "startColumn": 25,
+                  "endColumn": 40
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "1fea9a793c93d03a:1",
+            "primaryLocationStartColumnFingerprint": "20"
+          }
+        },
+        {
+          "ruleId": "java/docker-registry-endpoint-methods",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/docker-registry-endpoint-methods",
+            "index": 0
+          },
+          "message": {
+            "text": "Method: fromImageName (line 120)"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/docker/commons/credentials/DockerRegistryEndpoint.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 120,
+                  "startColumn": 42,
+                  "endColumn": 55
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "d691ec361075443d:1",
+            "primaryLocationStartColumnFingerprint": "37"
+          }
+        },
+        {
+          "ruleId": "java/docker-registry-endpoint-methods",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/docker-registry-endpoint-methods",
+            "index": 0
+          },
+          "message": {
+            "text": "Method: <clinit> (line 81)"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/docker/commons/credentials/DockerRegistryEndpoint.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 81,
+                  "startColumn": 14,
+                  "endColumn": 36
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "cf4b36c8b49ae810:1",
+            "primaryLocationStartColumnFingerprint": "13"
+          }
+        }
+      ]
+    },
+    {
+      "codeql_query_uuid": "20260402141027",
+      "codeql_raw_query": "/**\n * @name Taint flow from DockerRegistryEndpoint URL/imageName to command execution\n * @description Track taint from user-controlled DockerRegistryEndpoint fields to cmds/exec\n * @kind path-problem\n * @problem.severity error\n * @id java/docker-registry-endpoint-to-exec\n * @tags security\n *       external/cwe/cwe-078\n */\n\nimport java\nimport semmle.code.java.dataflow.TaintTracking\n\nmodule DockerCmdConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    // Source: getUrl(), getEffectiveUrl(), imageName() return values from DockerRegistryEndpoint\n    exists(MethodCall mc |\n      mc.getMethod().getDeclaringType().hasQualifiedName(\"org.jenkinsci.plugins.docker.commons.credentials\", \"DockerRegistryEndpoint\") and\n      (mc.getMethod().hasName(\"getUrl\") or \n       mc.getMethod().hasName(\"getEffectiveUrl\") or\n       mc.getMethod().hasName(\"imageName\") or\n       mc.getMethod().hasName(\"toString\")) and\n      source.asExpr() = mc\n    )\n    or\n    // Constructor parameters of DockerRegistryEndpoint\n    exists(Constructor c, Parameter p |\n      c.getDeclaringType().hasQualifiedName(\"org.jenkinsci.plugins.docker.commons.credentials\", \"DockerRegistryEndpoint\") and\n      p = c.getAParameter() and\n      source.asParameter() = p\n    )\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    // cmds() or cmdAsList() calls\n    exists(MethodCall mc |\n      (mc.getMethod().hasName(\"cmds\") or mc.getMethod().hasName(\"cmdAsList\") or\n       mc.getMethod().hasName(\"launch\") or mc.getMethod().hasName(\"join\")) and\n      sink.asExpr() = mc.getAnArgument()\n    )\n    or\n    // List.add() that feeds into cmds\n    exists(MethodCall mc |\n      mc.getMethod().hasName(\"add\") and\n      sink.asExpr() = mc.getAnArgument()\n    )\n  }\n}\n\nmodule DockerCmdFlow = TaintTracking::Global<DockerCmdConfig>;\nimport DockerCmdFlow::PathGraph\n\nfrom DockerCmdFlow::PathNode source, DockerCmdFlow::PathNode sink\nwhere DockerCmdFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"Docker endpoint value flows to command at $@.\", source.getNode(), \"source\"\n",
+      "hypothesis": "DockerRegistryEndpoint URL or image name flows into command execution arguments",
+      "severity": "high",
+      "cwe_ids": [],
+      "results_count": 0,
+      "results": []
+    },
+    {
+      "codeql_query_uuid": "20260402141344",
+      "codeql_raw_query": "/**\n * @name RegistryKeyMaterialFactory fields and constructor\n * @description Examine fields and constructor parameters to understand what 'endpoint' is\n * @kind problem\n * @problem.severity warning\n * @id java/registry-keymaterial-fields\n * @tags security\n *       external/cwe/cwe-078\n */\n\nimport java\n\nfrom Field f\nwhere\n  f.getDeclaringType().hasQualifiedName(\"org.jenkinsci.plugins.docker.commons.impl\", \"RegistryKeyMaterialFactory\")\nselect f, \"Field: \" + f.getType().getName() + \" \" + f.getName()\n",
+      "hypothesis": "Understand the fields of RegistryKeyMaterialFactory to trace what 'endpoint' contains",
+      "severity": "high",
+      "cwe_ids": [],
+      "results_count": 9,
+      "results": [
+        {
+          "ruleId": "java/registry-keymaterial-fields",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/registry-keymaterial-fields",
+            "index": 0
+          },
+          "message": {
+            "text": "Field: String dockerExecutable"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/docker/commons/impl/RegistryKeyMaterialFactory.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 62,
+                  "startColumn": 35,
+                  "endColumn": 51
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "1d8df1740d7865a8:1",
+            "primaryLocationStartColumnFingerprint": "30"
+          }
+        },
+        {
+          "ruleId": "java/registry-keymaterial-fields",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/registry-keymaterial-fields",
+            "index": 0
+          },
+          "message": {
+            "text": "Field: TaskListener listener"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/docker/commons/impl/RegistryKeyMaterialFactory.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 61,
+                  "startColumn": 41,
+                  "endColumn": 49
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "d7ef773a6888c1e1:1",
+            "primaryLocationStartColumnFingerprint": "36"
+          }
+        },
+        {
+          "ruleId": "java/registry-keymaterial-fields",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/registry-keymaterial-fields",
+            "index": 0
+          },
+          "message": {
+            "text": "Field: EnvVars env"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/docker/commons/impl/RegistryKeyMaterialFactory.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 60,
+                  "startColumn": 36,
+                  "endColumn": 39
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "e25246a6cabaffeb:1",
+            "primaryLocationStartColumnFingerprint": "31"
+          }
+        },
+        {
+          "ruleId": "java/registry-keymaterial-fields",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/registry-keymaterial-fields",
+            "index": 0
+          },
+          "message": {
+            "text": "Field: Launcher launcher"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/docker/commons/impl/RegistryKeyMaterialFactory.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 59,
+                  "startColumn": 37,
+                  "endColumn": 45
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "da78e23c5003cf57:1",
+            "primaryLocationStartColumnFingerprint": "32"
+          }
+        },
+        {
+          "ruleId": "java/registry-keymaterial-fields",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/registry-keymaterial-fields",
+            "index": 0
+          },
+          "message": {
+            "text": "Field: URL endpoint"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/docker/commons/impl/RegistryKeyMaterialFactory.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 58,
+                  "startColumn": 32,
+                  "endColumn": 40
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "ef05d358f7b9673f:1",
+            "primaryLocationStartColumnFingerprint": "27"
+          }
+        },
+        {
+          "ruleId": "java/registry-keymaterial-fields",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/registry-keymaterial-fields",
+            "index": 0
+          },
+          "message": {
+            "text": "Field: String password"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/docker/commons/impl/RegistryKeyMaterialFactory.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 57,
+                  "startColumn": 35,
+                  "endColumn": 43
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "4484ef1596d01331:1",
+            "primaryLocationStartColumnFingerprint": "30"
+          }
+        },
+        {
+          "ruleId": "java/registry-keymaterial-fields",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/registry-keymaterial-fields",
+            "index": 0
+          },
+          "message": {
+            "text": "Field: String username"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/docker/commons/impl/RegistryKeyMaterialFactory.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 56,
+                  "startColumn": 35,
+                  "endColumn": 43
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "c2e51a252ec1d555:1",
+            "primaryLocationStartColumnFingerprint": "30"
+          }
+        },
+        {
+          "ruleId": "java/registry-keymaterial-fields",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/registry-keymaterial-fields",
+            "index": 0
+          },
+          "message": {
+            "text": "Field: String\\[\\] BLACKLISTED_PROPERTIES"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/docker/commons/impl/RegistryKeyMaterialFactory.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 54,
+                  "startColumn": 35,
+                  "endColumn": 57
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "75eeff4be8d4d59b:1",
+            "primaryLocationStartColumnFingerprint": "30"
+          }
+        },
+        {
+          "ruleId": "java/registry-keymaterial-fields",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/registry-keymaterial-fields",
+            "index": 0
+          },
+          "message": {
+            "text": "Field: String DOCKER_CONFIG_FILENAME"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/docker/commons/impl/RegistryKeyMaterialFactory.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 53,
+                  "startColumn": 33,
+                  "endColumn": 55
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "3757c338f405170e:1",
+            "primaryLocationStartColumnFingerprint": "28"
+          }
+        }
+      ]
+    },
+    {
+      "codeql_query_uuid": "20260402141419",
+      "codeql_raw_query": "/**\n * @name RegistryKeyMaterialFactory line 95-115 method calls only\n * @description Narrow focus to method calls around line 101\n * @kind problem\n * @problem.severity error\n * @id java/registry-method-calls-101\n * @tags security\n *       external/cwe/cwe-078\n */\n\nimport java\n\nfrom MethodCall mc\nwhere\n  mc.getEnclosingCallable().getDeclaringType().hasQualifiedName(\"org.jenkinsci.plugins.docker.commons.impl\", \"RegistryKeyMaterialFactory\") and\n  mc.getLocation().getStartLine() >= 95 and\n  mc.getLocation().getStartLine() <= 115\nselect mc, \"Line \" + mc.getLocation().getStartLine() + \": \" + mc.getMethod().getDeclaringType().getName() + \".\" + mc.getMethod().getName() + \"(\" + mc.getMethod().getNumberOfParameters() + \" params)\"\n",
+      "hypothesis": "Examine detailed method calls around the cmds() invocation at line 101",
+      "severity": "high",
+      "cwe_ids": [],
+      "results_count": 12,
+      "results": [
+        {
+          "ruleId": "java/registry-method-calls-101",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/registry-method-calls-101",
+            "index": 0
+          },
+          "message": {
+            "text": "Line 100: EnvVars.put(2 params)"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/docker/commons/impl/RegistryKeyMaterialFactory.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 100,
+                  "startColumn": 13,
+                  "endColumn": 73
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "e0c4a1dadfd280ac:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "java/registry-method-calls-101",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/registry-method-calls-101",
+            "index": 0
+          },
+          "message": {
+            "text": "Line 100: FilePath.getRemote(0 params)"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/docker/commons/impl/RegistryKeyMaterialFactory.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 100,
+                  "startColumn": 48,
+                  "endColumn": 72
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "e0c4a1dadfd280ac:1",
+            "primaryLocationStartColumnFingerprint": "35"
+          }
+        },
+        {
+          "ruleId": "java/registry-method-calls-101",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/registry-method-calls-101",
+            "index": 0
+          },
+          "message": {
+            "text": "Line 101: ProcStarter.join(0 params)"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/docker/commons/impl/RegistryKeyMaterialFactory.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 101,
+                  "startColumn": 17,
+                  "endColumn": 191
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "addc28f09d6a4eef:1",
+            "primaryLocationStartColumnFingerprint": "4"
+          }
+        },
+        {
+          "ruleId": "java/registry-method-calls-101",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/registry-method-calls-101",
+            "index": 0
+          },
+          "message": {
+            "text": "Line 101: ProcStarter.stdout(1 params)"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/docker/commons/impl/RegistryKeyMaterialFactory.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 101,
+                  "startColumn": 17,
+                  "endColumn": 184
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "addc28f09d6a4eef:1",
+            "primaryLocationStartColumnFingerprint": "4"
+          }
+        },
+        {
+          "ruleId": "java/registry-method-calls-101",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/registry-method-calls-101",
+            "index": 0
+          },
+          "message": {
+            "text": "Line 101: ProcStarter.envs(1 params)"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/docker/commons/impl/RegistryKeyMaterialFactory.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 101,
+                  "startColumn": 17,
+                  "endColumn": 167
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "addc28f09d6a4eef:1",
+            "primaryLocationStartColumnFingerprint": "4"
+          }
+        },
+        {
+          "ruleId": "java/registry-method-calls-101",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/registry-method-calls-101",
+            "index": 0
+          },
+          "message": {
+            "text": "Line 101: ProcStarter.cmds(1 params)"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/docker/commons/impl/RegistryKeyMaterialFactory.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 101,
+                  "startColumn": 17,
+                  "endColumn": 147
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "addc28f09d6a4eef:1",
+            "primaryLocationStartColumnFingerprint": "4"
+          }
+        },
+        {
+          "ruleId": "java/registry-method-calls-101",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/registry-method-calls-101",
+            "index": 0
+          },
+          "message": {
+            "text": "Line 101: Launcher.launch(0 params)"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/docker/commons/impl/RegistryKeyMaterialFactory.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 101,
+                  "startColumn": 17,
+                  "endColumn": 34
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "addc28f09d6a4eef:1",
+            "primaryLocationStartColumnFingerprint": "4"
+          }
+        },
+        {
+          "ruleId": "java/registry-method-calls-101",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/registry-method-calls-101",
+            "index": 0
+          },
+          "message": {
+            "text": "Line 101: ArgumentListBuilder.add(1 params)"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/docker/commons/impl/RegistryKeyMaterialFactory.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 101,
+                  "startColumn": 40,
+                  "endColumn": 146
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "addc28f09d6a4eef:1",
+            "primaryLocationStartColumnFingerprint": "27"
+          }
+        },
+        {
+          "ruleId": "java/registry-method-calls-101",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/registry-method-calls-101",
+            "index": 0
+          },
+          "message": {
+            "text": "Line 101: ArgumentListBuilder.add(2 params)"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/docker/commons/impl/RegistryKeyMaterialFactory.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 101,
+                  "startColumn": 40,
+                  "endColumn": 132
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "addc28f09d6a4eef:1",
+            "primaryLocationStartColumnFingerprint": "27"
+          }
+        },
+        {
+          "ruleId": "java/registry-method-calls-101",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/registry-method-calls-101",
+            "index": 0
+          },
+          "message": {
+            "text": "Line 106: FilePath.deleteRecursive(0 params)"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/docker/commons/impl/RegistryKeyMaterialFactory.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 106,
+                  "startColumn": 17,
+                  "endColumn": 47
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "3c47f8145320d844:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "java/registry-method-calls-101",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/registry-method-calls-101",
+            "index": 0
+          },
+          "message": {
+            "text": "Line 108: Throwable.addSuppressed(1 params)"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/docker/commons/impl/RegistryKeyMaterialFactory.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 108,
+                  "startColumn": 17,
+                  "endColumn": 36
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "a62c61f378addcc7:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "java/registry-method-calls-101",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/registry-method-calls-101",
+            "index": 0
+          },
+          "message": {
+            "text": "Line 112: FilePath.getRemote(0 params)"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/docker/commons/impl/RegistryKeyMaterialFactory.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 112,
+                  "startColumn": 83,
+                  "endColumn": 107
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "d738d70f3d0f42ce:1",
+            "primaryLocationStartColumnFingerprint": "74"
+          }
+        }
+      ]
+    },
+    {
+      "codeql_query_uuid": "20260402141553",
+      "codeql_raw_query": "/**\n * @name Taint from DockerRegistryEndpoint constructor params to ProcStarter cmds\n * @description Track user-supplied URL/username/password from DockerRegistryEndpoint to docker login command\n * @kind path-problem\n * @problem.severity error\n * @id java/docker-login-credential-injection\n * @tags security\n *       external/cwe/cwe-078\n */\n\nimport java\nimport semmle.code.java.dataflow.TaintTracking\n\nmodule DockerLoginConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    // RegistryKeyMaterialFactory fields: username, password, endpoint\n    exists(Field f |\n      f.getDeclaringType().hasQualifiedName(\"org.jenkinsci.plugins.docker.commons.impl\", \"RegistryKeyMaterialFactory\") and\n      (f.hasName(\"username\") or f.hasName(\"password\") or f.hasName(\"endpoint\")) and\n      source.asExpr().(FieldAccess).getField() = f\n    )\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    // ProcStarter method calls: cmds, cmdAsList, stdin, envs\n    exists(MethodCall mc |\n      mc.getMethod().getDeclaringType().getASupertype*().hasQualifiedName(\"hudson\", \"Launcher$ProcStarter\") and\n      sink.asExpr() = mc.getAnArgument()\n    )\n    or\n    // List.add() for command building\n    exists(MethodCall addCall, MethodCall cmdsCall |\n      addCall.getMethod().hasName(\"add\") and\n      cmdsCall.getMethod().hasName(\"cmds\") and\n      addCall.getEnclosingCallable() = cmdsCall.getEnclosingCallable() and\n      sink.asExpr() = addCall.getAnArgument()\n    )\n  }\n}\n\nmodule DockerLoginFlow = TaintTracking::Global<DockerLoginConfig>;\nimport DockerLoginFlow::PathGraph\n\nfrom DockerLoginFlow::PathNode source, DockerLoginFlow::PathNode sink\nwhere DockerLoginFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"Credential/endpoint value flows to Docker command at $@.\", source.getNode(), \"source value\"\n",
+      "hypothesis": "Username, password or endpoint URL from DockerRegistryEndpoint flows to docker login command construction",
+      "severity": "critical",
+      "cwe_ids": [],
+      "results_count": 3,
+      "results": [
+        {
+          "ruleId": "java/docker-login-credential-injection",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/docker-login-credential-injection",
+            "index": 0
+          },
+          "message": {
+            "text": "Credential/endpoint value flows to Docker command at [source value](1).\nCredential/endpoint value flows to Docker command at [source value](2)."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/docker/commons/impl/RegistryKeyMaterialFactory.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 101,
+                  "startColumn": 40,
+                  "endColumn": 146
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "addc28f09d6a4eef:1",
+            "primaryLocationStartColumnFingerprint": "27"
+          },
+          "codeFlows": [
+            {
+              "threadFlows": [
+                {
+                  "locations": [
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/jenkinsci/plugins/docker/commons/impl/RegistryKeyMaterialFactory.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 101,
+                            "startColumn": 137,
+                            "endColumn": 145
+                          }
+                        },
+                        "message": {
+                          "text": "endpoint : URL"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/jenkinsci/plugins/docker/commons/impl/RegistryKeyMaterialFactory.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 101,
+                            "startColumn": 40,
+                            "endColumn": 146
+                          }
+                        },
+                        "message": {
+                          "text": "add(...)"
+                        }
+                      },
+                      "taxa": [
+                        {
+                          "index": 0,
+                          "toolComponent": {
+                            "index": 1
+                          },
+                          "properties": {
+                            "CodeQL/DataflowRole": "sink"
+                          }
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "threadFlows": [
+                {
+                  "locations": [
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/jenkinsci/plugins/docker/commons/impl/RegistryKeyMaterialFactory.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 101,
+                            "startColumn": 117,
+                            "endColumn": 125
+                          }
+                        },
+                        "message": {
+                          "text": "password : String"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/jenkinsci/plugins/docker/commons/impl/RegistryKeyMaterialFactory.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 101,
+                            "startColumn": 40,
+                            "endColumn": 132
+                          }
+                        },
+                        "message": {
+                          "text": "add(...) : ArgumentListBuilder"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/jenkinsci/plugins/docker/commons/impl/RegistryKeyMaterialFactory.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 101,
+                            "startColumn": 40,
+                            "endColumn": 146
+                          }
+                        },
+                        "message": {
+                          "text": "add(...)"
+                        }
+                      },
+                      "taxa": [
+                        {
+                          "index": 1,
+                          "toolComponent": {
+                            "index": 1
+                          },
+                          "properties": {
+                            "CodeQL/DataflowRole": "step"
+                          }
+                        },
+                        {
+                          "index": 0,
+                          "toolComponent": {
+                            "index": 1
+                          },
+                          "properties": {
+                            "CodeQL/DataflowRole": "sink"
+                          }
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            }
+          ],
+          "relatedLocations": [
+            {
+              "id": 1,
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/docker/commons/impl/RegistryKeyMaterialFactory.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 101,
+                  "startColumn": 137,
+                  "endColumn": 145
+                }
+              },
+              "message": {
+                "text": "source value"
+              }
+            },
+            {
+              "id": 2,
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/docker/commons/impl/RegistryKeyMaterialFactory.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 101,
+                  "startColumn": 117,
+                  "endColumn": 125
+                }
+              },
+              "message": {
+                "text": "source value"
+              }
+            },
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/docker/commons/impl/RegistryKeyMaterialFactory.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 101,
+                  "startColumn": 137,
+                  "endColumn": 145
+                }
+              }
+            },
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/docker/commons/impl/RegistryKeyMaterialFactory.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 101,
+                  "startColumn": 117,
+                  "endColumn": 125
+                }
+              }
+            }
+          ]
+        },
+        {
+          "ruleId": "java/docker-login-credential-injection",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/docker-login-credential-injection",
+            "index": 0
+          },
+          "message": {
+            "text": "Credential/endpoint value flows to Docker command at [source value](1)."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/docker/commons/impl/RegistryKeyMaterialFactory.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 101,
+                  "startColumn": 137,
+                  "endColumn": 145
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "addc28f09d6a4eef:1",
+            "primaryLocationStartColumnFingerprint": "124"
+          },
+          "relatedLocations": [
+            {
+              "id": 1,
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/docker/commons/impl/RegistryKeyMaterialFactory.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 101,
+                  "startColumn": 137,
+                  "endColumn": 145
+                }
+              },
+              "message": {
+                "text": "source value"
+              }
+            }
+          ]
+        },
+        {
+          "ruleId": "java/docker-login-credential-injection",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/docker-login-credential-injection",
+            "index": 0
+          },
+          "message": {
+            "text": "Credential/endpoint value flows to Docker command at [source value](1)."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/docker/commons/impl/RegistryKeyMaterialFactory.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 101,
+                  "startColumn": 117,
+                  "endColumn": 125
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "addc28f09d6a4eef:1",
+            "primaryLocationStartColumnFingerprint": "104"
+          },
+          "relatedLocations": [
+            {
+              "id": 1,
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/docker/commons/impl/RegistryKeyMaterialFactory.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 101,
+                  "startColumn": 117,
+                  "endColumn": 125
+                }
+              },
+              "message": {
+                "text": "source value"
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "codeql_query_uuid": "20260402141735",
+      "codeql_raw_query": "/**\n * @name All List.add() calls in RegistryKeyMaterialFactory\n * @description Find all items added to the command list to build docker login\n * @kind problem\n * @problem.severity error\n * @id java/registry-list-add-calls\n * @tags security\n *       external/cwe/cwe-078\n */\n\nimport java\n\nfrom MethodCall mc\nwhere\n  mc.getEnclosingCallable().getDeclaringType().hasQualifiedName(\"org.jenkinsci.plugins.docker.commons.impl\", \"RegistryKeyMaterialFactory\") and\n  mc.getMethod().hasName(\"add\") and\n  mc.getMethod().getDeclaringType().getASupertype*().hasQualifiedName(\"java.util\", \"Collection\")\nselect mc, \"Line \" + mc.getLocation().getStartLine() + \": list.add(\" + mc.getArgument(0).toString() + \") [type: \" + mc.getArgument(0).getType().getName() + \"]\"\n",
+      "hypothesis": "Identify all items added to the docker login command list to understand argument injection potential",
+      "severity": "high",
+      "cwe_ids": [],
+      "results_count": 0,
+      "results": []
+    },
+    {
+      "codeql_query_uuid": "20260402141900",
+      "codeql_raw_query": "/**\n * @name RegistryKeyMaterialFactory - all add method calls regardless of type\n * @description Find all .add() calls in RegistryKeyMaterialFactory\n * @kind problem\n * @problem.severity warning\n * @id java/registry-add-calls-v2\n * @tags security\n *       external/cwe/cwe-078\n */\n\nimport java\n\nfrom MethodCall mc, Expr arg\nwhere\n  mc.getEnclosingCallable().getDeclaringType().hasQualifiedName(\"org.jenkinsci.plugins.docker.commons.impl\", \"RegistryKeyMaterialFactory\") and\n  mc.getMethod().hasName(\"add\") and\n  mc.getNumArgument() = 1 and\n  arg = mc.getArgument(0)\nselect mc, \"Line \" + mc.getLocation().getStartLine() + \": .add(\" + arg.toString() + \") [\" + arg.getType().getName() + \"] in \" + mc.getEnclosingCallable().getName()\n",
+      "hypothesis": "Find all items added to lists in RegistryKeyMaterialFactory including command arguments",
+      "severity": "high",
+      "cwe_ids": [],
+      "results_count": 1,
+      "results": [
+        {
+          "ruleId": "java/registry-add-calls-v2",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/registry-add-calls-v2",
+            "index": 0
+          },
+          "message": {
+            "text": "Line 101: .add(endpoint) \\[URL\\] in materialize"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/docker/commons/impl/RegistryKeyMaterialFactory.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 101,
+                  "startColumn": 40,
+                  "endColumn": 146
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "addc28f09d6a4eef:1",
+            "primaryLocationStartColumnFingerprint": "27"
+          }
+        }
+      ]
+    },
+    {
+      "codeql_query_uuid": "20260402142027",
+      "codeql_raw_query": "/**\n * @name DockerRegistryEndpoint imageName() - how image names are combined with registry URL\n * @description Examine imageName() to detect if user-controlled image names flow into commands\n * @kind problem\n * @problem.severity error\n * @id java/docker-imagename-concat\n * @tags security\n *       external/cwe/cwe-078\n */\n\nimport java\n\nfrom Expr e\nwhere\n  e.getEnclosingCallable().getDeclaringType().hasQualifiedName(\"org.jenkinsci.plugins.docker.commons.credentials\", \"DockerRegistryEndpoint\") and\n  e.getEnclosingCallable().getName() = \"imageName\" and\n  (e instanceof StringLiteral or e instanceof AddExpr or e instanceof MethodCall or e instanceof VarAccess or e instanceof FieldAccess)\nselect e, \"Line \" + e.getLocation().getStartLine() + \": [\" + e.getType().getName() + \"] \" + e.toString()\n",
+      "hypothesis": "DockerRegistryEndpoint.imageName() builds image names by combining registry URL with image name - potential injection point",
+      "severity": "high",
+      "cwe_ids": [],
+      "results_count": 24,
+      "results": [
+        {
+          "ruleId": "java/docker-imagename-concat",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/docker-imagename-concat",
+            "index": 0
+          },
+          "message": {
+            "text": "Line 318: \\[URL\\] getEffectiveUrl(...)"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/docker/commons/credentials/DockerRegistryEndpoint.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 318,
+                  "startColumn": 28,
+                  "endColumn": 45
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "27782adc78a8ea3e:1",
+            "primaryLocationStartColumnFingerprint": "19"
+          }
+        },
+        {
+          "ruleId": "java/docker-imagename-concat",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/docker-imagename-concat",
+            "index": 0
+          },
+          "message": {
+            "text": "Line 320: \\[String\\] getHost(...)"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/docker/commons/credentials/DockerRegistryEndpoint.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 320,
+                  "startColumn": 45,
+                  "endColumn": 67
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "be9b4f02cbcb122:1",
+            "primaryLocationStartColumnFingerprint": "36"
+          }
+        },
+        {
+          "ruleId": "java/docker-imagename-concat",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/docker-imagename-concat",
+            "index": 0
+          },
+          "message": {
+            "text": "Line 320: \\[URL\\] effectiveUrl"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/docker/commons/credentials/DockerRegistryEndpoint.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 320,
+                  "startColumn": 45,
+                  "endColumn": 57
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "be9b4f02cbcb122:1",
+            "primaryLocationStartColumnFingerprint": "36"
+          }
+        },
+        {
+          "ruleId": "java/docker-imagename-concat",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/docker-imagename-concat",
+            "index": 0
+          },
+          "message": {
+            "text": "Line 312: \\[String\\] userAndRepo"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/docker/commons/credentials/DockerRegistryEndpoint.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 312,
+                  "startColumn": 13,
+                  "endColumn": 24
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "a1018585cf195b79:1",
+            "primaryLocationStartColumnFingerprint": "4"
+          }
+        },
+        {
+          "ruleId": "java/docker-imagename-concat",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/docker-imagename-concat",
+            "index": 0
+          },
+          "message": {
+            "text": "Line 313: \\[String\\] \"Image name cannot be null.\""
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/docker/commons/credentials/DockerRegistryEndpoint.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 313,
+                  "startColumn": 48,
+                  "endColumn": 76
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "5c43efc59888c67e:1",
+            "primaryLocationStartColumnFingerprint": "35"
+          }
+        },
+        {
+          "ruleId": "java/docker-imagename-concat",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/docker-imagename-concat",
+            "index": 0
+          },
+          "message": {
+            "text": "Line 315: \\[String\\] url"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/docker/commons/credentials/DockerRegistryEndpoint.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 315,
+                  "startColumn": 13,
+                  "endColumn": 16
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "fa68f59e570c3a08:1",
+            "primaryLocationStartColumnFingerprint": "4"
+          }
+        },
+        {
+          "ruleId": "java/docker-imagename-concat",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/docker-imagename-concat",
+            "index": 0
+          },
+          "message": {
+            "text": "Line 316: \\[String\\] userAndRepo"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/docker/commons/credentials/DockerRegistryEndpoint.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 316,
+                  "startColumn": 20,
+                  "endColumn": 31
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "7cc2b5bde6e03d72:1",
+            "primaryLocationStartColumnFingerprint": "7"
+          }
+        },
+        {
+          "ruleId": "java/docker-imagename-concat",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/docker-imagename-concat",
+            "index": 0
+          },
+          "message": {
+            "text": "Line 321: \\[int\\] getPort(...)"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/docker/commons/credentials/DockerRegistryEndpoint.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 321,
+                  "startColumn": 13,
+                  "endColumn": 35
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "ee3b2c5acb1fc821:1",
+            "primaryLocationStartColumnFingerprint": "4"
+          }
+        },
+        {
+          "ruleId": "java/docker-imagename-concat",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/docker-imagename-concat",
+            "index": 0
+          },
+          "message": {
+            "text": "Line 321: \\[URL\\] effectiveUrl"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/docker/commons/credentials/DockerRegistryEndpoint.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 321,
+                  "startColumn": 13,
+                  "endColumn": 25
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "ee3b2c5acb1fc821:1",
+            "primaryLocationStartColumnFingerprint": "4"
+          }
+        },
+        {
+          "ruleId": "java/docker-imagename-concat",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/docker-imagename-concat",
+            "index": 0
+          },
+          "message": {
+            "text": "Line 322: \\[StringBuilder\\] append(...)"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/docker/commons/credentials/DockerRegistryEndpoint.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 322,
+                  "startColumn": 13,
+                  "endColumn": 57
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "396b575debd79f7f:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "java/docker-imagename-concat",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/docker-imagename-concat",
+            "index": 0
+          },
+          "message": {
+            "text": "Line 322: \\[StringBuilder\\] append(...)"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/docker/commons/credentials/DockerRegistryEndpoint.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 322,
+                  "startColumn": 13,
+                  "endColumn": 26
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "396b575debd79f7f:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "java/docker-imagename-concat",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/docker-imagename-concat",
+            "index": 0
+          },
+          "message": {
+            "text": "Line 322: \\[int\\] getPort(...)"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/docker/commons/credentials/DockerRegistryEndpoint.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 322,
+                  "startColumn": 34,
+                  "endColumn": 56
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "396b575debd79f7f:1",
+            "primaryLocationStartColumnFingerprint": "21"
+          }
+        },
+        {
+          "ruleId": "java/docker-imagename-concat",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/docker-imagename-concat",
+            "index": 0
+          },
+          "message": {
+            "text": "Line 322: \\[StringBuilder\\] s"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/docker/commons/credentials/DockerRegistryEndpoint.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 322,
+                  "startColumn": 13,
+                  "endColumn": 14
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "396b575debd79f7f:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "java/docker-imagename-concat",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/docker-imagename-concat",
+            "index": 0
+          },
+          "message": {
+            "text": "Line 322: \\[URL\\] effectiveUrl"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/docker/commons/credentials/DockerRegistryEndpoint.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 322,
+                  "startColumn": 34,
+                  "endColumn": 46
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "396b575debd79f7f:1",
+            "primaryLocationStartColumnFingerprint": "21"
+          }
+        },
+        {
+          "ruleId": "java/docker-imagename-concat",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/docker-imagename-concat",
+            "index": 0
+          },
+          "message": {
+            "text": "Line 324: \\[boolean\\] startsWith(...)"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/docker/commons/credentials/DockerRegistryEndpoint.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 324,
+                  "startColumn": 13,
+                  "endColumn": 54
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "d4a64c376229a6b1:1",
+            "primaryLocationStartColumnFingerprint": "4"
+          }
+        },
+        {
+          "ruleId": "java/docker-imagename-concat",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/docker-imagename-concat",
+            "index": 0
+          },
+          "message": {
+            "text": "Line 324: \\[String\\] userAndRepo"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/docker/commons/credentials/DockerRegistryEndpoint.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 324,
+                  "startColumn": 13,
+                  "endColumn": 24
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "d4a64c376229a6b1:1",
+            "primaryLocationStartColumnFingerprint": "4"
+          }
+        },
+        {
+          "ruleId": "java/docker-imagename-concat",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/docker-imagename-concat",
+            "index": 0
+          },
+          "message": {
+            "text": "Line 324: \\[String\\] valueOf(...)"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/docker/commons/credentials/DockerRegistryEndpoint.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 324,
+                  "startColumn": 36,
+                  "endColumn": 53
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "d4a64c376229a6b1:1",
+            "primaryLocationStartColumnFingerprint": "27"
+          }
+        },
+        {
+          "ruleId": "java/docker-imagename-concat",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/docker-imagename-concat",
+            "index": 0
+          },
+          "message": {
+            "text": "Line 324: \\[StringBuilder\\] s"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/docker/commons/credentials/DockerRegistryEndpoint.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 324,
+                  "startColumn": 51,
+                  "endColumn": 52
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "d4a64c376229a6b1:1",
+            "primaryLocationStartColumnFingerprint": "42"
+          }
+        },
+        {
+          "ruleId": "java/docker-imagename-concat",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/docker-imagename-concat",
+            "index": 0
+          },
+          "message": {
+            "text": "Line 325: \\[String\\] userAndRepo"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/docker/commons/credentials/DockerRegistryEndpoint.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 325,
+                  "startColumn": 20,
+                  "endColumn": 31
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "c68e241b1e57b0f1:1",
+            "primaryLocationStartColumnFingerprint": "7"
+          }
+        },
+        {
+          "ruleId": "java/docker-imagename-concat",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/docker-imagename-concat",
+            "index": 0
+          },
+          "message": {
+            "text": "Line 327: \\[String\\] toString(...)"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/docker/commons/credentials/DockerRegistryEndpoint.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 327,
+                  "startColumn": 16,
+                  "endColumn": 60
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "c2881017eb41ff5b:1",
+            "primaryLocationStartColumnFingerprint": "7"
+          }
+        },
+        {
+          "ruleId": "java/docker-imagename-concat",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/docker-imagename-concat",
+            "index": 0
+          },
+          "message": {
+            "text": "Line 327: \\[StringBuilder\\] append(...)"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/docker/commons/credentials/DockerRegistryEndpoint.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 327,
+                  "startColumn": 16,
+                  "endColumn": 49
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "c2881017eb41ff5b:1",
+            "primaryLocationStartColumnFingerprint": "7"
+          }
+        },
+        {
+          "ruleId": "java/docker-imagename-concat",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/docker-imagename-concat",
+            "index": 0
+          },
+          "message": {
+            "text": "Line 327: \\[StringBuilder\\] append(...)"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/docker/commons/credentials/DockerRegistryEndpoint.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 327,
+                  "startColumn": 16,
+                  "endColumn": 29
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "c2881017eb41ff5b:1",
+            "primaryLocationStartColumnFingerprint": "7"
+          }
+        },
+        {
+          "ruleId": "java/docker-imagename-concat",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/docker-imagename-concat",
+            "index": 0
+          },
+          "message": {
+            "text": "Line 327: \\[String\\] userAndRepo"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/docker/commons/credentials/DockerRegistryEndpoint.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 327,
+                  "startColumn": 37,
+                  "endColumn": 48
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "c2881017eb41ff5b:1",
+            "primaryLocationStartColumnFingerprint": "28"
+          }
+        },
+        {
+          "ruleId": "java/docker-imagename-concat",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/docker-imagename-concat",
+            "index": 0
+          },
+          "message": {
+            "text": "Line 327: \\[StringBuilder\\] s"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/docker/commons/credentials/DockerRegistryEndpoint.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 327,
+                  "startColumn": 16,
+                  "endColumn": 17
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "c2881017eb41ff5b:1",
+            "primaryLocationStartColumnFingerprint": "7"
+          }
+        }
+      ]
+    },
+    {
+      "codeql_query_uuid": "20260402142130",
+      "codeql_raw_query": "/**\n * @name Username and password flow into docker login command arguments\n * @description Track username and password from RegistryKeyMaterialFactory into ProcStarter command args\n * @kind path-problem\n * @problem.severity error\n * @id java/docker-login-username-password-injection\n * @tags security\n *       external/cwe/cwe-078\n *       external/cwe/cwe-088\n */\n\nimport java\nimport semmle.code.java.dataflow.TaintTracking\n\nmodule DockerLoginCredConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    // username, password, endpoint fields accessed in RegistryKeyMaterialFactory\n    exists(FieldAccess fa |\n      fa.getField().getDeclaringType().hasQualifiedName(\"org.jenkinsci.plugins.docker.commons.impl\", \"RegistryKeyMaterialFactory\") and\n      (fa.getField().hasName(\"username\") or \n       fa.getField().hasName(\"password\") or\n       fa.getField().hasName(\"endpoint\")) and\n      source.asExpr() = fa\n    )\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    // ProcStarter.cmds() call argument \n    exists(MethodCall mc |\n      mc.getMethod().hasName(\"cmds\") and\n      sink.asExpr() = mc.getAnArgument()\n    )\n    or\n    // Any add() to a list that gets passed to cmds()\n    exists(MethodCall addMc |\n      addMc.getMethod().hasName(\"add\") and\n      addMc.getEnclosingCallable().getDeclaringType().hasQualifiedName(\"org.jenkinsci.plugins.docker.commons.impl\", \"RegistryKeyMaterialFactory\") and\n      sink.asExpr() = addMc.getArgument(0)\n    )\n  }\n}\n\nmodule DockerLoginCredFlow = TaintTracking::Global<DockerLoginCredConfig>;\nimport DockerLoginCredFlow::PathGraph\n\nfrom DockerLoginCredFlow::PathNode source, DockerLoginCredFlow::PathNode sink\nwhere DockerLoginCredFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"Username/password/endpoint flows to docker command argument at $@.\", source.getNode(), \"credential source\"\n",
+      "hypothesis": "Username and password fields from RegistryKeyMaterialFactory flow directly into docker login command arguments without sanitization",
+      "severity": "critical",
+      "cwe_ids": [],
+      "results_count": 3,
+      "results": [
+        {
+          "ruleId": "java/docker-login-username-password-injection",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/docker-login-username-password-injection",
+            "index": 0
+          },
+          "message": {
+            "text": "Username/password/endpoint flows to docker command argument at [credential source](1).\nUsername/password/endpoint flows to docker command argument at [credential source](2)."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/docker/commons/impl/RegistryKeyMaterialFactory.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 101,
+                  "startColumn": 40,
+                  "endColumn": 146
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "addc28f09d6a4eef:1",
+            "primaryLocationStartColumnFingerprint": "27"
+          },
+          "codeFlows": [
+            {
+              "threadFlows": [
+                {
+                  "locations": [
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/jenkinsci/plugins/docker/commons/impl/RegistryKeyMaterialFactory.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 101,
+                            "startColumn": 137,
+                            "endColumn": 145
+                          }
+                        },
+                        "message": {
+                          "text": "endpoint : URL"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/jenkinsci/plugins/docker/commons/impl/RegistryKeyMaterialFactory.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 101,
+                            "startColumn": 40,
+                            "endColumn": 146
+                          }
+                        },
+                        "message": {
+                          "text": "add(...)"
+                        }
+                      },
+                      "taxa": [
+                        {
+                          "index": 0,
+                          "toolComponent": {
+                            "index": 1
+                          },
+                          "properties": {
+                            "CodeQL/DataflowRole": "sink"
+                          }
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "threadFlows": [
+                {
+                  "locations": [
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/jenkinsci/plugins/docker/commons/impl/RegistryKeyMaterialFactory.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 101,
+                            "startColumn": 117,
+                            "endColumn": 125
+                          }
+                        },
+                        "message": {
+                          "text": "password : String"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/jenkinsci/plugins/docker/commons/impl/RegistryKeyMaterialFactory.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 101,
+                            "startColumn": 40,
+                            "endColumn": 132
+                          }
+                        },
+                        "message": {
+                          "text": "add(...) : ArgumentListBuilder"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/jenkinsci/plugins/docker/commons/impl/RegistryKeyMaterialFactory.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 101,
+                            "startColumn": 40,
+                            "endColumn": 146
+                          }
+                        },
+                        "message": {
+                          "text": "add(...)"
+                        }
+                      },
+                      "taxa": [
+                        {
+                          "index": 1,
+                          "toolComponent": {
+                            "index": 1
+                          },
+                          "properties": {
+                            "CodeQL/DataflowRole": "step"
+                          }
+                        },
+                        {
+                          "index": 0,
+                          "toolComponent": {
+                            "index": 1
+                          },
+                          "properties": {
+                            "CodeQL/DataflowRole": "sink"
+                          }
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            }
+          ],
+          "relatedLocations": [
+            {
+              "id": 1,
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/docker/commons/impl/RegistryKeyMaterialFactory.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 101,
+                  "startColumn": 137,
+                  "endColumn": 145
+                }
+              },
+              "message": {
+                "text": "credential source"
+              }
+            },
+            {
+              "id": 2,
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/docker/commons/impl/RegistryKeyMaterialFactory.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 101,
+                  "startColumn": 117,
+                  "endColumn": 125
+                }
+              },
+              "message": {
+                "text": "credential source"
+              }
+            },
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/docker/commons/impl/RegistryKeyMaterialFactory.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 101,
+                  "startColumn": 137,
+                  "endColumn": 145
+                }
+              }
+            },
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/docker/commons/impl/RegistryKeyMaterialFactory.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 101,
+                  "startColumn": 117,
+                  "endColumn": 125
+                }
+              }
+            }
+          ]
+        },
+        {
+          "ruleId": "java/docker-login-username-password-injection",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/docker-login-username-password-injection",
+            "index": 0
+          },
+          "message": {
+            "text": "Username/password/endpoint flows to docker command argument at [credential source](1)."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/docker/commons/impl/RegistryKeyMaterialFactory.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 101,
+                  "startColumn": 137,
+                  "endColumn": 145
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "addc28f09d6a4eef:1",
+            "primaryLocationStartColumnFingerprint": "124"
+          },
+          "relatedLocations": [
+            {
+              "id": 1,
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/docker/commons/impl/RegistryKeyMaterialFactory.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 101,
+                  "startColumn": 137,
+                  "endColumn": 145
+                }
+              },
+              "message": {
+                "text": "credential source"
+              }
+            }
+          ]
+        },
+        {
+          "ruleId": "java/docker-login-username-password-injection",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/docker-login-username-password-injection",
+            "index": 0
+          },
+          "message": {
+            "text": "Username/password/endpoint flows to docker command argument at [credential source](1)."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/docker/commons/impl/RegistryKeyMaterialFactory.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 101,
+                  "startColumn": 117,
+                  "endColumn": 125
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "addc28f09d6a4eef:1",
+            "primaryLocationStartColumnFingerprint": "104"
+          },
+          "relatedLocations": [
+            {
+              "id": 1,
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/docker/commons/impl/RegistryKeyMaterialFactory.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 101,
+                  "startColumn": 117,
+                  "endColumn": 125
+                }
+              },
+              "message": {
+                "text": "credential source"
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "codeql_query_uuid": "20260402142359",
+      "codeql_raw_query": "/**\n * @name All ProcStarter command construction in docker-commons plugin\n * @description Find all places where ProcStarter commands are built with user-controlled values\n * @kind problem\n * @problem.severity error\n * @id java/docker-commons-procstarter-commands\n * @tags security\n *       external/cwe/cwe-078\n */\n\nimport java\n\nfrom MethodCall mc\nwhere\n  mc.getEnclosingCallable().getDeclaringType().getPackage().getName().matches(\"org.jenkinsci.plugins.docker.commons%\") and\n  (mc.getMethod().hasName(\"cmds\") or\n   mc.getMethod().hasName(\"cmdAsList\") or\n   mc.getMethod().hasName(\"launch\") or\n   mc.getMethod().hasName(\"join\"))\nselect mc, \"ProcStarter command method '\" + mc.getMethod().getName() + \"' in \" + mc.getEnclosingCallable().getDeclaringType().getName() + \".\" + mc.getEnclosingCallable().getName() + \" at line \" + mc.getLocation().getStartLine()\n",
+      "hypothesis": "Find all ProcStarter command invocations in the plugin to ensure complete coverage",
+      "severity": "high",
+      "cwe_ids": [],
+      "results_count": 3,
+      "results": [
+        {
+          "ruleId": "java/docker-commons-procstarter-commands",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/docker-commons-procstarter-commands",
+            "index": 0
+          },
+          "message": {
+            "text": "ProcStarter command method 'join' in RegistryKeyMaterialFactory.materialize at line 101"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/docker/commons/impl/RegistryKeyMaterialFactory.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 101,
+                  "startColumn": 17,
+                  "endColumn": 191
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "addc28f09d6a4eef:1",
+            "primaryLocationStartColumnFingerprint": "4"
+          }
+        },
+        {
+          "ruleId": "java/docker-commons-procstarter-commands",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/docker-commons-procstarter-commands",
+            "index": 0
+          },
+          "message": {
+            "text": "ProcStarter command method 'cmds' in RegistryKeyMaterialFactory.materialize at line 101"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/docker/commons/impl/RegistryKeyMaterialFactory.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 101,
+                  "startColumn": 17,
+                  "endColumn": 147
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "addc28f09d6a4eef:1",
+            "primaryLocationStartColumnFingerprint": "4"
+          }
+        },
+        {
+          "ruleId": "java/docker-commons-procstarter-commands",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/docker-commons-procstarter-commands",
+            "index": 0
+          },
+          "message": {
+            "text": "ProcStarter command method 'launch' in RegistryKeyMaterialFactory.materialize at line 101"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/docker/commons/impl/RegistryKeyMaterialFactory.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 101,
+                  "startColumn": 17,
+                  "endColumn": 34
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "addc28f09d6a4eef:1",
+            "primaryLocationStartColumnFingerprint": "4"
+          }
+        }
+      ]
+    },
+    {
+      "codeql_query_uuid": "20260402142527",
+      "codeql_raw_query": "/**\n * @name Confirmed: username and password flow to docker login ProcStarter without sanitization\n * @description Confirm exact taint path from username/password fields to the docker login command join() call\n * @kind path-problem\n * @problem.severity error\n * @id java/docker-login-argument-injection-confirmed\n * @tags security\n *       external/cwe/cwe-078\n *       external/cwe/cwe-088\n */\n\nimport java\nimport semmle.code.java.dataflow.TaintTracking\n\nmodule ConfirmedDockerLoginConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    // username and password fields specifically (not endpoint which is a URL type)\n    exists(FieldAccess fa |\n      fa.getField().getDeclaringType().hasQualifiedName(\"org.jenkinsci.plugins.docker.commons.impl\", \"RegistryKeyMaterialFactory\") and\n      (fa.getField().hasName(\"username\") or fa.getField().hasName(\"password\")) and\n      source.asExpr() = fa\n    )\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    // The join() call at line 101 on ProcStarter - which executes the docker login command\n    exists(MethodCall joinCall |\n      joinCall.getMethod().hasName(\"join\") and\n      joinCall.getEnclosingCallable().getDeclaringType().hasQualifiedName(\"org.jenkinsci.plugins.docker.commons.impl\", \"RegistryKeyMaterialFactory\") and\n      // Sink is any argument to add() which feeds the list used in cmds() before join()\n      exists(MethodCall addCall |\n        addCall.getMethod().hasName(\"add\") and\n        addCall.getEnclosingCallable() = joinCall.getEnclosingCallable() and\n        sink.asExpr() = addCall.getArgument(0)\n      )\n    )\n  }\n}\n\nmodule ConfirmedDockerLoginFlow = TaintTracking::Global<ConfirmedDockerLoginConfig>;\nimport ConfirmedDockerLoginFlow::PathGraph\n\nfrom ConfirmedDockerLoginFlow::PathNode source, ConfirmedDockerLoginFlow::PathNode sink\nwhere ConfirmedDockerLoginFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"Argument injection: $@ flows to docker login command argument without sanitization.\", source.getNode(), \"credential value\"\n",
+      "hypothesis": "Confirm argument injection: username and password flow directly to docker login command without sanitization",
+      "severity": "critical",
+      "cwe_ids": [],
+      "results_count": 1,
+      "results": [
+        {
+          "ruleId": "java/docker-login-argument-injection-confirmed",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/docker-login-argument-injection-confirmed",
+            "index": 0
+          },
+          "message": {
+            "text": "Argument injection: [credential value](1) flows to docker login command argument without sanitization."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/docker/commons/impl/RegistryKeyMaterialFactory.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 101,
+                  "startColumn": 117,
+                  "endColumn": 125
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "addc28f09d6a4eef:1",
+            "primaryLocationStartColumnFingerprint": "104"
+          },
+          "relatedLocations": [
+            {
+              "id": 1,
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/jenkinsci/plugins/docker/commons/impl/RegistryKeyMaterialFactory.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 101,
+                  "startColumn": 117,
+                  "endColumn": 125
+                }
+              },
+              "message": {
+                "text": "credential value"
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

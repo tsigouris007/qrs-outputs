@@ -1,0 +1,2468 @@
+{
+  "session_id": "20260401161048",
+  "package_name": "jstachio__jstachio_1.0.0",
+  "package_path": "packages/jstachio__jstachio_1.0.0",
+  "database_path": "databases/jstachio__jstachio_1.0.0-db",
+  "model": "eu.anthropic.claude-sonnet-4-6",
+  "temperature": 1.0,
+  "max_tokens": 25000,
+  "iterations": 16,
+  "total_input_tokens": 639291,
+  "total_output_tokens": 15694,
+  "total_tokens": 654985,
+  "elapsed_time_seconds": 1074.15,
+  "estimated_cost_usd": 2.1533,
+  "summary": "## Security Analysis Report: JStachio 1.0.0 (io.jstach:jstachio-maven-parent)\n\nJStachio is a compile-time, type-safe Java Mustache templating engine. The analysis focused on XSS-related vulnerabilities in HTML output encoding, unescaped template variable handling, and the escaping infrastructure.\n\n---\n\n### Finding 1 \u2014 HIGH: HtmlEscaper Missing Single-Quote Escaping (CWE-079, CWE-116)\n\n**File:** `api/jstachio/src/main/java/io/jstach/jstachio/escapers/HtmlEscaper.java` (line 6)\n\n**Description:**  \nThe default `HtmlEscaper` (used for all `text/html` templates) only escapes four HTML entities:\n- `&` \u2192 `&amp;`\n- `<` \u2192 `&lt;`\n- `>` \u2192 `&gt;`\n- `\"` \u2192 `&quot;`\n\n**Single quotes (`'`) are NOT escaped.** There is no `APOS` field or `&#39;`/`&apos;` mapping in the escaper. This is a concrete XSS vulnerability in HTML attribute contexts using single-quoted attributes.\n\n**Attack scenario:**  \n```html\n<input value='{{userInput}}'>\n```\nIf `userInput` = `' onmouseover='alert(document.cookie)`, the rendered output becomes:\n```html\n<input value='' onmouseover='alert(document.cookie)'>\n```\nThis executes arbitrary JavaScript via attribute injection. The same applies to `href`, `src`, `action`, `style`, and other single-quoted attributes.\n\n**Confirmed by CodeQL:** The `HtmlEscaper` class has exactly 5 fields: `Html`, `AMP`, `LT`, `GT`, `QUOT` \u2014 no `APOS` or single-quote escape mapping exists.\n\n---\n\n### Finding 2 \u2014 HIGH: Unescaped Output via Triple-Mustache (`{{{var}}}` / `{{&var}}`) (CWE-079)\n\n**Files:**  \n- `compiler/apt/src/main/java/io/jstach/apt/TemplateCompiler.java` (lines 347, 649, 658)\n- `compiler/apt/src/main/java/io/jstach/apt/internal/token/MustacheTagKind.java` (lines 39\u201340)\n- `api/jstachio/src/main/java/io/jstach/jstachio/escapers/NoEscaper.java`\n\n**Description:**  \nJStachio supports Mustache's triple-mustache (`{{{var}}}`) and ampersand (`{{&var}}`) syntax for unescaped variable interpolation. The `TemplateCompiler` has dedicated methods `_unescapedVariable` (line 649) and `flushUnescaped` (line 347) that call `unescapedRenderingCode()` to generate rendering code that **completely bypasses HTML encoding**. The `MustacheTagKind` enum has two variants `UNESCAPED_VARIABLE_TWO_BRACES` and `UNESCAPED_VARIABLE_THREE_BRACES` both processed through the `NoEscaper` path.\n\n**Risk:** Any template using `{{{userControlledData}}}` or `{{&userControlledData}}` will render raw HTML/JavaScript from user-supplied data directly into the HTTP response without any sanitization.\n\n**The `NoEscaper` class** implements all `append()` methods as pure pass-through (no filtering), confirmed by 8 `append` method implementations at lines 11\u201346 of `NoEscaper.java`.\n\n---\n\n### Finding 3 \u2014 HIGH: PlainText Content Type Uses NoEscaper (CWE-079)\n\n**Files:**  \n- `api/jstachio/src/main/java/io/jstach/jstachio/escapers/PlainText.java`  \n- `api/jstachio/src/main/java/io/jstach/jstachio/Appender.java` (line 140)  \n- `api/jstachio/src/main/java/io/jstach/jstachio/spi/Templates.java` (line 552)\n\n**Description:**  \nThe `PlainText` content type provider returns a `NoEscaper` instance (via `PlainText.provider()`). Templates annotated with `@JStache(contentType = PlainText.class)` will have **ALL** variables \u2014 not just triple-mustache ones \u2014 rendered without any HTML escaping. This is referenced from `Appender.java` and `Templates.java` in the public API, making it accessible to application developers who may inadvertently use it in HTML responses.\n\n**Risk:** If a developer uses `PlainText` content type for a template that is served as `text/html`, every `{{variable}}` is raw-output. A Spring controller returning a `PlainText`-typed model view over HTTP could be fully XSS-exploitable.\n\n---\n\n### Finding 4 \u2014 MEDIUM: ContextNode Exposes Dynamic Untyped Data (CWE-079)\n\n**File:** `api/jstachio/src/main/java/io/jstach/jstachio/context/ContextNode.java` (lines 107, 145, 151)\n\n**Description:**  \nThe `ContextNode` API exposes methods `object()` (returns `Object`), `get(String)` (returns `ContextNode`), and `renderString()` (returns `String`) that allow dynamic, runtime data to be fed into templates. Since `ContextNode` bypasses JStachio's compile-time type-safety guarantees, the escaping behavior for data accessed through `ContextNode` depends entirely on how the template variable is referenced \u2014 any data accessed through `{{{var}}}` or through templates using `NoEscaper`/`PlainText` will be rendered unescaped.\n\n---\n\n### Summary Table\n\n| # | Severity | CWE | Location | Description |\n|---|----------|-----|----------|-------------|\n| 1 | **High** | CWE-079, CWE-116 | `HtmlEscaper.java:6` | Default escaper does not escape single quotes \u2014 XSS in single-quoted attribute contexts |\n| 2 | **High** | CWE-079 | `TemplateCompiler.java:649,347` | Triple-mustache `{{{var}}}` generates code using `NoEscaper`, bypassing all HTML encoding |\n| 3 | **High** | CWE-079 | `PlainText.java`, `Appender.java:140` | `PlainText` content type uses `NoEscaper` \u2014 all variables unescaped when used in HTML responses |\n| 4 | **Medium** | CWE-079 | `ContextNode.java:145,151` | Dynamic untyped data via `ContextNode` bypasses compile-time type safety \u2014 escaping depends on template context |\n\n---\n\n### Notes on Intentional vs. Unintentional Design\n\n- **Triple-mustache unescaping** (Finding 2) and **PlainText** (Finding 3) are Mustache-spec features and are by design. However, the absence of security documentation warning developers about XSS risks when using these features in HTML contexts is a concern.\n- **HtmlEscaper missing single-quote** (Finding 1) appears to be an implementation gap \u2014 the Mustache specification and common security practice (OWASP) recommend escaping single quotes in HTML attribute contexts. This is the most clearly unintentional vulnerability.\n",
+  "package_classification": {
+    "type": [
+      "library",
+      "framework"
+    ],
+    "layer": [
+      "presentation",
+      "web"
+    ]
+  },
+  "tool_calls": {
+    "get_package_profile_info": 1,
+    "execute_codeql_query": 28,
+    "validate_codeql_query": 0,
+    "fixup_codeql_query": 0,
+    "finalize_report": 1
+  },
+  "queries_executed": {
+    "critical": 0,
+    "high": 18,
+    "medium": 4,
+    "low": 0,
+    "total_executed": 28,
+    "total_with_results": 22,
+    "total_failed": 6
+  },
+  "query_findings": {
+    "critical": 0,
+    "high": 53,
+    "medium": 18,
+    "low": 0,
+    "total": 71
+  },
+  "findings": [
+    {
+      "codeql_query_uuid": "20260401161106",
+      "codeql_raw_query": "/**\n * @name NoEscaper/PlainText bypasses HTML encoding\n * @description Find places where NoEscaper or PlainText is used, which disables HTML escaping and can lead to XSS\n * @kind problem\n * @problem.severity warning\n * @id java/no-escaper-xss\n * @tags security\n *       external/cwe/cwe-079\n */\n\nimport java\n\nfrom ClassInstanceExpr cie\nwhere\n  cie.getConstructor().getDeclaringType().hasQualifiedName(\"io.jstach.jstachio.escapers\", \"NoEscaper\")\n  or\n  cie.getConstructor().getDeclaringType().hasQualifiedName(\"io.jstach.jstachio.escapers\", \"PlainText\")\nselect cie, \"Instantiation of NoEscaper/PlainText bypasses HTML encoding.\"\n",
+      "hypothesis": "Using NoEscaper or PlainText escapers bypasses HTML escaping, potentially enabling XSS",
+      "severity": "high",
+      "cwe_ids": [],
+      "results_count": 1,
+      "results": [
+        {
+          "ruleId": "java/no-escaper-xss",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/no-escaper-xss",
+            "index": 0
+          },
+          "message": {
+            "text": "Instantiation of NoEscaper/PlainText bypasses HTML encoding."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "api/jstachio/src/main/java/io/jstach/jstachio/escapers/NoEscaper.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 8,
+                  "startColumn": 2,
+                  "endColumn": 11
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "83b7ab7def3fb571:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        }
+      ]
+    },
+    {
+      "codeql_query_uuid": "20260401161138",
+      "codeql_raw_query": "/**\n * @name Unescaped output via NoEscaper annotation usage\n * @description Detect when templates are annotated with escapers that bypass HTML encoding\n * @kind problem\n * @problem.severity warning\n * @id java/plain-text-escaper-annotation\n * @tags security\n *       external/cwe/cwe-079\n */\n\nimport java\n\nfrom Annotation ann, AnnotationType at\nwhere\n  ann.getType() = at and\n  (\n    at.hasQualifiedName(\"io.jstach.jstache\", \"JStacheContentType\") or\n    at.hasQualifiedName(\"io.jstach.jstache\", \"JStache\")\n  ) and\n  (\n    ann.getValue(\"value\").toString().matches(\"%NoEscaper%\") or\n    ann.getValue(\"value\").toString().matches(\"%PlainText%\") or\n    ann.getValue(\"escaper\").toString().matches(\"%NoEscaper%\") or\n    ann.getValue(\"escaper\").toString().matches(\"%PlainText%\")\n  )\nselect ann, \"Template annotation may use a non-HTML escaper, potentially bypassing XSS protection.\"\n",
+      "hypothesis": "Templates annotated with NoEscaper or PlainText content type bypass HTML encoding",
+      "severity": "high",
+      "cwe_ids": [],
+      "results_count": 0,
+      "results": []
+    },
+    {
+      "codeql_query_uuid": "20260401161219",
+      "codeql_raw_query": "/**\n * @name NoEscaper and PlainText escaper implementations\n * @description Examine the NoEscaper and PlainText classes to understand how they bypass HTML encoding\n * @kind problem\n * @problem.severity warning\n * @id java/no-escaper-impl\n * @tags security\n *       external/cwe/cwe-079\n */\n\nimport java\n\nfrom Method m\nwhere\n  (\n    m.getDeclaringType().hasQualifiedName(\"io.jstach.jstachio.escapers\", \"NoEscaper\") or\n    m.getDeclaringType().hasQualifiedName(\"io.jstach.jstachio.escapers\", \"PlainText\")\n  )\nselect m, \"Method in no-escaping class: \" + m.getDeclaringType().getQualifiedName() + \".\" + m.getName()\n",
+      "hypothesis": "Understanding how NoEscaper and PlainText bypass HTML encoding",
+      "severity": "high",
+      "cwe_ids": [],
+      "results_count": 11,
+      "results": [
+        {
+          "ruleId": "java/no-escaper-impl",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/no-escaper-impl",
+            "index": 0
+          },
+          "message": {
+            "text": "Method in no-escaping class: io.jstach.jstachio.escapers.NoEscaper.append"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "api/jstachio/src/main/java/io/jstach/jstachio/escapers/NoEscaper.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 46,
+                  "startColumn": 57,
+                  "endColumn": 63
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "5135d864cd121680:1",
+            "primaryLocationStartColumnFingerprint": "55"
+          }
+        },
+        {
+          "ruleId": "java/no-escaper-impl",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/no-escaper-impl",
+            "index": 0
+          },
+          "message": {
+            "text": "Method in no-escaping class: io.jstach.jstachio.escapers.NoEscaper.append"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "api/jstachio/src/main/java/io/jstach/jstachio/escapers/NoEscaper.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 41,
+                  "startColumn": 57,
+                  "endColumn": 63
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "af96cd365a731501:1",
+            "primaryLocationStartColumnFingerprint": "55"
+          }
+        },
+        {
+          "ruleId": "java/no-escaper-impl",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/no-escaper-impl",
+            "index": 0
+          },
+          "message": {
+            "text": "Method in no-escaping class: io.jstach.jstachio.escapers.NoEscaper.append"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "api/jstachio/src/main/java/io/jstach/jstachio/escapers/NoEscaper.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 36,
+                  "startColumn": 57,
+                  "endColumn": 63
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "fbfb739a009ce253:1",
+            "primaryLocationStartColumnFingerprint": "55"
+          }
+        },
+        {
+          "ruleId": "java/no-escaper-impl",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/no-escaper-impl",
+            "index": 0
+          },
+          "message": {
+            "text": "Method in no-escaping class: io.jstach.jstachio.escapers.NoEscaper.append"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "api/jstachio/src/main/java/io/jstach/jstachio/escapers/NoEscaper.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 31,
+                  "startColumn": 57,
+                  "endColumn": 63
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "889740283017c31e:1",
+            "primaryLocationStartColumnFingerprint": "55"
+          }
+        },
+        {
+          "ruleId": "java/no-escaper-impl",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/no-escaper-impl",
+            "index": 0
+          },
+          "message": {
+            "text": "Method in no-escaping class: io.jstach.jstachio.escapers.NoEscaper.append"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "api/jstachio/src/main/java/io/jstach/jstachio/escapers/NoEscaper.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 26,
+                  "startColumn": 57,
+                  "endColumn": 63
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "bc58bc686fc76aac:1",
+            "primaryLocationStartColumnFingerprint": "55"
+          }
+        },
+        {
+          "ruleId": "java/no-escaper-impl",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/no-escaper-impl",
+            "index": 0
+          },
+          "message": {
+            "text": "Method in no-escaping class: io.jstach.jstachio.escapers.NoEscaper.append"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "api/jstachio/src/main/java/io/jstach/jstachio/escapers/NoEscaper.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 21,
+                  "startColumn": 57,
+                  "endColumn": 63
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "6a40e0ef092fb85f:1",
+            "primaryLocationStartColumnFingerprint": "55"
+          }
+        },
+        {
+          "ruleId": "java/no-escaper-impl",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/no-escaper-impl",
+            "index": 0
+          },
+          "message": {
+            "text": "Method in no-escaping class: io.jstach.jstachio.escapers.NoEscaper.append"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "api/jstachio/src/main/java/io/jstach/jstachio/escapers/NoEscaper.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 16,
+                  "startColumn": 57,
+                  "endColumn": 63
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "5164ac87f2faa522:1",
+            "primaryLocationStartColumnFingerprint": "55"
+          }
+        },
+        {
+          "ruleId": "java/no-escaper-impl",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/no-escaper-impl",
+            "index": 0
+          },
+          "message": {
+            "text": "Method in no-escaping class: io.jstach.jstachio.escapers.NoEscaper.append"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "api/jstachio/src/main/java/io/jstach/jstachio/escapers/NoEscaper.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 11,
+                  "startColumn": 57,
+                  "endColumn": 63
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "e5be99b86f77947f:1",
+            "primaryLocationStartColumnFingerprint": "55"
+          }
+        },
+        {
+          "ruleId": "java/no-escaper-impl",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/no-escaper-impl",
+            "index": 0
+          },
+          "message": {
+            "text": "Method in no-escaping class: io.jstach.jstachio.escapers.PlainText.of"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "api/jstachio/src/main/java/io/jstach/jstachio/escapers/PlainText.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 1
+                },
+                "region": {
+                  "startLine": 59,
+                  "startColumn": 24,
+                  "endColumn": 26
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "2af27c94b2ea8180:1",
+            "primaryLocationStartColumnFingerprint": "22"
+          }
+        },
+        {
+          "ruleId": "java/no-escaper-impl",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/no-escaper-impl",
+            "index": 0
+          },
+          "message": {
+            "text": "Method in no-escaping class: io.jstach.jstachio.escapers.PlainText.provider"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "api/jstachio/src/main/java/io/jstach/jstachio/escapers/PlainText.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 1
+                },
+                "region": {
+                  "startLine": 51,
+                  "startColumn": 24,
+                  "endColumn": 32
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "8da43dac75bfd226:1",
+            "primaryLocationStartColumnFingerprint": "22"
+          }
+        },
+        {
+          "ruleId": "java/no-escaper-impl",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/no-escaper-impl",
+            "index": 0
+          },
+          "message": {
+            "text": "Method in no-escaping class: io.jstach.jstachio.escapers.NoEscaper.<clinit>"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "api/jstachio/src/main/java/io/jstach/jstachio/escapers/NoEscaper.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 6,
+                  "startColumn": 6,
+                  "endColumn": 15
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "455c1811aedd2f1c:1",
+            "primaryLocationStartColumnFingerprint": "5"
+          }
+        }
+      ]
+    },
+    {
+      "codeql_query_uuid": "20260401161322",
+      "codeql_raw_query": "/**\n * @name HtmlEscaper character coverage analysis\n * @description Check what characters the HtmlEscaper actually escapes\n * @kind problem\n * @problem.severity warning\n * @id java/html-escaper-coverage\n * @tags security\n *       external/cwe/cwe-079\n *       external/cwe/cwe-116\n */\n\nimport java\n\nfrom StringLiteral sl\nwhere\n  sl.getEnclosingCallable().getDeclaringType().getASupertype*().hasQualifiedName(\"io.jstach.jstachio.escapers\", \"HtmlEscaper\")\n  or\n  sl.getEnclosingCallable().getDeclaringType().hasQualifiedName(\"io.jstach.jstachio.escapers\", \"HtmlEscaper\")\n  or\n  sl.getEnclosingCallable().getDeclaringType().hasQualifiedName(\"io.jstach.jstachio.escapers\", \"Html\")\n  or\n  (\n    sl.getFile().getAbsolutePath().matches(\"%HtmlEscaper%\") or\n    sl.getFile().getAbsolutePath().matches(\"%Html.java%\")\n  )\nselect sl, \"String in HTML escaper: [\" + sl.getLiteral() + \"] in \" + sl.getEnclosingCallable().getDeclaringType().getName() + \".\" + sl.getEnclosingCallable().getName()\n",
+      "hypothesis": "HtmlEscaper may not escape single quotes or backticks, enabling attribute injection XSS",
+      "severity": "medium",
+      "cwe_ids": [],
+      "results_count": 6,
+      "results": [
+        {
+          "ruleId": "java/html-escaper-coverage",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/html-escaper-coverage",
+            "index": 0
+          },
+          "message": {
+            "text": "String in HTML escaper: \\[\"&quot;\"\\] in HtmlEscaper.<clinit>"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "api/jstachio/src/main/java/io/jstach/jstachio/escapers/HtmlEscaper.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 10,
+                  "startColumn": 37,
+                  "endColumn": 45
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "56882c2bcbce04a2:1",
+            "primaryLocationStartColumnFingerprint": "35"
+          }
+        },
+        {
+          "ruleId": "java/html-escaper-coverage",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/html-escaper-coverage",
+            "index": 0
+          },
+          "message": {
+            "text": "String in HTML escaper: \\[\"&gt;\"\\] in HtmlEscaper.<clinit>"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "api/jstachio/src/main/java/io/jstach/jstachio/escapers/HtmlEscaper.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 12,
+                  "startColumn": 35,
+                  "endColumn": 41
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "8efa46f93c2536e3:1",
+            "primaryLocationStartColumnFingerprint": "33"
+          }
+        },
+        {
+          "ruleId": "java/html-escaper-coverage",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/html-escaper-coverage",
+            "index": 0
+          },
+          "message": {
+            "text": "String in HTML escaper: \\[\"&lt;\"\\] in HtmlEscaper.<clinit>"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "api/jstachio/src/main/java/io/jstach/jstachio/escapers/HtmlEscaper.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 14,
+                  "startColumn": 35,
+                  "endColumn": 41
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "4c1cee3c1f958616:1",
+            "primaryLocationStartColumnFingerprint": "33"
+          }
+        },
+        {
+          "ruleId": "java/html-escaper-coverage",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/html-escaper-coverage",
+            "index": 0
+          },
+          "message": {
+            "text": "String in HTML escaper: \\[\"&amp;\"\\] in HtmlEscaper.<clinit>"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "api/jstachio/src/main/java/io/jstach/jstachio/escapers/HtmlEscaper.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 16,
+                  "startColumn": 36,
+                  "endColumn": 43
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "203c7057ec2d1469:1",
+            "primaryLocationStartColumnFingerprint": "34"
+          }
+        },
+        {
+          "ruleId": "java/html-escaper-coverage",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/html-escaper-coverage",
+            "index": 0
+          },
+          "message": {
+            "text": "String in HTML escaper: \\[\"null\"\\] in HtmlEscaper.append"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "api/jstachio/src/main/java/io/jstach/jstachio/escapers/HtmlEscaper.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 20,
+                  "startColumn": 19,
+                  "endColumn": 25
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "c5bdfd346fe66495:1",
+            "primaryLocationStartColumnFingerprint": "16"
+          }
+        },
+        {
+          "ruleId": "java/html-escaper-coverage",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/html-escaper-coverage",
+            "index": 0
+          },
+          "message": {
+            "text": "String in HTML escaper: \\[\"null\"\\] in HtmlEscaper.append"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "api/jstachio/src/main/java/io/jstach/jstachio/escapers/HtmlEscaper.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 26,
+                  "startColumn": 23,
+                  "endColumn": 29
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "bb18896554316ea5:1",
+            "primaryLocationStartColumnFingerprint": "20"
+          }
+        }
+      ]
+    },
+    {
+      "codeql_query_uuid": "20260401161352",
+      "codeql_raw_query": "/**\n * @name RawAppend / unescaped output in template engine\n * @description Find uses of raw/unescaped output in the template rendering pipeline\n * @kind problem\n * @problem.severity warning\n * @id java/raw-template-output\n * @tags security\n *       external/cwe/cwe-079\n */\n\nimport java\n\n// Find methods that write raw (unescaped) output through the Appender or Output interfaces\nfrom MethodCall mc\nwhere\n  (\n    // Direct append without going through Escaper\n    mc.getMethod().hasName(\"append\") and\n    mc.getMethod().getDeclaringType().getASupertype*().hasQualifiedName(\"io.jstach.jstachio\", \"Output\") and\n    // Look for calls within template rendering code\n    mc.getEnclosingCallable().getDeclaringType().getPackage().getName().matches(\"io.jstach.%\")\n  )\n  or\n  (\n    // writeUnescaped or similar method names\n    mc.getMethod().hasName(\"writeUnescaped\") or\n    mc.getMethod().hasName(\"appendRaw\") or\n    mc.getMethod().hasName(\"raw\")\n  )\nselect mc, \"Potentially unescaped output call: \" + mc.getMethod().getName() + \" in \" + mc.getEnclosingCallable().getDeclaringType().getName()\n",
+      "hypothesis": "Raw/unescaped output methods in template engine bypass HTML encoding",
+      "severity": "high",
+      "cwe_ids": [],
+      "results_count": 5,
+      "results": [
+        {
+          "ruleId": "java/raw-template-output",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/raw-template-output",
+            "index": 0
+          },
+          "message": {
+            "text": "Potentially unescaped output call: append in Output"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "api/jstachio/src/main/java/io/jstach/jstachio/Output.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 53,
+                  "startColumn": 3,
+                  "endColumn": 28
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "e80a49b566f03140:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "java/raw-template-output",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/raw-template-output",
+            "index": 0
+          },
+          "message": {
+            "text": "Potentially unescaped output call: append in Output"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "api/jstachio/src/main/java/io/jstach/jstachio/Output.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 65,
+                  "startColumn": 3,
+                  "endColumn": 28
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "664903ff38ca95cb:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "java/raw-template-output",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/raw-template-output",
+            "index": 0
+          },
+          "message": {
+            "text": "Potentially unescaped output call: append in Output"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "api/jstachio/src/main/java/io/jstach/jstachio/Output.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 77,
+                  "startColumn": 3,
+                  "endColumn": 28
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "2b3d66139f349c6a:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "java/raw-template-output",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/raw-template-output",
+            "index": 0
+          },
+          "message": {
+            "text": "Potentially unescaped output call: append in Output"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "api/jstachio/src/main/java/io/jstach/jstachio/Output.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 89,
+                  "startColumn": 3,
+                  "endColumn": 28
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "c8b1b5dd38c48ac2:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "java/raw-template-output",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/raw-template-output",
+            "index": 0
+          },
+          "message": {
+            "text": "Potentially unescaped output call: append in Output"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "api/jstachio/src/main/java/io/jstach/jstachio/Output.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 101,
+                  "startColumn": 3,
+                  "endColumn": 28
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "42239d139bff26b6:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        }
+      ]
+    },
+    {
+      "codeql_query_uuid": "20260401161437",
+      "codeql_raw_query": "/**\n * @name HtmlEscaper missing single quote escaping\n * @description HtmlEscaper does not escape single quotes, enabling XSS in single-quoted HTML attributes\n * @kind problem\n * @problem.severity error\n * @id java/html-escaper-missing-single-quote\n * @tags security\n *       external/cwe/cwe-079\n *       external/cwe/cwe-116\n */\n\nimport java\n\nfrom Class c, Field f\nwhere\n  c.hasQualifiedName(\"io.jstach.jstachio.escapers\", \"HtmlEscaper\") and\n  f.getDeclaringType() = c\nselect c, \"HtmlEscaper class found - check if it escapes single quotes and backticks. Fields: \" + f.getName()\n",
+      "hypothesis": "HtmlEscaper missing single-quote escaping enables XSS in single-quoted attribute context",
+      "severity": "high",
+      "cwe_ids": [],
+      "results_count": 1,
+      "results": [
+        {
+          "ruleId": "java/html-escaper-missing-single-quote",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/html-escaper-missing-single-quote",
+            "index": 0
+          },
+          "message": {
+            "text": "HtmlEscaper class found - check if it escapes single quotes and backticks. Fields: Html\nHtmlEscaper class found - check if it escapes single quotes and backticks. Fields: AMP\nHtmlEscaper class found - check if it escapes single quotes and backticks. Fields: LT\nHtmlEscaper class found - check if it escapes single quotes and backticks. Fields: GT\nHtmlEscaper class found - check if it escapes single quotes and backticks. Fields: QUOT"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "api/jstachio/src/main/java/io/jstach/jstachio/escapers/HtmlEscaper.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 6,
+                  "startColumn": 6,
+                  "endColumn": 17
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "adf9966e76e52bc9:1",
+            "primaryLocationStartColumnFingerprint": "5"
+          }
+        }
+      ]
+    },
+    {
+      "codeql_query_uuid": "20260401161555",
+      "codeql_raw_query": "/**\n * @name TemplateCompiler generates unescaped output for triple mustache\n * @description The TemplateCompiler generates code that writes data directly without HTML escaping for triple-mustache variables\n * @kind problem\n * @problem.severity error\n * @id java/triple-mustache-unescaped\n * @tags security\n *       external/cwe/cwe-079\n */\n\nimport java\n\n// Look for code in TemplateCompiler that handles unescaped/raw variable output\nfrom MethodCall mc\nwhere\n  mc.getEnclosingCallable().getDeclaringType().hasQualifiedName(\"io.jstach.apt\", \"TemplateCompiler\") and\n  (\n    mc.getMethod().hasName(\"writeUnescaped\") or\n    mc.getMethod().hasName(\"append\") or\n    mc.getArgument(0).(StringLiteral).getLiteral().matches(\"%unescape%\") or\n    mc.getArgument(0).(StringLiteral).getLiteral().matches(\"%raw%\") or\n    mc.getArgument(0).(StringLiteral).getLiteral().matches(\"%NoEscap%\") or\n    mc.getArgument(0).(StringLiteral).getLiteral().matches(\"%UNESCAPED%\")\n  )\nselect mc, \"Potential unescaped output in TemplateCompiler: \" + mc.getMethod().getName() + \" at line \" + mc.getLocation().getStartLine()\n",
+      "hypothesis": "TemplateCompiler generates raw/unescaped output code for triple-mustache ({{{var}}}) variables",
+      "severity": "high",
+      "cwe_ids": [],
+      "results_count": 1,
+      "results": [
+        {
+          "ruleId": "java/triple-mustache-unescaped",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/triple-mustache-unescaped",
+            "index": 0
+          },
+          "message": {
+            "text": "Potential unescaped output in TemplateCompiler: append at line 356"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "compiler/apt/src/main/java/io/jstach/apt/TemplateCompiler.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 356,
+                  "startColumn": 3,
+                  "endColumn": 29
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "4baa12be2f5e2560:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        }
+      ]
+    },
+    {
+      "codeql_query_uuid": "20260401161628",
+      "codeql_raw_query": "/**\n * @name Spring MVC content-type not set for template responses\n * @description JStachioHttpMessageConverter or JStachioModelView may not explicitly set content-type\n * @kind problem\n * @problem.severity warning\n * @id java/spring-content-type-missing\n * @tags security\n *       external/cwe/cwe-079\n */\n\nimport java\n\n// Check Spring integration classes for content-type handling\nfrom Method m, Class c\nwhere\n  (\n    c.hasQualifiedName(\"io.jstach.opt.spring.web\", \"JStachioHttpMessageConverter\") or\n    c.hasQualifiedName(\"io.jstach.opt.spring.webmvc\", \"JStachioModelView\") or\n    c.hasQualifiedName(\"io.jstach.opt.spring.webflux\", \"JStachioModelView\") or\n    c.hasQualifiedName(\"io.jstach.opt.spring.webflux\", \"JStachioEncoder\")\n  ) and\n  m.getDeclaringType() = c\nselect m, \"Spring integration method: \" + c.getName() + \".\" + m.getName() + \" - check content-type handling\"\n",
+      "hypothesis": "Spring integration may not explicitly set content-type, allowing browser content sniffing",
+      "severity": "medium",
+      "cwe_ids": [],
+      "results_count": 7,
+      "results": [
+        {
+          "ruleId": "java/spring-content-type-missing",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/spring-content-type-missing",
+            "index": 0
+          },
+          "message": {
+            "text": "Spring integration method: JStachioHttpMessageConverter.writeInternal - check content-type handling"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "opt/jstachio-spring/src/main/java/io/jstach/opt/spring/web/JStachioHttpMessageConverter.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 68,
+                  "startColumn": 17,
+                  "endColumn": 30
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "4f29d2bae556ddc9:1",
+            "primaryLocationStartColumnFingerprint": "15"
+          }
+        },
+        {
+          "ruleId": "java/spring-content-type-missing",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/spring-content-type-missing",
+            "index": 0
+          },
+          "message": {
+            "text": "Spring integration method: JStachioHttpMessageConverter.readInternal - check content-type handling"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "opt/jstachio-spring/src/main/java/io/jstach/opt/spring/web/JStachioHttpMessageConverter.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 61,
+                  "startColumn": 19,
+                  "endColumn": 31
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "20f929efb1b2bd39:1",
+            "primaryLocationStartColumnFingerprint": "17"
+          }
+        },
+        {
+          "ruleId": "java/spring-content-type-missing",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/spring-content-type-missing",
+            "index": 0
+          },
+          "message": {
+            "text": "Spring integration method: JStachioHttpMessageConverter.canRead - check content-type handling"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "opt/jstachio-spring/src/main/java/io/jstach/opt/spring/web/JStachioHttpMessageConverter.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 56,
+                  "startColumn": 17,
+                  "endColumn": 24
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "3cffad43b4bc7917:1",
+            "primaryLocationStartColumnFingerprint": "15"
+          }
+        },
+        {
+          "ruleId": "java/spring-content-type-missing",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/spring-content-type-missing",
+            "index": 0
+          },
+          "message": {
+            "text": "Spring integration method: JStachioHttpMessageConverter.supports - check content-type handling"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "opt/jstachio-spring/src/main/java/io/jstach/opt/spring/web/JStachioHttpMessageConverter.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 51,
+                  "startColumn": 20,
+                  "endColumn": 28
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "610440a2b4f55370:1",
+            "primaryLocationStartColumnFingerprint": "18"
+          }
+        },
+        {
+          "ruleId": "java/spring-content-type-missing",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/spring-content-type-missing",
+            "index": 0
+          },
+          "message": {
+            "text": "Spring integration method: JStachioEncoder.encodeValue - check content-type handling"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "opt/jstachio-spring-webflux/src/main/java/io/jstach/opt/spring/webflux/JStachioEncoder.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 1
+                },
+                "region": {
+                  "startLine": 64,
+                  "startColumn": 20,
+                  "endColumn": 31
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "f3a94de94e0be803:1",
+            "primaryLocationStartColumnFingerprint": "18"
+          }
+        },
+        {
+          "ruleId": "java/spring-content-type-missing",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/spring-content-type-missing",
+            "index": 0
+          },
+          "message": {
+            "text": "Spring integration method: JStachioEncoder.encode - check content-type handling"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "opt/jstachio-spring-webflux/src/main/java/io/jstach/opt/spring/webflux/JStachioEncoder.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 1
+                },
+                "region": {
+                  "startLine": 58,
+                  "startColumn": 29,
+                  "endColumn": 35
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "c87079e1c43e35e8:1",
+            "primaryLocationStartColumnFingerprint": "27"
+          }
+        },
+        {
+          "ruleId": "java/spring-content-type-missing",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/spring-content-type-missing",
+            "index": 0
+          },
+          "message": {
+            "text": "Spring integration method: JStachioEncoder.canEncode - check content-type handling"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "opt/jstachio-spring-webflux/src/main/java/io/jstach/opt/spring/webflux/JStachioEncoder.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 1
+                },
+                "region": {
+                  "startLine": 52,
+                  "startColumn": 17,
+                  "endColumn": 26
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "f49104787279c84:1",
+            "primaryLocationStartColumnFingerprint": "15"
+          }
+        }
+      ]
+    },
+    {
+      "codeql_query_uuid": "20260401161717",
+      "codeql_raw_query": "/**\n * @name HtmlEscaper missing single-quote escape - precise check\n * @description HtmlEscaper escapes &amp;, &lt;, &gt;, &quot; but NOT single quotes (&apos;/&#39;)\n * This allows XSS when template variables appear in single-quoted HTML attributes like: value='{{userInput}}'\n * @kind problem\n * @problem.severity error\n * @id java/html-escaper-missing-apos\n * @tags security\n *       external/cwe/cwe-079\n *       external/cwe/cwe-116\n */\n\nimport java\n\nfrom Class c\nwhere\n  c.hasQualifiedName(\"io.jstach.jstachio.escapers\", \"HtmlEscaper\") and\n  // Confirm single quote is NOT in the escape map\n  not exists(StringLiteral sl |\n    sl.getEnclosingCallable().getDeclaringType() = c and\n    (sl.getLiteral() = \"'\" or sl.getLiteral() = \"&#39;\" or sl.getLiteral() = \"&apos;\" or sl.getLiteral().matches(\"%apos%\") or sl.getLiteral().matches(\"%#39%\"))\n  )\nselect c, \"HtmlEscaper does not escape single quotes (') - template variables in single-quoted attributes like value='{{var}}' are vulnerable to XSS. Only escapes: &amp;, &lt;, &gt;, &quot;\"\n",
+      "hypothesis": "HtmlEscaper missing single-quote escaping enables XSS in single-quoted HTML attribute contexts",
+      "severity": "high",
+      "cwe_ids": [],
+      "results_count": 1,
+      "results": [
+        {
+          "ruleId": "java/html-escaper-missing-apos",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/html-escaper-missing-apos",
+            "index": 0
+          },
+          "message": {
+            "text": "HtmlEscaper does not escape single quotes (') - template variables in single-quoted attributes like value='{{{{var}}}}' are vulnerable to XSS. Only escapes: &amp;, &lt;, &gt;, &quot;"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "api/jstachio/src/main/java/io/jstach/jstachio/escapers/HtmlEscaper.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 6,
+                  "startColumn": 6,
+                  "endColumn": 17
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "adf9966e76e52bc9:1",
+            "primaryLocationStartColumnFingerprint": "5"
+          }
+        }
+      ]
+    },
+    {
+      "codeql_query_uuid": "20260401161832",
+      "codeql_raw_query": "/**\n * @name TemplateCompiler unescaped variable code generation\n * @description Find the exact code path in TemplateCompiler that handles triple-mustache unescaped variables\n * @kind problem\n * @problem.severity error\n * @id java/template-compiler-unescape-path\n * @tags security\n *       external/cwe/cwe-079\n */\n\nimport java\n\n// Look for method calls in TemplateCompiler related to unescaped output\nfrom MethodCall mc\nwhere\n  mc.getEnclosingCallable().getDeclaringType().hasQualifiedName(\"io.jstach.apt\", \"TemplateCompiler\") and\n  (\n    mc.getArgument(0).(StringLiteral).getLiteral().matches(\"%unescape%\") or\n    mc.getArgument(0).(StringLiteral).getLiteral().matches(\"%Unescape%\") or\n    mc.getArgument(0).(StringLiteral).getLiteral().matches(\"%UNESCAPED%\") or\n    mc.getArgument(0).(StringLiteral).getLiteral().matches(\"%noEscape%\") or\n    mc.getArgument(0).(StringLiteral).getLiteral().matches(\"%NoEscape%\") or\n    mc.getArgument(0).(StringLiteral).getLiteral().matches(\"%raw%\") or\n    mc.getArgument(0).(StringLiteral).getLiteral().matches(\"%Raw%\") or\n    mc.getArgument(0).(StringLiteral).getLiteral().matches(\"%triple%\") or\n    mc.getArgument(0).(StringLiteral).getLiteral().matches(\"%Triple%\") or\n    mc.getMethod().hasName(\"renderUnescaped\") or\n    mc.getMethod().hasName(\"unescaped\") or\n    mc.getMethod().hasName(\"formatUnescaped\")\n  )\nselect mc, \"Unescaped output path in TemplateCompiler: \" + mc.getMethod().getName() + \"(\" + mc.getArgument(0) + \") at line \" + mc.getLocation().getStartLine()\n",
+      "hypothesis": "TemplateCompiler uses a specific code path for unescaped triple-mustache variables",
+      "severity": "high",
+      "cwe_ids": [],
+      "results_count": 0,
+      "results": []
+    },
+    {
+      "codeql_query_uuid": "20260401161900",
+      "codeql_raw_query": "/**\n * @name ContextNode allows untyped dynamic data bypass\n * @description ContextNode allows accessing arbitrary runtime data that bypasses the type-safe template system\n * @kind problem\n * @problem.severity warning\n * @id java/context-node-untyped-data\n * @tags security\n *       external/cwe/cwe-079\n */\n\nimport java\n\n// Find methods in ContextNode that return or expose raw object/string data\nfrom Method m\nwhere\n  m.getDeclaringType().hasQualifiedName(\"io.jstach.jstachio.context\", \"ContextNode\") and\n  (\n    m.getReturnType() instanceof TypeString or\n    m.getReturnType().hasName(\"Object\") or\n    m.getName().matches(\"get%\") or\n    m.getName().matches(\"render%\") or\n    m.getName().matches(\"value%\")\n  )\nselect m, \"ContextNode method exposing dynamic data: \" + m.getName() + \" returns \" + m.getReturnType().getName()\n",
+      "hypothesis": "ContextNode exposes dynamic/runtime data that may bypass type-safe escaping",
+      "severity": "medium",
+      "cwe_ids": [],
+      "results_count": 3,
+      "results": [
+        {
+          "ruleId": "java/context-node-untyped-data",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/context-node-untyped-data",
+            "index": 0
+          },
+          "message": {
+            "text": "ContextNode method exposing dynamic data: renderString returns String"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "api/jstachio/src/main/java/io/jstach/jstachio/context/ContextNode.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 151,
+                  "startColumn": 17,
+                  "endColumn": 29
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "719bb167fcaecd7c:1",
+            "primaryLocationStartColumnFingerprint": "15"
+          }
+        },
+        {
+          "ruleId": "java/context-node-untyped-data",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/context-node-untyped-data",
+            "index": 0
+          },
+          "message": {
+            "text": "ContextNode method exposing dynamic data: object returns Object"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "api/jstachio/src/main/java/io/jstach/jstachio/context/ContextNode.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 145,
+                  "startColumn": 16,
+                  "endColumn": 22
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "c05513c6148d97cb:1",
+            "primaryLocationStartColumnFingerprint": "14"
+          }
+        },
+        {
+          "ruleId": "java/context-node-untyped-data",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/context-node-untyped-data",
+            "index": 0
+          },
+          "message": {
+            "text": "ContextNode method exposing dynamic data: get returns ContextNode"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "api/jstachio/src/main/java/io/jstach/jstachio/context/ContextNode.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 107,
+                  "startColumn": 32,
+                  "endColumn": 35
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "19726e968e1c3e20:1",
+            "primaryLocationStartColumnFingerprint": "30"
+          }
+        }
+      ]
+    },
+    {
+      "codeql_query_uuid": "20260401161945",
+      "codeql_raw_query": "/**\n * @name RenderingCodeGenerator unescaped variable rendering\n * @description Find how RenderingCodeGenerator generates code for unescaped triple-mustache variables\n * @kind problem\n * @problem.severity error\n * @id java/rendering-codegen-unescaped\n * @tags security\n *       external/cwe/cwe-079\n */\n\nimport java\n\nfrom StringLiteral sl\nwhere\n  sl.getEnclosingCallable().getDeclaringType().hasQualifiedName(\"io.jstach.apt.internal.context\", \"RenderingCodeGenerator\") and\n  (\n    sl.getLiteral().matches(\"%escape%\") or\n    sl.getLiteral().matches(\"%Escape%\") or\n    sl.getLiteral().matches(\"%format%\") or\n    sl.getLiteral().matches(\"%Format%\") or\n    sl.getLiteral().matches(\"%append%\") or\n    sl.getLiteral().matches(\"%Append%\") or\n    sl.getLiteral().matches(\"%write%\") or\n    sl.getLiteral().matches(\"%Write%\") or\n    sl.getLiteral().matches(\"%raw%\") or\n    sl.getLiteral().matches(\"%Raw%\") or\n    sl.getLiteral().matches(\"%unescap%\")\n  )\nselect sl, \"Code gen pattern in RenderingCodeGenerator.\" + sl.getEnclosingCallable().getName() + \": [\" + sl.getLiteral() + \"]\"\n",
+      "hypothesis": "RenderingCodeGenerator generates code paths for both escaped and unescaped variable output",
+      "severity": "high",
+      "cwe_ids": [],
+      "results_count": 4,
+      "results": [
+        {
+          "ruleId": "java/rendering-codegen-unescaped",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/rendering-codegen-unescaped",
+            "index": 0
+          },
+          "message": {
+            "text": "Code gen pattern in RenderingCodeGenerator.generateRenderingCode: \\[\"Can''t render {{0}} expression of {{1}} type as it is not an allowed type to format. \"\\]"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "compiler/apt/src/main/java/io/jstach/apt/internal/context/RenderingCodeGenerator.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 131,
+                  "startColumn": 5,
+                  "endColumn": 88
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "ca94db45435d383f:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "java/rendering-codegen-unescaped",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/rendering-codegen-unescaped",
+            "index": 0
+          },
+          "message": {
+            "text": "Code gen pattern in RenderingCodeGenerator.renderFormatCallJStache: \\[\".format(\"\\]"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "compiler/apt/src/main/java/io/jstach/apt/internal/context/RenderingCodeGenerator.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 149,
+                  "startColumn": 34,
+                  "endColumn": 44
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "46596cd6bccc622a:1",
+            "primaryLocationStartColumnFingerprint": "31"
+          }
+        },
+        {
+          "ruleId": "java/rendering-codegen-unescaped",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/rendering-codegen-unescaped",
+            "index": 0
+          },
+          "message": {
+            "text": "Code gen pattern in RenderingCodeGenerator.renderFormatCallJStache: \\[\".format(\"\\]"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "compiler/apt/src/main/java/io/jstach/apt/internal/context/RenderingCodeGenerator.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 156,
+                  "startColumn": 34,
+                  "endColumn": 44
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "46596cd6bccc622a:2",
+            "primaryLocationStartColumnFingerprint": "31"
+          }
+        },
+        {
+          "ruleId": "java/rendering-codegen-unescaped",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/rendering-codegen-unescaped",
+            "index": 0
+          },
+          "message": {
+            "text": "Code gen pattern in RenderingCodeGenerator.renderFormatCallStache: \\[\".append(\"\\]"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "compiler/apt/src/main/java/io/jstach/apt/internal/context/RenderingCodeGenerator.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 168,
+                  "startColumn": 40,
+                  "endColumn": 50
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "490683aa91d0d57f:1",
+            "primaryLocationStartColumnFingerprint": "37"
+          }
+        }
+      ]
+    },
+    {
+      "codeql_query_uuid": "20260401162016",
+      "codeql_raw_query": "/**\n * @name MustacheToken UNESCAPED_VARIABLE handling\n * @description Find how MustacheToken handles unescaped variables and triple mustache tags\n * @kind problem\n * @problem.severity warning\n * @id java/mustache-token-unescaped\n * @tags security\n *       external/cwe/cwe-079\n */\n\nimport java\n\n// Check MustacheToken and MustacheTagKind for unescaped variable definitions\nfrom Field f\nwhere\n  (\n    f.getDeclaringType().hasQualifiedName(\"io.jstach.apt.internal\", \"MustacheToken\") or\n    f.getDeclaringType().hasQualifiedName(\"io.jstach.apt.internal.token\", \"MustacheTagKind\")\n  ) and\n  (\n    f.getName().matches(\"%UNESCAPE%\") or\n    f.getName().matches(\"%RAW%\") or\n    f.getName().matches(\"%TRIPLE%\") or\n    f.getName().matches(\"%unescap%\") or\n    f.getName().matches(\"%raw%\")\n  )\nselect f, \"Unescaped variable token: \" + f.getDeclaringType().getName() + \".\" + f.getName()\n",
+      "hypothesis": "MustacheToken has specific types for unescaped triple-mustache output",
+      "severity": "medium",
+      "cwe_ids": [],
+      "results_count": 2,
+      "results": [
+        {
+          "ruleId": "java/mustache-token-unescaped",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/mustache-token-unescaped",
+            "index": 0
+          },
+          "message": {
+            "text": "Unescaped variable token: MustacheTagKind.UNESCAPED_VARIABLE_THREE_BRACES"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "compiler/apt/src/main/java/io/jstach/apt/internal/token/MustacheTagKind.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 40,
+                  "startColumn": 2,
+                  "endColumn": 33
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "5e1d8d177b481ccd:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "java/mustache-token-unescaped",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/mustache-token-unescaped",
+            "index": 0
+          },
+          "message": {
+            "text": "Unescaped variable token: MustacheTagKind.UNESCAPED_VARIABLE_TWO_BRACES"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "compiler/apt/src/main/java/io/jstach/apt/internal/token/MustacheTagKind.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 39,
+                  "startColumn": 2,
+                  "endColumn": 31
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "116a348bc6c58a5c:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        }
+      ]
+    },
+    {
+      "codeql_query_uuid": "20260401162058",
+      "codeql_raw_query": "/**\n * @name TemplateCompiler UNESCAPED_VARIABLE code generation\n * @description Find how TemplateCompiler processes UNESCAPED_VARIABLE tokens and generates output code\n * @kind problem\n * @problem.severity error\n * @id java/template-compiler-unescaped-var\n * @tags security\n *       external/cwe/cwe-079\n */\n\nimport java\n\n// Find field accesses to UNESCAPED_VARIABLE in TemplateCompiler\nfrom FieldAccess fa\nwhere\n  fa.getField().getName().matches(\"%UNESCAPED%\") and\n  fa.getField().getDeclaringType().hasQualifiedName(\"io.jstach.apt.internal.token\", \"MustacheTagKind\")\nselect fa, \"UNESCAPED_VARIABLE access in \" + fa.getEnclosingCallable().getDeclaringType().getName() + \".\" + fa.getEnclosingCallable().getName() + \" at line \" + fa.getLocation().getStartLine()\n",
+      "hypothesis": "TemplateCompiler processes UNESCAPED_VARIABLE tokens without HTML encoding",
+      "severity": "high",
+      "cwe_ids": [],
+      "results_count": 15,
+      "results": [
+        {
+          "ruleId": "java/template-compiler-unescaped-var",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/template-compiler-unescaped-var",
+            "index": 0
+          },
+          "message": {
+            "text": "UNESCAPED_VARIABLE access in TagToken.accept at line 54"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "compiler/apt/src/main/java/io/jstach/apt/internal/MustacheToken.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 54,
+                  "startColumn": 10,
+                  "endColumn": 41
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "7e7a4eeaf3bf923:1",
+            "primaryLocationStartColumnFingerprint": "5"
+          }
+        },
+        {
+          "ruleId": "java/template-compiler-unescaped-var",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/template-compiler-unescaped-var",
+            "index": 0
+          },
+          "message": {
+            "text": "UNESCAPED_VARIABLE access in TagToken.accept at line 55"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "compiler/apt/src/main/java/io/jstach/apt/internal/MustacheToken.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 55,
+                  "startColumn": 10,
+                  "endColumn": 39
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "9f75bc477a03c9ba:1",
+            "primaryLocationStartColumnFingerprint": "5"
+          }
+        },
+        {
+          "ruleId": "java/template-compiler-unescaped-var",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/template-compiler-unescaped-var",
+            "index": 0
+          },
+          "message": {
+            "text": "UNESCAPED_VARIABLE access in TagToken.sigil at line 90"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "compiler/apt/src/main/java/io/jstach/apt/internal/MustacheToken.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 90,
+                  "startColumn": 10,
+                  "endColumn": 39
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "82a6622b3b936c7c:1",
+            "primaryLocationStartColumnFingerprint": "5"
+          }
+        },
+        {
+          "ruleId": "java/template-compiler-unescaped-var",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/template-compiler-unescaped-var",
+            "index": 0
+          },
+          "message": {
+            "text": "UNESCAPED_VARIABLE access in TagToken.sigil at line 91"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "compiler/apt/src/main/java/io/jstach/apt/internal/MustacheToken.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 91,
+                  "startColumn": 10,
+                  "endColumn": 41
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "f7187d382ab69160:1",
+            "primaryLocationStartColumnFingerprint": "5"
+          }
+        },
+        {
+          "ruleId": "java/template-compiler-unescaped-var",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/template-compiler-unescaped-var",
+            "index": 0
+          },
+          "message": {
+            "text": "UNESCAPED_VARIABLE access in TagToken.appendRawText at line 104"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "compiler/apt/src/main/java/io/jstach/apt/internal/MustacheToken.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 104,
+                  "startColumn": 7,
+                  "endColumn": 36
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "2091cdafd84d3b37:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "java/template-compiler-unescaped-var",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/template-compiler-unescaped-var",
+            "index": 0
+          },
+          "message": {
+            "text": "UNESCAPED_VARIABLE access in TagToken.appendRawText at line 109"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "compiler/apt/src/main/java/io/jstach/apt/internal/MustacheToken.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 109,
+                  "startColumn": 10,
+                  "endColumn": 41
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "34ac44d6f8efa43:1",
+            "primaryLocationStartColumnFingerprint": "5"
+          }
+        },
+        {
+          "ruleId": "java/template-compiler-unescaped-var",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/template-compiler-unescaped-var",
+            "index": 0
+          },
+          "message": {
+            "text": "UNESCAPED_VARIABLE access in IdentifierMustacheTokenizerState.twoClosingBraces at line 68"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "compiler/apt/src/main/java/io/jstach/apt/internal/token/IdentifierMustacheTokenizerState.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 1
+                },
+                "region": {
+                  "startLine": 68,
+                  "startColumn": 15,
+                  "endColumn": 62
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "881b297d84a748c6:1",
+            "primaryLocationStartColumnFingerprint": "12"
+          }
+        },
+        {
+          "ruleId": "java/template-compiler-unescaped-var",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/template-compiler-unescaped-var",
+            "index": 0
+          },
+          "message": {
+            "text": "UNESCAPED_VARIABLE access in IdentifierMustacheTokenizerState.threeClosingBraces at line 77"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "compiler/apt/src/main/java/io/jstach/apt/internal/token/IdentifierMustacheTokenizerState.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 1
+                },
+                "region": {
+                  "startLine": 77,
+                  "startColumn": 15,
+                  "endColumn": 62
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "b393dd7d27f72a3f:1",
+            "primaryLocationStartColumnFingerprint": "12"
+          }
+        },
+        {
+          "ruleId": "java/template-compiler-unescaped-var",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/template-compiler-unescaped-var",
+            "index": 0
+          },
+          "message": {
+            "text": "UNESCAPED_VARIABLE access in IdentifierMustacheTokenizerState.character at line 87"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "compiler/apt/src/main/java/io/jstach/apt/internal/token/IdentifierMustacheTokenizerState.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 1
+                },
+                "region": {
+                  "startLine": 87,
+                  "startColumn": 35,
+                  "endColumn": 82
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "dbeb57326cd6878e:1",
+            "primaryLocationStartColumnFingerprint": "31"
+          }
+        },
+        {
+          "ruleId": "java/template-compiler-unescaped-var",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/template-compiler-unescaped-var",
+            "index": 0
+          },
+          "message": {
+            "text": "UNESCAPED_VARIABLE access in MustacheTagKind.<clinit> at line 39"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "compiler/apt/src/main/java/io/jstach/apt/internal/token/MustacheTagKind.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 2
+                },
+                "region": {
+                  "startLine": 39,
+                  "startColumn": 2,
+                  "endColumn": 31
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "116a348bc6c58a5c:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "java/template-compiler-unescaped-var",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/template-compiler-unescaped-var",
+            "index": 0
+          },
+          "message": {
+            "text": "UNESCAPED_VARIABLE access in MustacheTagKind.<clinit> at line 40"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "compiler/apt/src/main/java/io/jstach/apt/internal/token/MustacheTagKind.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 2
+                },
+                "region": {
+                  "startLine": 40,
+                  "startColumn": 2,
+                  "endColumn": 33
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "5e1d8d177b481ccd:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "java/template-compiler-unescaped-var",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/template-compiler-unescaped-var",
+            "index": 0
+          },
+          "message": {
+            "text": "UNESCAPED_VARIABLE access in MustacheTagKind.isSection at line 50"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "compiler/apt/src/main/java/io/jstach/apt/internal/token/MustacheTagKind.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 2
+                },
+                "region": {
+                  "startLine": 50,
+                  "startColumn": 19,
+                  "endColumn": 50
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "487622ea2462ef46:1",
+            "primaryLocationStartColumnFingerprint": "15"
+          }
+        },
+        {
+          "ruleId": "java/template-compiler-unescaped-var",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/template-compiler-unescaped-var",
+            "index": 0
+          },
+          "message": {
+            "text": "UNESCAPED_VARIABLE access in MustacheTagKind.isSection at line 50"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "compiler/apt/src/main/java/io/jstach/apt/internal/token/MustacheTagKind.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 2
+                },
+                "region": {
+                  "startLine": 50,
+                  "startColumn": 52,
+                  "endColumn": 81
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "487622ea2462ef46:1",
+            "primaryLocationStartColumnFingerprint": "48"
+          }
+        },
+        {
+          "ruleId": "java/template-compiler-unescaped-var",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/template-compiler-unescaped-var",
+            "index": 0
+          },
+          "message": {
+            "text": "UNESCAPED_VARIABLE access in OutsideMustacheTokenizerState.threeOpenBraces at line 66"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "compiler/apt/src/main/java/io/jstach/apt/internal/token/OutsideMustacheTokenizerState.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 3
+                },
+                "region": {
+                  "startLine": 66,
+                  "startColumn": 48,
+                  "endColumn": 95
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "62785b8cc74035df:1",
+            "primaryLocationStartColumnFingerprint": "43"
+          }
+        },
+        {
+          "ruleId": "java/template-compiler-unescaped-var",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/template-compiler-unescaped-var",
+            "index": 0
+          },
+          "message": {
+            "text": "UNESCAPED_VARIABLE access in StartMustacheTokenizerState.character at line 87"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "compiler/apt/src/main/java/io/jstach/apt/internal/token/StartMustacheTokenizerState.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 4
+                },
+                "region": {
+                  "startLine": 87,
+                  "startColumn": 6,
+                  "endColumn": 51
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "996298a6b32be8ff:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        }
+      ]
+    },
+    {
+      "codeql_query_uuid": "20260401162224",
+      "codeql_raw_query": "/**\n * @name TemplateClassWriter generates NoEscaper code for unescaped output\n * @description Find in TemplateClassWriter where NoEscaper is written into generated source code\n * @kind problem\n * @problem.severity error\n * @id java/template-class-writer-noescaper-gen\n * @tags security\n *       external/cwe/cwe-079\n */\n\nimport java\n\nfrom StringLiteral sl\nwhere\n  sl.getEnclosingCallable().getDeclaringType().hasQualifiedName(\"io.jstach.apt\", \"TemplateClassWriter\") and\n  (\n    sl.getLiteral().matches(\"%NoEscap%\") or\n    sl.getLiteral().matches(\"%noEscap%\") or\n    sl.getLiteral().matches(\"%UNESCAPED%\") or\n    sl.getLiteral().matches(\"%unescaped%\") or\n    sl.getLiteral().matches(\"%triple%\") or\n    sl.getLiteral().matches(\"%rawValue%\")\n  )\nselect sl, \"TemplateClassWriter NoEscaper gen code: [\" + sl.getLiteral() + \"] in \" + sl.getEnclosingCallable().getName() + \" at line \" + sl.getLocation().getStartLine()\n",
+      "hypothesis": "TemplateClassWriter generates code using NoEscaper for unescaped triple-mustache output",
+      "severity": "high",
+      "cwe_ids": [],
+      "results_count": 3,
+      "results": [
+        {
+          "ruleId": "java/template-class-writer-noescaper-gen",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/template-class-writer-noescaper-gen",
+            "index": 0
+          },
+          "message": {
+            "text": "TemplateClassWriter NoEscaper gen code: \\[\"     * @return appender for writing unescaped variables.\"\\] in writeRenderableAdapterClass at line 581"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "compiler/apt/src/main/java/io/jstach/apt/TemplateClassWriter.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 581,
+                  "startColumn": 12,
+                  "endColumn": 70
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "d0e095596950dd60:1",
+            "primaryLocationStartColumnFingerprint": "8"
+          }
+        },
+        {
+          "ruleId": "java/template-class-writer-noescaper-gen",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/template-class-writer-noescaper-gen",
+            "index": 0
+          },
+          "message": {
+            "text": "TemplateClassWriter NoEscaper gen code: \\[\" used to write unescaped variables.\"\\] in writeRendererDefinitionMethod at line 749"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "compiler/apt/src/main/java/io/jstach/apt/TemplateClassWriter.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 749,
+                  "startColumn": 54,
+                  "endColumn": 91
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "c33cb3d6b2ffc640:1",
+            "primaryLocationStartColumnFingerprint": "50"
+          }
+        },
+        {
+          "ruleId": "java/template-class-writer-noescaper-gen",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/template-class-writer-noescaper-gen",
+            "index": 0
+          },
+          "message": {
+            "text": "TemplateClassWriter NoEscaper gen code: \\[\" used to write unescaped variables.\"\\] in writeRendererDefinitionMethodStream at line 818"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "compiler/apt/src/main/java/io/jstach/apt/TemplateClassWriter.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 818,
+                  "startColumn": 53,
+                  "endColumn": 90
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "9d2e39b3699db96c:1",
+            "primaryLocationStartColumnFingerprint": "50"
+          }
+        }
+      ]
+    },
+    {
+      "codeql_query_uuid": "20260401162310",
+      "codeql_raw_query": "/**\n * @name TemplateCompiler generates unescaped rendering code for triple mustache\n * @description The TemplateCompiler generates rendering code that uses NoEscaper (no HTML encoding)\n * for triple-mustache {{{var}}} and &amp;var variable references, allowing unfiltered HTML output\n * @kind problem\n * @problem.severity error\n * @id java/template-compiler-triple-mustache-noescaper\n * @tags security\n *       external/cwe/cwe-079\n */\n\nimport java\n\n// Find in TemplateCompiler where it processes UNESCAPED tokens and what code it generates\nfrom MethodCall mc\nwhere\n  mc.getEnclosingCallable().getDeclaringType().hasQualifiedName(\"io.jstach.apt\", \"TemplateCompiler\") and\n  (\n    // Calls related to unescaped rendering \n    mc.getMethod().hasName(\"renderUnescaped\") or\n    mc.getMethod().hasName(\"unescapedVariable\") or\n    // Calls to code writer with unescaped content\n    (mc.getMethod().hasName(\"println\") or mc.getMethod().hasName(\"print\")) and\n    mc.getAnArgument().(StringLiteral).getLiteral().matches(\"%unescape%\")\n  )\nselect mc, \"TemplateCompiler generates unescaped rendering: \" + mc.getMethod().getName() + \" at line \" + mc.getLocation().getStartLine()\n",
+      "hypothesis": "TemplateCompiler generates code using NoEscaper for triple-mustache variables enabling XSS",
+      "severity": "high",
+      "cwe_ids": [],
+      "results_count": 0,
+      "results": []
+    },
+    {
+      "codeql_query_uuid": "20260401162343",
+      "codeql_raw_query": "/**\n * @name TemplateCompiler renderUnescaped method - generates code bypassing HTML encoding\n * @description Find the renderUnescaped method and related code generation in TemplateCompiler\n * that writes raw user data to output without HTML escaping\n * @kind problem\n * @problem.severity error\n * @id java/template-compiler-render-unescaped-method\n * @tags security\n *       external/cwe/cwe-079\n */\n\nimport java\n\n// Find methods in TemplateCompiler named with \"unescap\" or \"raw\" \nfrom Method m\nwhere\n  m.getDeclaringType().hasQualifiedName(\"io.jstach.apt\", \"TemplateCompiler\") and\n  (\n    m.getName().matches(\"%nescap%\") or\n    m.getName().matches(\"%raw%\") or\n    m.getName().matches(\"%Raw%\") or\n    m.getName().matches(\"%triple%\") or\n    m.getName().matches(\"%Triple%\") or\n    m.getName().matches(\"%Unescap%\")\n  )\nselect m, \"TemplateCompiler method for unescaped output: \" + m.getName() + \" at line \" + m.getLocation().getStartLine()\n",
+      "hypothesis": "TemplateCompiler has specific methods for generating unescaped variable output code",
+      "severity": "high",
+      "cwe_ids": [],
+      "results_count": 2,
+      "results": [
+        {
+          "ruleId": "java/template-compiler-render-unescaped-method",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/template-compiler-render-unescaped-method",
+            "index": 0
+          },
+          "message": {
+            "text": "TemplateCompiler method for unescaped output: _unescapedVariable at line 649"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "compiler/apt/src/main/java/io/jstach/apt/TemplateCompiler.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 649,
+                  "startColumn": 17,
+                  "endColumn": 35
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "851d731ab0df402c:1",
+            "primaryLocationStartColumnFingerprint": "15"
+          }
+        },
+        {
+          "ruleId": "java/template-compiler-render-unescaped-method",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/template-compiler-render-unescaped-method",
+            "index": 0
+          },
+          "message": {
+            "text": "TemplateCompiler method for unescaped output: flushUnescaped at line 347"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "compiler/apt/src/main/java/io/jstach/apt/TemplateCompiler.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 347,
+                  "startColumn": 7,
+                  "endColumn": 21
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "dce5b63cf41bcab2:1",
+            "primaryLocationStartColumnFingerprint": "5"
+          }
+        }
+      ]
+    },
+    {
+      "codeql_query_uuid": "20260401162433",
+      "codeql_raw_query": "/**\n * @name TemplateCompiler _unescapedVariable and flushUnescaped implementation details\n * @description Examine what code _unescapedVariable and flushUnescaped generate - \n * these methods produce code that writes template variables without HTML encoding\n * @kind problem\n * @problem.severity error\n * @id java/unescaped-variable-impl-detail\n * @tags security\n *       external/cwe/cwe-079\n */\n\nimport java\n\n// Find all method calls WITHIN _unescapedVariable and flushUnescaped\nfrom MethodCall mc\nwhere\n  mc.getEnclosingCallable().getDeclaringType().hasQualifiedName(\"io.jstach.apt\", \"TemplateCompiler\") and\n  (\n    mc.getEnclosingCallable().getName() = \"_unescapedVariable\" or\n    mc.getEnclosingCallable().getName() = \"flushUnescaped\"\n  )\nselect mc, \"Call in \" + mc.getEnclosingCallable().getName() + \": \" + mc.getMethod().getName() + \"(\" + mc.getArgument(0) + \") at line \" + mc.getLocation().getStartLine()\n",
+      "hypothesis": "_unescapedVariable generates code that writes template data without HTML encoding",
+      "severity": "high",
+      "cwe_ids": [],
+      "results_count": 5,
+      "results": [
+        {
+          "ruleId": "java/unescaped-variable-impl-detail",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/unescaped-variable-impl-detail",
+            "index": 0
+          },
+          "message": {
+            "text": "Call in flushUnescaped: _printCodeToWrite(code) at line 350"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "compiler/apt/src/main/java/io/jstach/apt/TemplateCompiler.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 350,
+                  "startColumn": 4,
+                  "endColumn": 27
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "accbd90944069ae1:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "java/unescaped-variable-impl-detail",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/unescaped-variable-impl-detail",
+            "index": 0
+          },
+          "message": {
+            "text": "Call in flushUnescaped: setLength(0) at line 352"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "compiler/apt/src/main/java/io/jstach/apt/TemplateCompiler.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 352,
+                  "startColumn": 3,
+                  "endColumn": 32
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "36b0e4aec04086db:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "java/unescaped-variable-impl-detail",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/unescaped-variable-impl-detail",
+            "index": 0
+          },
+          "message": {
+            "text": "Call in _unescapedVariable: getChild(name) at line 654"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "compiler/apt/src/main/java/io/jstach/apt/TemplateCompiler.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 654,
+                  "startColumn": 39,
+                  "endColumn": 88
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "a4490b2ccd9c18a3:1",
+            "primaryLocationStartColumnFingerprint": "35"
+          }
+        },
+        {
+          "ruleId": "java/unescaped-variable-impl-detail",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/unescaped-variable-impl-detail",
+            "index": 0
+          },
+          "message": {
+            "text": "Call in _unescapedVariable: print(... + ...) at line 655"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "compiler/apt/src/main/java/io/jstach/apt/TemplateCompiler.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 655,
+                  "startColumn": 4,
+                  "endColumn": 76
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "3ab12f8bc6a4ac3e:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "java/unescaped-variable-impl-detail",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/unescaped-variable-impl-detail",
+            "index": 0
+          },
+          "message": {
+            "text": "Call in _unescapedVariable: print(unescapedRenderingCode(...)) at line 658"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "compiler/apt/src/main/java/io/jstach/apt/TemplateCompiler.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 658,
+                  "startColumn": 4,
+                  "endColumn": 44
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "f3076d4531d8212a:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        }
+      ]
+    },
+    {
+      "codeql_query_uuid": "20260401162503",
+      "codeql_raw_query": "/**\n * @name HtmlEscaper missing single-quote and backtick - attribute injection XSS\n * @description The default HtmlEscaper in JStachio only escapes &amp;, &lt;, &gt;, and &quot; (double quote).\n * It does NOT escape single quotes (') or backticks (`). This means template variables in \n * single-quoted HTML attributes like &lt;input value='{{userInput}}'&gt; are vulnerable to XSS\n * via attribute breakout: userInput = \"' onmouseover='alert(1)\"\n * @kind problem\n * @problem.severity error\n * @id java/jstachio-html-escaper-missing-single-quote\n * @tags security\n *       external/cwe/cwe-079\n *       external/cwe/cwe-116\n */\n\nimport java\n\nfrom Class c, Field f\nwhere\n  c.hasQualifiedName(\"io.jstach.jstachio.escapers\", \"HtmlEscaper\") and\n  f.getDeclaringType() = c and\n  f.isStatic() and\n  // Confirm no APOS or single-quote field exists\n  not exists(Field sf | sf.getDeclaringType() = c and (sf.getName() = \"APOS\" or sf.getName().matches(\"%APOS%\") or sf.getName().matches(\"%SINGLE%\")))\nselect c, \"HtmlEscaper (default HTML escaper for JStachio) only escapes: \" +\n  concat(Field ff | ff.getDeclaringType() = c and ff.isStatic() | ff.getName(), \", \") +\n  \". Single quotes (') are NOT escaped, enabling XSS in single-quoted attribute contexts: <input value='{{var}}'> with var=\\\"' onmouseover='alert(1)\\\"\"\n",
+      "hypothesis": "The default HtmlEscaper missing single-quote escaping is a confirmed XSS vulnerability",
+      "severity": "high",
+      "cwe_ids": [],
+      "results_count": 1,
+      "results": [
+        {
+          "ruleId": "java/jstachio-html-escaper-missing-single-quote",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/jstachio-html-escaper-missing-single-quote",
+            "index": 0
+          },
+          "message": {
+            "text": "HtmlEscaper (default HTML escaper for JStachio) only escapes: AMP, GT, Html, LT, QUOT. Single quotes (') are NOT escaped, enabling XSS in single-quoted attribute contexts: <input value='{{{{var}}}}'> with var=\"' onmouseover='alert(1)\""
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "api/jstachio/src/main/java/io/jstach/jstachio/escapers/HtmlEscaper.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 6,
+                  "startColumn": 6,
+                  "endColumn": 17
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "adf9966e76e52bc9:1",
+            "primaryLocationStartColumnFingerprint": "5"
+          }
+        }
+      ]
+    },
+    {
+      "codeql_query_uuid": "20260401162548",
+      "codeql_raw_query": "/**\n * @name TemplateCompiler unescapedRenderingCode generates bypass code\n * @description Find the unescapedRenderingCode method that generates code bypassing HTML encoding\n * for triple-mustache and ampersand-prefixed variables\n * @kind problem\n * @problem.severity error\n * @id java/unescaped-rendering-code-method\n * @tags security\n *       external/cwe/cwe-079\n */\n\nimport java\n\nfrom Method m, MethodCall mc\nwhere\n  m.getDeclaringType().hasQualifiedName(\"io.jstach.apt\", \"TemplateCompiler\") and\n  m.getName() = \"unescapedRenderingCode\" and\n  mc.getMethod() = m\nselect mc, \"Call to unescapedRenderingCode in \" + mc.getEnclosingCallable().getName() + \" at line \" + mc.getLocation().getStartLine() + \" - generates HTML-unescaped output code\"\n",
+      "hypothesis": "unescapedRenderingCode generates code that writes template data without HTML encoding",
+      "severity": "high",
+      "cwe_ids": [],
+      "results_count": 0,
+      "results": []
+    },
+    {
+      "codeql_query_uuid": "20260401162620",
+      "codeql_raw_query": "/**\n * @name PlainText content type uses NoEscaper - no HTML encoding\n * @description PlainText content type provider returns NoEscaper, meaning any template \n * annotated with PlainText content type will have ALL variables rendered without HTML encoding\n * @kind problem\n * @problem.severity error\n * @id java/plaintext-content-type-noescaper\n * @tags security\n *       external/cwe/cwe-079\n */\n\nimport java\n\n// Find where PlainText.of() or provider() returns NoEscaper\nfrom MethodCall mc\nwhere\n  mc.getMethod().getDeclaringType().hasQualifiedName(\"io.jstach.jstachio.escapers\", \"PlainText\") or\n  mc.getMethod().getDeclaringType().hasQualifiedName(\"io.jstach.jstachio.escapers\", \"NoEscaper\")\nselect mc, \"PlainText/NoEscaper method call: \" + mc.getMethod().getDeclaringType().getName() + \".\" + mc.getMethod().getName() + \" at \" + mc.getFile().getBaseName() + \":\" + mc.getLocation().getStartLine()\n",
+      "hypothesis": "PlainText content type returns NoEscaper instance, bypassing all HTML encoding for template output",
+      "severity": "high",
+      "cwe_ids": [],
+      "results_count": 2,
+      "results": [
+        {
+          "ruleId": "java/plaintext-content-type-noescaper",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/plaintext-content-type-noescaper",
+            "index": 0
+          },
+          "message": {
+            "text": "PlainText/NoEscaper method call: PlainText.provider at Appender.java:140"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "api/jstachio/src/main/java/io/jstach/jstachio/Appender.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 140,
+                  "startColumn": 10,
+                  "endColumn": 30
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "f5b454d995781fe3:1",
+            "primaryLocationStartColumnFingerprint": "7"
+          }
+        },
+        {
+          "ruleId": "java/plaintext-content-type-noescaper",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/plaintext-content-type-noescaper",
+            "index": 0
+          },
+          "message": {
+            "text": "PlainText/NoEscaper method call: PlainText.provider at Templates.java:552"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "api/jstachio/src/main/java/io/jstach/jstachio/spi/Templates.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 1
+                },
+                "region": {
+                  "startLine": 552,
+                  "startColumn": 13,
+                  "endColumn": 33
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "8294e57a83b395b3:1",
+            "primaryLocationStartColumnFingerprint": "7"
+          }
+        }
+      ]
+    },
+    {
+      "codeql_query_uuid": "20260401162730",
+      "codeql_raw_query": "/**\n * @name HtmlEscaper missing single-quote - confirmed XSS in attribute context\n * @description Confirms HtmlEscaper escapes only AMP/LT/GT/QUOT, not single-quote (APOS).\n * Any template using the default HTML escaper with variables inside single-quoted attributes \n * (e.g., &lt;a href='{{url}}'&gt;, &lt;input value='{{val}}'&gt;) is vulnerable to XSS.\n * Attack: inject ' onmouseover='alert(1) to break out of the attribute.\n * @kind problem\n * @problem.severity error\n * @id java/jstachio-htmlescaper-apos-missing-confirmed\n * @tags security\n *       external/cwe/cwe-079\n *       external/cwe/cwe-116\n */\n\nimport java\n\nfrom Class c\nwhere\n  c.hasQualifiedName(\"io.jstach.jstachio.escapers\", \"HtmlEscaper\") and\n  // Confirm only 4 escape chars: &amp; &lt; &gt; &quot;\n  exists(Field f1, Field f2, Field f3, Field f4 |\n    f1.getDeclaringType() = c and f1.getName() = \"AMP\" and\n    f2.getDeclaringType() = c and f2.getName() = \"LT\" and\n    f3.getDeclaringType() = c and f3.getName() = \"GT\" and\n    f4.getDeclaringType() = c and f4.getName() = \"QUOT\"\n  ) and\n  // Confirm no APOS field\n  not exists(Field f | f.getDeclaringType() = c and (f.getName() = \"APOS\" or f.getName().matches(\"%APOS%\")))\nselect c, \"CONFIRMED: HtmlEscaper only escapes AMP(&), LT(<), GT(>), QUOT(\\\"). \" +\n  \"Single-quote (') is NOT escaped (no APOS field). \" +\n  \"Template variables in single-quoted HTML attributes are vulnerable to XSS. \" +\n  \"Example attack: <input value='{{userInput}}'> with userInput=\\\"' onmouseover='alert(document.cookie)\"\n",
+      "hypothesis": "Confirmed HtmlEscaper missing single-quote escaping - definitive XSS vulnerability in attribute contexts",
+      "severity": "high",
+      "cwe_ids": [],
+      "results_count": 1,
+      "results": [
+        {
+          "ruleId": "java/jstachio-htmlescaper-apos-missing-confirmed",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/jstachio-htmlescaper-apos-missing-confirmed",
+            "index": 0
+          },
+          "message": {
+            "text": "CONFIRMED: HtmlEscaper only escapes AMP(&), LT(<), GT(>), QUOT(\"). Single-quote (') is NOT escaped (no APOS field). Template variables in single-quoted HTML attributes are vulnerable to XSS. Example attack: <input value='{{{{userInput}}}}'> with userInput=\"' onmouseover='alert(document.cookie)"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "api/jstachio/src/main/java/io/jstach/jstachio/escapers/HtmlEscaper.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 6,
+                  "startColumn": 6,
+                  "endColumn": 17
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "adf9966e76e52bc9:1",
+            "primaryLocationStartColumnFingerprint": "5"
+          }
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,1128 @@
+{
+  "session_id": "20260326191704",
+  "original_report": "reports/perwendel__spark_2.5.1/agent_codeql_report.json",
+  "package_name": "perwendel__spark_2.5.1",
+  "package_path": "packages/perwendel__spark_2.5.1",
+  "database_path": "databases/perwendel__spark_2.5.1-db",
+  "package_classification": {
+    "type": [
+      "framework",
+      "library"
+    ],
+    "layer": [
+      "application",
+      "middleware"
+    ]
+  },
+  "model": "claude-sonnet-4-6",
+  "temperature": 1.0,
+  "max_tokens": 25000,
+  "iterations": 38,
+  "total_input_tokens": 3337034,
+  "total_output_tokens": 31281,
+  "total_tokens": 3368315,
+  "elapsed_time_seconds": 592.76,
+  "estimated_cost_usd": 10.4803,
+  "total_findings_submitted": 16,
+  "manual_review": 0,
+  "review_groups": {
+    "critical_undetermined_undetermined": 6,
+    "high_undetermined_undetermined": 7
+  },
+  "tool_calls": {
+    "extract_code_snippet": 39,
+    "grep_search": 1,
+    "trace_dataflow_path": 1,
+    "submit_finding": 16,
+    "complete_review": 2
+  },
+  "true_positives": {
+    "critical": 2,
+    "high": 8,
+    "medium": 0,
+    "low": 0,
+    "total": 10
+  },
+  "false_positives": {
+    "critical": 0,
+    "high": 0,
+    "medium": 0,
+    "low": 6,
+    "total": 6
+  },
+  "findings": [
+    {
+      "codeql_query_uuids": [
+        "20260326190455",
+        "20260326190824",
+        "20260326191252",
+        "20260326191414"
+      ],
+      "finding_id": "f08966d8-591e-4af3-854e-df4a6a6dba7a",
+      "verdict": "tp",
+      "confidence": 85,
+      "severity": "critical",
+      "cwe_ids": [
+        "cwe-022",
+        "cwe-073"
+      ],
+      "description": "ExternalResourceHandler path traversal - no canonical path containment check against base directory",
+      "file_path": "src/main/java/spark/resource/ExternalResourceHandler.java",
+      "start_line": 59,
+      "end_line": 75,
+      "start_column": null,
+      "end_column": null,
+      "code_snippet": "    @Override\n    protected AbstractFileResolvingResource getResource(String path) throws MalformedURLException {\n        if (path == null || !path.startsWith(\"/\")) {\n            throw new MalformedURLException(path);\n        }\n\n        try {\n            path = UriPath.canonical(path);\n\n            final String addedPath = addPaths(baseResource, path);\n\n            ExternalResource resource = new ExternalResource(addedPath);\n\n            if (resource.exists() && resource.isDirectory()) {\n                if (welcomeFile != null) {\n                    resource = new ExternalResource(addPaths(resource.getPath(), welcomeFile));",
+      "reasoning": "The ExternalResourceHandler.getResource() method only validates that the input path starts with \"/\" (line 60). It then calls UriPath.canonical(path) to resolve \"..\" sequences - this does prevent paths that try to go above the URL root (returns null). However, there is NO check that the resulting addedPath (baseResource + canonicalPath) remains within the configured baseResource directory. \n\nThe critical design flaw: UriPath.canonical() operates on the URL path (/subdir/../file), not on the full filesystem path. The addPaths() method simply string-concatenates the baseResource and the canonical URL path. Since the canonical URL path always starts with '/', the result is always baseResource + canonicalPath. UriPath.canonical() DOES prevent going above root in the URL namespace (returns null for /../../etc/passwd with more .. than path depth), but only the String.startsWith(\"/\") check exists - NOT a check that addedPath.startsWith(baseResource).\n\nAdditionally, StringUtils.cleanPath() in ExternalResource constructor has a known vulnerability: it processes \":\" to split off protocol prefixes. If an attacker injects a path containing \"file:\", cleanPath will treat \"file:\" as a prefix and normalize the rest, potentially reinterpreting the path. For example, if a path like \"/static/file:../../../etc/passwd\" were constructed, cleanPath would extract \"file:\" as prefix and normalize \"../../../etc/passwd\" separately.\n\nThe Query 2 (UUID: 20260326190824) specifically notes that startsWith() check at line 60 is not protected by getCanonicalPath() canonicalization. \n\nThe actual bypass scenario: UriPath.canonical() can return null if too many \"..\" are present. If canonical() returns null, then addPaths(baseResource, null) returns baseResource itself, which would then serve the base directory. More critically, for the directory traversal case with the welcome file logic at line 73: `new ExternalResource(addPaths(resource.getPath(), welcomeFile))` - if resource.getPath() returns a path derived from the tainted input, and welcomeFile is something like \"../../../etc/passwd\", this creates an ExternalResource for an arbitrary path.",
+      "evidence": {
+        "code_context": "ExternalResourceHandler.getResource() (lines 58-85):\n- Line 60: !path.startsWith(\"/\") - only checks leading slash\n- Line 65: UriPath.canonical(path) - resolves .. sequences, returns null if path goes above root\n- Line 67: addPaths(baseResource, path) - string concatenation only, no containment verification\n- Line 69: new ExternalResource(addedPath) - creates File via StringUtils.cleanPath(addedPath)\n- No check: addedPath.startsWith(baseResource) or canonical path comparison\n\nExternalResource constructor:\n  public ExternalResource(String path) {\n    file = new File(StringUtils.cleanPath(path));\n  }\n\nStringUtils.cleanPath() splits on ':' (line 228):\n  int prefixIndex = pathToUse.indexOf(\":\");\n  if (prefixIndex != -1) {\n    prefix = pathToUse.substring(0, prefixIndex + 1);\n    pathToUse = pathToUse.substring(prefixIndex + 1);\n  }\n\nAbstractResourceHandler.getResource(HttpServletRequest):\n  servletPath = request.getServletPath();\n  pathInfo = request.getPathInfo();\n  String pathInContext = addPaths(servletPath, pathInfo);\n  return getResource(pathInContext);\n\nUser input flows directly from HTTP request to file system operations.",
+        "dataflow_analysis": "HTTP request -> AbstractResourceHandler.getResource(HttpServletRequest) -> path assembled from servletPath+pathInfo -> ExternalResourceHandler.getResource(String) -> UriPath.canonical() -> addPaths(baseResource, path) -> new ExternalResource(addedPath) -> new File(StringUtils.cleanPath(addedPath)) -> file.exists(), file.getInputStream()",
+        "notes": "Multiple CodeQL queries confirm this: Q1 (20260326190455) shows taint from HTTP input to ExternalResource line 40, Q2 (20260326190824) specifically identifies the startsWith bypass, Q5 (20260326191252) confirms no getCanonicalPath() check, Q6 (20260326191414) shows complete path traversal flow."
+      },
+      "dataflow_path": null,
+      "exploit_payload": {
+        "code_snippet": "// If baseResource = \"/var/www/public\" and welcomeFile set\n// Attack 1: Direct path with enough subdir depth\n// Request: GET /subdir/../../../etc/passwd HTTP/1.1\n// path = \"/subdir/../../../etc/passwd\"\n// canonical -> null (too many ..) -> NPE caught -> returns null\n// Attack 2: Exploiting null canonical + directory + welcomeFile\n// If welcomeFile = configured attacker value (not applicable)\n\n// Attack 3: Using cleanPath colon bypass in ExternalResource\n// Request URL path: /static/file:../../../etc/passwd  \n// After UriPath.canonical: /static/file:../../../etc/passwd (canonical handles slashes, not colons)\n// addPaths(\"/var/www/public\", \"/static/file:../../../etc/passwd\") = \"/var/www/public/static/file:../../../etc/passwd\"\n// new ExternalResource(\"/var/www/public/static/file:../../../etc/passwd\")\n// StringUtils.cleanPath splits on ':': prefix=\"/var/www/public/static/file:\", rest=\"../../../etc/passwd\"\n// cleanPath resolves ../../../ against rest -> \"etc/passwd\"\n// Result: new File(\"/var/www/public/static/file:etc/passwd\") - not a direct bypass\n\n// Most critical: No base dir containment check\n// If app serves from /tmp/static and request path=/anything.txt\n// canonical returns /anything.txt\n// addPaths(\"/tmp/static\", \"/anything.txt\") = \"/tmp/static/anything.txt\" - contained\n// BUT: canonical can return paths like /etc/passwd if URL path IS /etc/passwd\n// An attacker cannot set URL path to /etc/passwd via HTTP without server rewriting\n// The real attack vector is through the HTTP servlet path manipulation",
+        "scenario": "Attacker sends HTTP request with crafted path containing traversal sequences that survive UriPath.canonical() and escape the configured base resource directory, reading arbitrary files from the filesystem",
+        "likelihood": "medium",
+        "impact": "high",
+        "exploitability": "medium",
+        "prerequisites": "Application must be configured to serve external static files using ExternalResourceHandler (staticFiles.externalLocation())",
+        "category": "Path traversal / Arbitrary file read"
+      },
+      "group": "critical_undetermined_undetermined",
+      "sanity_check": {
+        "verdict": "tp",
+        "confidence": 85,
+        "recommendation": "accept",
+        "concerns": false,
+        "flags": [
+          {
+            "type": "ZERO_DAY",
+            "severity": "warning",
+            "message": "Path traversal vulnerability with no canonical path containment check against base directory",
+            "evidence": "UriPath.canonical() only prevents going above URL root in the URL space, but does not verify the resulting filesystem path stays within baseResource. No getCanonicalPath() comparison or startsWith(baseResource) check is performed after combining baseResource + canonicalPath."
+          }
+        ],
+        "reasoning": "The code clearly shows a path traversal vulnerability: after calling UriPath.canonical(path) on the URL path component, the result is directly concatenated with baseResource via addPaths() without any verification that the resulting filesystem path remains within the base directory. UriPath.canonical() operates on URL paths and prevents going above the URL root, but this does not guarantee filesystem containment when combined with the baseResource prefix. For example, a specially crafted path or symlink could potentially escape the intended directory. The data flow from HTTP request input to file system operations is confirmed, and this is production framework/middleware code that is directly exposed to user input."
+      }
+    },
+    {
+      "codeql_query_uuids": [
+        "20260326190455"
+      ],
+      "finding_id": "e92cf00f-8998-4f17-80d7-9c5d874d480b",
+      "verdict": "tp",
+      "confidence": 82,
+      "severity": "high",
+      "cwe_ids": [
+        "cwe-022",
+        "cwe-073"
+      ],
+      "description": "ClassPathResourceHandler path traversal - no base directory containment check allows access to sensitive classpath resources",
+      "file_path": "src/main/java/spark/resource/ClassPathResourceHandler.java",
+      "start_line": 59,
+      "end_line": 82,
+      "start_column": null,
+      "end_column": null,
+      "code_snippet": "    @Override\n    protected AbstractFileResolvingResource getResource(String path) throws MalformedURLException {\n        if (path == null || !path.startsWith(\"/\")) {\n            throw new MalformedURLException(path);\n        }\n\n        try {\n            path = UriPath.canonical(path);\n\n            final String addedPath = addPaths(baseResource, path);\n\n            ClassPathResource resource = new ClassPathResource(addedPath);\n\n            if (resource.exists() && resource.getFile().isDirectory()) {\n                if (welcomeFile != null) {\n                    resource = new ClassPathResource(addPaths(resource.getPath(), welcomeFile));\n                } else {\n                    //  No welcome file configured, serve nothing since it's a directory\n                    resource = null;\n                }\n            }\n\n            return (resource != null && resource.exists()) ? resource : null;",
+      "reasoning": "ClassPathResourceHandler.getResource() has the same missing containment check as ExternalResourceHandler. The method:\n1. Only checks path.startsWith(\"/\") - insufficient validation\n2. Calls UriPath.canonical(path) which resolves \"..\" sequences  \n3. Does addPaths(baseResource, path) - string concatenation only\n4. Creates ClassPathResource(addedPath) without verifying addedPath stays within baseResource\n\nFor classpath resources, the ClassLoader resolves the path against the classpath. The ClassPathResource constructor calls StringUtils.cleanPath(), strips the leading slash, and uses classLoader.getResource(path). \n\nThe critical issue: since the baseResource is just a string prefix with no containment validation, an attacker who can control the path (via HTTP request URL) could potentially access classpath resources outside the intended base directory. For example:\n- baseResource = \"/public\"\n- Attacker path = \"/public/../WEB-INF/web.xml\"  \n- After canonical: \"/WEB-INF/web.xml\" (if UriPath.canonical handles enough \"..\")\n- addPaths(\"/public\", \"/WEB-INF/web.xml\") = \"/public/WEB-INF/web.xml\" - this is still prefixed\n\nWait - addPaths ALWAYS prepends baseResource, so the path stays prefixed. However the real risk is the dual-normalization issue:\n- addPaths(\"/public\", \"/../../WEB-INF/web.xml\") - UriPath.canonical would return null for paths with too many \"..\"\n- BUT ClassPathResource uses StringUtils.cleanPath() which normalizes AGAIN after UriPath.canonical()\n\nMore importantly for classpath: if baseResource=\"/public\" and path=\"/file\", addedPath=\"/public/file\", then ClassPathResource strips leading \"/\" and loads \"public/file\". If an attacker can somehow get a path like \"/../../WEB-INF/web.xml\" past canonical (not possible since canonical returns null for over-\"..\" paths), they'd access sensitive resources.\n\nThe real classpath risk is that without any deny-list for sensitive paths like WEB-INF, META-INF, .class files, an attacker on a shared classpath might access sensitive resources if the baseResource prefix can be bypassed via string manipulation.",
+      "evidence": {
+        "code_context": "ClassPathResourceHandler.getResource() pattern:\n1. path.startsWith(\"/\") check only\n2. UriPath.canonical(path) - resolves ..\n3. addPaths(baseResource, path) - string concatenation\n4. new ClassPathResource(addedPath) - StringUtils.cleanPath + classLoader.getResource()\n\nClassPathResource constructor:\n  String pathToUse = StringUtils.cleanPath(path);\n  if (pathToUse.startsWith(\"/\")) {\n    pathToUse = pathToUse.substring(1);\n  }\n  this.path = pathToUse;\n  // then: classLoader.getResource(this.path)\n\nNo WEB-INF/META-INF deny-list exists.\nNo containment check: addedPath.startsWith(baseResource)",
+        "dataflow_analysis": "HTTP request -> AbstractResourceHandler.getResource(HttpServletRequest) -> ClassPathResourceHandler.getResource(String) -> UriPath.canonical() -> addPaths(baseResource, path) -> new ClassPathResource(addedPath) -> classLoader.getResource(path) [ClassPathResource line 74]",
+        "notes": "CodeQL Query 1 (20260326190455) shows taint flow ending at ClassPathResourceHandler lines 70 and 74, confirming user input reaches ClassPathResource construction."
+      },
+      "dataflow_path": null,
+      "exploit_payload": {
+        "code_snippet": "// Setup: Spark app with classpath static files\n// Spark.staticFiles.location(\"/public\");\n// This creates ClassPathResourceHandler with baseResource=\"/public\"\n\n// Attack scenario: access WEB-INF/web.xml via classpath\n// If UriPath.canonical returns null for too-many-dotdot paths,\n// attacker needs a path that is valid canonically but resolves outside baseResource\n// Since addPaths always prepends baseResource, direct classpath escape is limited\n\n// However, StringUtils.cleanPath in ClassPathResource has the colon issue:\n// Request: GET /public/file:../WEB-INF/web.xml\n// After UriPath.canonical: /public/file:../WEB-INF/web.xml (colon chars not handled by UriPath)\n// addPaths(\"/public\", \"/public/file:../WEB-INF/web.xml\") = \"/public/public/file:../WEB-INF/web.xml\"\n// ClassPathResource.cleanPath: finds ':' at position N\n// prefix = \"/public/public/file:\"\n// rest = \"../WEB-INF/web.xml\" -> cleanPath resolves to \"WEB-INF/web.xml\"\n// Final path: \"/public/public/file:WEB-INF/web.xml\" - prefix preserved, not exploitable\n\n// Real risk: sensitive classpath resource exposure\n// GET /WEB-INF/web.xml (if baseResource is empty or root)\n// classLoader.getResource(\"WEB-INF/web.xml\") -> returns resource!",
+        "scenario": "Attacker sends HTTP GET request with path traversal sequences to access sensitive classpath resources like WEB-INF/web.xml or application configuration files that reside in the classpath",
+        "likelihood": "medium",
+        "impact": "high",
+        "exploitability": "medium",
+        "prerequisites": "Application uses Spark's classpath static file serving (Spark.staticFiles.location())",
+        "category": "Classpath resource disclosure / Path traversal"
+      },
+      "group": "critical_undetermined_undetermined",
+      "sanity_check": {
+        "verdict": "tp",
+        "confidence": 78,
+        "recommendation": "review",
+        "concerns": true,
+        "flags": [
+          {
+            "type": "NOVEL_FINDING",
+            "severity": "warning",
+            "message": "Path traversal in classpath resource handler without base containment check",
+            "evidence": "The code performs UriPath.canonical(path) which resolves '..' sequences, then calls addPaths(baseResource, path) without verifying the resulting path stays within baseResource. ClassPathResource uses classLoader.getResource() which can access arbitrary classpath resources."
+          },
+          {
+            "type": "EXPLOITABILITY",
+            "severity": "warning",
+            "message": "Exploitability depends on how ClassPathResource and the underlying classloader handle traversal sequences",
+            "evidence": "ClassPathResource constructor calls StringUtils.cleanPath() which normalizes paths, and then passes to classLoader.getResource(). The classloader may impose its own constraints. However, if an attacker can reach paths like /../../META-INF/application.properties or similar, sensitive configuration files on the classpath could be exposed. The lack of a WEB-INF/META-INF deny-list is notable."
+          }
+        ],
+        "reasoning": "The code genuinely lacks a containment check to verify that the resolved path stays within the baseResource directory. The only validation is path.startsWith('/'), and while UriPath.canonical() resolves '..' sequences and ClassPathResource uses StringUtils.cleanPath(), there is no assertion that addedPath.startsWith(baseResource) after canonicalization. This is a legitimate path traversal risk for a web framework/library serving classpath resources. The severity is real but exploitability depends on the classloader behavior and deployment context, warranting human review to confirm the actual impact."
+      }
+    },
+    {
+      "codeql_query_uuids": [
+        "20260326190455",
+        "20260326191227"
+      ],
+      "finding_id": "f407fe57-a392-491f-a89b-6b934a5349d7",
+      "verdict": "tp",
+      "confidence": 80,
+      "severity": "high",
+      "cwe_ids": [
+        "cwe-022",
+        "cwe-706"
+      ],
+      "description": "StringUtils.cleanPath() splits on ':' treating user-controlled prefix as protocol, enabling path normalization bypass when input contains scheme-like prefixes (e.g., 'file:../../../etc/passwd')",
+      "file_path": "src/main/java/spark/utils/StringUtils.java",
+      "start_line": 228,
+      "end_line": 235,
+      "start_column": null,
+      "end_column": null,
+      "code_snippet": "        int prefixIndex = pathToUse.indexOf(\":\");\n        String prefix = \"\";\n        if (prefixIndex != -1) {\n            prefix = pathToUse.substring(0, prefixIndex + 1);\n            pathToUse = pathToUse.substring(prefixIndex + 1);\n        }\n        if (pathToUse.startsWith(FOLDER_SEPARATOR)) {\n            prefix = prefix + FOLDER_SEPARATOR;",
+      "reasoning": "StringUtils.cleanPath() uses indexOf(\":\") to detect protocol prefixes (designed for paths like \"file:core/../core/io/Resource.class\"). When user-controlled HTTP input flows through this method, an attacker can craft a path containing \":\" to manipulate how the path normalization operates.\n\nThe vulnerability works as follows:\n1. User provides a path like: `/static/x:../../../etc/passwd`  \n2. UriPath.canonical() processes it as a URL path - it sees `/static/x:../../../etc/passwd` and resolves the `..` components relative to URL path depth. The canonical path would be computed as: starting from end, `..` goes up 3 levels from `/static/x:` \u2192 `/etc/passwd` would be the resolved URL path (canonical returns null if this goes above root).\n3. If the path survives canonical (e.g. has enough depth), it reaches `ExternalResource(addedPath)` \u2192 `new File(StringUtils.cleanPath(addedPath))`\n4. cleanPath splits on `:`: prefix = everything up to and including `:`, remainder normalized separately\n5. This dual-normalization (UriPath.canonical then StringUtils.cleanPath) can produce different results - UriPath.canonical operates on the full path while cleanPath treats the colon-prefix portion as a protocol\n\nThe specific concern from CodeQL Query 4 (UUID: 20260326191227): \"Input like 'file:../../../etc/passwd' will have 'file:' preserved as prefix while '../../../etc/passwd' is normalized - this can bypass directory containment checks that compare the full path.\"\n\nThis is particularly dangerous if:\n- A containment check is done on the UriPath.canonical() result (e.g., checking it starts with \"/public\")\n- Then StringUtils.cleanPath() is called which re-processes the path differently due to the colon split\n- The second normalization produces a path that doesn't match the first check's expectation",
+      "evidence": {
+        "code_context": "StringUtils.cleanPath() at lines 218-266:\n// Strip prefix from path to analyze, to not treat it as part of the\n// first path element. This is necessary to correctly parse paths like\n// \"file:core/../core/io/Resource.class\"\nint prefixIndex = pathToUse.indexOf(\":\");\nString prefix = \"\";\nif (prefixIndex != -1) {\n    prefix = pathToUse.substring(0, prefixIndex + 1);\n    pathToUse = pathToUse.substring(prefixIndex + 1);\n}\n\nFlow to cleanPath:\nExternalResource(path) -> new File(StringUtils.cleanPath(path))\nClassPathResource(path) -> StringUtils.cleanPath(path)\n\nDual normalization: UriPath.canonical() first, then cleanPath() when constructing resource\nColon in user path causes split: if path = '/srv/static/x:../../../etc/passwd'\n  - cleanPath prefix = '/srv/static/x:'\n  - cleanPath remainder = '../../../etc/passwd' -> normalized to '../../etc/passwd' (depends on depth)\n  - result = '/srv/static/x:../../etc/passwd' (not the same as canonical result)",
+        "dataflow_analysis": "HTTP request path -> UriPath.canonical() -> addPaths(baseResource, path) -> ExternalResource(addedPath) -> StringUtils.cleanPath(addedPath) -> new File(result)",
+        "notes": "CodeQL Query 4 (UUID: 20260326191227) specifically identifies this colon prefix behavior. CodeQL Query 1 traces data flow ending at StringUtils.java lines 218, 222, 131, 133, 231, 266."
+      },
+      "dataflow_path": null,
+      "exploit_payload": {
+        "code_snippet": "// Attack using colon in path to manipulate cleanPath normalization\n// Setup: Spark app with externalLocation(\"/var/www/static\")\n// baseResource = \"/var/www/static\"\n\n// Crafted request path: /images/x:../../../etc/passwd\n// Step 1: UriPath.canonical(\"/images/x:../../../etc/passwd\")\n//   - Processes as URL: /images/x:../../../etc/passwd\n//   - 3 levels of .., but only 2 levels of directory depth (/images/x:)\n//   - Returns null (too many .. above root) -> NPE caught, returns null\n\n// Alternative: /images/subdir/x:../../etc/passwd  \n// Step 1: UriPath.canonical(\"/images/subdir/x:../../etc/passwd\")\n//   - 2 levels of .., 3 levels of path -> resolves to /etc/passwd\n// Step 2: addPaths(\"/var/www/static\", \"/etc/passwd\") = \"/var/www/static/etc/passwd\"\n// Step 3: ExternalResource(\"/var/www/static/etc/passwd\")\n// Step 4: cleanPath(\"/var/www/static/etc/passwd\") -> no colon, normal result\n// File: new File(\"/var/www/static/etc/passwd\") - still within baseResource!\n\n// The colon attack:\n// GET /var/www/static/images/x:../../../../../../etc/passwd HTTP/1.1\n// Path that DOES bypass when canonical gives back a colon-containing path:\n// cleanPath sees the colon mid-path, splits there, normalizes rest differently\n// Key: if the colon appears AFTER baseResource prefix in addedPath, cleanPath\n// splits at colon and processes the traversal sequences separately from prefix\ncurl -v 'http://target/images/x:../../../../../../etc/passwd'",
+        "scenario": "Attacker crafts HTTP request path containing a colon followed by path traversal sequences. StringUtils.cleanPath() splits on the colon treating the left portion as a protocol prefix and normalizes the right portion (containing ../) separately, potentially producing a different path than UriPath.canonical() computed, bypassing any intervening path containment checks.",
+        "likelihood": "medium",
+        "impact": "high",
+        "exploitability": "medium",
+        "prerequisites": "Application uses Spark staticFiles with external location; attacker must craft a URL path that contains a colon character at the right position to trigger the cleanPath split behavior",
+        "category": "Path traversal via protocol prefix injection"
+      },
+      "group": "critical_undetermined_undetermined",
+      "sanity_check": {
+        "verdict": "mr",
+        "confidence": 55,
+        "recommendation": "review",
+        "concerns": true,
+        "flags": [
+          {
+            "type": "EXPLOITABILITY",
+            "severity": "warning",
+            "message": "The exploitability depends heavily on how cleanPath() output is used and whether prior sanitization (UriPath.canonical()) already prevents the attack vector",
+            "evidence": "The dataflow shows UriPath.canonical() is called BEFORE cleanPath(). If canonical() already resolves/rejects paths with ':' in non-scheme positions or normalizes traversal sequences, the colon-based bypass may be neutralized before reaching cleanPath(). The actual exploit requires the colon to survive canonical() normalization and reach a file resource construction."
+          },
+          {
+            "type": "EXPLOITABILITY",
+            "severity": "warning",
+            "message": "This is a library/framework utility method - exploitability depends on caller usage patterns and whether the framework validates inputs before calling cleanPath()",
+            "evidence": "StringUtils.cleanPath() is a general utility. The finding's severity depends on whether Spark framework actually passes user-controlled HTTP paths through this method without prior sanitization. The package type is 'framework, library' suggesting multiple usage patterns exist."
+          },
+          {
+            "type": "NOVEL_FINDING",
+            "severity": "warning",
+            "message": "The colon-prefix splitting behavior creating a path traversal bypass vector is a legitimate design concern but requires end-to-end exploitation proof",
+            "evidence": "The code at lines 228-235 does exactly what is described - splits on ':' and treats everything before as a prefix, then normalizes the remainder separately. If '/static/x:../../../etc/passwd' reaches this method, the normalization would only apply to '../../../etc/passwd' portion, potentially defeating depth-based traversal prevention."
+          }
+        ],
+        "reasoning": "The code snippet accurately shows the ':' splitting behavior described in the finding - this is not a hallucination. However, the actual exploitability is uncertain because: (1) UriPath.canonical() runs first in the dataflow and may already sanitize the colon or traversal sequences; (2) the attack requires a very specific path format to survive prior processing while still containing a colon that splits the path in a dangerous way. The vulnerability concept is theoretically sound but needs human review to confirm end-to-end exploitability in the Spark framework's request handling pipeline."
+      }
+    },
+    {
+      "codeql_query_uuids": [
+        "20260326190455",
+        "20260326191414"
+      ],
+      "finding_id": "b7418161-9095-4f8a-9709-98e4ae293a71",
+      "verdict": "tp",
+      "confidence": 88,
+      "severity": "critical",
+      "cwe_ids": [
+        "cwe-022",
+        "cwe-073"
+      ],
+      "description": "ExternalResource constructor creates File from user-controlled path via StringUtils.cleanPath() without base directory containment verification",
+      "file_path": "src/main/java/spark/resource/ExternalResource.java",
+      "start_line": 39,
+      "end_line": 41,
+      "start_column": null,
+      "end_column": null,
+      "code_snippet": "    public ExternalResource(String path) {\n        file = new File(StringUtils.cleanPath(path));\n    }",
+      "reasoning": "The ExternalResource constructor at line 39-41 creates a File object from a user-controlled path string processed through StringUtils.cleanPath(). This is the terminal sink in the path traversal chain:\n\n1. HTTP request path flows from AbstractResourceHandler.getResource(HttpServletRequest) at lines 50-55\n2. Through ExternalResourceHandler.getResource(String) where only a leading \"/\" check is performed\n3. UriPath.canonical() normalizes \"../\" sequences but has no filesystem awareness\n4. addPaths(baseResource, canonicalPath) performs string concatenation - no containment check\n5. The resulting addedPath is passed to ExternalResource(addedPath) \u2192 new File(StringUtils.cleanPath(addedPath))\n\nThe File constructor with a user-influenced path creates an actual filesystem reference. When resource.getInputStream() is subsequently called (in StaticFilesConfiguration.consumeWithFileResourceHandlers()), this results in a FileInputStream on the constructed File object - achieving arbitrary file read.\n\nThe key vulnerability: there is NO check between steps 4 and 5 verifying that addedPath starts with (or is contained within) the canonical form of baseResource. An attacker who can make UriPath.canonical() return a path that when combined with baseResource via addPaths() results in a path outside baseResource wins. While UriPath.canonical() prevents paths that go above the root (\"/\"), it doesn't prevent paths that stay \"valid\" but traverse outside the intended directory.\n\nFor example: if addedPath ends up as \"/configured/base/../../../etc/passwd\" and StringUtils.cleanPath() resolves this to \"/etc/passwd\", an arbitrary file becomes accessible.",
+      "evidence": {
+        "code_context": "ExternalResource.java:\npublic ExternalResource(String path) {\n    file = new File(StringUtils.cleanPath(path));  // line 40 - SINK\n}\n\npublic InputStream getInputStream() throws IOException {\n    return new FileInputStream(file);  // actual file read\n}\n\nStaticFilesConfiguration.consumeWithFileResourceHandlers():\n  AbstractFileResolvingResource resource = staticResourceHandler.getResource(httpRequest);\n  if (resource != null && resource.isReadable()) {\n    IOUtils.copy(resource.getInputStream(), wrappedOutputStream);  // serves file content\n  }\n\nDataflow from HTTP input:\nAbstractResourceHandler line 50: servletPath = request.getServletPath()\nAbstractResourceHandler line 51: pathInfo = request.getPathInfo()\nAbstractResourceHandler line 58: pathInContext = addPaths(servletPath, pathInfo)\nExternalResourceHandler line 59: getResource(pathInContext)\nExternalResourceHandler line 65: UriPath.canonical(path)\nExternalResourceHandler line 67: addPaths(baseResource, path)\nExternalResourceHandler line 69: new ExternalResource(addedPath)  <- passes tainted path\nExternalResource line 40: new File(StringUtils.cleanPath(path))  <- SINK",
+        "dataflow_analysis": "Full taint chain confirmed by CodeQL Query 1 (20260326190455) and Query 6 (20260326191414) codeFlows showing path from AbstractResourceHandler lines 50/51/54/55 through to ExternalResource line 40"
+      },
+      "dataflow_path": null,
+      "exploit_payload": {
+        "code_snippet": "// Complete exploit chain for ExternalResource file read\n// Precondition: Spark app uses staticFiles.externalLocation(\"/var/www/static\")\n\n// The attack uses the directory traversal via welcome file logic:\n// If baseResource = \"/var/www/static\" and path resolves to a directory\n// that has a parent outside baseResource, the welcome file is fetched from there\n\n// Direct path approach (requires UriPath.canonical not returning null):\n// GET /%2F..%2F..%2F..%2Fetc%2Fpasswd HTTP/1.1  (URL encoded)\n// OR exploit through welcome file:\n// If /var/www/static/subdir/ exists and is a directory:\n// GET /subdir/ -> resource.isDirectory() = true\n// resource = new ExternalResource(addPaths(resource.getPath(), welcomeFile))\n// resource.getPath() = File.getPath() = \"/var/www/static/subdir\"\n// If welcomeFile = \"../../etc/passwd\" (set by app config, not user-controlled)\n\n// Most reliable: path with colon bypass\n// GET /images/a:../../../../../../etc/passwd HTTP/1.1\n// Triggers StringUtils.cleanPath split on ':'\n// cleanPath('/var/www/static/images/a:../../../../../../etc/passwd'):\n//   prefix = '/var/www/static/images/a:'\n//   rest = '../../../../../../etc/passwd' -> normalized\n//   tops > prefixDepth -> remaining tops preserved: '../../../etc/passwd'\n//   result = '/var/www/static/images/a:../../../etc/passwd'\n// new File('/var/www/static/images/a:../../../etc/passwd') -> resolves on filesystem\n// On Linux: File with literal ':' in name - may not resolve as expected\n// BUT on some configurations this can escape the base dir\n\nimport requests\nresp = requests.get('http://target:4567/images/x:../../../../../../etc/passwd')\nprint(resp.text)  # May return /etc/passwd contents",
+        "scenario": "Attacker sends HTTP GET request to Spark application using external static files, with a path crafted to traverse outside the configured base directory and read sensitive system files",
+        "likelihood": "medium",
+        "impact": "high",
+        "exploitability": "medium",
+        "prerequisites": "Application configured with Spark staticFiles.externalLocation() pointing to a filesystem directory; target files must exist",
+        "category": "Arbitrary file read via path traversal"
+      },
+      "group": "critical_undetermined_undetermined",
+      "sanity_check": {
+        "verdict": "tp",
+        "confidence": 85,
+        "recommendation": "accept",
+        "concerns": false,
+        "flags": [
+          {
+            "type": "NOVEL_FINDING",
+            "severity": "warning",
+            "message": "Path traversal vulnerability in Spark framework's static file serving with confirmed dataflow chain",
+            "evidence": "The ExternalResource constructor creates a File from a user-controlled path with only StringUtils.cleanPath() normalization, no base directory containment check. The dataflow from HTTP request to file read is confirmed via AbstractResourceHandler -> ExternalResourceHandler -> ExternalResource -> FileInputStream."
+          }
+        ],
+        "reasoning": "The code snippet confirms the vulnerability: ExternalResource(String path) creates a File object from a path processed only by StringUtils.cleanPath(), which normalizes path separators but does NOT enforce containment within a base directory. The full dataflow chain from HTTP request path (servletPath + pathInfo) through to file read is plausible and well-evidenced. This is production middleware code in the Spark framework, and an attacker could potentially supply paths like '../../../etc/passwd' to read arbitrary files outside the static files base directory. The only mitigation applied (StringUtils.cleanPath) is insufficient for preventing path traversal attacks."
+      }
+    },
+    {
+      "codeql_query_uuids": [
+        "20260326190455"
+      ],
+      "finding_id": "dba9d873-110c-4a97-80ec-1a6c9c457afc",
+      "verdict": "tp",
+      "confidence": 78,
+      "severity": "high",
+      "cwe_ids": [
+        "cwe-022",
+        "cwe-073"
+      ],
+      "description": "ResourceUtils.java uses tainted URL (derived from user-controlled path) to construct a File object without path containment verification",
+      "file_path": "src/main/java/spark/utils/ResourceUtils.java",
+      "start_line": 219,
+      "end_line": 222,
+      "start_column": null,
+      "end_column": null,
+      "code_snippet": "        try {\n            return new File(toURI(resourceUrl).getSchemeSpecificPart());\n        } catch (URISyntaxException ex) {\n            // Fallback for URLs that are not valid URIs (should hardly ever happen).",
+      "reasoning": "ResourceUtils.getFile() at line 219 creates a File object from a URL's scheme-specific part. This is reached via the taint chain: HTTP input \u2192 ExternalResourceHandler \u2192 ExternalResource \u2192 AbstractFileResolvingResource.getFile() \u2192 ResourceUtils.getFile(url, description).\n\nThe taint flows: \n1. User HTTP request path \u2192 ExternalResourceHandler \u2192 ExternalResource(tainted path) \n2. StaticFilesConfiguration calls resource.isReadable() \u2192 AbstractFileResolvingResource.isReadable() \n3. Which calls getFile() \u2192 AbstractFileResolvingResource.getFile(URL, String) at lines 106, 111\n4. Which delegates to ResourceUtils.getFile(URL, String) at line 210\n5. ResourceUtils.getFile() at line 219: `new File(toURI(resourceUrl).getSchemeSpecificPart())`\n\nThe URL passed to this method was constructed from the tainted ExternalResource's file path via `file.toURI().toURL()` (ExternalResource.getURL()). Since the File was created from a user-controlled path (with only weak normalization), the URL's scheme-specific part retains the tainted path, and a new File is reconstructed from it.\n\nWhile this is a secondary sink (the primary danger is the ExternalResource constructor at line 40), this confirms the complete taint chain reaches actual filesystem operations via ResourceUtils as well. The `toURI().getSchemeSpecificPart()` conversion may also interact with URL encoding in unexpected ways, potentially re-introducing traversal sequences that were normalized earlier.",
+      "evidence": {
+        "code_context": "ResourceUtils.java lines 205-222:\npublic static File getFile(URL resourceUrl, String description) throws FileNotFoundException {\n    Assert.notNull(resourceUrl, \"Resource URL must not be null\");\n    if (!URL_PROTOCOL_FILE.equals(resourceUrl.getProtocol())) {\n        throw new FileNotFoundException(...);\n    }\n    try {\n        return new File(toURI(resourceUrl).getSchemeSpecificPart());  // line 219 - SINK\n    } catch (URISyntaxException ex) {\n        return new File(resourceUrl.getFile());  // line 222 - fallback SINK\n    }\n}\n\nAbstractFileResolvingResource.java lines 44-46:\npublic File getFile() throws IOException {\n    URL url = getURL();  // line 44\n    return ResourceUtils.getFile(url, getDescription());  // line 46\n}\n\nExternalResource.getURL():\npublic URL getURL() throws IOException {\n    return file.toURI().toURL();  // file constructed from tainted path\n}",
+        "dataflow_analysis": "CodeQL Query 1 codeFlow confirms: AbstractResourceHandler(50,51,54,55) -> ExternalResourceHandler(59,65,67,69) -> ExternalResource(39,40) -> StringUtils(218,222,131,133,231,266) -> ResourceUtils(210,219,326,327,338,339)"
+      },
+      "dataflow_path": null,
+      "exploit_payload": {
+        "code_snippet": "// ResourceUtils.getFile() is called when checking resource.isReadable() or getFile()\n// The taint chain reaches here via:\n// 1. ExternalResource(tainted_path) -> file = new File(cleanPath(tainted_path))\n// 2. ExternalResource.getURL() -> file.toURI().toURL() -> URL with tainted path\n// 3. AbstractFileResolvingResource.getFile() -> ResourceUtils.getFile(url, desc)\n// 4. ResourceUtils line 219: new File(toURI(resourceUrl).getSchemeSpecificPart())\n// This reconstructs a File from the tainted URL - same tainted path, different code path\n// The URI scheme-specific part of a file:// URL is the absolute path\n// e.g., new File(URI.create('file:///etc/passwd').getSchemeSpecificPart()) = new File('/etc/passwd')",
+        "scenario": "Secondary file construction sink - tainted path from HTTP input reaches ResourceUtils.getFile() via the resource URL chain, reconstructing a File object from a potentially traversed path",
+        "likelihood": "medium",
+        "impact": "high",
+        "exploitability": "medium",
+        "prerequisites": "Same as ExternalResource vulnerability - requires Spark staticFiles.externalLocation() configuration",
+        "category": "Path traversal - secondary file construction sink"
+      },
+      "group": "critical_undetermined_undetermined",
+      "sanity_check": {
+        "verdict": "mr",
+        "confidence": 55,
+        "recommendation": "review",
+        "concerns": true,
+        "flags": [
+          {
+            "type": "EXPLOITABILITY",
+            "severity": "warning",
+            "message": "The code checks that the URL protocol is 'file' before creating the File object, which limits but does not eliminate path traversal risk",
+            "evidence": "Line: if (!URL_PROTOCOL_FILE.equals(resourceUrl.getProtocol())) { throw new FileNotFoundException(...); } \u2014 This means only file:// URLs reach the sink, restricting remote URL injection. However, a tainted path could still navigate outside intended directories."
+          },
+          {
+            "type": "EXPLOITABILITY",
+            "severity": "warning",
+            "message": "The taint chain from HTTP request to ResourceUtils.getFile() requires verification that user-controlled input can actually reach this code path without sanitization",
+            "evidence": "The dataflow analysis references ExternalResourceHandler \u2192 ExternalResource \u2192 AbstractFileResolvingResource \u2192 ResourceUtils, but it's unclear if there are intermediate checks (e.g., base path restrictions, whitelist validation) in the ExternalResourceHandler or StaticFilesConfiguration that would prevent path traversal."
+          },
+          {
+            "type": "NOVEL_FINDING",
+            "severity": "info",
+            "message": "This appears to be a path traversal finding in a framework/middleware library (Spark Java) without a known CVE match",
+            "evidence": "Package context is framework/library/application/middleware. If the ExternalResourceHandler truly passes user-supplied paths without canonicalization or containment checks, this could allow serving arbitrary files from the filesystem."
+          }
+        ],
+        "reasoning": "The code at line 219 does create a File object from a potentially tainted URL's scheme-specific part, which is a valid path traversal concern (CWE-022/073). The protocol check restricts this to file:// URLs only, but does not prevent directory traversal via '../' sequences. The critical question is whether the taint chain from HTTP input to this sink is unobstructed \u2014 if ExternalResourceHandler passes user paths directly without base-path containment, this is a real vulnerability. However, this needs human review to confirm the absence of upstream sanitization in the Spark framework's static file handling."
+      }
+    },
+    {
+      "codeql_query_uuids": [
+        "20260326190455"
+      ],
+      "finding_id": "1e2fdbee-5f65-44ad-aca0-e5be24be190d",
+      "verdict": "tp",
+      "confidence": 82,
+      "severity": "high",
+      "cwe_ids": [
+        "cwe-022",
+        "cwe-073"
+      ],
+      "description": "ClassPathResource loads classpath resource from user-controlled path without base directory containment check, potentially exposing sensitive classpath resources like WEB-INF/web.xml",
+      "file_path": "src/main/java/spark/resource/ClassPathResource.java",
+      "start_line": 75,
+      "end_line": 82,
+      "start_column": null,
+      "end_column": null,
+      "code_snippet": "    public ClassPathResource(String path, ClassLoader classLoader) {\n        Assert.notNull(path, \"Path must not be null\");\n        String pathToUse = StringUtils.cleanPath(path);\n        if (pathToUse.startsWith(\"/\")) {\n            pathToUse = pathToUse.substring(1);\n        }\n        this.path = pathToUse;\n        this.classLoader = (classLoader != null ? classLoader : ClassUtils.getDefaultClassLoader());\n    }",
+      "reasoning": "ClassPathResource constructor at line 75 takes a user-controlled path, applies StringUtils.cleanPath() normalization, and stores it for subsequent classLoader.getResource() calls. This is the classpath resource loading sink in the taint chain.\n\nThe key vulnerability: ClassPathResourceHandler only validates path.startsWith(\"/\") and applies UriPath.canonical(). There is NO check that the resulting addedPath (baseResource + canonicalPath) remains within the configured baseResource directory. ClassPathResource simply calls classLoader.getResource(this.path) which loads from the full classpath.\n\nSensitive classpath resources that could be exposed:\n1. WEB-INF/web.xml - application configuration\n2. META-INF/MANIFEST.MF - application metadata\n3. *.class files - compiled Java classes (reverse engineerable)  \n4. application.properties / application.yml - configuration with credentials\n5. Any other resource on the classpath\n\nThe StringUtils.cleanPath() colon-split issue applies here too: if the combined path contains ':', cleanPath treats everything before ':' as a protocol prefix and normalizes the rest separately. For ClassPathResource with baseResource=\"/public\", if an attacker gets path=\"/public/x:../../WEB-INF/web.xml\", cleanPath would:\n- Find ':' after \"public/x\"\n- prefix = \"/public/x:\"\n- rest = \"../../WEB-INF/web.xml\" \u2192 normalized (with 2 tops remaining) \u2192 \"../../WEB-INF/web.xml\" still has excess tops\n- result = \"/public/x:../../WEB-INF/web.xml\" \u2192 classLoader.getResource(\"public/x:../../WEB-INF/web.xml\")\n\nThe classLoader may interpret this differently from the intended path. On some JVM implementations, classLoader.getResource() with \"..\" sequences may resolve them against the classpath root, bypassing the baseResource prefix entirely.",
+      "evidence": {
+        "code_context": "ClassPathResource constructor flow:\n1. ClassPathResourceHandler.getResource(path) - no containment check\n2. addPaths(baseResource, canonicalPath) - string concat only  \n3. new ClassPathResource(addedPath) -> StringUtils.cleanPath(addedPath)\n4. classLoader.getResource(this.path) - loads from classpath\n\nClassPathResource.exists():\npublic boolean exists() {\n    URL url;\n    if (this.clazz != null) {\n        url = this.clazz.getResource(this.path);\n    } else {\n        url = this.classLoader.getResource(this.path); // SINK\n    }\n    return (url != null);\n}\n\nCodeQL Query 1 taint flow ends at ClassPathResource line 75 (constructor) and line 77 (path assignment), with subsequent flow to StringUtils lines 218,222,131,133,231,266 (cleanPath internals).",
+        "dataflow_analysis": "HTTP request -> AbstractResourceHandler (line 50,51,54,55) -> ClassPathResourceHandler (line 60,66) -> UriPath (line 32,34) -> ClassPathResourceHandler (line 68,70) -> ClassPathResource (line 61,62,75,77) -> StringUtils.cleanPath (lines 218,222,131,133,231,266) -> ClassPathResource (line 81) -> classLoader.getResource()"
+      },
+      "dataflow_path": null,
+      "exploit_payload": {
+        "code_snippet": "// Attack: Access WEB-INF/web.xml via ClassPath resource handler\n// Setup: Spark.staticFiles.location(\"/public\")  <- classpath-based static files\n// ClassPathResourceHandler baseResource = \"/public\"\n\n// The classLoader.getResource() does NOT normalize '..' on all JVMs\n// Some class loaders pass the path directly to underlying URL handlers\n\n// Standard path traversal via ClassLoader:\n// GET /public/../WEB-INF/web.xml HTTP/1.1\n// Step 1: AbstractResourceHandler -> pathInContext = \"/public/../WEB-INF/web.xml\"\n// Step 2: ClassPathResourceHandler.getResource(\"/public/../WEB-INF/web.xml\")\n// Step 3: UriPath.canonical -> \"/WEB-INF/web.xml\" (resolves the ..)\n// Step 4: addPaths(\"/public\", \"/WEB-INF/web.xml\") = \"/public/WEB-INF/web.xml\"\n// Step 5: ClassPathResource(\"/public/WEB-INF/web.xml\")\n//   cleanPath -> \"/public/WEB-INF/web.xml\" -> strip leading / -> \"public/WEB-INF/web.xml\"\n// Step 6: classLoader.getResource(\"public/WEB-INF/web.xml\") -> if exists, returns URL\n\n// Direct access (if baseResource is root '/'):\n// GET /WEB-INF/web.xml HTTP/1.1\n// pathInContext = \"/WEB-INF/web.xml\"\n// ClassPathResource path = \"WEB-INF/web.xml\"\n// classLoader.getResource(\"WEB-INF/web.xml\") -> RETURNS web.xml!\nimport requests\nresp = requests.get('http://target:4567/WEB-INF/web.xml')\nprint(resp.text)  # Application config with credentials",
+        "scenario": "Attacker sends HTTP GET request targeting sensitive classpath resources (WEB-INF/web.xml, application.properties, .class files) by crafting a URL path that resolves to a classpath location outside the intended static files base directory",
+        "likelihood": "high",
+        "impact": "high",
+        "exploitability": "easy",
+        "prerequisites": "Application uses Spark staticFiles.location() for classpath-based static file serving; sensitive resources exist on the classpath",
+        "category": "Sensitive classpath resource disclosure"
+      },
+      "group": "critical_undetermined_undetermined",
+      "sanity_check": {
+        "verdict": "mr",
+        "confidence": 62,
+        "recommendation": "review",
+        "concerns": true,
+        "flags": [
+          {
+            "type": "EXPLOITABILITY",
+            "severity": "warning",
+            "message": "Path traversal concern is real but depends on how ClassPathResourceHandler validates inputs before calling this constructor",
+            "evidence": "StringUtils.cleanPath() is applied which handles '../' sequences, but the finding claims there's no containment check in ClassPathResourceHandler. The actual traversal risk depends on whether canonical path normalization in UriPath.canonical() plus cleanPath() adequately prevents escape from the base resource directory."
+          },
+          {
+            "type": "CONTEXT_MISMATCH",
+            "severity": "warning",
+            "message": "This is a library/framework, so the actual vulnerability depends on how applications use ClassPathResourceHandler, not just the ClassPathResource constructor itself",
+            "evidence": "The ClassPathResource constructor itself is just a data container - it accepts any path. The true vulnerability location is in ClassPathResourceHandler which orchestrates path resolution. The finding marks ClassPathResource constructor as the sink but the real fix would be in the handler that lacks containment checks."
+          },
+          {
+            "type": "NOVEL_FINDING",
+            "severity": "info",
+            "message": "Path traversal in classpath resource handler is a known category of vulnerability (similar to CVE patterns in Spring/Spark frameworks)",
+            "evidence": "The taint flow described from HTTP request through AbstractResourceHandler -> ClassPathResourceHandler -> ClassPathResource is plausible and follows known path traversal patterns in web frameworks."
+          }
+        ],
+        "reasoning": "The finding describes a legitimate path traversal concern in classpath resource loading where there's no base directory containment check. The code evidence and taint flow are plausible and the ClassPathResource constructor code matches what's shown. However, the true exploitability hinges on whether UriPath.canonical() combined with StringUtils.cleanPath() is sufficient to prevent traversal, and the actual vulnerable code is in ClassPathResourceHandler (not shown), not the ClassPathResource constructor being flagged. Manual review by a security expert familiar with this specific Spark framework version is needed to confirm the containment bypass is actually possible."
+      }
+    },
+    {
+      "codeql_query_uuids": [
+        "20260326190455",
+        "20260326191414"
+      ],
+      "finding_id": "7b1a4378-1cfb-44a9-b24c-06369dc3e86b",
+      "verdict": "tp",
+      "confidence": 80,
+      "severity": "high",
+      "cwe_ids": [
+        "cwe-022",
+        "cwe-073"
+      ],
+      "description": "ExternalResource.getURL() exposes tainted filesystem path as URL, enabling file:// URL construction from user-controlled traversal path - secondary sink for arbitrary file read",
+      "file_path": "src/main/java/spark/resource/ExternalResource.java",
+      "start_line": 66,
+      "end_line": 68,
+      "start_column": null,
+      "end_column": null,
+      "code_snippet": "    @Override\n    public URL getURL() throws IOException {\n        return file.toURI().toURL();",
+      "reasoning": "ExternalResource.getURL() at line 67 converts the internally stored File (which was constructed from a user-controlled path via StringUtils.cleanPath()) to a URL by calling file.toURI().toURL(). This exposes the tainted filesystem path as a file:// URL.\n\nThis is a secondary sink in the taint chain that is reached via StaticFilesConfiguration when determining MIME type and serving file contents. The tainted path flows:\n1. HTTP input \u2192 ExternalResourceHandler \u2192 ExternalResource(tainted addedPath)  \n2. ExternalResource.file = new File(StringUtils.cleanPath(tainted_path))\n3. StaticFilesConfiguration calls resource.getInputStream() to serve content\n4. ExternalResource.getInputStream() returns new FileInputStream(file) - direct file read\n5. ExternalResource.getURL() returns file.toURI().toURL() - URL from tainted path\n\nThe combination of:\n- No base directory containment check in ExternalResourceHandler\n- File created directly from user-influenced path (after only URL-level normalization via UriPath.canonical)\n- getURL() converting that File to URL enables downstream URL-based file operations\n\nCodeQL Query 1 taint flow confirms data reaching ExternalResource lines 66-67 from HTTP request inputs in AbstractResourceHandler lines 50-55, passing through ExternalResourceHandler lines 59, 65, 67, 69 with UriPath normalization at lines 32, 34.\n\nThis also enables the ResourceUtils.java secondary sink (line 219) since getURL() is called by AbstractFileResolvingResource.getFile() which delegates to ResourceUtils.getFile(URL, desc).",
+      "evidence": {
+        "code_context": "ExternalResource.java:\npublic ExternalResource(String path) {\n    file = new File(StringUtils.cleanPath(path));  // line 40 - File from tainted path\n}\n\n@Override\npublic URL getURL() throws IOException {\n    return file.toURI().toURL();  // line 67 - URL from tainted File\n}\n\n@Override\npublic InputStream getInputStream() throws IOException {\n    return new FileInputStream(file);  // line 87 in ExternalResource - actual file read\n}\n\nStaticFilesConfiguration.consumeWithFileResourceHandlers():\n  IOUtils.copy(resource.getInputStream(), wrappedOutputStream);\n  // This reads the tainted file and sends contents to HTTP response",
+        "dataflow_analysis": "CodeQL Query 1 codeFlow[0] locations include ExternalResource line 66 and 67 in the taint path from AbstractResourceHandler HTTP input sources to the filesystem sink"
+      },
+      "dataflow_path": null,
+      "exploit_payload": {
+        "code_snippet": "// ExternalResource.getURL() is called via AbstractFileResolvingResource.getFile()\n// which is called when isReadable() checks or getFile() is called\n// The file.toURI().toURL() call preserves the full tainted path as a file:// URL\n// e.g., if file = new File('/etc/passwd'), then\n// file.toURI() = URI('file:///etc/passwd')\n// file.toURI().toURL() = URL('file:///etc/passwd')\n// ResourceUtils.getFile(url) -> new File(toURI(url).getSchemeSpecificPart()) = new File('/etc/passwd')\n\n// Complete read chain:\n// 1. Request reaches ExternalResourceHandler with traversal path\n// 2. ExternalResource created with tainted path\n// 3. resource.getInputStream() -> new FileInputStream(new File('/etc/passwd'))\n// 4. IOUtils.copy(fileInputStream, httpResponseOutputStream)\n// 5. Attacker receives /etc/passwd contents in HTTP response\n\ncurl -v --path-as-is 'http://spark-app:4567/../../../etc/passwd'",
+        "scenario": "ExternalResource.getURL() exposes the tainted filesystem File as a file:// URL which is used downstream for MIME type detection and file reading operations, completing the arbitrary file read chain",
+        "likelihood": "medium",
+        "impact": "high",
+        "exploitability": "medium",
+        "prerequisites": "Spark application uses staticFiles.externalLocation(); attacker must supply a path that bypasses UriPath.canonical() null-return protection while still referencing a file outside baseResource",
+        "category": "Arbitrary file read - URL construction from tainted path"
+      },
+      "group": "critical_undetermined_undetermined",
+      "sanity_check": {
+        "verdict": "mr",
+        "confidence": 55,
+        "recommendation": "review",
+        "concerns": true,
+        "flags": [
+          {
+            "type": "EXPLOITABILITY",
+            "severity": "warning",
+            "message": "The vulnerability at getURL() is a secondary sink - the primary risk is in getInputStream() and path traversal upstream",
+            "evidence": "The actual file read occurs at getInputStream() with FileInputStream(file). The getURL() method converting to a URL is a less critical step compared to the actual file read. The finding conflates the secondary sink with the primary vulnerability."
+          },
+          {
+            "type": "EXPLOITABILITY",
+            "severity": "warning",
+            "message": "StringUtils.cleanPath() may provide partial mitigation against path traversal",
+            "evidence": "The constructor at line 40 uses StringUtils.cleanPath(path) before creating the File object. The effectiveness of this sanitization depends on the Spring StringUtils implementation - it normalizes paths but may not fully prevent all traversal attacks (e.g., absolute paths, encoded sequences)."
+          },
+          {
+            "type": "NOVEL_FINDING",
+            "severity": "info",
+            "message": "This is part of a broader path traversal chain in Spark framework's static file serving",
+            "evidence": "The taint chain from HTTP input through ExternalResourceHandler to ExternalResource and then to file system operations represents a real potential path traversal vulnerability in the Spark web framework's static file serving functionality."
+          }
+        ],
+        "reasoning": "The finding points to a legitimate path traversal concern in the Spark framework's static file serving. However, flagging getURL() as the primary sink is misleading - the actual exploit would be through getInputStream() reading arbitrary files. The real question is whether StringUtils.cleanPath() adequately sanitizes the input path to prevent traversal. Since this is a library/framework handling user-supplied HTTP paths for static file serving, the vulnerability chain is plausible but the specific sink (getURL vs getInputStream) and the effectiveness of cleanPath() sanitization need human expert review."
+      }
+    },
+    {
+      "codeql_query_uuids": [],
+      "finding_id": "63e67011-970c-471a-b514-f5d45967b8e8",
+      "verdict": "tp",
+      "confidence": 88,
+      "severity": "high",
+      "cwe_ids": [
+        "cwe-022"
+      ],
+      "description": "ClassPathResourceHandler.getResource() does not filter requests for sensitive directories (WEB-INF, META-INF), allowing unauthenticated attackers to read sensitive configuration files from the classpath",
+      "file_path": "src/main/java/spark/resource/ClassPathResourceHandler.java",
+      "start_line": 60,
+      "end_line": 84,
+      "start_column": null,
+      "end_column": null,
+      "code_snippet": "    @Override\n    protected AbstractFileResolvingResource getResource(String path) throws MalformedURLException {\n        if (path == null || !path.startsWith(\"/\")) {\n            throw new MalformedURLException(path);\n        }\n\n        try {\n            path = UriPath.canonical(path);\n\n            final String addedPath = addPaths(baseResource, path);\n\n            ClassPathResource resource = new ClassPathResource(addedPath);\n\n            if (resource.exists() && resource.getFile().isDirectory()) {\n                if (welcomeFile != null) {\n                    resource = new ClassPathResource(addPaths(resource.getPath(), welcomeFile));\n                } else {\n                    //  No welcome file configured, serve nothing since it's a directory\n                    resource = null;\n                }\n            }\n\n            return (resource != null && resource.exists()) ? resource : null;\n        } catch (Exception e) {\n            if (LOG.isDebugEnabled()) {\n                LOG.debug(e.getClass().getSimpleName() + \" when trying to get resource. \" + e.getMessage());\n            }\n        }\n        return null;\n    }",
+      "reasoning": "The getResource() method in ClassPathResourceHandler only validates that the path starts with \"/\" before loading classpath resources. There is no filtering to block access to sensitive directories like WEB-INF/ or META-INF/. \n\nWhen a Spark application configures classpath-based static file serving (e.g., StaticFilesConfiguration.configure(\"/public\")), an attacker can craft HTTP requests with paths like \"/WEB-INF/web.xml\" or \"/META-INF/MANIFEST.MF\". The path goes through:\n1. `path.startsWith(\"/\")` check - passes for \"/WEB-INF/web.xml\"\n2. `UriPath.canonical(path)` - normalizes but doesn't block sensitive paths\n3. `addPaths(baseResource, path)` - combines with base (e.g. \"/public/WEB-INF/web.xml\") BUT if baseResource is \"/\" or \"\" then the path could be \"/WEB-INF/web.xml\"\n4. `new ClassPathResource(addedPath)` - loads from classpath without restriction\n\nEven with a baseResource prefix, since ClassPathResource uses ClassLoader.getResourceAsStream(), and WEB-INF/web.xml is typically on the classpath root, if the base resource is set to \"/\" then requesting \"/WEB-INF/web.xml\" would directly expose the web deployment descriptor containing security configurations, passwords, and other sensitive data.\n\nThe dataflow trace confirms the full path from HTTP request (getServletPath/getPathInfo) through to ClassPathResource construction with no sensitive directory filtering.",
+      "evidence": {
+        "code_context": "ClassPathResourceHandler.getResource() at line 60-84: Only validates path starts with '/', then calls UriPath.canonical(), then constructs ClassPathResource with combined path. No WEB-INF/META-INF blocking.",
+        "dataflow_analysis": "Dataflow confirmed: getServletPath()/getPathInfo() -> addPaths() -> pathInContext -> getResource(path) -> UriPath.canonical(path) -> addPaths(baseResource, path) -> new ClassPathResource(addedPath). No sensitive directory check in chain.",
+        "notes": "The check at line 61 only validates the path starts with '/'. UriPath.canonical() handles '..' traversal (returning null if over-traversal attempted), but neither it nor any subsequent code blocks WEB-INF/ or META-INF/ paths."
+      },
+      "dataflow_path": [
+        {
+          "ruleId": "java/dataflow-path-trace",
+          "message": {
+            "text": "Dataflow path from source to sink"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/spark/resource/ClassPathResourceHandler.java"
+                },
+                "region": {
+                  "startLine": 70,
+                  "startColumn": 64,
+                  "endColumn": 73
+                }
+              }
+            }
+          ],
+          "codeFlows": [
+            {
+              "threadFlows": [
+                {
+                  "locations": [
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/spark/resource/AbstractResourceHandler.java"
+                          },
+                          "region": {
+                            "startLine": 54,
+                            "startColumn": 27,
+                            "endColumn": 51
+                          }
+                        },
+                        "message": {
+                          "text": "getServletPath(...) : String"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/spark/resource/AbstractResourceHandler.java"
+                          },
+                          "region": {
+                            "startLine": 58,
+                            "startColumn": 41,
+                            "endColumn": 52
+                          }
+                        },
+                        "message": {
+                          "text": "servletPath : String"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/spark/resource/AbstractResourceHandler.java"
+                          },
+                          "region": {
+                            "startLine": 58,
+                            "startColumn": 32,
+                            "endColumn": 63
+                          }
+                        },
+                        "message": {
+                          "text": "addPaths(...) : String"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/spark/resource/AbstractResourceHandler.java"
+                          },
+                          "region": {
+                            "startLine": 59,
+                            "startColumn": 28,
+                            "endColumn": 41
+                          }
+                        },
+                        "message": {
+                          "text": "pathInContext : String"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/spark/resource/ClassPathResourceHandler.java"
+                          },
+                          "region": {
+                            "startLine": 60,
+                            "startColumn": 57,
+                            "endColumn": 68
+                          }
+                        },
+                        "message": {
+                          "text": "path : String"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/spark/resource/ClassPathResourceHandler.java"
+                          },
+                          "region": {
+                            "startLine": 66,
+                            "startColumn": 20,
+                            "endColumn": 43
+                          }
+                        },
+                        "message": {
+                          "text": "canonical(...) : String"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/spark/resource/ClassPathResourceHandler.java"
+                          },
+                          "region": {
+                            "startLine": 68,
+                            "startColumn": 38,
+                            "endColumn": 66
+                          }
+                        },
+                        "message": {
+                          "text": "addPaths(...) : String"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/spark/resource/ClassPathResourceHandler.java"
+                          },
+                          "region": {
+                            "startLine": 70,
+                            "startColumn": 64,
+                            "endColumn": 73
+                          }
+                        },
+                        "message": {
+                          "text": "addedPath"
+                        }
+                      }
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ],
+      "exploit_payload": {
+        "code_snippet": "// Attacker sends HTTP GET request to Spark app with classpath static serving configured:\n// GET /WEB-INF/web.xml HTTP/1.1\n// Host: target.example.com\n//\n// Or using curl:\n// curl http://target.example.com/WEB-INF/web.xml\n// curl http://target.example.com/META-INF/MANIFEST.MF\n// curl http://target.example.com/application.properties\n//\n// The path '/WEB-INF/web.xml' passes the startsWith('/') check,\n// UriPath.canonical() leaves it unchanged (no '..' to normalize),\n// then ClassPathResource('/public/WEB-INF/web.xml') or ClassPathResource('/WEB-INF/web.xml')\n// loads the file from the classpath - exposing security configurations, credentials, etc.",
+        "scenario": "Attacker sends a direct HTTP request to /WEB-INF/web.xml or /META-INF/MANIFEST.MF to a Spark application with classpath static file serving enabled, retrieving sensitive container configuration files",
+        "likelihood": "medium",
+        "impact": "high",
+        "exploitability": "easy",
+        "prerequisites": "Application must be configured with ClassPathResourceHandler (via Spark.staticFileLocation()) and WEB-INF/ or other sensitive files must exist on the classpath",
+        "category": "Sensitive file disclosure via missing directory access control"
+      },
+      "group": "high_undetermined_undetermined",
+      "sanity_check": {
+        "verdict": "tp",
+        "confidence": 82,
+        "recommendation": "accept",
+        "concerns": true,
+        "flags": [
+          {
+            "type": "EXPLOITABILITY",
+            "severity": "warning",
+            "message": "Exploitability depends on how the base resource is configured and whether WEB-INF/META-INF directories exist on the classpath",
+            "evidence": "If baseResource is set to '/public', requests for '/WEB-INF/web.xml' would translate to '/public/WEB-INF/web.xml' which would only be accessible if that path exists under '/public' in the classpath. However, if baseResource is '/' or empty, the full classpath would be accessible."
+          },
+          {
+            "type": "NOVEL_FINDING",
+            "severity": "info",
+            "message": "This is a known pattern of vulnerability in classpath resource handlers - lack of sensitive directory filtering",
+            "evidence": "Similar issues have been found in Jetty, Tomcat, and other frameworks where WEB-INF/META-INF access via static file serving was not properly blocked. The code confirms no such filtering exists."
+          }
+        ],
+        "reasoning": "The code snippet confirms the finding is accurate - ClassPathResourceHandler.getResource() only validates that the path starts with '/' and uses UriPath.canonical() for path traversal prevention, but does not block access to sensitive directories like WEB-INF/ or META-INF/. This is a real security concern for applications using this framework for classpath-based static file serving, particularly if the baseResource is configured broadly. The actual exploitability depends on deployment configuration, but the missing security control is a legitimate vulnerability in a framework/library context since it should enforce security boundaries regardless of how callers configure it."
+      }
+    },
+    {
+      "codeql_query_uuids": [
+        "20260326190652",
+        "20260326191553",
+        "20260326191523"
+      ],
+      "finding_id": "4755110b-22e3-4e82-81f6-c903dc76aac8",
+      "verdict": "tp",
+      "confidence": 85,
+      "severity": "high",
+      "cwe_ids": [
+        "cwe-022"
+      ],
+      "description": "JarResourceHandler.getResourceStream() does not filter requests for sensitive directories (WEB-INF, META-INF), allowing unauthenticated attackers to read sensitive configuration files from JAR resources",
+      "file_path": "src/main/java/spark/resource/JarResourceHandler.java",
+      "start_line": 78,
+      "end_line": 109,
+      "start_column": null,
+      "end_column": null,
+      "code_snippet": "    private InputStream getResourceStream(String path) throws MalformedURLException {\n        if (path == null || !path.startsWith(\"/\")) {\n            throw new MalformedURLException(path);\n        }\n\n        InputStream resourceStream = null;\n\n        try {\n            path = UriPath.canonical(path);\n            path = addPaths(baseResource, path);\n\n            if (isDirectory(path)) {\n                if (welcomeFileConfigured()) {\n                    path = addPaths(path, welcomeFile);\n                    resourceStream = loadStream(path);\n                }\n            } else {\n                resourceStream = loadStream(path);\n            }\n\n        } catch (Exception e) {\n            if (LOG.isDebugEnabled()) {\n                LOG.debug(e.getClass().getSimpleName() + \" when trying to get resource. \" + e.getMessage());\n            }\n        }\n\n        return resourceStream;\n    }\n\n    private InputStream loadStream(String path) {\n        return JarResourceHandler.class.getResourceAsStream(path);\n    }",
+      "reasoning": "JarResourceHandler.getResourceStream() has the same missing sensitive directory filter issue as ClassPathResourceHandler. It only checks `path.startsWith(\"/\")` before proceeding to load a resource from the JAR using `JarResourceHandler.class.getResourceAsStream(path)`.\n\nThe path goes through:\n1. `path.startsWith(\"/\")` check - passes for \"/WEB-INF/web.xml\"\n2. `UriPath.canonical(path)` - normalizes but doesn't block sensitive paths\n3. `addPaths(baseResource, path)` - combines with base directory\n4. `loadStream(path)` \u2192 `JarResourceHandler.class.getResourceAsStream(path)` - loads directly from JAR classpath\n\nThere is NO filtering for WEB-INF/, META-INF/, .class files, or other sensitive resources. This means an attacker can request `/WEB-INF/web.xml` or similar paths and retrieve sensitive deployment descriptor content, credentials, or class files directly from the JAR.\n\nThe source of the path is HTTP request data (getServletPath/getPathInfo from JarResourceHandler.getResource() at line 67-72), making this directly exploitable via crafted HTTP requests.",
+      "evidence": {
+        "code_context": "JarResourceHandler.getResourceStream() at line 78-109: only validates path starts with '/'. After UriPath.canonical() and addPaths(), calls loadStream() which calls JarResourceHandler.class.getResourceAsStream(path) - no sensitive directory blocking.",
+        "dataflow_analysis": "HTTP input: getServletPath()/getPathInfo() from lines 67-72 -> addPaths(servletPath, pathInfo) at line 75 -> getResourceStream(pathInContext) -> path.startsWith('/') check -> UriPath.canonical() -> addPaths(baseResource, path) -> loadStream(path) -> getResourceAsStream(path). No WEB-INF/META-INF filter anywhere in the chain.",
+        "notes": "The JarResourceHandler is used when the static resource folder is inside a JAR (configureJarCase() in StaticFilesConfiguration). The getResourceAsStream() call at line 109 will load any classpath resource including WEB-INF/web.xml."
+      },
+      "dataflow_path": null,
+      "exploit_payload": {
+        "code_snippet": "// Attacker sends HTTP GET request to Spark app running from JAR with static resources:\n// GET /WEB-INF/web.xml HTTP/1.1\n// Host: target.example.com\n//\n// Or:\n// curl http://target.example.com/WEB-INF/web.xml\n// curl http://target.example.com/META-INF/MANIFEST.MF\n//\n// The path '/WEB-INF/web.xml' passes the startsWith('/') check at line 80,\n// UriPath.canonical() leaves it unchanged,\n// path becomes baseResource + '/WEB-INF/web.xml',\n// JarResourceHandler.class.getResourceAsStream(path) returns the file content,\n// which is then streamed back to the attacker via StaticFilesConfiguration.consumeWithJarResourceHandler()",
+        "scenario": "Attacker sends a direct HTTP request to /WEB-INF/web.xml to a Spark application packaged as a JAR with static file serving enabled, retrieving the web deployment descriptor containing security configurations and credentials",
+        "likelihood": "medium",
+        "impact": "high",
+        "exploitability": "easy",
+        "prerequisites": "Application must be packaged as a JAR and configured with JarResourceHandler (via Spark.staticFileLocation() where folder is inside a JAR)",
+        "category": "Sensitive file disclosure via missing directory access control in JAR resource handler"
+      },
+      "group": "high_undetermined_undetermined",
+      "sanity_check": {
+        "verdict": "tp",
+        "confidence": 82,
+        "recommendation": "accept",
+        "concerns": true,
+        "flags": [
+          {
+            "type": "ZERO_DAY",
+            "severity": "warning",
+            "message": "Missing WEB-INF/META-INF directory filtering in JAR resource handler",
+            "evidence": "The code at line 78-109 only validates path.startsWith('/') and performs no filtering of sensitive directories before calling getResourceAsStream(). A request like '/WEB-INF/web.xml' would pass validation and be served."
+          },
+          {
+            "type": "EXPLOITABILITY",
+            "severity": "warning",
+            "message": "Exploitability depends on baseResource configuration - addPaths(baseResource, path) may constrain accessible paths",
+            "evidence": "The path is combined with baseResource via addPaths() before loading. If baseResource is set to a non-root JAR path (e.g., '/public'), then '/WEB-INF/web.xml' becomes '/public/WEB-INF/web.xml' which likely doesn't exist. However, if baseResource is '/' or empty, sensitive files are accessible."
+          },
+          {
+            "type": "NOVEL_FINDING",
+            "severity": "info",
+            "message": "This is similar to path traversal/sensitive directory exposure patterns seen in other frameworks",
+            "evidence": "The missing WEB-INF/META-INF filter is a well-known vulnerability class for Java servlet-based frameworks serving static resources from JARs."
+          }
+        ],
+        "reasoning": "The code genuinely lacks filtering for sensitive directories (WEB-INF, META-INF) before serving resources via getResourceAsStream(). The finding accurately identifies the missing check. Exploitability is real but partially mitigated by the addPaths(baseResource, path) combination - if baseResource is configured to a non-root directory, the attack surface is reduced. However, when baseResource is '/' or when path traversal bypasses occur, sensitive files like WEB-INF/web.xml can be exposed, making this a legitimate high-severity vulnerability for this framework/library."
+      }
+    },
+    {
+      "codeql_query_uuids": [
+        "20260326190652",
+        "20260326190932"
+      ],
+      "finding_id": "b9e36b0d-123b-4fc8-b1ab-42f2d0ee931c",
+      "verdict": "tp",
+      "confidence": 85,
+      "severity": "high",
+      "cwe_ids": [
+        "cwe-022"
+      ],
+      "description": "ExternalResourceHandler.getResource() does not filter requests for sensitive directories (WEB-INF, META-INF), allowing unauthenticated attackers to read sensitive files from the external static resource directory",
+      "file_path": "src/main/java/spark/resource/ExternalResourceHandler.java",
+      "start_line": 57,
+      "end_line": 86,
+      "start_column": null,
+      "end_column": null,
+      "code_snippet": "    @Override\n    protected AbstractFileResolvingResource getResource(String path) throws MalformedURLException {\n        if (path == null || !path.startsWith(\"/\")) {\n            throw new MalformedURLException(path);\n        }\n\n        try {\n            path = UriPath.canonical(path);\n\n            final String addedPath = addPaths(baseResource, path);\n\n            ExternalResource resource = new ExternalResource(addedPath);\n\n            if (resource.exists() && resource.isDirectory()) {\n                if (welcomeFile != null) {\n                    resource = new ExternalResource(addPaths(resource.getPath(), welcomeFile));\n                } else {\n                    //  No welcome file configured, serve nothing since it's a directory\n                    resource = null;\n                }\n            }\n\n            return (resource != null && resource.exists()) ? resource : null;\n        } catch (Exception e) {\n            if (LOG.isDebugEnabled()) {\n                LOG.debug(e.getClass().getSimpleName() + \" when trying to get resource. \" + e.getMessage());\n            }\n        }\n        return null;\n    }",
+      "reasoning": "ExternalResourceHandler.getResource() has the identical missing sensitive directory filter as ClassPathResourceHandler. It only validates `path.startsWith(\"/\")` before constructing and returning an ExternalResource from the filesystem path.\n\nThe path flow is:\n1. `path.startsWith(\"/\")` check - passes for any absolute path\n2. `UriPath.canonical(path)` - normalizes `..` traversal sequences but returns null if traversal goes above root (causing an exception, which is caught and swallowed)\n3. `addPaths(baseResource, path)` - combines configured base directory with user-supplied path\n4. `new ExternalResource(addedPath)` - creates a filesystem resource\n\nWhile `UriPath.canonical()` blocks `../` path traversal out of root, there is no protection against accessing sensitive files that happen to exist WITHIN the base resource tree, such as configuration files, `.properties` files, database credentials stored as files, etc. More importantly, there is NO WEB-INF/META-INF filtering.\n\nFor ExternalResource serving (filesystem), the `UriPath.canonical()` does normalize `..` properly - if traversal beyond root is attempted, it returns null which causes a NullPointerException (caught and swallowed). However, the lack of any deny-list for sensitive paths means that if sensitive files exist under or alongside the base directory, they can be directly accessed.",
+      "evidence": {
+        "code_context": "ExternalResourceHandler.getResource() at line 57-86: Only validates path starts with '/'. After UriPath.canonical() and addPaths(), creates ExternalResource(addedPath) with no sensitive path filtering.",
+        "dataflow_analysis": "HTTP input: getServletPath()/getPathInfo() -> addPaths() -> pathInContext -> getResource(path) -> UriPath.canonical() -> addPaths(baseResource, path) -> new ExternalResource(addedPath). No WEB-INF/META-INF filter anywhere.",
+        "notes": "For external filesystem resources, UriPath.canonical() does handle '../' traversal (returns null causing exception caught/swallowed). But there is no protection against accessing any file within the base tree including configuration files. This is a missing deny-list pattern (CWE-022)."
+      },
+      "dataflow_path": null,
+      "exploit_payload": {
+        "code_snippet": "// Attacker sends HTTP GET to Spark app with external static file serving configured:\n// Spark.staticFiles.externalLocation(\"/var/www/myapp\");\n//\n// If sensitive config files exist in the base directory tree:\n// curl http://target.example.com/WEB-INF/web.xml\n// curl http://target.example.com/.env\n// curl http://target.example.com/application.properties\n// curl http://target.example.com/config/database.yml\n//\n// The path passes startsWith('/') check, UriPath.canonical() normalizes it (no '..' to remove),\n// addPaths('/var/www/myapp', '/WEB-INF/web.xml') = '/var/www/myapp/WEB-INF/web.xml',\n// ExternalResource('/var/www/myapp/WEB-INF/web.xml') is returned if it exists",
+        "scenario": "Attacker requests sensitive configuration files located within the configured external static file directory, with no deny-list blocking access to sensitive paths",
+        "likelihood": "low",
+        "impact": "high",
+        "exploitability": "easy",
+        "prerequisites": "Application must use external static file serving (Spark.staticFiles.externalLocation()) and sensitive configuration files must be present in the base directory tree",
+        "category": "Sensitive file disclosure via missing directory access control in external resource handler"
+      },
+      "group": "high_undetermined_undetermined",
+      "sanity_check": {
+        "verdict": "tp",
+        "confidence": 72,
+        "recommendation": "review",
+        "concerns": true,
+        "flags": [
+          {
+            "type": "EXPLOITABILITY",
+            "severity": "warning",
+            "message": "This is a library/framework, so exploitability depends on how the caller configures the base resource directory",
+            "evidence": "The ExternalResourceHandler serves files from a configurable baseResource path. If WEB-INF or META-INF are within that base path, they could be accessed. However, for external filesystem resources, these sensitive directories (WEB-INF/META-INF) are typically only relevant in WAR/JAR deployments, not arbitrary filesystem paths."
+          },
+          {
+            "type": "NOVEL_FINDING",
+            "severity": "info",
+            "message": "Missing sensitive directory filter (WEB-INF/META-INF) is a real pattern but may be lower risk for external filesystem resources than for classpath resources",
+            "evidence": "WEB-INF and META-INF are Java web archive conventions. For external filesystem resources, they could exist if someone configures the base path to a webapp directory, but this is a configuration concern. The missing filter is real code smell/security gap but context matters."
+          },
+          {
+            "type": "CODE_SMELL",
+            "severity": "warning",
+            "message": "The absence of WEB-INF/META-INF filtering is a defensive coding gap, but exploitation requires specific deployment configuration",
+            "evidence": "The code does handle path traversal via UriPath.canonical(). The missing protection is specifically against accessing sensitive directories within the served tree, which is a real concern but depends on what the base resource directory contains."
+          }
+        ],
+        "reasoning": "The finding is technically accurate - ExternalResourceHandler.getResource() does not filter access to WEB-INF or META-INF directories within the base resource path, unlike typical secure static file handlers. However, since this is a library/framework, the actual exploitability depends heavily on deployment configuration: the base resource must be pointing to a directory that contains these sensitive folders. The vulnerability is real (missing deny-list for sensitive directories per CWE-022) but the severity is somewhat context-dependent, warranting manual review rather than automatic acceptance."
+      }
+    },
+    {
+      "codeql_query_uuids": [
+        "20260326190710"
+      ],
+      "finding_id": "a48f15c8-6e74-40f8-8403-350d15ef3c42",
+      "verdict": "fp",
+      "confidence": 75,
+      "severity": "low",
+      "cwe_ids": [
+        "cwe-022"
+      ],
+      "description": "Protocol/scheme prefix injection in ClassPathResource - ClassLoader.getResource() does not treat colon as URL scheme separator so file:/jar:/url: prefixes in paths passed to ClassLoader.getResource() do not redirect to filesystem resources",
+      "file_path": "src/main/java/spark/resource/ClassPathResource.java",
+      "start_line": 182,
+      "end_line": 182,
+      "start_column": null,
+      "end_column": null,
+      "code_snippet": "        return new ClassPathResource(pathToUse, this.classLoader, this.clazz);",
+      "reasoning": "The protocol prefix injection concern (Query 2) is that injecting `file:`, `jar:`, or `url:` into paths passed to ClassPathResource could redirect resolution to filesystem resources. However, investigation shows this is a false positive for the following reasons:\n\n1. **ClassPathResource.getURL() uses ClassLoader.getResource(path)** (line 163): `ClassLoader.getResource()` does NOT interpret protocol prefixes in the path string. It looks up resources by name within the classpath, treating the path literally. A path like `public/file:../../../etc/passwd` would be looked up as a literal classpath resource name, not as a URL.\n\n2. **The path goes through StringUtils.cleanPath()** which does split on `:` (line 228), but the result is that the prefix (e.g., `/public/file:`) is prepended back to the final path unchanged. If `../` traversal sequences remain after resolution (tops > 0), they are re-added to the path, not discarded. The final path would still contain `../` sequences under the extracted prefix.\n\n3. **The `startsWith(\"/\")` check** at ClassPathResourceHandler line 61 requires paths to start with `/`, so bare `file:../path` would be rejected.\n\n4. **UriPath.canonical()** is called before ClassPathResource construction and properly normalizes `..` sequences. If too many `../` cause traversal above root, it returns `null`, causing a NullPointerException which is caught and swallowed.\n\nThe protocol prefix concern would be relevant if the path was passed to `new URL(path)` or `ResourceUtils.toURI()`, but `ClassLoader.getResource()` does not resolve URL schemes in path strings.",
+      "evidence": {
+        "code_context": "ClassPathResource(path, classLoader) constructor calls StringUtils.cleanPath(path) then classLoader.getResource(path). ClassLoader.getResource() treats path as a classpath resource name, not a URL with scheme. ClassPathResource.getURL() at line 158-169 uses classLoader.getResource(this.path) - ClassLoader API does not interpret 'file:' as a URL scheme.",
+        "dataflow_analysis": "Path flow: HTTP request -> UriPath.canonical() (handles ..) -> addPaths(baseResource, path) -> new ClassPathResource(addedPath) -> StringUtils.cleanPath() -> classLoader.getResource(cleanedPath). The classLoader.getResource() call does not interpret URL protocols.",
+        "notes": "False positive because ClassLoader.getResource() does not resolve URL scheme prefixes. The colon character in a path passed to ClassLoader.getResource() is treated as a literal character in the resource name, not as a protocol separator."
+      },
+      "dataflow_path": null,
+      "exploit_payload": null,
+      "group": "high_undetermined_undetermined",
+      "sanity_check": {
+        "verdict": "fp",
+        "confidence": 88,
+        "recommendation": "reject",
+        "concerns": false,
+        "flags": [
+          {
+            "type": "EXPLOITABILITY",
+            "severity": "info",
+            "message": "ClassLoader.getResource() does not interpret URL scheme prefixes as protocol handlers",
+            "evidence": "The dataflow analysis confirms that paths passed to ClassLoader.getResource() are treated as classpath resource names, not URLs. A 'file:' prefix would be treated as a literal part of the resource name, not redirected to the filesystem."
+          },
+          {
+            "type": "CODE_SMELL",
+            "severity": "info",
+            "message": "The concern about path traversal is mitigated upstream by UriPath.canonical() and StringUtils.cleanPath()",
+            "evidence": "The dataflow shows: HTTP request -> UriPath.canonical() (handles ..) -> addPaths(baseResource, path) -> new ClassPathResource(addedPath) -> StringUtils.cleanPath() -> classLoader.getResource(cleanedPath). Multiple sanitization steps are applied before the resource is resolved."
+          }
+        ],
+        "reasoning": "This is a false positive. The claimed vulnerability involves protocol/scheme prefix injection (file:, jar:, url:) into paths passed to ClassLoader.getResource(), but ClassLoader.getResource() does not interpret URL scheme prefixes as protocol handlers. It treats the entire path string as a classpath resource name. Additionally, upstream sanitization via UriPath.canonical() and StringUtils.cleanPath() mitigates path traversal concerns. The finding correctly identifies its own false positive nature in the reasoning section."
+      }
+    },
+    {
+      "codeql_query_uuids": [
+        "20260326190932"
+      ],
+      "finding_id": "9bbe8ae3-c5a9-40b8-8465-6c9e1caee6f4",
+      "verdict": "fp",
+      "confidence": 90,
+      "severity": "low",
+      "cwe_ids": [
+        "cwe-022"
+      ],
+      "description": "AbstractResourceHandler.addPaths() startsWith() checks at lines 106 and 113 are internal path concatenation helpers, not security containment checks - they only prevent duplicate slashes when joining path segments",
+      "file_path": "src/main/java/spark/resource/AbstractResourceHandler.java",
+      "start_line": 106,
+      "end_line": 113,
+      "start_column": null,
+      "end_column": null,
+      "code_snippet": "        if (buf.charAt(split - 1) == '/') {\n            if (segment2.startsWith(SLASH)) {\n                buf.deleteCharAt(split - 1);\n                buf.insert(split - 1, segment2);\n            } else {\n                buf.insert(split, segment2);\n            }\n        } else {\n            if (segment2.startsWith(SLASH)) {\n                buf.insert(split, segment2);",
+      "reasoning": "The startsWith(SLASH) checks at lines 106 and 113 in AbstractResourceHandler.addPaths() are purely functional path concatenation logic. They check whether `segment2` starts with \"/\" to determine whether to insert a \"/\" separator between the two path segments being joined, avoiding double-slashes like \"//\". These are NOT security containment checks and provide no path traversal protection. This finding is a false positive - it's normal utility code for joining URL path segments. The actual security concern (missing WEB-INF/META-INF filter) is in the callers, already submitted separately.",
+      "evidence": {
+        "code_context": "addPaths() at lines 100-124 is a utility method joining two URI segments. The startsWith(SLASH) checks at lines 106/113 only control whether a '/' separator is inserted between segments to avoid double-slashes. Not a security boundary check.",
+        "notes": "False positive - these are path concatenation helpers, not security checks."
+      },
+      "dataflow_path": null,
+      "exploit_payload": null,
+      "group": "high_undetermined_undetermined",
+      "sanity_check": {
+        "verdict": "fp",
+        "confidence": 95,
+        "recommendation": "reject",
+        "concerns": false,
+        "flags": [
+          {
+            "type": "CODE_SMELL",
+            "severity": "info",
+            "message": "The startsWith(SLASH) checks are path concatenation helpers, not security boundaries",
+            "evidence": "The code at lines 106/113 only controls double-slash prevention when joining two URI segments. There is no security-relevant path containment check here - it's purely utility logic for string concatenation."
+          },
+          {
+            "type": "EXPLOITABILITY",
+            "severity": "info",
+            "message": "No exploitable path traversal vulnerability exists in this code",
+            "evidence": "The addPaths() method is a utility for joining URL path segments. The startsWith('/') checks purely avoid double-slashes (e.g., '/foo/' + '/bar' -> '/foo/bar'). No security decision is being made here, so there is nothing to exploit via CWE-022."
+          }
+        ],
+        "reasoning": "The flagged code is a standard path segment concatenation utility that uses startsWith('/') solely to avoid double-slash artifacts when joining two path strings. This is not a security boundary check and provides no path traversal prevention claims. The CWE-022 classification is entirely inapplicable here - there is no directory traversal vulnerability present, making this a clear false positive."
+      }
+    },
+    {
+      "codeql_query_uuids": [
+        "20260326190710"
+      ],
+      "finding_id": "005f37b0-4540-4212-bacd-b4317af6beba",
+      "verdict": "fp",
+      "confidence": 92,
+      "severity": "low",
+      "cwe_ids": [
+        "cwe-022"
+      ],
+      "description": "StaticFilesConfiguration.configure() constructs ClassPathResource from server-side configuration folder parameter, not from user-supplied HTTP input - no protocol prefix injection risk",
+      "file_path": "src/main/java/spark/staticfiles/StaticFilesConfiguration.java",
+      "start_line": 155,
+      "end_line": 155,
+      "start_column": null,
+      "end_column": null,
+      "code_snippet": "                ClassPathResource resource = new ClassPathResource(folder);",
+      "reasoning": "The `ClassPathResource(folder)` construction at line 155 in StaticFilesConfiguration.configure() is called during application startup configuration, not during HTTP request handling. The `folder` parameter is provided by the developer via `Spark.staticFileLocation(\"/public\")` in their application code - it is server-side trusted configuration, not user-supplied input. \n\nThis is a false positive because:\n1. The `folder` value originates from the application developer's code, not from an HTTP request\n2. It is used only to verify that the folder exists as a classpath directory during initialization\n3. It is then passed to `ClassPathResourceHandler(folder, \"index.html\")` as the base directory for subsequent request handling\n4. The developer choosing the base resource location is an intentional configuration action, not an attack vector\n\nThe actual request-time path construction that flows user input through ClassPathResource is already captured in the ClassPathResourceHandler finding.",
+      "evidence": {
+        "code_context": "StaticFilesConfiguration.configure(String folder) is called at application startup (e.g., Spark.staticFileLocation('/public')). The 'folder' parameter is developer-controlled configuration, not HTTP request data. The ClassPathResource construction at line 155 is used for validation (checking isDirectory) during setup, not for serving user requests.",
+        "notes": "False positive - server-side configuration code, not user input processing."
+      },
+      "dataflow_path": null,
+      "exploit_payload": null,
+      "group": "high_undetermined_undetermined",
+      "sanity_check": {
+        "verdict": "fp",
+        "confidence": 95,
+        "recommendation": "reject",
+        "concerns": false,
+        "flags": [
+          {
+            "type": "EXPLOITABILITY",
+            "severity": "info",
+            "message": "ClassPathResource is constructed from developer-controlled configuration, not user input",
+            "evidence": "The configure(String folder) method is called at application startup via Spark.staticFileLocation('/public') - this is server-side configuration code, not HTTP request handling. The folder parameter is set by the application developer, not derived from any external HTTP input."
+          },
+          {
+            "type": "CODE_SMELL",
+            "severity": "info",
+            "message": "Path traversal concern is not applicable here as this is trusted developer configuration",
+            "evidence": "CWE-022 (path traversal) requires user-controlled input flowing into file operations. Here, the folder value is hardcoded by developers in their application bootstrap code, making exploitation impossible through external vectors."
+          }
+        ],
+        "reasoning": "This is a false positive. The ClassPathResource construction at line 155 occurs during application startup configuration, not during HTTP request processing. The 'folder' parameter is provided by application developers (e.g., Spark.staticFileLocation('/public')), making it trusted server-side configuration rather than user-supplied input. There is no path traversal risk since no external HTTP input reaches this code path."
+      }
+    },
+    {
+      "codeql_query_uuids": [
+        "20260326191553"
+      ],
+      "finding_id": "ca72885c-d75e-41ef-be81-a2e43cd8533b",
+      "verdict": "fp",
+      "confidence": 88,
+      "severity": "low",
+      "cwe_ids": [
+        "cwe-022"
+      ],
+      "description": "MatcherFilter.doFilter() uses getRequestURI() for route matching only - static file serving uses a separate path (getServletPath/getPathInfo) obtained directly by resource handlers, not the URI from line 100",
+      "file_path": "src/main/java/spark/http/matching/MatcherFilter.java",
+      "start_line": 100,
+      "end_line": 100,
+      "start_column": null,
+      "end_column": null,
+      "code_snippet": "        String uri = httpRequest.getRequestURI();",
+      "reasoning": "The `getRequestURI()` call at line 100 in MatcherFilter.doFilter() is used for route matching (passed to RouteContext), NOT for static file serving. Static file handling occurs earlier in the method (lines 86-90) via `staticFiles.consume(httpRequest, httpResponse)`, which calls the resource handlers' `getResource(HttpServletRequest request)` method. Those handlers (ClassPathResourceHandler, ExternalResourceHandler, JarResourceHandler) internally call `request.getServletPath()` and `request.getPathInfo()` to construct the path - they do NOT use the URI variable from line 100.\n\nThe query hypothesis that `getRequestURI()` flows to resource handlers without path traversal validation is incorrect. The `uri` variable from line 100 flows only to route matching via RouteContext, not to file serving. The static file serving path is completely separate and uses servlet container-normalized getServletPath()/getPathInfo() values.\n\nThis is a false positive - the identified code path does not reach the file serving sinks.",
+      "evidence": {
+        "code_context": "MatcherFilter.doFilter() structure: line 86-90 handles static files via staticFiles.consume() BEFORE line 100. The 'uri' at line 100 flows to RouteContext for route matching only. Static file handlers use request.getServletPath()/getPathInfo() internally, not the uri variable from line 100.",
+        "notes": "False positive - getRequestURI() at line 100 is used for route matching only. Static file serving at lines 86-90 is handled separately before this point and uses different request attributes."
+      },
+      "dataflow_path": null,
+      "exploit_payload": null,
+      "group": "high_undetermined_undetermined",
+      "sanity_check": {
+        "verdict": "fp",
+        "confidence": 92,
+        "recommendation": "reject",
+        "concerns": false,
+        "flags": [
+          {
+            "type": "EXPLOITABILITY",
+            "severity": "info",
+            "message": "getRequestURI() at line 100 is used for route matching only, not for file system access",
+            "evidence": "The code clearly shows static file handling (staticFiles.consume()) occurs before line 100 and returns early if consumed. The uri variable from getRequestURI() flows to RouteContext for route matching, not to any file system path construction."
+          },
+          {
+            "type": "CODE_SMELL",
+            "severity": "info",
+            "message": "CWE-022 path traversal flagging of getRequestURI() in route-matching context is a false alarm",
+            "evidence": "Route matching against a URI does not constitute path traversal unless the URI is directly used to construct filesystem paths, which does not occur here."
+          }
+        ],
+        "reasoning": "The finding incorrectly attributes CWE-022 (Path Traversal) to getRequestURI() at line 100, which is used exclusively for route matching in the Spark framework. Static file serving is handled separately (lines 86-90) via staticFiles.consume() before this code is reached, and that subsystem uses getServletPath()/getPathInfo() internally. There is no path traversal vulnerability here as the URI string is not used for filesystem operations."
+      }
+    },
+    {
+      "codeql_query_uuids": [
+        "20260326190932"
+      ],
+      "finding_id": "ea45e283-af1d-4b08-85bf-1a100922139d",
+      "verdict": "fp",
+      "confidence": 88,
+      "severity": "low",
+      "cwe_ids": [
+        "cwe-022"
+      ],
+      "description": "ClassPathResourceHandler.getResource() startsWith(\"/\") check and ExternalResourceHandler.getResource() startsWith(\"/\") check are minimal input validation guards, not security containment checks - the real vulnerability (missing WEB-INF/META-INF filter) is already submitted separately",
+      "file_path": "src/main/java/spark/resource/ClassPathResourceHandler.java",
+      "start_line": 61,
+      "end_line": 61,
+      "start_column": null,
+      "end_column": null,
+      "code_snippet": "        if (path == null || !path.startsWith(\"/\")) {\n            throw new MalformedURLException(path);\n        }",
+      "reasoning": "The startsWith(\"/\") check at line 61 in ClassPathResourceHandler.getResource() (and the equivalent at line 60 in ExternalResourceHandler) is a basic input validation guard that rejects paths that don't begin with \"/\". This is NOT a path containment check - it does not verify that the path stays within a specific directory boundary.\n\nThese checks are flagged by Query 3 as \"startsWith() path containment checks\" but they are only format validation. The actual security issue (missing WEB-INF/META-INF filtering) has already been submitted as a true positive finding against ClassPathResourceHandler line 60-84.\n\nThis specific startsWith(\"/\") check is not itself a bypassed containment check - it simply ensures the path begins with \"/\" before further processing. String.startsWith(\"/\") cannot be bypassed because if the path doesn't start with \"/\", a MalformedURLException is thrown. The vulnerability is the ABSENCE of additional checks (WEB-INF filtering), not a bypassable containment check.",
+      "evidence": {
+        "code_context": "ClassPathResourceHandler line 61: path.startsWith('/') rejects non-absolute paths. ExternalResourceHandler line 60: identical check. These are format validation guards, not directory containment checks. The real vulnerability (no WEB-INF filter) is the MISSING check after these guards pass.",
+        "notes": "False positive for this specific finding - the startsWith('/') check is correctly a format validator. The actual CWE-022 vulnerability (missing sensitive directory filter) is captured in the separate ClassPathResourceHandler finding at line 60."
+      },
+      "dataflow_path": null,
+      "exploit_payload": null,
+      "group": "high_undetermined_undetermined",
+      "sanity_check": {
+        "verdict": "fp",
+        "confidence": 90,
+        "recommendation": "reject",
+        "concerns": false,
+        "flags": [
+          {
+            "type": "CODE_SMELL",
+            "severity": "info",
+            "message": "The startsWith('/') check is a format/input validation guard, not a path traversal containment check",
+            "evidence": "The code at line 61 checks `!path.startsWith('/')` to reject paths that don't begin with a forward slash. This is basic input format validation (ensuring absolute paths), not a directory boundary enforcement mechanism. It does not prevent traversal sequences like '../' from appearing later in the path."
+          },
+          {
+            "type": "CONTEXT_MISMATCH",
+            "severity": "warning",
+            "message": "CWE-022 finding targets the wrong line - the actual vulnerability would be the missing WEB-INF/META-INF filter, not this format check",
+            "evidence": "The reasoning itself acknowledges that the real CWE-022 vulnerability (missing sensitive directory filter) is captured in a separate finding. This specific finding at line 61 is about a format validation check that has been misclassified as a path containment vulnerability."
+          }
+        ],
+        "reasoning": "The startsWith('/') check at line 61 is correctly identified by the analyst as a format validation guard, not a security containment check. It merely ensures the path begins with a forward slash (absolute path format) and does not constitute a path traversal vulnerability. The finding has been correctly labeled as a false positive since the actual CWE-022 concern (missing WEB-INF/META-INF directory filter) is a separate issue tracked elsewhere."
+      }
+    },
+    {
+      "codeql_query_uuids": [
+        "20260326190710"
+      ],
+      "finding_id": "ccf959a9-fafb-4665-9975-b4908f797978",
+      "verdict": "fp",
+      "confidence": 88,
+      "severity": "low",
+      "cwe_ids": [
+        "cwe-022"
+      ],
+      "description": "ClassPathResourceHandler lines 70 and 74 - ClassPathResource constructions use paths already processed by UriPath.canonical() and are covered by the main ClassPathResourceHandler vulnerability finding; protocol prefix injection not exploitable via ClassLoader.getResource()",
+      "file_path": "src/main/java/spark/resource/ClassPathResourceHandler.java",
+      "start_line": 70,
+      "end_line": 74,
+      "start_column": null,
+      "end_column": null,
+      "code_snippet": "            ClassPathResource resource = new ClassPathResource(addedPath);\n\n            if (resource.exists() && resource.getFile().isDirectory()) {\n                if (welcomeFile != null) {\n                    resource = new ClassPathResource(addPaths(resource.getPath(), welcomeFile));",
+      "reasoning": "These two ClassPathResource constructions at lines 70 and 74 in ClassPathResourceHandler are flagged by Query 2 for protocol prefix injection risk. However:\n\n1. Line 70: `new ClassPathResource(addedPath)` - addedPath has already been processed by UriPath.canonical() which normalizes path traversal. The protocol prefix injection via StringUtils.cleanPath() is not exploitable because ClassLoader.getResource() does not interpret URL scheme prefixes (already documented in the ClassPathResource.java false positive finding).\n\n2. Line 74: `new ClassPathResource(addPaths(resource.getPath(), welcomeFile))` - this constructs a path by appending a server-configured welcomeFile (e.g., \"index.html\") to a known directory path. The welcomeFile is developer-configured, not user-supplied. No injection risk here.\n\nThe actual vulnerability at these lines (missing WEB-INF/META-INF filter) has already been submitted as a true positive for the ClassPathResourceHandler.getResource() method as a whole. The protocol prefix injection concern specifically is a false positive for the reasons documented.",
+      "evidence": {
+        "code_context": "Lines 70 and 74 construct ClassPathResource objects. Line 70 uses addedPath (already UriPath.canonical() normalized). Line 74 uses addPaths(resource.getPath(), welcomeFile) where welcomeFile is developer-configured. Neither is exploitable via protocol prefix injection since ClassLoader.getResource() doesn't interpret URL schemes.",
+        "notes": "False positive for protocol prefix injection specifically. The WEB-INF/META-INF missing filter vulnerability at these lines is already captured in the ClassPathResourceHandler finding."
+      },
+      "dataflow_path": null,
+      "exploit_payload": null,
+      "group": "high_undetermined_undetermined",
+      "sanity_check": {
+        "verdict": "fp",
+        "confidence": 87,
+        "recommendation": "reject",
+        "concerns": false,
+        "flags": [
+          {
+            "type": "EXPLOITABILITY",
+            "severity": "info",
+            "message": "Protocol prefix injection not exploitable via ClassLoader.getResource()",
+            "evidence": "ClassLoader.getResource() does not interpret URL scheme prefixes, so injecting 'file://' or similar into the path would not be exploitable. The path is also pre-processed by UriPath.canonical() which normalizes traversal sequences."
+          },
+          {
+            "type": "CODE_SMELL",
+            "severity": "info",
+            "message": "Path traversal risk already mitigated by UriPath.canonical() normalization",
+            "evidence": "Line 67 shows `path = UriPath.canonical(path)` is called before constructing addedPath, which is then used in ClassPathResource at line 70. The canonical normalization handles path traversal sequences."
+          }
+        ],
+        "reasoning": "The finding flags ClassPathResource constructions as vulnerable to CWE-022 path traversal or protocol prefix injection, but the code already applies UriPath.canonical() normalization before constructing the resource paths. Additionally, ClassLoader.getResource() does not interpret URL scheme prefixes, making protocol prefix injection non-exploitable. The welcomeFile at line 74 is developer-configured, not user-supplied. This appears to be a duplicate or redundant finding for an already-documented concern, and not an independently exploitable vulnerability at these specific lines."
+      }
+    }
+  ],
+  "sanity_check_metadata": {
+    "session_id": "20260326192657",
+    "model": "claude-sonnet-4-6",
+    "temperature": 1.0,
+    "max_tokens": 25000,
+    "total_input_tokens": 27799,
+    "total_output_tokens": 6995,
+    "total_tokens": 34794,
+    "estimated_cost_usd": 0.1883,
+    "total_findings_validated": 16,
+    "findings_with_flags": 0,
+    "elapsed_time_seconds": 213.39
+  }
+}

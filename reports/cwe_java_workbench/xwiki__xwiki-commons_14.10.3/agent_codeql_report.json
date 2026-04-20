@@ -1,0 +1,3734 @@
+{
+  "session_id": "20260331175441",
+  "package_name": "xwiki__xwiki-commons_14.10.3",
+  "package_path": "packages/xwiki__xwiki-commons_14.10.3",
+  "database_path": "databases/xwiki__xwiki-commons_14.10.3-db",
+  "model": "claude-sonnet-4-6",
+  "temperature": 1.0,
+  "max_tokens": 25000,
+  "iterations": 17,
+  "total_input_tokens": 1729142,
+  "total_output_tokens": 13738,
+  "total_tokens": 1742880,
+  "elapsed_time_seconds": 1958.51,
+  "estimated_cost_usd": 5.3935,
+  "summary": "\n## Security Analysis: XWiki Commons 14.10.3\n\n### Overview\nXWiki Commons is a large Java framework providing core utilities for the XWiki collaborative wiki platform. This analysis focused on XSS and output encoding vulnerabilities (CWE-079, CWE-080, CWE-116, CWE-087).\n\n---\n\n### Finding 1 \u2014 **HIGH**: Flawed `data-` Attribute Regex in `SecureHTMLElementSanitizer` (CWE-079)\n\n**File:** `xwiki-commons-core/xwiki-commons-xml/src/main/java/org/xwiki/xml/internal/html/SecureHTMLElementSanitizer.java` (line 68)\n\nThe regex used to validate `data-*` attribute names is:\n```\n^data-[\\-\\w.]\n```\n\nThis pattern is **missing a `+` quantifier and `$` end anchor**. The correct pattern should be `^data-[-\\w.]+$`. Due to the missing quantifier and end anchor, the regex only checks that the attribute name starts with `data-` followed by **exactly one** valid character \u2014 any additional characters are not validated. This could theoretically allow attribute names like `data-x<space>onclick` to pass the initial check (the attribute format validation only checks the prefix), potentially enabling attribute injection.\n\nCompare with the `aria-` pattern at line 70 which has the correct form `^aria-[-\\w]+$`.\n\n---\n\n### Finding 2 \u2014 **HIGH**: Dangerous URL Scheme Blocklist Regex May Have Bypass Vectors (CWE-079, CWE-087)\n\n**File:** `xwiki-commons-core/xwiki-commons-xml/src/main/java/org/xwiki/xml/internal/html/SecureHTMLElementSanitizer.java` (line 63)\n\nThe dangerous URL pattern is:\n```\n^(?:\\w+script|data):\n```\n\nThis regex is compiled **without the `Pattern.CASE_INSENSITIVE` flag**. However, attribute values are lowercased before checking (line 183: `toLowerCase`), so case insensitivity is handled externally. The concern is that this blocklist uses a **denylist approach** (`\\w+script` matches `javascript`, `vbscript`, etc.) rather than checking against the allowlist first. The pattern requires `\\w+` before `script`, which correctly catches `javascript:` and `vbscript:`.\n\nMore significantly, this denylist is checked alongside an **allowlist** at line 72: `^(?:(?:f|ht)tps?|mailto|tel|callto|cid|xmpp):` \u2014 the logic structure creates a situation where:\n1. If the URL matches the allowlist \u2192 allowed\n2. If the URL matches the denylist \u2192 blocked  \n3. Otherwise, if `isAllowUnknownProtocols` is `true` \u2192 allowed (XSS risk)\n4. Otherwise, the relative URL check at line 75 is applied\n\n---\n\n### Finding 3 \u2014 **HIGH**: `allowUnknownProtocols` Configuration Bypasses URL Scheme Validation (CWE-079)\n\n**File:** `xwiki-commons-core/xwiki-commons-xml/src/main/java/org/xwiki/xml/internal/html/SecureHTMLElementSanitizer.java` (line 155)  \n**Config:** `xwiki-commons-xml/src/main/java/org/xwiki/xml/internal/html/HTMLElementSanitizerConfiguration.java` (line 58)\n\nThe `isAllowUnknownProtocols` configuration property (`xml.htmlElementSanitizer.allowUnknownProtocols`) is read at line 155 of `SecureHTMLElementSanitizer`. When this flag is enabled, URLs with **any protocol not matched by the denylist** will be allowed through. This means protocols like `file:`, `blob:`, `filesystem:`, or custom protocols could be used in `href`/`src` attributes. This is an explicit security-relevant configuration option that could easily be misconfigured to enable XSS.\n\n---\n\n### Finding 4 \u2014 **MEDIUM**: `extraDataUriTags` Config Expands `data:` URI Support (CWE-079)\n\n**File:** `xwiki-commons-core/xwiki-commons-xml/src/main/java/org/xwiki/xml/internal/html/SecureHTMLElementSanitizer.java` (line 154)  \n**Config:** `HTMLElementSanitizerConfiguration.java` (line 51)\n\nThe `xml.htmlElementSanitizer.extraDataUriTags` configuration property allows additional HTML tags to accept `data:` URIs in their `src`/`href` attributes. By default `data:` URIs are blocked (the denylist blocks `data:` scheme), but this config can re-enable them for specified tags. If an attacker can influence this configuration, they can craft `data:text/html,<script>` payloads.\n\n---\n\n### Finding 5 \u2014 **MEDIUM**: `xlink:href` Attribute Permitted in SVG Context (CWE-079)\n\n**File:** `xwiki-commons-core/xwiki-commons-xml/src/main/java/org/xwiki/xml/internal/html/SecureHTMLElementSanitizer.java` (line 135)\n\nThe attribute `xlink:href` is listed as a URL-type attribute that receives URL scheme validation. While URL validation is applied, `xlink:href` in SVG elements (e.g., `<use>`, `<image>`) can be used to reference external resources or trigger JavaScript execution in some browser versions. The presence of this attribute in the allowed set warrants careful review of the URL validation logic to ensure `javascript:` and `data:` URIs are properly rejected in this namespace context.\n\n---\n\n### Finding 6 \u2014 **MEDIUM**: `EscapeTool` Has No Dedicated HTML-Context Escaping Method (CWE-116)\n\n**File:** `xwiki-commons-core/xwiki-commons-velocity/src/main/java/org/xwiki/velocity/tools/EscapeTool.java`\n\nThe `EscapeTool` Velocity template tool provides `xml()`, `json()`, `css()`, `url()` methods but **no dedicated `html()` method**. Developers writing Velocity templates who want to escape user data for HTML output must use `$escapetool.xml()` (which provides XML escaping) rather than a purpose-built HTML escaper. The absence of a dedicated HTML escaping method increases the chance of developers using the wrong escaping method or no escaping at all when embedding user data in HTML attributes or JavaScript contexts.\n\n---\n\n### Finding 7 \u2014 **MEDIUM**: `SanitizerFilter` Allows SVG and MathML Namespaces (CWE-079)\n\n**File:** `xwiki-commons-core/xwiki-commons-xml/src/main/java/org/xwiki/xml/internal/html/filter/SanitizerFilter.java` (lines 60-64)\n\n`SanitizerFilter` handles SVG (`http://www.w3.org/2000/svg`) and MathML (`http://www.w3.org/1998/Math/MathML`) namespaces. SVG and MathML elements create namespace integration points with HTML5 parsing that have historically enabled mutation XSS (mXSS) attacks where apparently-safe markup is re-parsed by the browser into executable content. The `htmlIntegrationPoints` concept in `SVGDefinitions` (line 58) demonstrates awareness of this issue, but the interplay between the sanitizer and the HTML5 browser parser's foreign content model requires careful validation.\n\n---\n\n### Summary Table\n\n| # | Severity | File | Issue |\n|---|----------|------|-------|\n| 1 | High | `SecureHTMLElementSanitizer.java:68` | Broken `data-*` attribute regex (missing `+$`) |\n| 2 | High | `SecureHTMLElementSanitizer.java:63` | Denylist-based URL scheme blocking with potential bypass |\n| 3 | High | `SecureHTMLElementSanitizer.java:155` | `allowUnknownProtocols` bypasses URL validation entirely |\n| 4 | Medium | `SecureHTMLElementSanitizer.java:154` | `extraDataUriTags` re-enables dangerous `data:` URIs |\n| 5 | Medium | `SecureHTMLElementSanitizer.java:135` | `xlink:href` in SVG context requires precise validation |\n| 6 | Medium | `EscapeTool.java` | No dedicated HTML escaping method in Velocity EscapeTool |\n| 7 | Medium | `SanitizerFilter.java:60-64` | SVG/MathML namespaces create mXSS risk surface |\n",
+  "package_classification": {
+    "type": [
+      "library",
+      "framework"
+    ],
+    "layer": [
+      "xml-processing",
+      "web",
+      "template-engine",
+      "security"
+    ]
+  },
+  "tool_calls": {
+    "get_package_profile_info": 1,
+    "execute_codeql_query": 29,
+    "validate_codeql_query": 0,
+    "fixup_codeql_query": 0,
+    "finalize_report": 1
+  },
+  "queries_executed": {
+    "critical": 0,
+    "high": 14,
+    "medium": 4,
+    "low": 0,
+    "total_executed": 29,
+    "total_with_results": 18,
+    "total_failed": 11
+  },
+  "query_findings": {
+    "critical": 0,
+    "high": 89,
+    "medium": 24,
+    "low": 0,
+    "total": 113
+  },
+  "findings": [
+    {
+      "codeql_query_uuid": "20260331175509",
+      "codeql_raw_query": "/**\n * @name HTML sanitizer allows dangerous attributes\n * @description The HTML sanitizer may not properly filter dangerous attributes that can enable XSS\n * @kind problem\n * @problem.severity error\n * @id java/xss-sanitizer-bypass-xwiki\n * @tags security\n *       external/cwe/cwe-079\n */\nimport java\n\n// Find SecureHTMLElementSanitizer and its isAllowedAttribute method\nfrom Method m, MethodCall mc\nwhere\n  m.getDeclaringType().hasQualifiedName(\"org.xwiki.xml.internal.html\", \"SecureHTMLElementSanitizer\")\n  and m.hasName(\"isElementAllowed\")\n  and mc.getMethod() = m\nselect m, \"SecureHTMLElementSanitizer.isElementAllowed called here - examining sanitizer logic\"\n",
+      "hypothesis": "HTML sanitizer may allow dangerous elements or attributes that enable XSS",
+      "severity": "high",
+      "cwe_ids": [],
+      "results_count": 0,
+      "results": []
+    },
+    {
+      "codeql_query_uuid": "20260331175602",
+      "codeql_raw_query": "/**\n * @name Link filter allows javascript: URIs\n * @description The LinkFilter may not properly validate URL schemes, allowing javascript: URIs\n * @kind problem\n * @problem.severity error\n * @id java/xss-link-filter-xwiki\n * @tags security\n *       external/cwe/cwe-079\n */\nimport java\n\nfrom Class c, Method m\nwhere\n  c.hasQualifiedName(\"org.xwiki.xml.internal.html.filter\", \"LinkFilter\")\n  and m.getDeclaringType() = c\nselect m, \"LinkFilter method: \" + m.getName()\n",
+      "hypothesis": "LinkFilter may not properly block javascript: or data: URIs in href/src attributes",
+      "severity": "high",
+      "cwe_ids": [],
+      "results_count": 4,
+      "results": [
+        {
+          "ruleId": "java/xss-link-filter-xwiki",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/xss-link-filter-xwiki",
+            "index": 0
+          },
+          "message": {
+            "text": "LinkFilter method: filter"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "xwiki-commons-core/xwiki-commons-xml/src/main/java/org/xwiki/xml/internal/html/filter/LinkFilter.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 64,
+                  "startColumn": 17,
+                  "endColumn": 23
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "4f541bc9ffda0d21:1",
+            "primaryLocationStartColumnFingerprint": "12"
+          }
+        },
+        {
+          "ruleId": "java/xss-link-filter-xwiki",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/xss-link-filter-xwiki",
+            "index": 0
+          },
+          "message": {
+            "text": "LinkFilter method: isExternalLink"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "xwiki-commons-core/xwiki-commons-xml/src/main/java/org/xwiki/xml/internal/html/filter/LinkFilter.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 115,
+                  "startColumn": 21,
+                  "endColumn": 35
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "85c783e7b557c865:1",
+            "primaryLocationStartColumnFingerprint": "16"
+          }
+        },
+        {
+          "ruleId": "java/xss-link-filter-xwiki",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/xss-link-filter-xwiki",
+            "index": 0
+          },
+          "message": {
+            "text": "LinkFilter method: filter"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "xwiki-commons-core/xwiki-commons-xml/src/main/java/org/xwiki/xml/internal/html/filter/LinkFilter.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 72,
+                  "startColumn": 18,
+                  "endColumn": 24
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "3c09fc3540e9771e:1",
+            "primaryLocationStartColumnFingerprint": "13"
+          }
+        },
+        {
+          "ruleId": "java/xss-link-filter-xwiki",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/xss-link-filter-xwiki",
+            "index": 0
+          },
+          "message": {
+            "text": "LinkFilter method: <clinit>"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "xwiki-commons-core/xwiki-commons-xml/src/main/java/org/xwiki/xml/internal/html/filter/LinkFilter.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 57,
+                  "startColumn": 14,
+                  "endColumn": 24
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "37bb15adf68806e8:1",
+            "primaryLocationStartColumnFingerprint": "13"
+          }
+        }
+      ]
+    },
+    {
+      "codeql_query_uuid": "20260331175704",
+      "codeql_raw_query": "/**\n * @name LinkFilter URL scheme validation\n * @description Examining how LinkFilter validates URL schemes for XSS prevention\n * @kind problem\n * @problem.severity error\n * @id java/link-filter-scheme-check\n * @tags security\n *       external/cwe/cwe-079\n */\nimport java\n\n// Look at string literals and comparisons in LinkFilter to understand what schemes are blocked\nfrom Class c, StringLiteral sl\nwhere\n  c.hasQualifiedName(\"org.xwiki.xml.internal.html.filter\", \"LinkFilter\")\n  and sl.getEnclosingCallable().getDeclaringType() = c\nselect sl, \"LinkFilter string literal: \" + sl.getValue()\n",
+      "hypothesis": "LinkFilter may have incomplete scheme validation",
+      "severity": "high",
+      "cwe_ids": [],
+      "results_count": 7,
+      "results": [
+        {
+          "ruleId": "java/link-filter-scheme-check",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/link-filter-scheme-check",
+            "index": 0
+          },
+          "message": {
+            "text": "LinkFilter string literal: noopener"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "xwiki-commons-core/xwiki-commons-xml/src/main/java/org/xwiki/xml/internal/html/filter/LinkFilter.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 59,
+                  "startColumn": 44,
+                  "endColumn": 54
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "d098144d5ef7167a:1",
+            "primaryLocationStartColumnFingerprint": "39"
+          }
+        },
+        {
+          "ruleId": "java/link-filter-scheme-check",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/link-filter-scheme-check",
+            "index": 0
+          },
+          "message": {
+            "text": "LinkFilter string literal: noreferrer"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "xwiki-commons-core/xwiki-commons-xml/src/main/java/org/xwiki/xml/internal/html/filter/LinkFilter.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 61,
+                  "startColumn": 46,
+                  "endColumn": 58
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "2198f357ce7937c0:1",
+            "primaryLocationStartColumnFingerprint": "41"
+          }
+        },
+        {
+          "ruleId": "java/link-filter-scheme-check",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/link-filter-scheme-check",
+            "index": 0
+          },
+          "message": {
+            "text": "LinkFilter string literal: _self"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "xwiki-commons-core/xwiki-commons-xml/src/main/java/org/xwiki/xml/internal/html/filter/LinkFilter.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 89,
+                  "startColumn": 21,
+                  "endColumn": 28
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "7de21b42be7f305a:1",
+            "primaryLocationStartColumnFingerprint": "4"
+          }
+        },
+        {
+          "ruleId": "java/link-filter-scheme-check",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/link-filter-scheme-check",
+            "index": 0
+          },
+          "message": {
+            "text": "LinkFilter string literal: _parent"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "xwiki-commons-core/xwiki-commons-xml/src/main/java/org/xwiki/xml/internal/html/filter/LinkFilter.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 89,
+                  "startColumn": 48,
+                  "endColumn": 57
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "7de21b42be7f305a:1",
+            "primaryLocationStartColumnFingerprint": "31"
+          }
+        },
+        {
+          "ruleId": "java/link-filter-scheme-check",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/link-filter-scheme-check",
+            "index": 0
+          },
+          "message": {
+            "text": "LinkFilter string literal: _top"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "xwiki-commons-core/xwiki-commons-xml/src/main/java/org/xwiki/xml/internal/html/filter/LinkFilter.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 89,
+                  "startColumn": 77,
+                  "endColumn": 83
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "7de21b42be7f305a:1",
+            "primaryLocationStartColumnFingerprint": "60"
+          }
+        },
+        {
+          "ruleId": "java/link-filter-scheme-check",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/link-filter-scheme-check",
+            "index": 0
+          },
+          "message": {
+            "text": "LinkFilter string literal:  "
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "xwiki-commons-core/xwiki-commons-xml/src/main/java/org/xwiki/xml/internal/html/filter/LinkFilter.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 95,
+                  "startColumn": 71,
+                  "endColumn": 74
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "7105cc0b684ce764:1",
+            "primaryLocationStartColumnFingerprint": "54"
+          }
+        },
+        {
+          "ruleId": "java/link-filter-scheme-check",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/link-filter-scheme-check",
+            "index": 0
+          },
+          "message": {
+            "text": "LinkFilter string literal:  "
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "xwiki-commons-core/xwiki-commons-xml/src/main/java/org/xwiki/xml/internal/html/filter/LinkFilter.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 110,
+                  "startColumn": 62,
+                  "endColumn": 65
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "fad0014c1576d997:1",
+            "primaryLocationStartColumnFingerprint": "45"
+          }
+        }
+      ]
+    },
+    {
+      "codeql_query_uuid": "20260331175846",
+      "codeql_raw_query": "/**\n * @name SecureHTMLElementSanitizer regex patterns for URL schemes\n * @description Examining the URL scheme regex pattern used to block dangerous protocols\n * @kind problem\n * @problem.severity error\n * @id java/secure-sanitizer-url-regex\n * @tags security\n *       external/cwe/cwe-079\n */\nimport java\n\n// Find all string literals in SecureHTMLElementSanitizer related to regex/URL filtering\nfrom Class c, StringLiteral sl, int line\nwhere\n  c.hasQualifiedName(\"org.xwiki.xml.internal.html\", \"SecureHTMLElementSanitizer\")\n  and sl.getEnclosingCallable().getDeclaringType() = c\n  and line = sl.getLocation().getStartLine()\n  and line >= 60 and line <= 130\nselect sl, \"Line \" + line + \": \" + sl.getValue()\n",
+      "hypothesis": "Regex pattern for blocking dangerous URL schemes may have bypass vectors",
+      "severity": "high",
+      "cwe_ids": [],
+      "results_count": 13,
+      "results": [
+        {
+          "ruleId": "java/secure-sanitizer-url-regex",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/secure-sanitizer-url-regex",
+            "index": 0
+          },
+          "message": {
+            "text": "Line 61: secure"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "xwiki-commons-core/xwiki-commons-xml/src/main/java/org/xwiki/xml/internal/html/SecureHTMLElementSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 61,
+                  "startColumn": 39,
+                  "endColumn": 47
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "e9e1ac3bfe8c503c:1",
+            "primaryLocationStartColumnFingerprint": "34"
+          }
+        },
+        {
+          "ruleId": "java/secure-sanitizer-url-regex",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/secure-sanitizer-url-regex",
+            "index": 0
+          },
+          "message": {
+            "text": "Line 63: ^(?:\\w+script|data):"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "xwiki-commons-core/xwiki-commons-xml/src/main/java/org/xwiki/xml/internal/html/SecureHTMLElementSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 63,
+                  "startColumn": 62,
+                  "endColumn": 85
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "63ba3ae99208c3ce:1",
+            "primaryLocationStartColumnFingerprint": "57"
+          }
+        },
+        {
+          "ruleId": "java/secure-sanitizer-url-regex",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/secure-sanitizer-url-regex",
+            "index": 0
+          },
+          "message": {
+            "text": "Line 66: \\[\\u0000-\\u0020\\u00A0\\u1680\\u180E\\u2000-\\u2029\\u205F\\u3000\\]"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "xwiki-commons-core/xwiki-commons-xml/src/main/java/org/xwiki/xml/internal/html/SecureHTMLElementSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 66,
+                  "startColumn": 25,
+                  "endColumn": 94
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "3148f8788c0c57cd:1",
+            "primaryLocationStartColumnFingerprint": "16"
+          }
+        },
+        {
+          "ruleId": "java/secure-sanitizer-url-regex",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/secure-sanitizer-url-regex",
+            "index": 0
+          },
+          "message": {
+            "text": "Line 68: ^data-\\[\\-\\w.\\u00B7-\\uFFFF\\]"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "xwiki-commons-core/xwiki-commons-xml/src/main/java/org/xwiki/xml/internal/html/SecureHTMLElementSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 68,
+                  "startColumn": 54,
+                  "endColumn": 86
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "ac9508da2c7a519c:1",
+            "primaryLocationStartColumnFingerprint": "49"
+          }
+        },
+        {
+          "ruleId": "java/secure-sanitizer-url-regex",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/secure-sanitizer-url-regex",
+            "index": 0
+          },
+          "message": {
+            "text": "Line 70: ^aria-\\[\\-\\w\\]+$"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "xwiki-commons-core/xwiki-commons-xml/src/main/java/org/xwiki/xml/internal/html/SecureHTMLElementSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 70,
+                  "startColumn": 54,
+                  "endColumn": 72
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "815358919975c91f:1",
+            "primaryLocationStartColumnFingerprint": "49"
+          }
+        },
+        {
+          "ruleId": "java/secure-sanitizer-url-regex",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/secure-sanitizer-url-regex",
+            "index": 0
+          },
+          "message": {
+            "text": "Line 72: ^(?:(?:f|ht)tps?|mailto|tel|callto|cid|xmpp):"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "xwiki-commons-core/xwiki-commons-xml/src/main/java/org/xwiki/xml/internal/html/SecureHTMLElementSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 72,
+                  "startColumn": 59,
+                  "endColumn": 106
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "4389ae3baaee60e:1",
+            "primaryLocationStartColumnFingerprint": "54"
+          }
+        },
+        {
+          "ruleId": "java/secure-sanitizer-url-regex",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/secure-sanitizer-url-regex",
+            "index": 0
+          },
+          "message": {
+            "text": "Line 75: ^(?:\\[^a-z\\]|\\[a-z+.\\-\\]+(?:\\[^a-z+.\\-:\\]|$))"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "xwiki-commons-core/xwiki-commons-xml/src/main/java/org/xwiki/xml/internal/html/SecureHTMLElementSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 75,
+                  "startColumn": 54,
+                  "endColumn": 97
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "39684d60f768ac25:1",
+            "primaryLocationStartColumnFingerprint": "49"
+          }
+        },
+        {
+          "ruleId": "java/secure-sanitizer-url-regex",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/secure-sanitizer-url-regex",
+            "index": 0
+          },
+          "message": {
+            "text": "Line 128: audio"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "xwiki-commons-core/xwiki-commons-xml/src/main/java/org/xwiki/xml/internal/html/SecureHTMLElementSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 128,
+                  "startColumn": 56,
+                  "endColumn": 63
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "48ade58cdf7c1866:1",
+            "primaryLocationStartColumnFingerprint": "47"
+          }
+        },
+        {
+          "ruleId": "java/secure-sanitizer-url-regex",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/secure-sanitizer-url-regex",
+            "index": 0
+          },
+          "message": {
+            "text": "Line 128: video"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "xwiki-commons-core/xwiki-commons-xml/src/main/java/org/xwiki/xml/internal/html/SecureHTMLElementSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 128,
+                  "startColumn": 65,
+                  "endColumn": 72
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "48ade58cdf7c1866:1",
+            "primaryLocationStartColumnFingerprint": "56"
+          }
+        },
+        {
+          "ruleId": "java/secure-sanitizer-url-regex",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/secure-sanitizer-url-regex",
+            "index": 0
+          },
+          "message": {
+            "text": "Line 128: img"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "xwiki-commons-core/xwiki-commons-xml/src/main/java/org/xwiki/xml/internal/html/SecureHTMLElementSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 128,
+                  "startColumn": 74,
+                  "endColumn": 79
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "48ade58cdf7c1866:1",
+            "primaryLocationStartColumnFingerprint": "65"
+          }
+        },
+        {
+          "ruleId": "java/secure-sanitizer-url-regex",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/secure-sanitizer-url-regex",
+            "index": 0
+          },
+          "message": {
+            "text": "Line 128: source"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "xwiki-commons-core/xwiki-commons-xml/src/main/java/org/xwiki/xml/internal/html/SecureHTMLElementSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 128,
+                  "startColumn": 81,
+                  "endColumn": 89
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "48ade58cdf7c1866:1",
+            "primaryLocationStartColumnFingerprint": "72"
+          }
+        },
+        {
+          "ruleId": "java/secure-sanitizer-url-regex",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/secure-sanitizer-url-regex",
+            "index": 0
+          },
+          "message": {
+            "text": "Line 128: image"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "xwiki-commons-core/xwiki-commons-xml/src/main/java/org/xwiki/xml/internal/html/SecureHTMLElementSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 128,
+                  "startColumn": 91,
+                  "endColumn": 98
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "48ade58cdf7c1866:1",
+            "primaryLocationStartColumnFingerprint": "82"
+          }
+        },
+        {
+          "ruleId": "java/secure-sanitizer-url-regex",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/secure-sanitizer-url-regex",
+            "index": 0
+          },
+          "message": {
+            "text": "Line 128: track"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "xwiki-commons-core/xwiki-commons-xml/src/main/java/org/xwiki/xml/internal/html/SecureHTMLElementSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 128,
+                  "startColumn": 100,
+                  "endColumn": 107
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "48ade58cdf7c1866:1",
+            "primaryLocationStartColumnFingerprint": "91"
+          }
+        }
+      ]
+    },
+    {
+      "codeql_query_uuid": "20260331175926",
+      "codeql_raw_query": "/**\n * @name SanitizerFilter allowed attributes\n * @description Examining what attributes are allowed in SanitizerFilter\n * @kind problem\n * @problem.severity error\n * @id java/sanitizer-filter-attrs\n * @tags security\n *       external/cwe/cwe-079\n */\nimport java\n\n// Look at string literals in SanitizerFilter to understand what's allowed\nfrom Class c, StringLiteral sl\nwhere\n  c.hasQualifiedName(\"org.xwiki.xml.internal.html.filter\", \"SanitizerFilter\")\n  and sl.getEnclosingCallable().getDeclaringType() = c\nselect sl, \"SanitizerFilter string literal at line \" + sl.getLocation().getStartLine() + \": \" + sl.getValue()\n",
+      "hypothesis": "SanitizerFilter may have incomplete attribute filtering",
+      "severity": "high",
+      "cwe_ids": [],
+      "results_count": 7,
+      "results": [
+        {
+          "ruleId": "java/sanitizer-filter-attrs",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/sanitizer-filter-attrs",
+            "index": 0
+          },
+          "message": {
+            "text": "SanitizerFilter string literal at line 60: http://www.w3.org/1998/Math/MathML"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "xwiki-commons-core/xwiki-commons-xml/src/main/java/org/xwiki/xml/internal/html/filter/SanitizerFilter.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 60,
+                  "startColumn": 52,
+                  "endColumn": 88
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "272273b6da27adb7:1",
+            "primaryLocationStartColumnFingerprint": "47"
+          }
+        },
+        {
+          "ruleId": "java/sanitizer-filter-attrs",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/sanitizer-filter-attrs",
+            "index": 0
+          },
+          "message": {
+            "text": "SanitizerFilter string literal at line 62: http://www.w3.org/2000/svg"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "xwiki-commons-core/xwiki-commons-xml/src/main/java/org/xwiki/xml/internal/html/filter/SanitizerFilter.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 62,
+                  "startColumn": 49,
+                  "endColumn": 77
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "caf9d009b547ced2:1",
+            "primaryLocationStartColumnFingerprint": "44"
+          }
+        },
+        {
+          "ruleId": "java/sanitizer-filter-attrs",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/sanitizer-filter-attrs",
+            "index": 0
+          },
+          "message": {
+            "text": "SanitizerFilter string literal at line 64: http://www.w3.org/1999/xhtml"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "xwiki-commons-core/xwiki-commons-xml/src/main/java/org/xwiki/xml/internal/html/filter/SanitizerFilter.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 64,
+                  "startColumn": 50,
+                  "endColumn": 80
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "6ea6e3487d7f832c:1",
+            "primaryLocationStartColumnFingerprint": "45"
+          }
+        },
+        {
+          "ruleId": "java/sanitizer-filter-attrs",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/sanitizer-filter-attrs",
+            "index": 0
+          },
+          "message": {
+            "text": "SanitizerFilter string literal at line 79: true"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "xwiki-commons-core/xwiki-commons-xml/src/main/java/org/xwiki/xml/internal/html/filter/SanitizerFilter.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 79,
+                  "startColumn": 13,
+                  "endColumn": 19
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "8d82dfd9f18f109d:1",
+            "primaryLocationStartColumnFingerprint": "4"
+          }
+        },
+        {
+          "ruleId": "java/sanitizer-filter-attrs",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/sanitizer-filter-attrs",
+            "index": 0
+          },
+          "message": {
+            "text": "SanitizerFilter string literal at line 135: html"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "xwiki-commons-core/xwiki-commons-xml/src/main/java/org/xwiki/xml/internal/html/filter/SanitizerFilter.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 135,
+                  "startColumn": 62,
+                  "endColumn": 68
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "45208ef0cbe456f3:1",
+            "primaryLocationStartColumnFingerprint": "53"
+          }
+        },
+        {
+          "ruleId": "java/sanitizer-filter-attrs",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/sanitizer-filter-attrs",
+            "index": 0
+          },
+          "message": {
+            "text": "SanitizerFilter string literal at line 192: math"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "xwiki-commons-core/xwiki-commons-xml/src/main/java/org/xwiki/xml/internal/html/filter/SanitizerFilter.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 192,
+                  "startColumn": 17,
+                  "endColumn": 23
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "e8933a5b78e47a37:1",
+            "primaryLocationStartColumnFingerprint": "4"
+          }
+        },
+        {
+          "ruleId": "java/sanitizer-filter-attrs",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/sanitizer-filter-attrs",
+            "index": 0
+          },
+          "message": {
+            "text": "SanitizerFilter string literal at line 194: svg"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "xwiki-commons-core/xwiki-commons-xml/src/main/java/org/xwiki/xml/internal/html/filter/SanitizerFilter.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 194,
+                  "startColumn": 24,
+                  "endColumn": 29
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "209bee0602099df0:1",
+            "primaryLocationStartColumnFingerprint": "11"
+          }
+        }
+      ]
+    },
+    {
+      "codeql_query_uuid": "20260331180040",
+      "codeql_raw_query": "/**\n * @name SecureHTMLElementSanitizer URL attribute check methods\n * @description Examining how URL attributes are validated in secure sanitizer\n * @kind problem\n * @problem.severity error\n * @id java/secure-sanitizer-url-check\n * @tags security\n *       external/cwe/cwe-079\n */\nimport java\n\n// Look at all methods and string constants in SecureHTMLElementSanitizer\nfrom Class c, StringLiteral sl\nwhere\n  c.hasQualifiedName(\"org.xwiki.xml.internal.html\", \"SecureHTMLElementSanitizer\")\n  and sl.getEnclosingCallable().getDeclaringType() = c\n  and sl.getLocation().getStartLine() >= 80\n  and sl.getLocation().getStartLine() <= 145\nselect sl, \"Line \" + sl.getLocation().getStartLine() + \": \" + sl.getValue()\n",
+      "hypothesis": "SecureHTMLElementSanitizer URL attribute validation details",
+      "severity": "high",
+      "cwe_ids": [],
+      "results_count": 25,
+      "results": [
+        {
+          "ruleId": "java/secure-sanitizer-url-check",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/secure-sanitizer-url-check",
+            "index": 0
+          },
+          "message": {
+            "text": "Line 128: audio"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "xwiki-commons-core/xwiki-commons-xml/src/main/java/org/xwiki/xml/internal/html/SecureHTMLElementSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 128,
+                  "startColumn": 56,
+                  "endColumn": 63
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "48ade58cdf7c1866:1",
+            "primaryLocationStartColumnFingerprint": "47"
+          }
+        },
+        {
+          "ruleId": "java/secure-sanitizer-url-check",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/secure-sanitizer-url-check",
+            "index": 0
+          },
+          "message": {
+            "text": "Line 128: video"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "xwiki-commons-core/xwiki-commons-xml/src/main/java/org/xwiki/xml/internal/html/SecureHTMLElementSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 128,
+                  "startColumn": 65,
+                  "endColumn": 72
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "48ade58cdf7c1866:1",
+            "primaryLocationStartColumnFingerprint": "56"
+          }
+        },
+        {
+          "ruleId": "java/secure-sanitizer-url-check",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/secure-sanitizer-url-check",
+            "index": 0
+          },
+          "message": {
+            "text": "Line 128: img"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "xwiki-commons-core/xwiki-commons-xml/src/main/java/org/xwiki/xml/internal/html/SecureHTMLElementSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 128,
+                  "startColumn": 74,
+                  "endColumn": 79
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "48ade58cdf7c1866:1",
+            "primaryLocationStartColumnFingerprint": "65"
+          }
+        },
+        {
+          "ruleId": "java/secure-sanitizer-url-check",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/secure-sanitizer-url-check",
+            "index": 0
+          },
+          "message": {
+            "text": "Line 128: source"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "xwiki-commons-core/xwiki-commons-xml/src/main/java/org/xwiki/xml/internal/html/SecureHTMLElementSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 128,
+                  "startColumn": 81,
+                  "endColumn": 89
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "48ade58cdf7c1866:1",
+            "primaryLocationStartColumnFingerprint": "72"
+          }
+        },
+        {
+          "ruleId": "java/secure-sanitizer-url-check",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/secure-sanitizer-url-check",
+            "index": 0
+          },
+          "message": {
+            "text": "Line 128: image"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "xwiki-commons-core/xwiki-commons-xml/src/main/java/org/xwiki/xml/internal/html/SecureHTMLElementSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 128,
+                  "startColumn": 91,
+                  "endColumn": 98
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "48ade58cdf7c1866:1",
+            "primaryLocationStartColumnFingerprint": "82"
+          }
+        },
+        {
+          "ruleId": "java/secure-sanitizer-url-check",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/secure-sanitizer-url-check",
+            "index": 0
+          },
+          "message": {
+            "text": "Line 128: track"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "xwiki-commons-core/xwiki-commons-xml/src/main/java/org/xwiki/xml/internal/html/SecureHTMLElementSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 128,
+                  "startColumn": 100,
+                  "endColumn": 107
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "48ade58cdf7c1866:1",
+            "primaryLocationStartColumnFingerprint": "91"
+          }
+        },
+        {
+          "ruleId": "java/secure-sanitizer-url-check",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/secure-sanitizer-url-check",
+            "index": 0
+          },
+          "message": {
+            "text": "Line 131: alt"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "xwiki-commons-core/xwiki-commons-xml/src/main/java/org/xwiki/xml/internal/html/SecureHTMLElementSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 131,
+                  "startColumn": 27,
+                  "endColumn": 32
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "2d2305a5f8d9f3be:1",
+            "primaryLocationStartColumnFingerprint": "14"
+          }
+        },
+        {
+          "ruleId": "java/secure-sanitizer-url-check",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/secure-sanitizer-url-check",
+            "index": 0
+          },
+          "message": {
+            "text": "Line 131: class"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "xwiki-commons-core/xwiki-commons-xml/src/main/java/org/xwiki/xml/internal/html/SecureHTMLElementSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 131,
+                  "startColumn": 34,
+                  "endColumn": 41
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "2d2305a5f8d9f3be:1",
+            "primaryLocationStartColumnFingerprint": "21"
+          }
+        },
+        {
+          "ruleId": "java/secure-sanitizer-url-check",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/secure-sanitizer-url-check",
+            "index": 0
+          },
+          "message": {
+            "text": "Line 131: for"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "xwiki-commons-core/xwiki-commons-xml/src/main/java/org/xwiki/xml/internal/html/SecureHTMLElementSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 131,
+                  "startColumn": 43,
+                  "endColumn": 48
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "2d2305a5f8d9f3be:1",
+            "primaryLocationStartColumnFingerprint": "30"
+          }
+        },
+        {
+          "ruleId": "java/secure-sanitizer-url-check",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/secure-sanitizer-url-check",
+            "index": 0
+          },
+          "message": {
+            "text": "Line 131: id"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "xwiki-commons-core/xwiki-commons-xml/src/main/java/org/xwiki/xml/internal/html/SecureHTMLElementSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 131,
+                  "startColumn": 50,
+                  "endColumn": 54
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "2d2305a5f8d9f3be:1",
+            "primaryLocationStartColumnFingerprint": "37"
+          }
+        },
+        {
+          "ruleId": "java/secure-sanitizer-url-check",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/secure-sanitizer-url-check",
+            "index": 0
+          },
+          "message": {
+            "text": "Line 131: label"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "xwiki-commons-core/xwiki-commons-xml/src/main/java/org/xwiki/xml/internal/html/SecureHTMLElementSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 131,
+                  "startColumn": 56,
+                  "endColumn": 63
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "2d2305a5f8d9f3be:1",
+            "primaryLocationStartColumnFingerprint": "43"
+          }
+        },
+        {
+          "ruleId": "java/secure-sanitizer-url-check",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/secure-sanitizer-url-check",
+            "index": 0
+          },
+          "message": {
+            "text": "Line 131: name"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "xwiki-commons-core/xwiki-commons-xml/src/main/java/org/xwiki/xml/internal/html/SecureHTMLElementSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 131,
+                  "startColumn": 65,
+                  "endColumn": 71
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "2d2305a5f8d9f3be:1",
+            "primaryLocationStartColumnFingerprint": "52"
+          }
+        },
+        {
+          "ruleId": "java/secure-sanitizer-url-check",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/secure-sanitizer-url-check",
+            "index": 0
+          },
+          "message": {
+            "text": "Line 131: pattern"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "xwiki-commons-core/xwiki-commons-xml/src/main/java/org/xwiki/xml/internal/html/SecureHTMLElementSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 131,
+                  "startColumn": 73,
+                  "endColumn": 82
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "2d2305a5f8d9f3be:1",
+            "primaryLocationStartColumnFingerprint": "60"
+          }
+        },
+        {
+          "ruleId": "java/secure-sanitizer-url-check",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/secure-sanitizer-url-check",
+            "index": 0
+          },
+          "message": {
+            "text": "Line 131: placeholder"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "xwiki-commons-core/xwiki-commons-xml/src/main/java/org/xwiki/xml/internal/html/SecureHTMLElementSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 131,
+                  "startColumn": 84,
+                  "endColumn": 97
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "2d2305a5f8d9f3be:1",
+            "primaryLocationStartColumnFingerprint": "71"
+          }
+        },
+        {
+          "ruleId": "java/secure-sanitizer-url-check",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/secure-sanitizer-url-check",
+            "index": 0
+          },
+          "message": {
+            "text": "Line 131: role"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "xwiki-commons-core/xwiki-commons-xml/src/main/java/org/xwiki/xml/internal/html/SecureHTMLElementSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 131,
+                  "startColumn": 99,
+                  "endColumn": 105
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "2d2305a5f8d9f3be:1",
+            "primaryLocationStartColumnFingerprint": "86"
+          }
+        },
+        {
+          "ruleId": "java/secure-sanitizer-url-check",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/secure-sanitizer-url-check",
+            "index": 0
+          },
+          "message": {
+            "text": "Line 131: summary"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "xwiki-commons-core/xwiki-commons-xml/src/main/java/org/xwiki/xml/internal/html/SecureHTMLElementSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 131,
+                  "startColumn": 107,
+                  "endColumn": 116
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "2d2305a5f8d9f3be:1",
+            "primaryLocationStartColumnFingerprint": "94"
+          }
+        },
+        {
+          "ruleId": "java/secure-sanitizer-url-check",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/secure-sanitizer-url-check",
+            "index": 0
+          },
+          "message": {
+            "text": "Line 132: title"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "xwiki-commons-core/xwiki-commons-xml/src/main/java/org/xwiki/xml/internal/html/SecureHTMLElementSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 132,
+                  "startColumn": 17,
+                  "endColumn": 24
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "384454a77716f13c:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "java/secure-sanitizer-url-check",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/secure-sanitizer-url-check",
+            "index": 0
+          },
+          "message": {
+            "text": "Line 132: value"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "xwiki-commons-core/xwiki-commons-xml/src/main/java/org/xwiki/xml/internal/html/SecureHTMLElementSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 132,
+                  "startColumn": 26,
+                  "endColumn": 33
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "384454a77716f13c:1",
+            "primaryLocationStartColumnFingerprint": "9"
+          }
+        },
+        {
+          "ruleId": "java/secure-sanitizer-url-check",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/secure-sanitizer-url-check",
+            "index": 0
+          },
+          "message": {
+            "text": "Line 132: style"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "xwiki-commons-core/xwiki-commons-xml/src/main/java/org/xwiki/xml/internal/html/SecureHTMLElementSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 132,
+                  "startColumn": 35,
+                  "endColumn": 42
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "384454a77716f13c:1",
+            "primaryLocationStartColumnFingerprint": "18"
+          }
+        },
+        {
+          "ruleId": "java/secure-sanitizer-url-check",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/secure-sanitizer-url-check",
+            "index": 0
+          },
+          "message": {
+            "text": "Line 132: xmlns"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "xwiki-commons-core/xwiki-commons-xml/src/main/java/org/xwiki/xml/internal/html/SecureHTMLElementSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 132,
+                  "startColumn": 44,
+                  "endColumn": 51
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "384454a77716f13c:1",
+            "primaryLocationStartColumnFingerprint": "27"
+          }
+        },
+        {
+          "ruleId": "java/secure-sanitizer-url-check",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/secure-sanitizer-url-check",
+            "index": 0
+          },
+          "message": {
+            "text": "Line 135: xlink:href"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "xwiki-commons-core/xwiki-commons-xml/src/main/java/org/xwiki/xml/internal/html/SecureHTMLElementSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 135,
+                  "startColumn": 41,
+                  "endColumn": 53
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "ed97e88fa067579c:1",
+            "primaryLocationStartColumnFingerprint": "28"
+          }
+        },
+        {
+          "ruleId": "java/secure-sanitizer-url-check",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/secure-sanitizer-url-check",
+            "index": 0
+          },
+          "message": {
+            "text": "Line 135: xml:id"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "xwiki-commons-core/xwiki-commons-xml/src/main/java/org/xwiki/xml/internal/html/SecureHTMLElementSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 135,
+                  "startColumn": 55,
+                  "endColumn": 63
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "ed97e88fa067579c:1",
+            "primaryLocationStartColumnFingerprint": "42"
+          }
+        },
+        {
+          "ruleId": "java/secure-sanitizer-url-check",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/secure-sanitizer-url-check",
+            "index": 0
+          },
+          "message": {
+            "text": "Line 135: xlink:title"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "xwiki-commons-core/xwiki-commons-xml/src/main/java/org/xwiki/xml/internal/html/SecureHTMLElementSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 135,
+                  "startColumn": 65,
+                  "endColumn": 78
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "ed97e88fa067579c:1",
+            "primaryLocationStartColumnFingerprint": "52"
+          }
+        },
+        {
+          "ruleId": "java/secure-sanitizer-url-check",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/secure-sanitizer-url-check",
+            "index": 0
+          },
+          "message": {
+            "text": "Line 135: xml:space"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "xwiki-commons-core/xwiki-commons-xml/src/main/java/org/xwiki/xml/internal/html/SecureHTMLElementSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 135,
+                  "startColumn": 80,
+                  "endColumn": 91
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "ed97e88fa067579c:1",
+            "primaryLocationStartColumnFingerprint": "67"
+          }
+        },
+        {
+          "ruleId": "java/secure-sanitizer-url-check",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/secure-sanitizer-url-check",
+            "index": 0
+          },
+          "message": {
+            "text": "Line 135: xmlns:xlink"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "xwiki-commons-core/xwiki-commons-xml/src/main/java/org/xwiki/xml/internal/html/SecureHTMLElementSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 135,
+                  "startColumn": 93,
+                  "endColumn": 106
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "ed97e88fa067579c:1",
+            "primaryLocationStartColumnFingerprint": "80"
+          }
+        }
+      ]
+    },
+    {
+      "codeql_query_uuid": "20260331180130",
+      "codeql_raw_query": "/**\n * @name InsecureHTMLElementSanitizer - check if it bypasses sanitization\n * @description InsecureHTMLElementSanitizer may allow all content, used in wrong context\n * @kind problem\n * @problem.severity error\n * @id java/insecure-sanitizer-usage\n * @tags security\n *       external/cwe/cwe-079\n */\nimport java\n\n// Check where InsecureHTMLElementSanitizer is instantiated and used\nfrom ClassInstanceExpr cie\nwhere\n  cie.getConstructor().getDeclaringType().hasQualifiedName(\"org.xwiki.xml.internal.html\", \"InsecureHTMLElementSanitizer\")\nselect cie, \"InsecureHTMLElementSanitizer instantiated at line \" + cie.getLocation().getStartLine()\n",
+      "hypothesis": "InsecureHTMLElementSanitizer may be used in contexts where secure sanitization is expected",
+      "severity": "medium",
+      "cwe_ids": [],
+      "results_count": 0,
+      "results": []
+    },
+    {
+      "codeql_query_uuid": "20260331180853",
+      "codeql_raw_query": "/**\n * @name SecureHTMLElementSanitizer - xlink:href and URL attribute handling\n * @description Check if xlink:href URL validation is applied properly in SVG context\n * @kind problem\n * @problem.severity error\n * @id java/secure-sanitizer-xlink-href\n * @tags security\n *       external/cwe/cwe-079\n */\nimport java\n\n// Look for all string literals in SecureHTMLElementSanitizer above line 80\nfrom Class c, StringLiteral sl\nwhere\n  c.hasQualifiedName(\"org.xwiki.xml.internal.html\", \"SecureHTMLElementSanitizer\")\n  and sl.getEnclosingCallable().getDeclaringType() = c\n  and sl.getLocation().getStartLine() >= 80\n  and sl.getLocation().getStartLine() < 128\nselect sl, \"Line \" + sl.getLocation().getStartLine() + \": \" + sl.getValue()\n",
+      "hypothesis": "xlink:href in SVG context may bypass URL validation",
+      "severity": "high",
+      "cwe_ids": [],
+      "results_count": 0,
+      "results": []
+    },
+    {
+      "codeql_query_uuid": "20260331181016",
+      "codeql_raw_query": "/**\n * @name SVGDefinitions all string literals\n * @description Check all SVG elements and attributes defined\n * @kind problem\n * @problem.severity error\n * @id java/svg-definitions-all\n * @tags security\n *       external/cwe/cwe-079\n */\nimport java\n\nfrom Class c, Field f\nwhere\n  c.hasQualifiedName(\"org.xwiki.xml.internal.html\", \"SVGDefinitions\")\n  and f.getDeclaringType() = c\nselect f, \"SVGDefinitions field: \" + f.getName() + \" type: \" + f.getType().getName()\n",
+      "hypothesis": "SVGDefinitions field structure",
+      "severity": "medium",
+      "cwe_ids": [],
+      "results_count": 6,
+      "results": [
+        {
+          "ruleId": "java/svg-definitions-all",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/svg-definitions-all",
+            "index": 0
+          },
+          "message": {
+            "text": "SVGDefinitions field: htmlIntegrationPoints type: Set<String>"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "xwiki-commons-core/xwiki-commons-xml/src/main/java/org/xwiki/xml/internal/html/SVGDefinitions.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 58,
+                  "startColumn": 31,
+                  "endColumn": 52
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "5de6116279545877:1",
+            "primaryLocationStartColumnFingerprint": "26"
+          }
+        },
+        {
+          "ruleId": "java/svg-definitions-all",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/svg-definitions-all",
+            "index": 0
+          },
+          "message": {
+            "text": "SVGDefinitions field: commonHTMLElements type: Set<String>"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "xwiki-commons-core/xwiki-commons-xml/src/main/java/org/xwiki/xml/internal/html/SVGDefinitions.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 56,
+                  "startColumn": 31,
+                  "endColumn": 49
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "e6d2b674fa194f62:1",
+            "primaryLocationStartColumnFingerprint": "26"
+          }
+        },
+        {
+          "ruleId": "java/svg-definitions-all",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/svg-definitions-all",
+            "index": 0
+          },
+          "message": {
+            "text": "SVGDefinitions field: allowedAttributes type: Set<String>"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "xwiki-commons-core/xwiki-commons-xml/src/main/java/org/xwiki/xml/internal/html/SVGDefinitions.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 54,
+                  "startColumn": 31,
+                  "endColumn": 48
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "c04bf6f3deda2eb0:1",
+            "primaryLocationStartColumnFingerprint": "26"
+          }
+        },
+        {
+          "ruleId": "java/svg-definitions-all",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/svg-definitions-all",
+            "index": 0
+          },
+          "message": {
+            "text": "SVGDefinitions field: allTags type: Set<String>"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "xwiki-commons-core/xwiki-commons-xml/src/main/java/org/xwiki/xml/internal/html/SVGDefinitions.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 52,
+                  "startColumn": 31,
+                  "endColumn": 38
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "876f6a05ab2c91a6:1",
+            "primaryLocationStartColumnFingerprint": "26"
+          }
+        },
+        {
+          "ruleId": "java/svg-definitions-all",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/svg-definitions-all",
+            "index": 0
+          },
+          "message": {
+            "text": "SVGDefinitions field: filterTags type: Set<String>"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "xwiki-commons-core/xwiki-commons-xml/src/main/java/org/xwiki/xml/internal/html/SVGDefinitions.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 50,
+                  "startColumn": 31,
+                  "endColumn": 41
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "e4cbbe458be6fea2:1",
+            "primaryLocationStartColumnFingerprint": "26"
+          }
+        },
+        {
+          "ruleId": "java/svg-definitions-all",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/svg-definitions-all",
+            "index": 0
+          },
+          "message": {
+            "text": "SVGDefinitions field: safeTags type: Set<String>"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "xwiki-commons-core/xwiki-commons-xml/src/main/java/org/xwiki/xml/internal/html/SVGDefinitions.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 48,
+                  "startColumn": 31,
+                  "endColumn": 39
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "a6c78936f6620beb:1",
+            "primaryLocationStartColumnFingerprint": "26"
+          }
+        }
+      ]
+    },
+    {
+      "codeql_query_uuid": "20260331181107",
+      "codeql_raw_query": "/**\n * @name SecureHTMLElementSanitizer isAttributeAllowed method logic\n * @description Examine how isAttributeAllowed validates URL attributes\n * @kind problem\n * @problem.severity error\n * @id java/secure-sanitizer-attr-allowed\n * @tags security\n *       external/cwe/cwe-079\n */\nimport java\n\n// Find all method calls within SecureHTMLElementSanitizer to understand the sanitization logic\nfrom Method m, MethodCall mc\nwhere\n  m.getDeclaringType().hasQualifiedName(\"org.xwiki.xml.internal.html\", \"SecureHTMLElementSanitizer\")\n  and mc.getEnclosingCallable() = m\nselect m.getName(), mc.getMethod().getName(), mc.getMethod().getDeclaringType().getName(),\n  \"Line \" + mc.getLocation().getStartLine()\n",
+      "hypothesis": "Understanding isAttributeAllowed logic for URL attribute validation",
+      "severity": "high",
+      "cwe_ids": [],
+      "results_count": 0,
+      "results": []
+    },
+    {
+      "codeql_query_uuid": "20260331181349",
+      "codeql_raw_query": "/**\n * @name SecureHTMLElementSanitizer URL attribute set\n * @description Find which attributes receive URL validation in SecureHTMLElementSanitizer\n * @kind problem\n * @problem.severity error\n * @id java/secure-sanitizer-url-attrs\n * @tags security\n *       external/cwe/cwe-079\n */\nimport java\n\n// Look for Set.of() or Arrays.asList() calls in the class initializer that build URL attribute sets\nfrom Class c, MethodCall mc, StringLiteral sl\nwhere\n  c.hasQualifiedName(\"org.xwiki.xml.internal.html\", \"SecureHTMLElementSanitizer\")\n  and mc.getEnclosingCallable().getDeclaringType() = c\n  and mc.getMethod().hasName(\"of\")\n  and sl.getParent*() = mc\nselect mc, \"Line \" + mc.getLocation().getStartLine() + \" Set.of() call with string: \" + sl.getValue()\n",
+      "hypothesis": "Checking which attributes receive URL validation in SecureHTMLElementSanitizer",
+      "severity": "high",
+      "cwe_ids": [],
+      "results_count": 0,
+      "results": []
+    },
+    {
+      "codeql_query_uuid": "20260331181441",
+      "codeql_raw_query": "/**\n * @name EscapeTool methods\n * @description Check EscapeTool methods for encoding completeness\n * @kind problem\n * @problem.severity error\n * @id java/escape-tool-methods\n * @tags security\n *       external/cwe/cwe-116\n */\nimport java\n\nfrom Class c, Method m\nwhere\n  c.hasQualifiedName(\"org.xwiki.velocity.tools\", \"EscapeTool\")\n  and m.getDeclaringType() = c\n  and not m.hasName(\"<init>\")\nselect m, \"EscapeTool method: \" + m.getName() + \" at line \" + m.getLocation().getStartLine()\n",
+      "hypothesis": "EscapeTool methods for HTML/JS escaping",
+      "severity": "medium",
+      "cwe_ids": [],
+      "results_count": 10,
+      "results": [
+        {
+          "ruleId": "java/escape-tool-methods",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/escape-tool-methods",
+            "index": 0
+          },
+          "message": {
+            "text": "EscapeTool method: url at line 258"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "xwiki-commons-core/xwiki-commons-velocity/src/main/java/org/xwiki/velocity/tools/EscapeTool.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 258,
+                  "startColumn": 19,
+                  "endColumn": 22
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "b32ad5cdd75c951:1",
+            "primaryLocationStartColumnFingerprint": "14"
+          }
+        },
+        {
+          "ruleId": "java/escape-tool-methods",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/escape-tool-methods",
+            "index": 0
+          },
+          "message": {
+            "text": "EscapeTool method: css at line 239"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "xwiki-commons-core/xwiki-commons-velocity/src/main/java/org/xwiki/velocity/tools/EscapeTool.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 239,
+                  "startColumn": 19,
+                  "endColumn": 22
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "5c1a996d1912f46:1",
+            "primaryLocationStartColumnFingerprint": "14"
+          }
+        },
+        {
+          "ruleId": "java/escape-tool-methods",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/escape-tool-methods",
+            "index": 0
+          },
+          "message": {
+            "text": "EscapeTool method: url at line 180"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "xwiki-commons-core/xwiki-commons-velocity/src/main/java/org/xwiki/velocity/tools/EscapeTool.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 180,
+                  "startColumn": 19,
+                  "endColumn": 22
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "1e3a3ceb64c0a447:1",
+            "primaryLocationStartColumnFingerprint": "14"
+          }
+        },
+        {
+          "ruleId": "java/escape-tool-methods",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/escape-tool-methods",
+            "index": 0
+          },
+          "message": {
+            "text": "EscapeTool method: b at line 158"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "xwiki-commons-core/xwiki-commons-velocity/src/main/java/org/xwiki/velocity/tools/EscapeTool.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 158,
+                  "startColumn": 19,
+                  "endColumn": 20
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "e39ec31a8eb9dd7e:1",
+            "primaryLocationStartColumnFingerprint": "14"
+          }
+        },
+        {
+          "ruleId": "java/escape-tool-methods",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/escape-tool-methods",
+            "index": 0
+          },
+          "message": {
+            "text": "EscapeTool method: q at line 138"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "xwiki-commons-core/xwiki-commons-velocity/src/main/java/org/xwiki/velocity/tools/EscapeTool.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 138,
+                  "startColumn": 19,
+                  "endColumn": 20
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "5620ba1af6401df4:1",
+            "primaryLocationStartColumnFingerprint": "14"
+          }
+        },
+        {
+          "ruleId": "java/escape-tool-methods",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/escape-tool-methods",
+            "index": 0
+          },
+          "message": {
+            "text": "EscapeTool method: quotedPrintable at line 118"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "xwiki-commons-core/xwiki-commons-velocity/src/main/java/org/xwiki/velocity/tools/EscapeTool.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 118,
+                  "startColumn": 19,
+                  "endColumn": 34
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "25a07a931f803790:1",
+            "primaryLocationStartColumnFingerprint": "14"
+          }
+        },
+        {
+          "ruleId": "java/escape-tool-methods",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/escape-tool-methods",
+            "index": 0
+          },
+          "message": {
+            "text": "EscapeTool method: json at line 102"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "xwiki-commons-core/xwiki-commons-velocity/src/main/java/org/xwiki/velocity/tools/EscapeTool.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 102,
+                  "startColumn": 19,
+                  "endColumn": 23
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "8984301fe51ef084:1",
+            "primaryLocationStartColumnFingerprint": "14"
+          }
+        },
+        {
+          "ruleId": "java/escape-tool-methods",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/escape-tool-methods",
+            "index": 0
+          },
+          "message": {
+            "text": "EscapeTool method: xml at line 86"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "xwiki-commons-core/xwiki-commons-velocity/src/main/java/org/xwiki/velocity/tools/EscapeTool.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 86,
+                  "startColumn": 19,
+                  "endColumn": 22
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "162b255dbf5a23b5:1",
+            "primaryLocationStartColumnFingerprint": "14"
+          }
+        },
+        {
+          "ruleId": "java/escape-tool-methods",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/escape-tool-methods",
+            "index": 0
+          },
+          "message": {
+            "text": "EscapeTool method: addQueryStringPair at line 216"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "xwiki-commons-core/xwiki-commons-velocity/src/main/java/org/xwiki/velocity/tools/EscapeTool.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 216,
+                  "startColumn": 18,
+                  "endColumn": 36
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "fbd92c00f5e359ca:1",
+            "primaryLocationStartColumnFingerprint": "13"
+          }
+        },
+        {
+          "ruleId": "java/escape-tool-methods",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/escape-tool-methods",
+            "index": 0
+          },
+          "message": {
+            "text": "EscapeTool method: <clinit> at line 51"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "xwiki-commons-core/xwiki-commons-velocity/src/main/java/org/xwiki/velocity/tools/EscapeTool.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 51,
+                  "startColumn": 14,
+                  "endColumn": 24
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "d5fcf3a42a7805f6:1",
+            "primaryLocationStartColumnFingerprint": "13"
+          }
+        }
+      ]
+    },
+    {
+      "codeql_query_uuid": "20260331181812",
+      "codeql_raw_query": "/**\n * @name ControlCharactersFilter - URL stripping\n * @description Check if control characters filter strips dangerous whitespace from URLs\n * @kind problem  \n * @problem.severity error\n * @id java/control-chars-filter\n * @tags security\n *       external/cwe/cwe-079\n */\nimport java\n\n// Look at string literals in ControlCharactersFilter\nfrom Class c, StringLiteral sl\nwhere\n  c.hasQualifiedName(\"org.xwiki.xml.internal.html.filter\", \"ControlCharactersFilter\")\n  and sl.getEnclosingCallable().getDeclaringType() = c\nselect sl, \"ControlCharactersFilter line \" + sl.getLocation().getStartLine() + \": \" + sl.getValue()\n",
+      "hypothesis": "ControlCharactersFilter may not strip all whitespace variants used to bypass URL scheme detection",
+      "severity": "high",
+      "cwe_ids": [],
+      "results_count": 0,
+      "results": []
+    },
+    {
+      "codeql_query_uuid": "20260331181913",
+      "codeql_raw_query": "/**\n * @name SecureHTMLElementSanitizer field initialization with compile\n * @description Find Pattern.compile calls with the dangerous URL regex\n * @kind problem\n * @problem.severity error\n * @id java/secure-sanitizer-pattern-compile\n * @tags security\n *       external/cwe/cwe-079\n */\nimport java\n\n// Find Pattern.compile calls in SecureHTMLElementSanitizer\nfrom MethodCall mc, StringLiteral sl\nwhere\n  mc.getMethod().hasName(\"compile\")\n  and mc.getMethod().getDeclaringType().hasQualifiedName(\"java.util.regex\", \"Pattern\")\n  and mc.getEnclosingCallable().getDeclaringType().hasQualifiedName(\"org.xwiki.xml.internal.html\", \"SecureHTMLElementSanitizer\")\n  and sl.getParent*() = mc\nselect mc, \"Pattern.compile at line \" + mc.getLocation().getStartLine() + \" with: \" + sl.getValue()\n",
+      "hypothesis": "The dangerous URL pattern regex ^(?:\\w+script|data): may not block vbscript: since vbscript starts with non-word chars... actually vbscript is all word chars - but checking if CASE_INSENSITIVE flag is missing",
+      "severity": "high",
+      "cwe_ids": [],
+      "results_count": 6,
+      "results": [
+        {
+          "ruleId": "java/secure-sanitizer-pattern-compile",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/secure-sanitizer-pattern-compile",
+            "index": 0
+          },
+          "message": {
+            "text": "Pattern.compile at line 63 with: ^(?:\\w+script|data):"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "xwiki-commons-core/xwiki-commons-xml/src/main/java/org/xwiki/xml/internal/html/SecureHTMLElementSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 63,
+                  "startColumn": 46,
+                  "endColumn": 112
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "63ba3ae99208c3ce:1",
+            "primaryLocationStartColumnFingerprint": "41"
+          }
+        },
+        {
+          "ruleId": "java/secure-sanitizer-pattern-compile",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/secure-sanitizer-pattern-compile",
+            "index": 0
+          },
+          "message": {
+            "text": "Pattern.compile at line 66 with: \\[\\u0000-\\u0020\\u00A0\\u1680\\u180E\\u2000-\\u2029\\u205F\\u3000\\]"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "xwiki-commons-core/xwiki-commons-xml/src/main/java/org/xwiki/xml/internal/html/SecureHTMLElementSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 66,
+                  "startColumn": 9,
+                  "endColumn": 95
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "3148f8788c0c57cd:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "java/secure-sanitizer-pattern-compile",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/secure-sanitizer-pattern-compile",
+            "index": 0
+          },
+          "message": {
+            "text": "Pattern.compile at line 68 with: ^data-\\[\\-\\w.\\u00B7-\\uFFFF\\]"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "xwiki-commons-core/xwiki-commons-xml/src/main/java/org/xwiki/xml/internal/html/SecureHTMLElementSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 68,
+                  "startColumn": 38,
+                  "endColumn": 87
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "ac9508da2c7a519c:1",
+            "primaryLocationStartColumnFingerprint": "33"
+          }
+        },
+        {
+          "ruleId": "java/secure-sanitizer-pattern-compile",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/secure-sanitizer-pattern-compile",
+            "index": 0
+          },
+          "message": {
+            "text": "Pattern.compile at line 70 with: ^aria-\\[\\-\\w\\]+$"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "xwiki-commons-core/xwiki-commons-xml/src/main/java/org/xwiki/xml/internal/html/SecureHTMLElementSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 70,
+                  "startColumn": 38,
+                  "endColumn": 73
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "815358919975c91f:1",
+            "primaryLocationStartColumnFingerprint": "33"
+          }
+        },
+        {
+          "ruleId": "java/secure-sanitizer-pattern-compile",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/secure-sanitizer-pattern-compile",
+            "index": 0
+          },
+          "message": {
+            "text": "Pattern.compile at line 72 with: ^(?:(?:f|ht)tps?|mailto|tel|callto|cid|xmpp):"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "xwiki-commons-core/xwiki-commons-xml/src/main/java/org/xwiki/xml/internal/html/SecureHTMLElementSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 72,
+                  "startColumn": 43,
+                  "endLine": 73,
+                  "endColumn": 34
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "4389ae3baaee60e:1",
+            "primaryLocationStartColumnFingerprint": "38"
+          }
+        },
+        {
+          "ruleId": "java/secure-sanitizer-pattern-compile",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/secure-sanitizer-pattern-compile",
+            "index": 0
+          },
+          "message": {
+            "text": "Pattern.compile at line 75 with: ^(?:\\[^a-z\\]|\\[a-z+.\\-\\]+(?:\\[^a-z+.\\-:\\]|$))"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "xwiki-commons-core/xwiki-commons-xml/src/main/java/org/xwiki/xml/internal/html/SecureHTMLElementSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 75,
+                  "startColumn": 38,
+                  "endLine": 76,
+                  "endColumn": 34
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "39684d60f768ac25:1",
+            "primaryLocationStartColumnFingerprint": "33"
+          }
+        }
+      ]
+    },
+    {
+      "codeql_query_uuid": "20260331182002",
+      "codeql_raw_query": "/**\n * @name HTMLElementSanitizerConfiguration - allowed elements config\n * @description Check configuration for HTML element sanitizer  \n * @kind problem\n * @problem.severity error\n * @id java/sanitizer-config-check\n * @tags security\n *       external/cwe/cwe-079\n */\nimport java\n\n// Find string literals in HTMLElementSanitizerConfiguration  \nfrom Class c, StringLiteral sl\nwhere\n  c.hasQualifiedName(\"org.xwiki.xml.internal.html\", \"HTMLElementSanitizerConfiguration\")\n  and sl.getEnclosingCallable().getDeclaringType() = c\nselect sl, \"HTMLElementSanitizerConfiguration line \" + sl.getLocation().getStartLine() + \": \" + sl.getValue()\n",
+      "hypothesis": "HTMLElementSanitizerConfiguration may have gaps in element/attribute allowlists",
+      "severity": "medium",
+      "cwe_ids": [],
+      "results_count": 8,
+      "results": [
+        {
+          "ruleId": "java/sanitizer-config-check",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/sanitizer-config-check",
+            "index": 0
+          },
+          "message": {
+            "text": "HTMLElementSanitizerConfiguration line 43: xml.htmlElementSanitizer.extraAllowedTags"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "xwiki-commons-core/xwiki-commons-xml/src/main/java/org/xwiki/xml/internal/html/HTMLElementSanitizerConfiguration.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 43,
+                  "startColumn": 68,
+                  "endColumn": 111
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "a9a3778e63f45ad9:1",
+            "primaryLocationStartColumnFingerprint": "63"
+          }
+        },
+        {
+          "ruleId": "java/sanitizer-config-check",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/sanitizer-config-check",
+            "index": 0
+          },
+          "message": {
+            "text": "HTMLElementSanitizerConfiguration line 46: xml.htmlElementSanitizer.extraAllowedAttributes"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "xwiki-commons-core/xwiki-commons-xml/src/main/java/org/xwiki/xml/internal/html/HTMLElementSanitizerConfiguration.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 46,
+                  "startColumn": 9,
+                  "endColumn": 58
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "ca259e77e83bf523:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "java/sanitizer-config-check",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/sanitizer-config-check",
+            "index": 0
+          },
+          "message": {
+            "text": "HTMLElementSanitizerConfiguration line 49: xml.htmlElementSanitizer.extraURISafeAttributes"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "xwiki-commons-core/xwiki-commons-xml/src/main/java/org/xwiki/xml/internal/html/HTMLElementSanitizerConfiguration.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 49,
+                  "startColumn": 9,
+                  "endColumn": 58
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "984d19b39ee0d135:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "java/sanitizer-config-check",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/sanitizer-config-check",
+            "index": 0
+          },
+          "message": {
+            "text": "HTMLElementSanitizerConfiguration line 51: xml.htmlElementSanitizer.extraDataUriTags"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "xwiki-commons-core/xwiki-commons-xml/src/main/java/org/xwiki/xml/internal/html/HTMLElementSanitizerConfiguration.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 51,
+                  "startColumn": 69,
+                  "endColumn": 112
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "c89067cbe148c2ae:1",
+            "primaryLocationStartColumnFingerprint": "64"
+          }
+        },
+        {
+          "ruleId": "java/sanitizer-config-check",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/sanitizer-config-check",
+            "index": 0
+          },
+          "message": {
+            "text": "HTMLElementSanitizerConfiguration line 53: xml.htmlElementSanitizer.forbidTags"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "xwiki-commons-core/xwiki-commons-xml/src/main/java/org/xwiki/xml/internal/html/HTMLElementSanitizerConfiguration.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 53,
+                  "startColumn": 61,
+                  "endColumn": 98
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "2161fdb8058c6f8c:1",
+            "primaryLocationStartColumnFingerprint": "56"
+          }
+        },
+        {
+          "ruleId": "java/sanitizer-config-check",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/sanitizer-config-check",
+            "index": 0
+          },
+          "message": {
+            "text": "HTMLElementSanitizerConfiguration line 55: xml.htmlElementSanitizer.forbidAttributes"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "xwiki-commons-core/xwiki-commons-xml/src/main/java/org/xwiki/xml/internal/html/HTMLElementSanitizerConfiguration.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 55,
+                  "startColumn": 67,
+                  "endColumn": 110
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "6e6db81ecf9084c1:1",
+            "primaryLocationStartColumnFingerprint": "62"
+          }
+        },
+        {
+          "ruleId": "java/sanitizer-config-check",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/sanitizer-config-check",
+            "index": 0
+          },
+          "message": {
+            "text": "HTMLElementSanitizerConfiguration line 58: xml.htmlElementSanitizer.allowUnknownProtocols"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "xwiki-commons-core/xwiki-commons-xml/src/main/java/org/xwiki/xml/internal/html/HTMLElementSanitizerConfiguration.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 58,
+                  "startColumn": 9,
+                  "endColumn": 57
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "8edefa3f0f04e3e6:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "java/sanitizer-config-check",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/sanitizer-config-check",
+            "index": 0
+          },
+          "message": {
+            "text": "HTMLElementSanitizerConfiguration line 60: xml.htmlElementSanitizer.allowedUriRegexp"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "xwiki-commons-core/xwiki-commons-xml/src/main/java/org/xwiki/xml/internal/html/HTMLElementSanitizerConfiguration.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 60,
+                  "startColumn": 68,
+                  "endColumn": 111
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "d408f33969a23fd9:1",
+            "primaryLocationStartColumnFingerprint": "63"
+          }
+        }
+      ]
+    },
+    {
+      "codeql_query_uuid": "20260331182124",
+      "codeql_raw_query": "/**\n * @name SecureHTMLElementSanitizer - allowUnknownProtocols usage and data attribute regex flaw\n * @description Analyze how allowUnknownProtocols bypasses URL validation and check data-attr regex\n * @kind problem\n * @problem.severity error\n * @id java/secure-sanitizer-allow-unknown-protocols\n * @tags security\n *       external/cwe/cwe-079\n */\nimport java\n\n// Find uses of allowUnknownProtocols in SecureHTMLElementSanitizer\nfrom MethodCall mc\nwhere\n  mc.getMethod().hasName(\"isAllowUnknownProtocols\")\n  or mc.getMethod().hasName(\"getAllowedUriRegexp\")\n  or mc.getMethod().hasName(\"getExtraDataUriTags\")\n  or mc.getMethod().hasName(\"getExtraAllowedTags\")\n  or mc.getMethod().hasName(\"getExtraAllowedAttributes\")\nselect mc, \"Configuration access at line \" + mc.getLocation().getStartLine() + \n  \" in \" + mc.getEnclosingCallable().getDeclaringType().getName() + \n  \": \" + mc.getMethod().getName()\n",
+      "hypothesis": "allowUnknownProtocols setting can bypass URL validation entirely, and extraDataUriTags can expand dangerous data URI support",
+      "severity": "high",
+      "cwe_ids": [],
+      "results_count": 5,
+      "results": [
+        {
+          "ruleId": "java/secure-sanitizer-allow-unknown-protocols",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/secure-sanitizer-allow-unknown-protocols",
+            "index": 0
+          },
+          "message": {
+            "text": "Configuration access at line 158 in SecureHTMLElementSanitizer: getAllowedUriRegexp"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "xwiki-commons-core/xwiki-commons-xml/src/main/java/org/xwiki/xml/internal/html/SecureHTMLElementSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 158,
+                  "startColumn": 35,
+                  "endColumn": 95
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "d306a0c50dd2776b:1",
+            "primaryLocationStartColumnFingerprint": "26"
+          }
+        },
+        {
+          "ruleId": "java/secure-sanitizer-allow-unknown-protocols",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/secure-sanitizer-allow-unknown-protocols",
+            "index": 0
+          },
+          "message": {
+            "text": "Configuration access at line 151 in SecureHTMLElementSanitizer: getExtraAllowedTags"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "xwiki-commons-core/xwiki-commons-xml/src/main/java/org/xwiki/xml/internal/html/SecureHTMLElementSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 151,
+                  "startColumn": 38,
+                  "endColumn": 98
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "3c1e5041377dea86:1",
+            "primaryLocationStartColumnFingerprint": "29"
+          }
+        },
+        {
+          "ruleId": "java/secure-sanitizer-allow-unknown-protocols",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/secure-sanitizer-allow-unknown-protocols",
+            "index": 0
+          },
+          "message": {
+            "text": "Configuration access at line 152 in SecureHTMLElementSanitizer: getExtraAllowedAttributes"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "xwiki-commons-core/xwiki-commons-xml/src/main/java/org/xwiki/xml/internal/html/SecureHTMLElementSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 152,
+                  "startColumn": 44,
+                  "endColumn": 110
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "13c32bfcef9e29b4:1",
+            "primaryLocationStartColumnFingerprint": "35"
+          }
+        },
+        {
+          "ruleId": "java/secure-sanitizer-allow-unknown-protocols",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/secure-sanitizer-allow-unknown-protocols",
+            "index": 0
+          },
+          "message": {
+            "text": "Configuration access at line 154 in SecureHTMLElementSanitizer: getExtraDataUriTags"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "xwiki-commons-core/xwiki-commons-xml/src/main/java/org/xwiki/xml/internal/html/SecureHTMLElementSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 154,
+                  "startColumn": 33,
+                  "endColumn": 93
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "8286e6dc7e05ea9e:1",
+            "primaryLocationStartColumnFingerprint": "24"
+          }
+        },
+        {
+          "ruleId": "java/secure-sanitizer-allow-unknown-protocols",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/secure-sanitizer-allow-unknown-protocols",
+            "index": 0
+          },
+          "message": {
+            "text": "Configuration access at line 155 in SecureHTMLElementSanitizer: isAllowUnknownProtocols"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "xwiki-commons-core/xwiki-commons-xml/src/main/java/org/xwiki/xml/internal/html/SecureHTMLElementSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 155,
+                  "startColumn": 38,
+                  "endColumn": 102
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "e9f063de1fbdfdd8:1",
+            "primaryLocationStartColumnFingerprint": "29"
+          }
+        }
+      ]
+    },
+    {
+      "codeql_query_uuid": "20260331182427",
+      "codeql_raw_query": "/**\n * @name Broken regex patterns in SecureHTMLElementSanitizer\n * @description Identifies flawed regex patterns for attribute name validation that may allow XSS\n * @kind problem\n * @problem.severity error\n * @id java/secure-sanitizer-broken-regex-v2\n * @tags security\n *       external/cwe/cwe-079\n */\nimport java\n\nfrom MethodCall mc\nwhere\n  mc.getMethod().hasName(\"compile\")\n  and mc.getMethod().getDeclaringType().hasQualifiedName(\"java.util.regex\", \"Pattern\")\n  and mc.getEnclosingCallable().getDeclaringType().hasQualifiedName(\"org.xwiki.xml.internal.html\", \"SecureHTMLElementSanitizer\")\nselect mc, \"Pattern.compile at line \" + mc.getLocation().getStartLine()\n",
+      "hypothesis": "Broken regex patterns for data- and aria- attribute validation in SecureHTMLElementSanitizer",
+      "severity": "high",
+      "cwe_ids": [],
+      "results_count": 7,
+      "results": [
+        {
+          "ruleId": "java/secure-sanitizer-broken-regex-v2",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/secure-sanitizer-broken-regex-v2",
+            "index": 0
+          },
+          "message": {
+            "text": "Pattern.compile at line 63"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "xwiki-commons-core/xwiki-commons-xml/src/main/java/org/xwiki/xml/internal/html/SecureHTMLElementSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 63,
+                  "startColumn": 46,
+                  "endColumn": 112
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "63ba3ae99208c3ce:1",
+            "primaryLocationStartColumnFingerprint": "41"
+          }
+        },
+        {
+          "ruleId": "java/secure-sanitizer-broken-regex-v2",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/secure-sanitizer-broken-regex-v2",
+            "index": 0
+          },
+          "message": {
+            "text": "Pattern.compile at line 66"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "xwiki-commons-core/xwiki-commons-xml/src/main/java/org/xwiki/xml/internal/html/SecureHTMLElementSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 66,
+                  "startColumn": 9,
+                  "endColumn": 95
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "3148f8788c0c57cd:1",
+            "primaryLocationStartColumnFingerprint": "0"
+          }
+        },
+        {
+          "ruleId": "java/secure-sanitizer-broken-regex-v2",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/secure-sanitizer-broken-regex-v2",
+            "index": 0
+          },
+          "message": {
+            "text": "Pattern.compile at line 68"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "xwiki-commons-core/xwiki-commons-xml/src/main/java/org/xwiki/xml/internal/html/SecureHTMLElementSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 68,
+                  "startColumn": 38,
+                  "endColumn": 87
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "ac9508da2c7a519c:1",
+            "primaryLocationStartColumnFingerprint": "33"
+          }
+        },
+        {
+          "ruleId": "java/secure-sanitizer-broken-regex-v2",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/secure-sanitizer-broken-regex-v2",
+            "index": 0
+          },
+          "message": {
+            "text": "Pattern.compile at line 70"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "xwiki-commons-core/xwiki-commons-xml/src/main/java/org/xwiki/xml/internal/html/SecureHTMLElementSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 70,
+                  "startColumn": 38,
+                  "endColumn": 73
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "815358919975c91f:1",
+            "primaryLocationStartColumnFingerprint": "33"
+          }
+        },
+        {
+          "ruleId": "java/secure-sanitizer-broken-regex-v2",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/secure-sanitizer-broken-regex-v2",
+            "index": 0
+          },
+          "message": {
+            "text": "Pattern.compile at line 72"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "xwiki-commons-core/xwiki-commons-xml/src/main/java/org/xwiki/xml/internal/html/SecureHTMLElementSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 72,
+                  "startColumn": 43,
+                  "endLine": 73,
+                  "endColumn": 34
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "4389ae3baaee60e:1",
+            "primaryLocationStartColumnFingerprint": "38"
+          }
+        },
+        {
+          "ruleId": "java/secure-sanitizer-broken-regex-v2",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/secure-sanitizer-broken-regex-v2",
+            "index": 0
+          },
+          "message": {
+            "text": "Pattern.compile at line 75"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "xwiki-commons-core/xwiki-commons-xml/src/main/java/org/xwiki/xml/internal/html/SecureHTMLElementSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 75,
+                  "startColumn": 38,
+                  "endLine": 76,
+                  "endColumn": 34
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "39684d60f768ac25:1",
+            "primaryLocationStartColumnFingerprint": "33"
+          }
+        },
+        {
+          "ruleId": "java/secure-sanitizer-broken-regex-v2",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/secure-sanitizer-broken-regex-v2",
+            "index": 0
+          },
+          "message": {
+            "text": "Pattern.compile at line 160"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "xwiki-commons-core/xwiki-commons-xml/src/main/java/org/xwiki/xml/internal/html/SecureHTMLElementSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 160,
+                  "startColumn": 38,
+                  "endColumn": 97
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "b7b8d8d57656b4f8:1",
+            "primaryLocationStartColumnFingerprint": "25"
+          }
+        }
+      ]
+    },
+    {
+      "codeql_query_uuid": "20260331182556",
+      "codeql_raw_query": "/**\n * @name SecureHTMLElementSanitizer - configurable URI regexp and data-attr regex flaw\n * @description Confirm the configurable URI allowlist and broken data-attr regex pattern\n * @kind problem\n * @problem.severity error\n * @id java/secure-sanitizer-config-bypass\n * @tags security\n *       external/cwe/cwe-079\n */\nimport java\n\n// Find the isAttributeAllowed method and its logic around data- attribute pattern matching\nfrom Method m, MethodCall mc\nwhere\n  m.getDeclaringType().hasQualifiedName(\"org.xwiki.xml.internal.html\", \"SecureHTMLElementSanitizer\")\n  and m.hasName(\"isAttributeAllowed\")\n  and mc.getEnclosingCallable() = m\nselect mc, \"isAttributeAllowed calls: \" + mc.getMethod().getName() + \n  \" on \" + mc.getMethod().getDeclaringType().getName() +\n  \" at line \" + mc.getLocation().getStartLine()\n",
+      "hypothesis": "isAttributeAllowed logic and how data-attribute pattern matching works",
+      "severity": "high",
+      "cwe_ids": [],
+      "results_count": 15,
+      "results": [
+        {
+          "ruleId": "java/secure-sanitizer-config-bypass",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/secure-sanitizer-config-bypass",
+            "index": 0
+          },
+          "message": {
+            "text": "isAttributeAllowed calls: toLowerCase on String at line 182"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "xwiki-commons-core/xwiki-commons-xml/src/main/java/org/xwiki/xml/internal/html/SecureHTMLElementSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 182,
+                  "startColumn": 31,
+                  "endColumn": 56
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "250108bdd251ce59:1",
+            "primaryLocationStartColumnFingerprint": "22"
+          }
+        },
+        {
+          "ruleId": "java/secure-sanitizer-config-bypass",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/secure-sanitizer-config-bypass",
+            "index": 0
+          },
+          "message": {
+            "text": "isAttributeAllowed calls: toLowerCase on String at line 183"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "xwiki-commons-core/xwiki-commons-xml/src/main/java/org/xwiki/xml/internal/html/SecureHTMLElementSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 183,
+                  "startColumn": 33,
+                  "endColumn": 60
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "87b57c27b352d5c3:1",
+            "primaryLocationStartColumnFingerprint": "24"
+          }
+        },
+        {
+          "ruleId": "java/secure-sanitizer-config-bypass",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/secure-sanitizer-config-bypass",
+            "index": 0
+          },
+          "message": {
+            "text": "isAttributeAllowed calls: find on Matcher at line 185"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "xwiki-commons-core/xwiki-commons-xml/src/main/java/org/xwiki/xml/internal/html/SecureHTMLElementSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 185,
+                  "startColumn": 14,
+                  "endColumn": 54
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "7d261163f4df4889:1",
+            "primaryLocationStartColumnFingerprint": "5"
+          }
+        },
+        {
+          "ruleId": "java/secure-sanitizer-config-bypass",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/secure-sanitizer-config-bypass",
+            "index": 0
+          },
+          "message": {
+            "text": "isAttributeAllowed calls: find on Matcher at line 185"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "xwiki-commons-core/xwiki-commons-xml/src/main/java/org/xwiki/xml/internal/html/SecureHTMLElementSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 185,
+                  "startColumn": 58,
+                  "endColumn": 98
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "7d261163f4df4889:1",
+            "primaryLocationStartColumnFingerprint": "49"
+          }
+        },
+        {
+          "ruleId": "java/secure-sanitizer-config-bypass",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/secure-sanitizer-config-bypass",
+            "index": 0
+          },
+          "message": {
+            "text": "isAttributeAllowed calls: matcher on Pattern at line 185"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "xwiki-commons-core/xwiki-commons-xml/src/main/java/org/xwiki/xml/internal/html/SecureHTMLElementSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 185,
+                  "startColumn": 14,
+                  "endColumn": 47
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "7d261163f4df4889:1",
+            "primaryLocationStartColumnFingerprint": "5"
+          }
+        },
+        {
+          "ruleId": "java/secure-sanitizer-config-bypass",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/secure-sanitizer-config-bypass",
+            "index": 0
+          },
+          "message": {
+            "text": "isAttributeAllowed calls: matcher on Pattern at line 185"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "xwiki-commons-core/xwiki-commons-xml/src/main/java/org/xwiki/xml/internal/html/SecureHTMLElementSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 185,
+                  "startColumn": 58,
+                  "endColumn": 91
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "7d261163f4df4889:1",
+            "primaryLocationStartColumnFingerprint": "49"
+          }
+        },
+        {
+          "ruleId": "java/secure-sanitizer-config-bypass",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/secure-sanitizer-config-bypass",
+            "index": 0
+          },
+          "message": {
+            "text": "isAttributeAllowed calls: contains on Set<String> at line 186"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "xwiki-commons-core/xwiki-commons-xml/src/main/java/org/xwiki/xml/internal/html/SecureHTMLElementSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 186,
+                  "startColumn": 17,
+                  "endColumn": 63
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "f22c240b8ab89e27:1",
+            "primaryLocationStartColumnFingerprint": "4"
+          }
+        },
+        {
+          "ruleId": "java/secure-sanitizer-config-bypass",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/secure-sanitizer-config-bypass",
+            "index": 0
+          },
+          "message": {
+            "text": "isAttributeAllowed calls: isAttributeAllowed on SecureHTMLElementSanitizer at line 189"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "xwiki-commons-core/xwiki-commons-xml/src/main/java/org/xwiki/xml/internal/html/SecureHTMLElementSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 189,
+                  "startColumn": 20,
+                  "endColumn": 54
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "600a660065b44d4f:1",
+            "primaryLocationStartColumnFingerprint": "11"
+          }
+        },
+        {
+          "ruleId": "java/secure-sanitizer-config-bypass",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/secure-sanitizer-config-bypass",
+            "index": 0
+          },
+          "message": {
+            "text": "isAttributeAllowed calls: contains on Set<String> at line 189"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "xwiki-commons-core/xwiki-commons-xml/src/main/java/org/xwiki/xml/internal/html/SecureHTMLElementSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 189,
+                  "startColumn": 59,
+                  "endColumn": 105
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "600a660065b44d4f:1",
+            "primaryLocationStartColumnFingerprint": "50"
+          }
+        },
+        {
+          "ruleId": "java/secure-sanitizer-config-bypass",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/secure-sanitizer-config-bypass",
+            "index": 0
+          },
+          "message": {
+            "text": "isAttributeAllowed calls: isAllowedValue on SecureHTMLElementSanitizer at line 190"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "xwiki-commons-core/xwiki-commons-xml/src/main/java/org/xwiki/xml/internal/html/SecureHTMLElementSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 190,
+                  "startColumn": 22,
+                  "endColumn": 82
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "7031dffc1c1cdfc7:1",
+            "primaryLocationStartColumnFingerprint": "9"
+          }
+        },
+        {
+          "ruleId": "java/secure-sanitizer-config-bypass",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/secure-sanitizer-config-bypass",
+            "index": 0
+          },
+          "message": {
+            "text": "isAttributeAllowed calls: contains on Set<String> at line 213"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "xwiki-commons-core/xwiki-commons-xml/src/main/java/org/xwiki/xml/internal/html/SecureHTMLElementSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 213,
+                  "startColumn": 26,
+                  "endColumn": 77
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "4e7c9e61b27b2bce:1",
+            "primaryLocationStartColumnFingerprint": "17"
+          }
+        },
+        {
+          "ruleId": "java/secure-sanitizer-config-bypass",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/secure-sanitizer-config-bypass",
+            "index": 0
+          },
+          "message": {
+            "text": "isAttributeAllowed calls: isAllowedAttribute on HTMLDefinitions at line 214"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "xwiki-commons-core/xwiki-commons-xml/src/main/java/org/xwiki/xml/internal/html/SecureHTMLElementSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 214,
+                  "startColumn": 28,
+                  "endColumn": 82
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "991c4b8892136d57:1",
+            "primaryLocationStartColumnFingerprint": "19"
+          }
+        },
+        {
+          "ruleId": "java/secure-sanitizer-config-bypass",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/secure-sanitizer-config-bypass",
+            "index": 0
+          },
+          "message": {
+            "text": "isAttributeAllowed calls: isAllowedAttribute on SVGDefinitions at line 215"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "xwiki-commons-core/xwiki-commons-xml/src/main/java/org/xwiki/xml/internal/html/SecureHTMLElementSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 215,
+                  "startColumn": 28,
+                  "endColumn": 81
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "eefbcf7be744d802:1",
+            "primaryLocationStartColumnFingerprint": "19"
+          }
+        },
+        {
+          "ruleId": "java/secure-sanitizer-config-bypass",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/secure-sanitizer-config-bypass",
+            "index": 0
+          },
+          "message": {
+            "text": "isAttributeAllowed calls: isAllowedAttribute on MathMLDefinitions at line 216"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "xwiki-commons-core/xwiki-commons-xml/src/main/java/org/xwiki/xml/internal/html/SecureHTMLElementSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 216,
+                  "startColumn": 28,
+                  "endColumn": 84
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "f1737b8d31052e76:1",
+            "primaryLocationStartColumnFingerprint": "19"
+          }
+        },
+        {
+          "ruleId": "java/secure-sanitizer-config-bypass",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/secure-sanitizer-config-bypass",
+            "index": 0
+          },
+          "message": {
+            "text": "isAttributeAllowed calls: contains on Set<String> at line 217"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "xwiki-commons-core/xwiki-commons-xml/src/main/java/org/xwiki/xml/internal/html/SecureHTMLElementSanitizer.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 217,
+                  "startColumn": 28,
+                  "endColumn": 70
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "3b579ea27162762b:1",
+            "primaryLocationStartColumnFingerprint": "19"
+          }
+        }
+      ]
+    }
+  ]
+}

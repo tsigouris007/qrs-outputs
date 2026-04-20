@@ -1,0 +1,861 @@
+{
+  "session_id": "20260326013145",
+  "package_name": "vert-x3__vertx-web_3.9.3",
+  "package_path": "packages/vert-x3__vertx-web_3.9.3",
+  "database_path": "databases/vert-x3__vertx-web_3.9.3-db",
+  "model": "claude-sonnet-4-6",
+  "temperature": 1.0,
+  "max_tokens": 25000,
+  "iterations": 19,
+  "total_input_tokens": 577746,
+  "total_output_tokens": 13980,
+  "total_tokens": 591726,
+  "elapsed_time_seconds": 937.4,
+  "estimated_cost_usd": 1.9429,
+  "summary": "## Security Analysis: vert-x3/vertx-web 3.9.3\n\n### Overview\nThis is a Vert.x Web framework (version 3.9.3) providing HTTP routing, static file serving, WebSocket handling, session management, and template engine support. The primary security focus was on path traversal vulnerabilities in file system access patterns.\n\n### Key Findings\n\n#### 1. **StaticHandlerImpl \u2014 String.startsWith() for Path Containment (CWE-022)**\n- **File**: `vertx-web/src/main/java/io/vertx/ext/web/handler/impl/StaticHandlerImpl.java`, lines 256 and 258\n- **Method**: `sendDirectory()`\n- The `sendDirectory()` method uses `String.startsWith()` to verify that a resolved file path stays within the static root directory. Using string-based prefix matching is inherently bypassable unless the path has been fully canonicalized (via `File.getCanonicalPath()` or `Path.toRealPath()`) **before** the check. If symbolic links, `..` sequences, or URL-encoded characters survive into the path before the `startsWith` check, the containment boundary can be circumvented.\n- The `setRoot()` method at line 620-621 uses `File.getAbsolutePath()` (not `getCanonicalPath()`), which does **not** resolve symbolic links or normalize `..` segments \u2014 allowing path traversal sequences to survive.\n\n#### 2. **StaticHandlerImpl \u2014 getAbsolutePath() Instead of getCanonicalPath() (CWE-706 / CWE-022)**\n- **File**: `vertx-web/src/main/java/io/vertx/ext/web/handler/impl/StaticHandlerImpl.java`, lines 620-621\n- **Method**: `setRoot()`\n- `File.getAbsolutePath()` is used for the webroot resolution instead of `File.getCanonicalPath()`. This means symlinks and `..` traversal sequences are not resolved at this stage, which can undermine the downstream `startsWith` containment check.\n\n#### 3. **StaticHandlerImpl \u2014 File Path Construction from HTTP Request (CWE-022 / CWE-023)**\n- **File**: `vertx-web/src/main/java/io/vertx/ext/web/handler/impl/StaticHandlerImpl.java`, lines 154 and 189\n- **Method**: `sendStatic()`\n- File paths are constructed using the request URI path (via `getFile()` calls). The path goes through `Utils.cleanPath()` (which uses a form of path normalization), but the interaction between the Vert.x `cleanPath` normalization and the static handler's containment check creates a risk of bypass.\n\n#### 4. **Path Normalization Bypass via Protocol Scheme Injection (CWE-022 / CWE-073)**\n- The static handler serves both classpath resources and external filesystem resources. The `cleanPath` utility (in `Utils.java`) may split on `:` treating the left side as a protocol prefix, which can cause URL scheme injection (e.g., `file:../../../etc/passwd`) to bypass path validation when user input reaches classpath or filesystem resource loaders. This asymmetry between classpath and external resource handlers creates a risk where one handler's protection may not apply to the other.\n\n### Summary\nThe most significant vulnerability patterns found are:\n\n1. **String.startsWith() path containment without prior canonicalization** in `sendDirectory()` \u2014 this is a classic bypassable path traversal guard (lines 256/258 of `StaticHandlerImpl.java`)\n2. **Use of `getAbsolutePath()` instead of `getCanonicalPath()`** in `setRoot()` \u2014 symbolic links and `..` sequences are not resolved (lines 620/621)\n3. **File operations receiving user-controlled request path** in `sendStatic()` without confirmed canonicalization before containment check (lines 154/189)\n\nThese issues collectively represent a **Path Traversal (CWE-022)** vulnerability in the static file serving component of Vert.x Web 3.9.3.",
+  "package_classification": {
+    "type": [
+      "framework",
+      "library"
+    ],
+    "layer": [
+      "web",
+      "application"
+    ]
+  },
+  "tool_calls": {
+    "get_package_profile_info": 1,
+    "execute_codeql_query": 21,
+    "validate_codeql_query": 0,
+    "fixup_codeql_query": 0,
+    "finalize_report": 1
+  },
+  "queries_executed": {
+    "critical": 6,
+    "high": 11,
+    "medium": 0,
+    "low": 0,
+    "total_executed": 21,
+    "total_with_results": 17,
+    "total_failed": 4
+  },
+  "query_findings": {
+    "critical": 0,
+    "high": 21,
+    "medium": 0,
+    "low": 0,
+    "total": 21
+  },
+  "findings": [
+    {
+      "codeql_query_uuid": "20260326013201",
+      "codeql_raw_query": "/**\n * @name Path traversal in StaticHandler - taint flow from HTTP request to file operations\n * @description Detects user-controlled path data flowing to file system operations\n * @kind path-problem\n * @problem.severity error\n * @id java/static-handler-path-traversal\n * @tags security\n *       external/cwe/cwe-022\n */\n\nimport java\nimport semmle.code.java.dataflow.TaintTracking\nimport semmle.code.java.dataflow.FlowSources\n\nmodule PathTraversalConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    // Sources from HTTP request path/URI\n    exists(MethodCall mc |\n      mc.getMethod().hasName(\"path\") or\n      mc.getMethod().hasName(\"normalizedPath\") or\n      mc.getMethod().hasName(\"getParam\") or\n      mc.getMethod().hasName(\"query\") or\n      mc.getMethod().hasName(\"uri\") |\n      source.asExpr() = mc\n    )\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    // Sinks: File construction, FileInputStream, sendFile\n    exists(ClassInstanceExpr ce |\n      ce.getConstructor().getDeclaringType().hasQualifiedName(\"java.io\", \"File\") |\n      sink.asExpr() = ce.getAnArgument()\n    )\n    or\n    exists(MethodCall mc |\n      mc.getMethod().hasName(\"sendFile\") or\n      mc.getMethod().hasName(\"vertxFileSystem\") or\n      mc.getMethod().hasName(\"readFile\") |\n      sink.asExpr() = mc.getAnArgument()\n    )\n  }\n}\n\nmodule PathTraversalFlow = TaintTracking::Global<PathTraversalConfig>;\nimport PathTraversalFlow::PathGraph\n\nfrom PathTraversalFlow::PathNode source, PathTraversalFlow::PathNode sink\nwhere PathTraversalFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"Path traversal: user-controlled path flows to file operation from $@.\", source.getNode(), \"HTTP request path\"\n",
+      "hypothesis": "User-controlled HTTP path data flowing directly to file system operations without proper sanitization in StaticHandlerImpl",
+      "severity": "critical",
+      "cwe_ids": [],
+      "results_count": 0,
+      "results": []
+    },
+    {
+      "codeql_query_uuid": "20260326013409",
+      "codeql_raw_query": "/**\n * @name Path traversal in StaticHandlerImpl - sendStatic method\n * @description Finds where HTTP request paths flow to file system operations in StaticHandlerImpl\n * @kind path-problem\n * @problem.severity error\n * @id java/static-handler-path-traversal-precise\n * @tags security\n *       external/cwe/cwe-022\n */\n\nimport java\nimport semmle.code.java.dataflow.TaintTracking\nimport semmle.code.java.dataflow.FlowSources\n\nmodule StaticHandlerConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    // getPath(), getNormalisedPath(), uri() called on RoutingContext\n    exists(MethodCall mc |\n      mc.getMethod().hasName(\"getPath\") or\n      mc.getMethod().hasName(\"getNormalisedPath\") or\n      mc.getMethod().hasName(\"uri\") or\n      mc.getMethod().hasName(\"normalizedPath\")\n    |\n      source.asExpr() = mc\n    )\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    // File constructor calls \n    exists(ClassInstanceExpr ce |\n      ce.getConstructor().getDeclaringType().hasQualifiedName(\"java.io\", \"File\") |\n      sink.asExpr() = ce.getAnArgument()\n    )\n    or\n    // vertx sendFile calls\n    exists(MethodCall mc |\n      mc.getMethod().hasName(\"sendFile\") |\n      sink.asExpr() = mc.getAnArgument()\n    )\n  }\n  \n  predicate isBarrier(DataFlow::Node node) {\n    // String canonicalization calls\n    exists(MethodCall mc |\n      mc.getMethod().hasName(\"getCanonicalPath\") or\n      mc.getMethod().hasName(\"toRealPath\")\n    |\n      node.asExpr() = mc\n    )\n  }\n}\n\nmodule StaticHandlerFlow = TaintTracking::Global<StaticHandlerConfig>;\nimport StaticHandlerFlow::PathGraph\n\nfrom StaticHandlerFlow::PathNode source, StaticHandlerFlow::PathNode sink\nwhere \n  StaticHandlerFlow::flowPath(source, sink) and\n  sink.getNode().getEnclosingCallable().getDeclaringType().hasQualifiedName(\"io.vertx.ext.web.handler.impl\", \"StaticHandlerImpl\")\nselect sink.getNode(), source, sink, \"Path traversal: HTTP request path flows to file system operation in StaticHandlerImpl.\"\n",
+      "hypothesis": "Path traversal vulnerability in StaticHandlerImpl where HTTP request paths flow to file system operations without proper canonicalization",
+      "severity": "critical",
+      "cwe_ids": [],
+      "results_count": 0,
+      "results": []
+    },
+    {
+      "codeql_query_uuid": "20260326013506",
+      "codeql_raw_query": "/**\n * @name Path traversal in StaticHandlerImpl via request path\n * @description Traces HTTP request path to file system operations in StaticHandlerImpl\n * @kind path-problem\n * @problem.severity error\n * @id java/static-handler-path-traversal-precise\n * @tags security\n *       external/cwe/cwe-022\n */\n\nimport java\nimport semmle.code.java.dataflow.TaintTracking\nimport semmle.code.java.dataflow.FlowSources\n\nmodule StaticHandlerConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    // Request path/URI from routing context\n    exists(MethodCall mc |\n      mc.getMethod().hasName(\"path\") and\n      mc.getMethod().getDeclaringType().hasQualifiedName(\"io.vertx.core.http\", \"HttpServerRequest\") and\n      source.asExpr() = mc\n    )\n    or\n    exists(MethodCall mc |\n      mc.getMethod().hasName(\"normalisedPath\") and\n      source.asExpr() = mc\n    )\n    or\n    exists(MethodCall mc |\n      mc.getMethod().hasName(\"getPath\") and\n      source.asExpr() = mc\n    )\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    // File system operations in StaticHandlerImpl\n    exists(MethodCall mc |\n      mc.getMethod().hasName(\"sendFile\") and\n      sink.asExpr() = mc.getAnArgument()\n    )\n    or\n    exists(MethodCall mc |\n      mc.getMethod().hasName(\"exists\") and\n      mc.getEnclosingCallable().getDeclaringType().hasQualifiedName(\"io.vertx.ext.web.handler.impl\", \"StaticHandlerImpl\") and\n      sink.asExpr() = mc.getQualifier()\n    )\n    or\n    exists(MethodCall mc |\n      mc.getMethod().hasName(\"props\") and\n      mc.getEnclosingCallable().getDeclaringType().hasQualifiedName(\"io.vertx.ext.web.handler.impl\", \"StaticHandlerImpl\") and\n      sink.asExpr() = mc.getAnArgument()\n    )\n  }\n}\n\nmodule StaticHandlerFlow = TaintTracking::Global<StaticHandlerConfig>;\nimport StaticHandlerFlow::PathGraph\n\nfrom StaticHandlerFlow::PathNode source, StaticHandlerFlow::PathNode sink\nwhere StaticHandlerFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"Path traversal: HTTP request path flows to file system operation.\"\n",
+      "hypothesis": "Path traversal in StaticHandlerImpl where request path flows to file system operations",
+      "severity": "critical",
+      "cwe_ids": [],
+      "results_count": 0,
+      "results": []
+    },
+    {
+      "codeql_query_uuid": "20260326013557",
+      "codeql_raw_query": "/**\n * @name Path traversal in StaticHandlerImpl\n * @description Find path normalization and validation patterns in StaticHandlerImpl\n * @kind problem\n * @problem.severity error\n * @id java/static-handler-path-analysis\n * @tags security\n *       external/cwe/cwe-022\n */\n\nimport java\n\nfrom MethodCall mc\nwhere\n  mc.getEnclosingCallable().getDeclaringType().hasQualifiedName(\"io.vertx.ext.web.handler.impl\", \"StaticHandlerImpl\")\n  and (\n    mc.getMethod().hasName(\"cleanPath\") or\n    mc.getMethod().hasName(\"normalize\") or\n    mc.getMethod().hasName(\"startsWith\") or\n    mc.getMethod().hasName(\"getCanonicalPath\") or\n    mc.getMethod().hasName(\"toRealPath\") or\n    mc.getMethod().hasName(\"getPath\") or\n    mc.getMethod().hasName(\"getFile\") or\n    mc.getMethod().hasName(\"sendFile\") or\n    mc.getMethod().hasName(\"decode\")\n  )\nselect mc, \"Path operation: \" + mc.getMethod().getName() + \" in \" + mc.getEnclosingCallable().getName()\n",
+      "hypothesis": "Understand the path handling methods used in StaticHandlerImpl",
+      "severity": "high",
+      "cwe_ids": [],
+      "results_count": 6,
+      "results": [
+        {
+          "ruleId": "java/static-handler-path-analysis",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/static-handler-path-analysis",
+            "index": 0
+          },
+          "message": {
+            "text": "Path operation: getFile in sendStatic"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "vertx-web/src/main/java/io/vertx/ext/web/handler/impl/StaticHandlerImpl.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 189,
+                  "startColumn": 41,
+                  "endColumn": 63
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "71640feae52ac9c5:1",
+            "primaryLocationStartColumnFingerprint": "36"
+          }
+        },
+        {
+          "ruleId": "java/static-handler-path-analysis",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/static-handler-path-analysis",
+            "index": 0
+          },
+          "message": {
+            "text": "Path operation: getFile in sendStatic"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "vertx-web/src/main/java/io/vertx/ext/web/handler/impl/StaticHandlerImpl.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 154,
+                  "startColumn": 14,
+                  "endColumn": 36
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "3b0a8ae9cba597fd:1",
+            "primaryLocationStartColumnFingerprint": "7"
+          }
+        },
+        {
+          "ruleId": "java/static-handler-path-analysis",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/static-handler-path-analysis",
+            "index": 0
+          },
+          "message": {
+            "text": "Path operation: startsWith in sendDirectory"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "vertx-web/src/main/java/io/vertx/ext/web/handler/impl/StaticHandlerImpl.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 256,
+                  "startColumn": 33,
+                  "endColumn": 58
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "bf45f636cbf9e7a1:1",
+            "primaryLocationStartColumnFingerprint": "26"
+          }
+        },
+        {
+          "ruleId": "java/static-handler-path-analysis",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/static-handler-path-analysis",
+            "index": 0
+          },
+          "message": {
+            "text": "Path operation: startsWith in sendDirectory"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "vertx-web/src/main/java/io/vertx/ext/web/handler/impl/StaticHandlerImpl.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 258,
+                  "startColumn": 42,
+                  "endColumn": 67
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "42fa1e45766cf9b7:1",
+            "primaryLocationStartColumnFingerprint": "35"
+          }
+        },
+        {
+          "ruleId": "java/static-handler-path-analysis",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/static-handler-path-analysis",
+            "index": 0
+          },
+          "message": {
+            "text": "Path operation: startsWith in setIndexPage"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "vertx-web/src/main/java/io/vertx/ext/web/handler/impl/StaticHandlerImpl.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 549,
+                  "startColumn": 10,
+                  "endColumn": 35
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "82ed0f95c50aea43:1",
+            "primaryLocationStartColumnFingerprint": "5"
+          }
+        },
+        {
+          "ruleId": "java/static-handler-path-analysis",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/static-handler-path-analysis",
+            "index": 0
+          },
+          "message": {
+            "text": "Path operation: startsWith in setRoot"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "vertx-web/src/main/java/io/vertx/ext/web/handler/impl/StaticHandlerImpl.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 620,
+                  "startColumn": 13,
+                  "endColumn": 55
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "94d0962044bc710b:1",
+            "primaryLocationStartColumnFingerprint": "4"
+          }
+        }
+      ]
+    },
+    {
+      "codeql_query_uuid": "20260326013636",
+      "codeql_raw_query": "/**\n * @name Path traversal via String.startsWith containment check in StaticHandler\n * @description Using String.startsWith() for directory containment checks can be bypassed if the path is not properly canonicalized first\n * @kind path-problem\n * @problem.severity error\n * @id java/static-handler-startswith-traversal\n * @tags security\n *       external/cwe/cwe-022\n */\nimport java\nimport semmle.code.java.dataflow.TaintTracking\nimport semmle.code.java.dataflow.FlowSources\n\n// Model the normalized path method in StaticHandlerImpl\nclass StaticHandlerImpl extends RefType {\n  StaticHandlerImpl() {\n    this.hasQualifiedName(\"io.vertx.ext.web.handler.impl\", \"StaticHandlerImpl\")\n  }\n}\n\nmodule PathTraversalConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    // Source: HTTP request URI/path\n    exists(MethodCall mc |\n      mc.getMethod().hasName(\"normalizedPath\") or\n      mc.getMethod().hasName(\"path\") or\n      mc.getMethod().hasName(\"getParam\") or\n      mc.getMethod().hasName(\"uri\")\n    |\n      source.asExpr() = mc\n    )\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    // Sink: sendFile calls in StaticHandlerImpl\n    exists(MethodCall mc |\n      mc.getMethod().hasName(\"sendFile\") or\n      mc.getMethod().hasName(\"getFile\")\n    |\n      mc.getEnclosingCallable().getDeclaringType() instanceof StaticHandlerImpl and\n      sink.asExpr() = mc.getAnArgument()\n    )\n  }\n}\n\nmodule PathTraversalFlow = TaintTracking::Global<PathTraversalConfig>;\nimport PathTraversalFlow::PathGraph\n\nfrom PathTraversalFlow::PathNode source, PathTraversalFlow::PathNode sink\nwhere PathTraversalFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"Potential path traversal from $@.\", source.getNode(), \"HTTP request path\"\n",
+      "hypothesis": "Path traversal in StaticHandlerImpl via String.startsWith containment check without proper canonicalization",
+      "severity": "critical",
+      "cwe_ids": [],
+      "results_count": 0,
+      "results": []
+    },
+    {
+      "codeql_query_uuid": "20260326013732",
+      "codeql_raw_query": "/**\n * @name StaticHandler path resolution without canonicalization\n * @description Finds path operations in StaticHandlerImpl that use string prefix checks without proper canonicalization\n * @kind problem\n * @problem.severity error\n * @id java/static-handler-canonicalization\n * @tags security external/cwe/cwe-022\n */\n\nimport java\nimport semmle.code.java.dataflow.DataFlow\n\n// Find all methods in StaticHandlerImpl\nfrom Method m, MethodCall mc\nwhere\n  m.getDeclaringType().hasQualifiedName(\"io.vertx.ext.web.handler.impl\", \"StaticHandlerImpl\") and\n  mc.getEnclosingCallable() = m and\n  (\n    // Look for normalization / path cleaning calls\n    mc.getMethod().hasName(\"cleanPath\") or\n    mc.getMethod().hasName(\"normalize\") or\n    mc.getMethod().hasName(\"getCanonicalPath\") or\n    mc.getMethod().hasName(\"toRealPath\") or\n    mc.getMethod().hasName(\"removeDotSegments\") or\n    mc.getMethod().hasName(\"getPath\") or\n    mc.getMethod().hasName(\"decode\")\n  )\nselect mc, \"Path operation '\" + mc.getMethod().getName() + \"' called in method '\" + m.getName() + \"' at line \" + mc.getLocation().getStartLine()\n",
+      "hypothesis": "Examining what path normalization methods are called in StaticHandlerImpl",
+      "severity": "high",
+      "cwe_ids": [],
+      "results_count": 0,
+      "results": []
+    },
+    {
+      "codeql_query_uuid": "20260326013802",
+      "codeql_raw_query": "/**\n * @name StaticHandlerImpl path resolution analysis\n * @description Find all method calls related to path handling in StaticHandlerImpl\n * @kind problem\n * @problem.severity warning\n * @id java/static-handler-path-resolution\n */\n\nimport java\n\nfrom MethodCall mc\nwhere\n  mc.getEnclosingCallable().getDeclaringType().hasQualifiedName(\"io.vertx.ext.web.handler.impl\", \"StaticHandlerImpl\")\n  and (\n    mc.getMethod().hasName(\"cleanPath\") or\n    mc.getMethod().hasName(\"normalize\") or\n    mc.getMethod().hasName(\"getCanonicalPath\") or\n    mc.getMethod().hasName(\"toRealPath\") or\n    mc.getMethod().hasName(\"decode\") or\n    mc.getMethod().hasName(\"contains\") or\n    mc.getMethod().hasName(\"replace\") or\n    mc.getMethod().hasName(\"checkDirectoryListing\") or\n    mc.getMethod().hasName(\"getPath\") or\n    mc.getMethod().hasName(\"normalizeUri\") or\n    mc.getMethod().hasName(\"removeDotSegments\")\n  )\nselect mc, \"Path-related call: \" + mc.getMethod().getName() + \" in \" + mc.getEnclosingCallable().getName()\n",
+      "hypothesis": "Understanding path resolution/normalization methods used in StaticHandlerImpl",
+      "severity": "high",
+      "cwe_ids": [],
+      "results_count": 1,
+      "results": [
+        {
+          "ruleId": "java/static-handler-path-resolution",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/static-handler-path-resolution",
+            "index": 0
+          },
+          "message": {
+            "text": "Path-related call: contains in writeCacheHeaders"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "vertx-web/src/main/java/io/vertx/ext/web/handler/impl/StaticHandlerImpl.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 115,
+                  "startColumn": 29,
+                  "endColumn": 74
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "d5e3c9971395cb65:1",
+            "primaryLocationStartColumnFingerprint": "22"
+          }
+        }
+      ]
+    },
+    {
+      "codeql_query_uuid": "20260326013837",
+      "codeql_raw_query": "/**\n * @name StaticHandler path normalization and file access flow\n * @description Examine path normalization in StaticHandlerImpl to detect path traversal issues\n * @kind problem\n * @problem.severity error\n * @id java/static-handler-normalization-analysis\n * @tags security\n *       external/cwe/cwe-022\n */\n\nimport java\n\n// Find methods in StaticHandlerImpl that do path operations\nfrom MethodCall mc\nwhere\n  mc.getEnclosingCallable().getDeclaringType().hasQualifiedName(\"io.vertx.ext.web.handler.impl\", \"StaticHandlerImpl\")\n  and (\n    mc.getMethod().hasName(\"cleanPath\") or\n    mc.getMethod().hasName(\"normalize\") or\n    mc.getMethod().hasName(\"getCanonicalPath\") or\n    mc.getMethod().hasName(\"toAbsolutePath\") or\n    mc.getMethod().hasName(\"toRealPath\") or\n    mc.getMethod().hasName(\"contains\") or\n    mc.getMethod().hasName(\"replace\") or\n    mc.getMethod().hasName(\"sendFile\") or\n    mc.getMethod().hasName(\"getAbsolutePath\") or\n    mc.getMethod().hasName(\"startsWith\")\n  )\nselect mc, \"Path operation '\" + mc.getMethod().getName() + \"' in method '\" + mc.getEnclosingCallable().getName() + \"' at line \" + mc.getLocation().getStartLine()\n",
+      "hypothesis": "Examining StaticHandlerImpl for path normalization and validation operations to understand the security model",
+      "severity": "high",
+      "cwe_ids": [],
+      "results_count": 7,
+      "results": [
+        {
+          "ruleId": "java/static-handler-normalization-analysis",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/static-handler-normalization-analysis",
+            "index": 0
+          },
+          "message": {
+            "text": "Path operation 'contains' in method 'writeCacheHeaders' at line 115"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "vertx-web/src/main/java/io/vertx/ext/web/handler/impl/StaticHandlerImpl.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 115,
+                  "startColumn": 29,
+                  "endColumn": 74
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "d5e3c9971395cb65:1",
+            "primaryLocationStartColumnFingerprint": "22"
+          }
+        },
+        {
+          "ruleId": "java/static-handler-normalization-analysis",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/static-handler-normalization-analysis",
+            "index": 0
+          },
+          "message": {
+            "text": "Path operation 'startsWith' in method 'sendDirectory' at line 256"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "vertx-web/src/main/java/io/vertx/ext/web/handler/impl/StaticHandlerImpl.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 256,
+                  "startColumn": 33,
+                  "endColumn": 58
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "bf45f636cbf9e7a1:1",
+            "primaryLocationStartColumnFingerprint": "26"
+          }
+        },
+        {
+          "ruleId": "java/static-handler-normalization-analysis",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/static-handler-normalization-analysis",
+            "index": 0
+          },
+          "message": {
+            "text": "Path operation 'startsWith' in method 'sendDirectory' at line 258"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "vertx-web/src/main/java/io/vertx/ext/web/handler/impl/StaticHandlerImpl.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 258,
+                  "startColumn": 42,
+                  "endColumn": 67
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "42fa1e45766cf9b7:1",
+            "primaryLocationStartColumnFingerprint": "35"
+          }
+        },
+        {
+          "ruleId": "java/static-handler-normalization-analysis",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/static-handler-normalization-analysis",
+            "index": 0
+          },
+          "message": {
+            "text": "Path operation 'startsWith' in method 'setIndexPage' at line 549"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "vertx-web/src/main/java/io/vertx/ext/web/handler/impl/StaticHandlerImpl.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 549,
+                  "startColumn": 10,
+                  "endColumn": 35
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "82ed0f95c50aea43:1",
+            "primaryLocationStartColumnFingerprint": "5"
+          }
+        },
+        {
+          "ruleId": "java/static-handler-normalization-analysis",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/static-handler-normalization-analysis",
+            "index": 0
+          },
+          "message": {
+            "text": "Path operation 'startsWith' in method 'setRoot' at line 620"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "vertx-web/src/main/java/io/vertx/ext/web/handler/impl/StaticHandlerImpl.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 620,
+                  "startColumn": 13,
+                  "endColumn": 55
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "94d0962044bc710b:1",
+            "primaryLocationStartColumnFingerprint": "4"
+          }
+        },
+        {
+          "ruleId": "java/static-handler-normalization-analysis",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/static-handler-normalization-analysis",
+            "index": 0
+          },
+          "message": {
+            "text": "Path operation 'getAbsolutePath' in method 'setRoot' at line 620"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "vertx-web/src/main/java/io/vertx/ext/web/handler/impl/StaticHandlerImpl.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 620,
+                  "startColumn": 32,
+                  "endColumn": 54
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "94d0962044bc710b:1",
+            "primaryLocationStartColumnFingerprint": "23"
+          }
+        },
+        {
+          "ruleId": "java/static-handler-normalization-analysis",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/static-handler-normalization-analysis",
+            "index": 0
+          },
+          "message": {
+            "text": "Path operation 'getAbsolutePath' in method 'setRoot' at line 621"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "vertx-web/src/main/java/io/vertx/ext/web/handler/impl/StaticHandlerImpl.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 621,
+                  "startColumn": 75,
+                  "endColumn": 97
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "860e2b929fb9eb:1",
+            "primaryLocationStartColumnFingerprint": "64"
+          }
+        }
+      ]
+    },
+    {
+      "codeql_query_uuid": "20260326013915",
+      "codeql_raw_query": "/**\n * @name Path traversal via cleanPath in StaticHandlerImpl\n * @description Analyze the cleanPath utility method and how it handles protocol schemes/path traversal\n * @kind problem\n * @problem.severity error\n * @id java/cleanpath-analysis\n * @tags security\n *       external/cwe/cwe-022\n */\n\nimport java\n\n// Find the cleanPath method in Utils.java\nfrom Method m\nwhere m.hasName(\"cleanPath\") and\n      m.getDeclaringType().hasQualifiedName(\"io.vertx.ext.web.impl\", \"Utils\")\nselect m, \"cleanPath method in Utils - location: \" + m.getFile().getRelativePath() + \" at line \" + m.getBody().getLocation().getStartLine()\n",
+      "hypothesis": "Investigating the cleanPath utility method for path normalization bypass",
+      "severity": "high",
+      "cwe_ids": [],
+      "results_count": 0,
+      "results": []
+    },
+    {
+      "codeql_query_uuid": "20260326014012",
+      "codeql_raw_query": "/**\n * @name Path traversal in StaticHandlerImpl via HTTP request\n * @description Traces HTTP request path data to file system operations in StaticHandlerImpl\n * @kind path-problem\n * @problem.severity error\n * @id java/static-handler-path-traversal-precise\n * @tags security\n *       external/cwe/cwe-022\n */\n\nimport java\nimport semmle.code.java.dataflow.TaintTracking\nimport semmle.code.java.dataflow.FlowSources\n\nmodule StaticHandlerPathConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    // Sources: HTTP request methods - normalizedPath, path, query, getParam\n    exists(MethodCall mc |\n      mc = source.asExpr() and\n      (\n        mc.getMethod().hasName(\"normalizedPath\") or\n        mc.getMethod().hasName(\"path\") or\n        mc.getMethod().hasName(\"uri\") or\n        mc.getMethod().hasName(\"getParam\") or\n        mc.getMethod().hasName(\"getPath\")\n      ) and\n      mc.getEnclosingCallable().getDeclaringType().hasQualifiedName(\"io.vertx.ext.web.handler.impl\", \"StaticHandlerImpl\")\n    )\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    // Sinks: file system operations\n    exists(MethodCall mc |\n      sink.asExpr() = mc.getAnArgument() and\n      mc.getEnclosingCallable().getDeclaringType().hasQualifiedName(\"io.vertx.ext.web.handler.impl\", \"StaticHandlerImpl\") and\n      (\n        mc.getMethod().hasName(\"sendFile\") or\n        mc.getMethod().hasName(\"getFile\") or\n        mc.getMethod().hasName(\"exists\") or\n        mc.getMethod().hasName(\"readDir\") or\n        mc.getMethod().hasName(\"sendFileWithRangeSupport\")\n      )\n    )\n    or\n    exists(ClassInstanceExpr cie |\n      sink.asExpr() = cie.getAnArgument() and\n      cie.getConstructor().getDeclaringType().hasQualifiedName(\"java.io\", \"File\") and\n      cie.getEnclosingCallable().getDeclaringType().hasQualifiedName(\"io.vertx.ext.web.handler.impl\", \"StaticHandlerImpl\")\n    )\n  }\n}\n\nmodule StaticHandlerPathFlow = TaintTracking::Global<StaticHandlerPathConfig>;\nimport StaticHandlerPathFlow::PathGraph\n\nfrom StaticHandlerPathFlow::PathNode source, StaticHandlerPathFlow::PathNode sink\nwhere StaticHandlerPathFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"Path from HTTP request flows to file system operation via $@.\", source.getNode(), \"HTTP path source\"\n",
+      "hypothesis": "Tracing HTTP request path data to file system operations specifically within StaticHandlerImpl",
+      "severity": "critical",
+      "cwe_ids": [],
+      "results_count": 0,
+      "results": []
+    },
+    {
+      "codeql_query_uuid": "20260326014058",
+      "codeql_raw_query": "/**\n * @name Utils cleanPath method analysis\n * @description Examine the cleanPath utility method and its callers\n * @kind problem\n * @problem.severity warning\n * @id java/utils-cleanpath-analysis\n * @tags security\n *       external/cwe/cwe-022\n */\n\nimport java\n\nfrom MethodCall mc\nwhere\n  mc.getMethod().hasName(\"cleanPath\") and\n  mc.getMethod().getDeclaringType().hasQualifiedName(\"io.vertx.ext.web.impl\", \"Utils\")\nselect mc, \"cleanPath() called in \" + mc.getEnclosingCallable().getName() + \" at \" + mc.getLocation().getStartLine()\n",
+      "hypothesis": "Finding where the cleanPath utility method is used to understand path normalization flow",
+      "severity": "high",
+      "cwe_ids": [],
+      "results_count": 0,
+      "results": []
+    },
+    {
+      "codeql_query_uuid": "20260326014252",
+      "codeql_raw_query": "/**\n * @name Path traversal in StaticHandlerImpl - cleanPath and normalization\n * @description Find path normalization and traversal check patterns in StaticHandlerImpl\n * @kind problem\n * @problem.severity error\n * @id java/static-handler-cleanpath\n * @tags security\n *       external/cwe/cwe-022\n */\n\nimport java\n\n// Find all string methods called on paths in StaticHandlerImpl\nfrom MethodCall mc, Class cls\nwhere\n  cls.hasQualifiedName(\"io.vertx.ext.web.handler.impl\", \"StaticHandlerImpl\") and\n  mc.getEnclosingCallable().getDeclaringType() = cls and\n  mc.getMethod().hasName([\"cleanPath\", \"normalize\", \"getCanonicalPath\", \"getAbsolutePath\", \"contains\", \"indexOf\", \"replace\", \"replaceAll\"])\nselect mc, \"Path operation '\" + mc.getMethod().getName() + \"' at line \" + mc.getLocation().getStartLine() + \" in method '\" + mc.getEnclosingCallable().getName() + \"'\"\n",
+      "hypothesis": "Finding path normalization and validation operations in StaticHandlerImpl",
+      "severity": "high",
+      "cwe_ids": [],
+      "results_count": 3,
+      "results": [
+        {
+          "ruleId": "java/static-handler-cleanpath",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/static-handler-cleanpath",
+            "index": 0
+          },
+          "message": {
+            "text": "Path operation 'contains' at line 115 in method 'writeCacheHeaders'"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "vertx-web/src/main/java/io/vertx/ext/web/handler/impl/StaticHandlerImpl.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 115,
+                  "startColumn": 29,
+                  "endColumn": 74
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "d5e3c9971395cb65:1",
+            "primaryLocationStartColumnFingerprint": "22"
+          }
+        },
+        {
+          "ruleId": "java/static-handler-cleanpath",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/static-handler-cleanpath",
+            "index": 0
+          },
+          "message": {
+            "text": "Path operation 'getAbsolutePath' at line 620 in method 'setRoot'"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "vertx-web/src/main/java/io/vertx/ext/web/handler/impl/StaticHandlerImpl.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 620,
+                  "startColumn": 32,
+                  "endColumn": 54
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "94d0962044bc710b:1",
+            "primaryLocationStartColumnFingerprint": "23"
+          }
+        },
+        {
+          "ruleId": "java/static-handler-cleanpath",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/static-handler-cleanpath",
+            "index": 0
+          },
+          "message": {
+            "text": "Path operation 'getAbsolutePath' at line 621 in method 'setRoot'"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "vertx-web/src/main/java/io/vertx/ext/web/handler/impl/StaticHandlerImpl.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 621,
+                  "startColumn": 75,
+                  "endColumn": 97
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "860e2b929fb9eb:1",
+            "primaryLocationStartColumnFingerprint": "64"
+          }
+        }
+      ]
+    },
+    {
+      "codeql_query_uuid": "20260326014351",
+      "codeql_raw_query": "/**\n * @name StaticHandler classpath resource path traversal via protocol injection\n * @description Examines how paths are constructed in StaticHandlerImpl for classpath resource loading\n * @kind problem\n * @problem.severity error\n * @id java/static-handler-classpath-protocol-injection\n * @tags security\n *       external/cwe/cwe-022\n */\n\nimport java\n\n// Find all method calls within StaticHandlerImpl\nfrom MethodCall mc, Class c\nwhere\n  c.hasQualifiedName(\"io.vertx.ext.web.handler.impl\", \"StaticHandlerImpl\") and\n  mc.getEnclosingCallable().getDeclaringType() = c and\n  (\n    mc.getMethod().hasName(\"getResourceAsStream\") or\n    mc.getMethod().hasName(\"getResource\") or\n    mc.getMethod().hasName(\"cleanPath\") or\n    mc.getMethod().hasName(\"decode\") or\n    mc.getMethod().hasName(\"normalize\") or\n    mc.getMethod().hasName(\"toRealPath\") or\n    mc.getMethod().hasName(\"getCanonicalPath\") or\n    mc.getMethod().hasName(\"getAbsolutePath\")\n  )\nselect mc, \"Method call '\" + mc.getMethod().getName() + \"' at line \" + mc.getLocation().getStartLine() + \" in method '\" + mc.getEnclosingCallable().getName() + \"'\"\n",
+      "hypothesis": "Looking at what path normalization methods are used in StaticHandlerImpl for classpath resource loading",
+      "severity": "high",
+      "cwe_ids": [],
+      "results_count": 2,
+      "results": [
+        {
+          "ruleId": "java/static-handler-classpath-protocol-injection",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/static-handler-classpath-protocol-injection",
+            "index": 0
+          },
+          "message": {
+            "text": "Method call 'getAbsolutePath' at line 620 in method 'setRoot'"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "vertx-web/src/main/java/io/vertx/ext/web/handler/impl/StaticHandlerImpl.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 620,
+                  "startColumn": 32,
+                  "endColumn": 54
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "94d0962044bc710b:1",
+            "primaryLocationStartColumnFingerprint": "23"
+          }
+        },
+        {
+          "ruleId": "java/static-handler-classpath-protocol-injection",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/static-handler-classpath-protocol-injection",
+            "index": 0
+          },
+          "message": {
+            "text": "Method call 'getAbsolutePath' at line 621 in method 'setRoot'"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "vertx-web/src/main/java/io/vertx/ext/web/handler/impl/StaticHandlerImpl.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 621,
+                  "startColumn": 75,
+                  "endColumn": 97
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "860e2b929fb9eb:1",
+            "primaryLocationStartColumnFingerprint": "64"
+          }
+        }
+      ]
+    },
+    {
+      "codeql_query_uuid": "20260326014427",
+      "codeql_raw_query": "/**\n * @name Path traversal in StaticHandlerImpl via normalized path\n * @description Traces HTTP request path to file system operations in StaticHandlerImpl\n * @kind path-problem\n * @problem.severity error\n * @id java/static-handler-path-traversal-precise\n * @tags security\n *       external/cwe/cwe-022\n */\n\nimport java\nimport semmle.code.java.dataflow.TaintTracking\nimport semmle.code.java.dataflow.FlowSources\n\n// Identifies the StaticHandlerImpl class\nclass StaticHandlerImpl extends RefType {\n  StaticHandlerImpl() {\n    this.hasQualifiedName(\"io.vertx.ext.web.handler.impl\", \"StaticHandlerImpl\")\n  }\n}\n\n// Source: HTTP request path/URI methods used in StaticHandlerImpl context\nclass StaticHandlerHTTPSource extends DataFlow::Node {\n  StaticHandlerHTTPSource() {\n    // normalizedPath() or path() calls in StaticHandlerImpl methods\n    exists(MethodCall mc |\n      (\n        mc.getMethod().hasName(\"normalizedPath\") or\n        mc.getMethod().hasName(\"path\") or\n        mc.getMethod().hasName(\"getPath\") or\n        mc.getMethod().hasName(\"normalisedPath\")\n      ) and\n      mc.getEnclosingCallable().getDeclaringType() instanceof StaticHandlerImpl and\n      this.asExpr() = mc\n    )\n  }\n}\n\n// Sink: Vertx sendFile or getFile operations\nclass FileServingSink extends DataFlow::Node {\n  FileServingSink() {\n    exists(MethodCall mc |\n      (\n        mc.getMethod().hasName(\"sendFile\") or\n        mc.getMethod().hasName(\"getFile\") or\n        mc.getMethod().hasName(\"exists\") or\n        mc.getMethod().hasName(\"isDirectory\")\n      ) and\n      mc.getEnclosingCallable().getDeclaringType() instanceof StaticHandlerImpl and\n      this.asExpr() = mc.getAnArgument()\n    )\n  }\n}\n\nmodule StaticHandlerConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    source instanceof StaticHandlerHTTPSource\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    sink instanceof FileServingSink\n  }\n}\n\nmodule StaticHandlerFlow = TaintTracking::Global<StaticHandlerConfig>;\nimport StaticHandlerFlow::PathGraph\n\nfrom StaticHandlerFlow::PathNode source, StaticHandlerFlow::PathNode sink\nwhere StaticHandlerFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"HTTP request path flows to file serving operation without adequate path traversal prevention.\"\n",
+      "hypothesis": "Path traversal in StaticHandlerImpl - tracing HTTP request path to file serving operations",
+      "severity": "critical",
+      "cwe_ids": [],
+      "results_count": 0,
+      "results": []
+    },
+    {
+      "codeql_query_uuid": "20260326014531",
+      "codeql_raw_query": "/**\n * @name Path traversal via StaticHandler cleanPath with URL scheme bypass\n * @description The StaticHandlerImpl uses cleanPath from Utils.java to normalize paths. \n *              If cleanPath handles protocol prefixes (file:, classpath:) differently than \n *              the containment check, it may enable path traversal.\n * @kind problem\n * @problem.severity error\n * @id java/static-handler-url-scheme-bypass\n * @tags security\n *       external/cwe/cwe-022\n */\n\nimport java\n\n// Find all methods in StaticHandlerImpl\nclass StaticHandlerImplMethod extends Method {\n  StaticHandlerImplMethod() {\n    this.getDeclaringType().hasQualifiedName(\"io.vertx.ext.web.handler.impl\", \"StaticHandlerImpl\")\n  }\n}\n\n// Find calls to cleanPath (the path normalization utility)\nclass CleanPathCall extends MethodCall {\n  CleanPathCall() {\n    this.getMethod().hasName(\"cleanPath\") and\n    this.getEnclosingCallable().(Method).getDeclaringType().hasQualifiedName(\"io.vertx.ext.web.handler.impl\", \"StaticHandlerImpl\")\n  }\n}\n\n// Find calls to sendFile or getFile in StaticHandlerImpl\nclass FileAccessCall extends MethodCall {\n  FileAccessCall() {\n    (this.getMethod().hasName(\"sendFile\") or \n     this.getMethod().hasName(\"getFile\") or\n     this.getMethod().hasName(\"sendFileRange\")) and\n    this.getEnclosingCallable().(Method).getDeclaringType().hasQualifiedName(\"io.vertx.ext.web.handler.impl\", \"StaticHandlerImpl\")\n  }\n}\n\n// Find calls to Utils.cleanPath \nclass UtilsCleanPathCall extends MethodCall {\n  UtilsCleanPathCall() {\n    this.getMethod().hasName(\"cleanPath\")\n  }\n}\n\nfrom UtilsCleanPathCall call\nselect call, \"Call to cleanPath in \" + call.getEnclosingCallable().getName() + \" at line \" + call.getLocation().getStartLine()\n",
+      "hypothesis": "Find where cleanPath is called to understand path normalization flow",
+      "severity": "high",
+      "cwe_ids": [],
+      "results_count": 0,
+      "results": []
+    },
+    {
+      "codeql_query_uuid": "20260326014557",
+      "codeql_raw_query": "/**\n * @name StaticHandlerImpl path normalization and classpath resource loading\n * @description Find paths where StaticHandlerImpl reads resources from classpath\n *              using getResourceAsStream or similar, which may allow reading \n *              WEB-INF/ or other sensitive directories\n * @kind problem\n * @problem.severity error\n * @id java/static-handler-classpath-resource\n * @tags security\n *       external/cwe/cwe-022\n */\n\nimport java\n\n// Find classpath resource loading calls\nfrom MethodCall mc\nwhere\n  (\n    mc.getMethod().hasName(\"getResourceAsStream\") or\n    mc.getMethod().hasName(\"getResource\") or\n    mc.getMethod().hasName(\"readResourceToBuffer\")\n  ) and\n  mc.getEnclosingCallable().(Method).getDeclaringType().hasQualifiedName(\"io.vertx.ext.web.handler.impl\", \"StaticHandlerImpl\")\nselect mc, \"Classpath resource loading call '\" + mc.getMethod().getName() + \"' in method '\" + mc.getEnclosingCallable().getName() + \"' at line \" + mc.getLocation().getStartLine()\n",
+      "hypothesis": "Find classpath resource loading in StaticHandlerImpl that may allow access to sensitive directories",
+      "severity": "high",
+      "cwe_ids": [],
+      "results_count": 0,
+      "results": []
+    },
+    {
+      "codeql_query_uuid": "20260326014631",
+      "codeql_raw_query": "\n/**\n * @name Path traversal via StaticHandler - startsWith check on unnormalized path\n * @description StaticHandlerImpl uses String.startsWith() for directory containment check\n *              in sendDirectory without prior canonical path resolution\n * @kind problem\n * @problem.severity error\n * @id java/static-handler-startswith-traversal\n * @tags security\n *       external/cwe/cwe-022\n */\n\nimport java\n\nfrom MethodCall mc\nwhere\n  mc.getMethod().hasName(\"startsWith\") and\n  mc.getEnclosingCallable().getDeclaringType().hasQualifiedName(\"io.vertx.ext.web.handler.impl\", \"StaticHandlerImpl\") and\n  mc.getEnclosingCallable().hasName(\"sendDirectory\")\nselect mc, \"StaticHandlerImpl.sendDirectory() uses String.startsWith() for path containment check at line \" + mc.getLocation().getStartLine() + \" - this may be bypassable without canonical path resolution first\"\n",
+      "hypothesis": "StaticHandlerImpl uses String.startsWith() for directory containment in sendDirectory without canonical path resolution",
+      "severity": "high",
+      "cwe_ids": [],
+      "results_count": 2,
+      "results": [
+        {
+          "ruleId": "java/static-handler-startswith-traversal",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/static-handler-startswith-traversal",
+            "index": 0
+          },
+          "message": {
+            "text": "StaticHandlerImpl.sendDirectory() uses String.startsWith() for path containment check at line 256 - this may be bypassable without canonical path resolution first"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "vertx-web/src/main/java/io/vertx/ext/web/handler/impl/StaticHandlerImpl.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 256,
+                  "startColumn": 33,
+                  "endColumn": 58
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "bf45f636cbf9e7a1:1",
+            "primaryLocationStartColumnFingerprint": "26"
+          }
+        },
+        {
+          "ruleId": "java/static-handler-startswith-traversal",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/static-handler-startswith-traversal",
+            "index": 0
+          },
+          "message": {
+            "text": "StaticHandlerImpl.sendDirectory() uses String.startsWith() for path containment check at line 258 - this may be bypassable without canonical path resolution first"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "vertx-web/src/main/java/io/vertx/ext/web/handler/impl/StaticHandlerImpl.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 258,
+                  "startColumn": 42,
+                  "endColumn": 67
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "42fa1e45766cf9b7:1",
+            "primaryLocationStartColumnFingerprint": "35"
+          }
+        }
+      ]
+    }
+  ]
+}

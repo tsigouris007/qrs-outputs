@@ -1,0 +1,4468 @@
+{
+  "session_id": "20260409122053",
+  "package_name": "zeroturnaround__zt-zip_1.12",
+  "package_path": "packages/zeroturnaround__zt-zip_1.12",
+  "database_path": "databases/zeroturnaround__zt-zip_1.12-db",
+  "model": "claude-sonnet-4-6",
+  "temperature": 1.0,
+  "max_tokens": 25000,
+  "iterations": 16,
+  "total_input_tokens": 353358,
+  "total_output_tokens": 13663,
+  "total_tokens": 367021,
+  "elapsed_time_seconds": 714.32,
+  "estimated_cost_usd": 1.265,
+  "summary": "## Security Analysis: `zeroturnaround__zt-zip_1.12` (org.zeroturnaround:zt-zip:1.12)\n\n### Summary\n\nThe analysis identified a **critical Zip Slip path traversal vulnerability (CWE-022)** affecting multiple extraction classes in zt-zip 1.12. The library provides no path canonicalization or directory containment checks when extracting ZIP archive entries to the filesystem, allowing a maliciously crafted ZIP archive to write files to arbitrary locations outside the intended destination directory.\n\n---\n\n### Vulnerability: Zip Slip \u2014 Unvalidated ZipEntry Name Used in File Construction\n\n**Severity:** Critical  \n**CWE:** CWE-022 (Path Traversal), CWE-023 (Relative Path Traversal)\n\n#### Root Cause\n\nWhen unpacking ZIP archives, the library calls `ZipEntry.getName()` to determine the output file path. This name is passed through `IdentityNameMapper` (which returns it unchanged) and directly used to construct a `java.io.File` object relative to the destination directory. **No canonical path check, no `getCanonicalPath()` comparison, no `startsWith()` containment guard, and no `..` sequence validation is performed anywhere in the extraction pipeline.**\n\nAn attacker can craft a ZIP archive containing entries with names like `../../etc/cron.d/malicious` or `../../../home/user/.ssh/authorized_keys`. When extracted, these entries will be written outside the intended destination directory.\n\n#### Affected Classes and Locations\n\n| Class | Method | File | Lines |\n|---|---|---|---|\n| `Unpacker` (inner) | `process()` | `ZipUtil.java` | 1150\u20131152 |\n| `BackslashUnpacker` (inner) | `process()` | `ZipUtil.java` | 1196, 1214, 1220, 1225 |\n| `Unwraper` (inner) | `process()` | `ZipUtil.java` | 1258\u20131260 |\n| `UnpackingCallback` (inner) | `process()` | `Zips.java` | 676\u2013683 |\n\n#### Taint Flow (confirmed by CodeQL inter-procedural analysis)\n\n```\nZipEntry.getName()  [ZipUtil.java:1150 / Zips.java:676]\n  \u2192 IdentityNameMapper.map(name)  [IdentityNameMapper.java:31-32]  (returns name unchanged)\n  \u2192 new File(destDir, mappedName)  [ZipUtil.java:1152 / 1214 / 1220 / 1225 / 1260 / Zips.java:683]\n```\n\nNo barriers (no `getCanonicalPath`, `toRealPath`, `normalize`, or `startsWith` guards) exist anywhere along the taint path in any of the affected methods.\n\n#### Impact\n\n- **Arbitrary file write**: An attacker who can supply a crafted ZIP file can write arbitrary content to any path writable by the process running zt-zip.\n- **Remote code execution**: On servers, writing to application classpath directories, cron directories, shell profile files, or SSH authorized_keys can lead to full system compromise.\n- **Affects all public unpack/extract APIs**: Both `ZipUtil.unpack()` (which uses `Unpacker`, `BackslashUnpacker`, `Unwraper`) and the `Zips` fluent API (which uses `UnpackingCallback`) are affected.\n\n#### Fix\n\nBefore writing an extracted entry to disk, the canonicalized output path must be verified to start with the canonicalized destination directory path:\n\n```java\nFile destFile = new File(destDir, entry.getName());\nString destDirCanonical = destDir.getCanonicalPath();\nString destFileCanonical = destFile.getCanonicalPath();\nif (!destFileCanonical.startsWith(destDirCanonical + File.separator)) {\n    throw new ZipException(\"Entry is outside of the target dir: \" + entry.getName());\n}\n```\n\nThis vulnerability is publicly known as [Zip Slip](https://github.com/snyk/zip-slip-vulnerability) and was disclosed by Snyk in 2018. It is fixed in zt-zip 1.13+.\n",
+  "package_classification": {
+    "type": [
+      "library"
+    ],
+    "layer": [
+      "data",
+      "application"
+    ]
+  },
+  "tool_calls": {
+    "get_package_profile_info": 1,
+    "execute_codeql_query": 12,
+    "validate_codeql_query": 0,
+    "fixup_codeql_query": 2,
+    "finalize_report": 1
+  },
+  "queries_executed": {
+    "critical": 9,
+    "high": 0,
+    "medium": 0,
+    "low": 0,
+    "total_executed": 14,
+    "total_with_results": 9,
+    "total_failed": 7
+  },
+  "query_findings": {
+    "critical": 30,
+    "high": 0,
+    "medium": 0,
+    "low": 0,
+    "total": 30
+  },
+  "findings": [
+    {
+      "codeql_query_uuid": "20260409122115",
+      "codeql_raw_query": "/**\n * @name Zip Slip - ZipEntry name flows to File constructor without path traversal check\n * @description ZipEntry.getName() result used directly in File construction, enabling path traversal (Zip Slip)\n * @kind path-problem\n * @problem.severity error\n * @id java/zip-slip-path-traversal\n * @tags security\n *       external/cwe/cwe-022\n */\n\nimport java\nimport semmle.code.java.dataflow.TaintTracking\nimport semmle.code.java.dataflow.DataFlow\n\nmodule ZipSlipConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    // ZipEntry.getName() calls\n    exists(MethodCall mc |\n      mc.getMethod().hasName(\"getName\") and\n      mc.getMethod().getDeclaringType().hasQualifiedName(\"java.util.zip\", \"ZipEntry\") and\n      source.asExpr() = mc\n    )\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    // File constructor\n    exists(ClassInstanceExpr ce |\n      ce.getConstructor().getDeclaringType().hasQualifiedName(\"java.io\", \"File\") and\n      sink.asExpr() = ce.getAnArgument()\n    )\n    or\n    // Paths.get() / Path.resolve()\n    exists(MethodCall mc |\n      (\n        (mc.getMethod().hasName(\"get\") and mc.getMethod().getDeclaringType().hasQualifiedName(\"java.nio.file\", \"Paths\")) or\n        (mc.getMethod().hasName(\"resolve\") and mc.getMethod().getDeclaringType().getASupertype*().hasQualifiedName(\"java.nio.file\", \"Path\"))\n      ) and\n      sink.asExpr() = mc.getAnArgument()\n    )\n  }\n}\n\nmodule ZipSlipFlow = TaintTracking::Global<ZipSlipConfig>;\nimport ZipSlipFlow::PathGraph\n\nfrom ZipSlipFlow::PathNode source, ZipSlipFlow::PathNode sink\nwhere ZipSlipFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"Zip Slip: ZipEntry name flows to file path construction at $@.\", sink.getNode(), \"this location\"\n",
+      "hypothesis": "ZipEntry.getName() result flows to File constructor without path traversal validation (Zip Slip vulnerability)",
+      "severity": "critical",
+      "cwe_ids": [],
+      "results_count": 8,
+      "results": [
+        {
+          "ruleId": "java/zip-slip-path-traversal",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/zip-slip-path-traversal",
+            "index": 0
+          },
+          "message": {
+            "text": "Zip Slip: ZipEntry name flows to file path construction at [this location](1)."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/zeroturnaround/zip/ZipUtil.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 1152,
+                  "startColumn": 41,
+                  "endColumn": 45
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "e874bbc06f9156e3:1",
+            "primaryLocationStartColumnFingerprint": "32"
+          },
+          "codeFlows": [
+            {
+              "threadFlows": [
+                {
+                  "locations": [
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/zeroturnaround/zip/ZipUtil.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 1150,
+                            "startColumn": 32,
+                            "endColumn": 50
+                          }
+                        },
+                        "message": {
+                          "text": "getName(...) : String"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/zeroturnaround/zip/IdentityNameMapper.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 1
+                          },
+                          "region": {
+                            "startLine": 31,
+                            "startColumn": 21,
+                            "endColumn": 32
+                          }
+                        },
+                        "message": {
+                          "text": "name : String"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/zeroturnaround/zip/IdentityNameMapper.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 1
+                          },
+                          "region": {
+                            "startLine": 32,
+                            "startColumn": 12,
+                            "endColumn": 16
+                          }
+                        },
+                        "message": {
+                          "text": "name : String"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/zeroturnaround/zip/ZipUtil.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 1150,
+                            "startColumn": 21,
+                            "endColumn": 51
+                          }
+                        },
+                        "message": {
+                          "text": "map(...) : String"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/zeroturnaround/zip/ZipUtil.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 1152,
+                            "startColumn": 41,
+                            "endColumn": 45
+                          }
+                        },
+                        "message": {
+                          "text": "name"
+                        }
+                      }
+                    }
+                  ]
+                }
+              ]
+            }
+          ],
+          "relatedLocations": [
+            {
+              "id": 1,
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/zeroturnaround/zip/ZipUtil.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 1152,
+                  "startColumn": 41,
+                  "endColumn": 45
+                }
+              },
+              "message": {
+                "text": "this location"
+              }
+            },
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/zeroturnaround/zip/ZipUtil.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 1150,
+                  "startColumn": 32,
+                  "endColumn": 50
+                }
+              }
+            }
+          ]
+        },
+        {
+          "ruleId": "java/zip-slip-path-traversal",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/zip-slip-path-traversal",
+            "index": 0
+          },
+          "message": {
+            "text": "Zip Slip: ZipEntry name flows to file path construction at [this location](1)."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/zeroturnaround/zip/ZipUtil.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 1220,
+                  "startColumn": 36,
+                  "endColumn": 51
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "c7588b935c1897f4:1",
+            "primaryLocationStartColumnFingerprint": "25"
+          },
+          "codeFlows": [
+            {
+              "threadFlows": [
+                {
+                  "locations": [
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/zeroturnaround/zip/ZipUtil.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 1196,
+                            "startColumn": 32,
+                            "endColumn": 50
+                          }
+                        },
+                        "message": {
+                          "text": "getName(...) : String"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/zeroturnaround/zip/IdentityNameMapper.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 1
+                          },
+                          "region": {
+                            "startLine": 31,
+                            "startColumn": 21,
+                            "endColumn": 32
+                          }
+                        },
+                        "message": {
+                          "text": "name : String"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/zeroturnaround/zip/IdentityNameMapper.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 1
+                          },
+                          "region": {
+                            "startLine": 32,
+                            "startColumn": 12,
+                            "endColumn": 16
+                          }
+                        },
+                        "message": {
+                          "text": "name : String"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/zeroturnaround/zip/ZipUtil.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 1196,
+                            "startColumn": 21,
+                            "endColumn": 51
+                          }
+                        },
+                        "message": {
+                          "text": "map(...) : String"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/zeroturnaround/zip/ZipUtil.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 1210,
+                            "startColumn": 27,
+                            "endColumn": 31
+                          }
+                        },
+                        "message": {
+                          "text": "name : String"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/zeroturnaround/zip/ZipUtil.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 1210,
+                            "startColumn": 27,
+                            "endColumn": 45
+                          }
+                        },
+                        "message": {
+                          "text": "split(...) : String[]"
+                        }
+                      },
+                      "taxa": [
+                        {
+                          "index": 0,
+                          "toolComponent": {
+                            "index": 1
+                          },
+                          "properties": {
+                            "CodeQL/DataflowRole": "step"
+                          }
+                        }
+                      ]
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/zeroturnaround/zip/ZipUtil.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 1220,
+                            "startColumn": 36,
+                            "endColumn": 51
+                          }
+                        },
+                        "message": {
+                          "text": "parentDirectory"
+                        }
+                      },
+                      "taxa": [
+                        {
+                          "id": "AdditionalTaintStep",
+                          "properties": {
+                            "CodeQL/DataflowRole": "step"
+                          }
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "threadFlows": [
+                {
+                  "locations": [
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/zeroturnaround/zip/ZipUtil.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 1196,
+                            "startColumn": 32,
+                            "endColumn": 50
+                          }
+                        },
+                        "message": {
+                          "text": "getName(...) : String"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/zeroturnaround/zip/IdentityNameMapper.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 1
+                          },
+                          "region": {
+                            "startLine": 31,
+                            "startColumn": 21,
+                            "endColumn": 32
+                          }
+                        },
+                        "message": {
+                          "text": "name : String"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/zeroturnaround/zip/IdentityNameMapper.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 1
+                          },
+                          "region": {
+                            "startLine": 32,
+                            "startColumn": 12,
+                            "endColumn": 16
+                          }
+                        },
+                        "message": {
+                          "text": "name : String"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/zeroturnaround/zip/ZipUtil.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 1196,
+                            "startColumn": 21,
+                            "endColumn": 51
+                          }
+                        },
+                        "message": {
+                          "text": "map(...) : String"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/zeroturnaround/zip/ZipUtil.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 1210,
+                            "startColumn": 27,
+                            "endColumn": 31
+                          }
+                        },
+                        "message": {
+                          "text": "name : String"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/zeroturnaround/zip/ZipUtil.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 1210,
+                            "startColumn": 27,
+                            "endColumn": 45
+                          }
+                        },
+                        "message": {
+                          "text": "split(...) : String[]"
+                        }
+                      },
+                      "taxa": [
+                        {
+                          "index": 0,
+                          "toolComponent": {
+                            "index": 1
+                          },
+                          "properties": {
+                            "CodeQL/DataflowRole": "step"
+                          }
+                        }
+                      ]
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/zeroturnaround/zip/ZipUtil.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 1214,
+                            "startColumn": 34,
+                            "endColumn": 49
+                          }
+                        },
+                        "message": {
+                          "text": "parentDirectory : File"
+                        }
+                      },
+                      "taxa": [
+                        {
+                          "id": "AdditionalTaintStep",
+                          "properties": {
+                            "CodeQL/DataflowRole": "step"
+                          }
+                        }
+                      ]
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/zeroturnaround/zip/ZipUtil.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 1214,
+                            "startColumn": 25,
+                            "endColumn": 59
+                          }
+                        },
+                        "message": {
+                          "text": "new File(...) : File"
+                        }
+                      },
+                      "taxa": [
+                        {
+                          "index": 1,
+                          "toolComponent": {
+                            "index": 1
+                          },
+                          "properties": {
+                            "CodeQL/DataflowRole": "step"
+                          }
+                        }
+                      ]
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/zeroturnaround/zip/ZipUtil.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 1220,
+                            "startColumn": 36,
+                            "endColumn": 51
+                          }
+                        },
+                        "message": {
+                          "text": "parentDirectory"
+                        }
+                      }
+                    }
+                  ]
+                }
+              ]
+            }
+          ],
+          "relatedLocations": [
+            {
+              "id": 1,
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/zeroturnaround/zip/ZipUtil.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 1220,
+                  "startColumn": 36,
+                  "endColumn": 51
+                }
+              },
+              "message": {
+                "text": "this location"
+              }
+            },
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/zeroturnaround/zip/ZipUtil.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 1196,
+                  "startColumn": 32,
+                  "endColumn": 50
+                }
+              }
+            }
+          ]
+        },
+        {
+          "ruleId": "java/zip-slip-path-traversal",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/zip-slip-path-traversal",
+            "index": 0
+          },
+          "message": {
+            "text": "Zip Slip: ZipEntry name flows to file path construction at [this location](1)."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/zeroturnaround/zip/ZipUtil.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 1220,
+                  "startColumn": 53,
+                  "endColumn": 74
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "c7588b935c1897f4:1",
+            "primaryLocationStartColumnFingerprint": "42"
+          },
+          "codeFlows": [
+            {
+              "threadFlows": [
+                {
+                  "locations": [
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/zeroturnaround/zip/ZipUtil.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 1196,
+                            "startColumn": 32,
+                            "endColumn": 50
+                          }
+                        },
+                        "message": {
+                          "text": "getName(...) : String"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/zeroturnaround/zip/IdentityNameMapper.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 1
+                          },
+                          "region": {
+                            "startLine": 31,
+                            "startColumn": 21,
+                            "endColumn": 32
+                          }
+                        },
+                        "message": {
+                          "text": "name : String"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/zeroturnaround/zip/IdentityNameMapper.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 1
+                          },
+                          "region": {
+                            "startLine": 32,
+                            "startColumn": 12,
+                            "endColumn": 16
+                          }
+                        },
+                        "message": {
+                          "text": "name : String"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/zeroturnaround/zip/ZipUtil.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 1196,
+                            "startColumn": 21,
+                            "endColumn": 51
+                          }
+                        },
+                        "message": {
+                          "text": "map(...) : String"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/zeroturnaround/zip/ZipUtil.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 1210,
+                            "startColumn": 27,
+                            "endColumn": 31
+                          }
+                        },
+                        "message": {
+                          "text": "name : String"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/zeroturnaround/zip/ZipUtil.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 1210,
+                            "startColumn": 27,
+                            "endColumn": 45
+                          }
+                        },
+                        "message": {
+                          "text": "split(...) : String[]"
+                        }
+                      },
+                      "taxa": [
+                        {
+                          "index": 0,
+                          "toolComponent": {
+                            "index": 1
+                          },
+                          "properties": {
+                            "CodeQL/DataflowRole": "step"
+                          }
+                        }
+                      ]
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/zeroturnaround/zip/ZipUtil.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 1220,
+                            "startColumn": 53,
+                            "endColumn": 74
+                          }
+                        },
+                        "message": {
+                          "text": "...[...]"
+                        }
+                      }
+                    }
+                  ]
+                }
+              ]
+            }
+          ],
+          "relatedLocations": [
+            {
+              "id": 1,
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/zeroturnaround/zip/ZipUtil.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 1220,
+                  "startColumn": 53,
+                  "endColumn": 74
+                }
+              },
+              "message": {
+                "text": "this location"
+              }
+            },
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/zeroturnaround/zip/ZipUtil.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 1196,
+                  "startColumn": 32,
+                  "endColumn": 50
+                }
+              }
+            }
+          ]
+        },
+        {
+          "ruleId": "java/zip-slip-path-traversal",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/zip-slip-path-traversal",
+            "index": 0
+          },
+          "message": {
+            "text": "Zip Slip: ZipEntry name flows to file path construction at [this location](1)."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/zeroturnaround/zip/ZipUtil.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 1214,
+                  "startColumn": 34,
+                  "endColumn": 49
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "12cec3b5ebb717c0:1",
+            "primaryLocationStartColumnFingerprint": "21"
+          },
+          "codeFlows": [
+            {
+              "threadFlows": [
+                {
+                  "locations": [
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/zeroturnaround/zip/ZipUtil.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 1196,
+                            "startColumn": 32,
+                            "endColumn": 50
+                          }
+                        },
+                        "message": {
+                          "text": "getName(...) : String"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/zeroturnaround/zip/IdentityNameMapper.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 1
+                          },
+                          "region": {
+                            "startLine": 31,
+                            "startColumn": 21,
+                            "endColumn": 32
+                          }
+                        },
+                        "message": {
+                          "text": "name : String"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/zeroturnaround/zip/IdentityNameMapper.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 1
+                          },
+                          "region": {
+                            "startLine": 32,
+                            "startColumn": 12,
+                            "endColumn": 16
+                          }
+                        },
+                        "message": {
+                          "text": "name : String"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/zeroturnaround/zip/ZipUtil.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 1196,
+                            "startColumn": 21,
+                            "endColumn": 51
+                          }
+                        },
+                        "message": {
+                          "text": "map(...) : String"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/zeroturnaround/zip/ZipUtil.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 1210,
+                            "startColumn": 27,
+                            "endColumn": 31
+                          }
+                        },
+                        "message": {
+                          "text": "name : String"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/zeroturnaround/zip/ZipUtil.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 1210,
+                            "startColumn": 27,
+                            "endColumn": 45
+                          }
+                        },
+                        "message": {
+                          "text": "split(...) : String[]"
+                        }
+                      },
+                      "taxa": [
+                        {
+                          "index": 0,
+                          "toolComponent": {
+                            "index": 1
+                          },
+                          "properties": {
+                            "CodeQL/DataflowRole": "step"
+                          }
+                        }
+                      ]
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/zeroturnaround/zip/ZipUtil.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 1214,
+                            "startColumn": 34,
+                            "endColumn": 49
+                          }
+                        },
+                        "message": {
+                          "text": "parentDirectory"
+                        }
+                      },
+                      "taxa": [
+                        {
+                          "id": "AdditionalTaintStep",
+                          "properties": {
+                            "CodeQL/DataflowRole": "step"
+                          }
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "threadFlows": [
+                {
+                  "locations": [
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/zeroturnaround/zip/ZipUtil.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 1196,
+                            "startColumn": 32,
+                            "endColumn": 50
+                          }
+                        },
+                        "message": {
+                          "text": "getName(...) : String"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/zeroturnaround/zip/IdentityNameMapper.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 1
+                          },
+                          "region": {
+                            "startLine": 31,
+                            "startColumn": 21,
+                            "endColumn": 32
+                          }
+                        },
+                        "message": {
+                          "text": "name : String"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/zeroturnaround/zip/IdentityNameMapper.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 1
+                          },
+                          "region": {
+                            "startLine": 32,
+                            "startColumn": 12,
+                            "endColumn": 16
+                          }
+                        },
+                        "message": {
+                          "text": "name : String"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/zeroturnaround/zip/ZipUtil.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 1196,
+                            "startColumn": 21,
+                            "endColumn": 51
+                          }
+                        },
+                        "message": {
+                          "text": "map(...) : String"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/zeroturnaround/zip/ZipUtil.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 1210,
+                            "startColumn": 27,
+                            "endColumn": 31
+                          }
+                        },
+                        "message": {
+                          "text": "name : String"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/zeroturnaround/zip/ZipUtil.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 1210,
+                            "startColumn": 27,
+                            "endColumn": 45
+                          }
+                        },
+                        "message": {
+                          "text": "split(...) : String[]"
+                        }
+                      },
+                      "taxa": [
+                        {
+                          "index": 0,
+                          "toolComponent": {
+                            "index": 1
+                          },
+                          "properties": {
+                            "CodeQL/DataflowRole": "step"
+                          }
+                        }
+                      ]
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/zeroturnaround/zip/ZipUtil.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 1214,
+                            "startColumn": 34,
+                            "endColumn": 49
+                          }
+                        },
+                        "message": {
+                          "text": "parentDirectory : File"
+                        }
+                      },
+                      "taxa": [
+                        {
+                          "id": "AdditionalTaintStep",
+                          "properties": {
+                            "CodeQL/DataflowRole": "step"
+                          }
+                        }
+                      ]
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/zeroturnaround/zip/ZipUtil.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 1214,
+                            "startColumn": 25,
+                            "endColumn": 59
+                          }
+                        },
+                        "message": {
+                          "text": "new File(...) : File"
+                        }
+                      },
+                      "taxa": [
+                        {
+                          "index": 1,
+                          "toolComponent": {
+                            "index": 1
+                          },
+                          "properties": {
+                            "CodeQL/DataflowRole": "step"
+                          }
+                        }
+                      ]
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/zeroturnaround/zip/ZipUtil.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 1214,
+                            "startColumn": 34,
+                            "endColumn": 49
+                          }
+                        },
+                        "message": {
+                          "text": "parentDirectory"
+                        }
+                      }
+                    }
+                  ]
+                }
+              ]
+            }
+          ],
+          "relatedLocations": [
+            {
+              "id": 1,
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/zeroturnaround/zip/ZipUtil.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 1214,
+                  "startColumn": 34,
+                  "endColumn": 49
+                }
+              },
+              "message": {
+                "text": "this location"
+              }
+            },
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/zeroturnaround/zip/ZipUtil.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 1196,
+                  "startColumn": 32,
+                  "endColumn": 50
+                }
+              }
+            }
+          ]
+        },
+        {
+          "ruleId": "java/zip-slip-path-traversal",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/zip-slip-path-traversal",
+            "index": 0
+          },
+          "message": {
+            "text": "Zip Slip: ZipEntry name flows to file path construction at [this location](1)."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/zeroturnaround/zip/ZipUtil.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 1214,
+                  "startColumn": 51,
+                  "endColumn": 58
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "12cec3b5ebb717c0:1",
+            "primaryLocationStartColumnFingerprint": "38"
+          },
+          "codeFlows": [
+            {
+              "threadFlows": [
+                {
+                  "locations": [
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/zeroturnaround/zip/ZipUtil.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 1196,
+                            "startColumn": 32,
+                            "endColumn": 50
+                          }
+                        },
+                        "message": {
+                          "text": "getName(...) : String"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/zeroturnaround/zip/IdentityNameMapper.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 1
+                          },
+                          "region": {
+                            "startLine": 31,
+                            "startColumn": 21,
+                            "endColumn": 32
+                          }
+                        },
+                        "message": {
+                          "text": "name : String"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/zeroturnaround/zip/IdentityNameMapper.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 1
+                          },
+                          "region": {
+                            "startLine": 32,
+                            "startColumn": 12,
+                            "endColumn": 16
+                          }
+                        },
+                        "message": {
+                          "text": "name : String"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/zeroturnaround/zip/ZipUtil.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 1196,
+                            "startColumn": 21,
+                            "endColumn": 51
+                          }
+                        },
+                        "message": {
+                          "text": "map(...) : String"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/zeroturnaround/zip/ZipUtil.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 1210,
+                            "startColumn": 27,
+                            "endColumn": 31
+                          }
+                        },
+                        "message": {
+                          "text": "name : String"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/zeroturnaround/zip/ZipUtil.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 1210,
+                            "startColumn": 27,
+                            "endColumn": 45
+                          }
+                        },
+                        "message": {
+                          "text": "split(...) : String[]"
+                        }
+                      },
+                      "taxa": [
+                        {
+                          "index": 0,
+                          "toolComponent": {
+                            "index": 1
+                          },
+                          "properties": {
+                            "CodeQL/DataflowRole": "step"
+                          }
+                        }
+                      ]
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/zeroturnaround/zip/ZipUtil.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 1214,
+                            "startColumn": 51,
+                            "endColumn": 58
+                          }
+                        },
+                        "message": {
+                          "text": "...[...]"
+                        }
+                      }
+                    }
+                  ]
+                }
+              ]
+            }
+          ],
+          "relatedLocations": [
+            {
+              "id": 1,
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/zeroturnaround/zip/ZipUtil.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 1214,
+                  "startColumn": 51,
+                  "endColumn": 58
+                }
+              },
+              "message": {
+                "text": "this location"
+              }
+            },
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/zeroturnaround/zip/ZipUtil.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 1196,
+                  "startColumn": 32,
+                  "endColumn": 50
+                }
+              }
+            }
+          ]
+        },
+        {
+          "ruleId": "java/zip-slip-path-traversal",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/zip-slip-path-traversal",
+            "index": 0
+          },
+          "message": {
+            "text": "Zip Slip: ZipEntry name flows to file path construction at [this location](1)."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/zeroturnaround/zip/ZipUtil.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 1225,
+                  "startColumn": 47,
+                  "endColumn": 51
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "6ed8e92f37742e15:1",
+            "primaryLocationStartColumnFingerprint": "36"
+          },
+          "codeFlows": [
+            {
+              "threadFlows": [
+                {
+                  "locations": [
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/zeroturnaround/zip/ZipUtil.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 1196,
+                            "startColumn": 32,
+                            "endColumn": 50
+                          }
+                        },
+                        "message": {
+                          "text": "getName(...) : String"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/zeroturnaround/zip/IdentityNameMapper.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 1
+                          },
+                          "region": {
+                            "startLine": 31,
+                            "startColumn": 21,
+                            "endColumn": 32
+                          }
+                        },
+                        "message": {
+                          "text": "name : String"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/zeroturnaround/zip/IdentityNameMapper.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 1
+                          },
+                          "region": {
+                            "startLine": 32,
+                            "startColumn": 12,
+                            "endColumn": 16
+                          }
+                        },
+                        "message": {
+                          "text": "name : String"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/zeroturnaround/zip/ZipUtil.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 1196,
+                            "startColumn": 21,
+                            "endColumn": 51
+                          }
+                        },
+                        "message": {
+                          "text": "map(...) : String"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/zeroturnaround/zip/ZipUtil.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 1225,
+                            "startColumn": 47,
+                            "endColumn": 51
+                          }
+                        },
+                        "message": {
+                          "text": "name"
+                        }
+                      }
+                    }
+                  ]
+                }
+              ]
+            }
+          ],
+          "relatedLocations": [
+            {
+              "id": 1,
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/zeroturnaround/zip/ZipUtil.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 1225,
+                  "startColumn": 47,
+                  "endColumn": 51
+                }
+              },
+              "message": {
+                "text": "this location"
+              }
+            },
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/zeroturnaround/zip/ZipUtil.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 1196,
+                  "startColumn": 32,
+                  "endColumn": 50
+                }
+              }
+            }
+          ]
+        },
+        {
+          "ruleId": "java/zip-slip-path-traversal",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/zip-slip-path-traversal",
+            "index": 0
+          },
+          "message": {
+            "text": "Zip Slip: ZipEntry name flows to file path construction at [this location](1)."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/zeroturnaround/zip/ZipUtil.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 1260,
+                  "startColumn": 41,
+                  "endColumn": 45
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "e874bbc06f9156e3:2",
+            "primaryLocationStartColumnFingerprint": "32"
+          },
+          "codeFlows": [
+            {
+              "threadFlows": [
+                {
+                  "locations": [
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/zeroturnaround/zip/ZipUtil.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 1258,
+                            "startColumn": 54,
+                            "endColumn": 72
+                          }
+                        },
+                        "message": {
+                          "text": "getName(...) : String"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/zeroturnaround/zip/ZipUtil.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 1276,
+                            "startColumn": 49,
+                            "endColumn": 60
+                          }
+                        },
+                        "message": {
+                          "text": "name : String"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/zeroturnaround/zip/ZipUtil.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 1277,
+                            "startColumn": 14,
+                            "endColumn": 18
+                          }
+                        },
+                        "message": {
+                          "text": "name : String"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/zeroturnaround/zip/ZipUtil.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 1277,
+                            "startColumn": 14,
+                            "endColumn": 43
+                          }
+                        },
+                        "message": {
+                          "text": "substring(...) : String"
+                        }
+                      },
+                      "taxa": [
+                        {
+                          "index": 2,
+                          "toolComponent": {
+                            "index": 1
+                          },
+                          "properties": {
+                            "CodeQL/DataflowRole": "step"
+                          }
+                        }
+                      ]
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/zeroturnaround/zip/ZipUtil.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 1258,
+                            "startColumn": 32,
+                            "endColumn": 73
+                          }
+                        },
+                        "message": {
+                          "text": "getUnrootedName(...) : String"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/zeroturnaround/zip/IdentityNameMapper.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 1
+                          },
+                          "region": {
+                            "startLine": 31,
+                            "startColumn": 21,
+                            "endColumn": 32
+                          }
+                        },
+                        "message": {
+                          "text": "name : String"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/zeroturnaround/zip/IdentityNameMapper.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 1
+                          },
+                          "region": {
+                            "startLine": 32,
+                            "startColumn": 12,
+                            "endColumn": 16
+                          }
+                        },
+                        "message": {
+                          "text": "name : String"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/zeroturnaround/zip/ZipUtil.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 1258,
+                            "startColumn": 21,
+                            "endColumn": 74
+                          }
+                        },
+                        "message": {
+                          "text": "map(...) : String"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/zeroturnaround/zip/ZipUtil.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 1260,
+                            "startColumn": 41,
+                            "endColumn": 45
+                          }
+                        },
+                        "message": {
+                          "text": "name"
+                        }
+                      }
+                    }
+                  ]
+                }
+              ]
+            }
+          ],
+          "relatedLocations": [
+            {
+              "id": 1,
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/zeroturnaround/zip/ZipUtil.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 1260,
+                  "startColumn": 41,
+                  "endColumn": 45
+                }
+              },
+              "message": {
+                "text": "this location"
+              }
+            },
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/zeroturnaround/zip/ZipUtil.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 1258,
+                  "startColumn": 54,
+                  "endColumn": 72
+                }
+              }
+            }
+          ]
+        },
+        {
+          "ruleId": "java/zip-slip-path-traversal",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/zip-slip-path-traversal",
+            "index": 0
+          },
+          "message": {
+            "text": "Zip Slip: ZipEntry name flows to file path construction at [this location](1)."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/zeroturnaround/zip/Zips.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 2
+                },
+                "region": {
+                  "startLine": 683,
+                  "startColumn": 41,
+                  "endColumn": 50
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "29f4adffdf98fd72:1",
+            "primaryLocationStartColumnFingerprint": "34"
+          },
+          "codeFlows": [
+            {
+              "threadFlows": [
+                {
+                  "locations": [
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/zeroturnaround/zip/Zips.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 2
+                          },
+                          "region": {
+                            "startLine": 676,
+                            "startColumn": 26,
+                            "endColumn": 44
+                          }
+                        },
+                        "message": {
+                          "text": "getName(...) : String"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/zeroturnaround/zip/Zips.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 2
+                          },
+                          "region": {
+                            "startLine": 683,
+                            "startColumn": 41,
+                            "endColumn": 50
+                          }
+                        },
+                        "message": {
+                          "text": "entryName"
+                        }
+                      }
+                    }
+                  ]
+                }
+              ]
+            }
+          ],
+          "relatedLocations": [
+            {
+              "id": 1,
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/zeroturnaround/zip/Zips.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 2
+                },
+                "region": {
+                  "startLine": 683,
+                  "startColumn": 41,
+                  "endColumn": 50
+                }
+              },
+              "message": {
+                "text": "this location"
+              }
+            },
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/zeroturnaround/zip/Zips.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 2
+                },
+                "region": {
+                  "startLine": 676,
+                  "startColumn": 26,
+                  "endColumn": 44
+                }
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "codeql_query_uuid": "20260409122217",
+      "codeql_raw_query": "/**\n * @name Zip Slip - File construction from ZipEntry name without canonical path check\n * @description ZipEntry name used to construct File without verifying the canonical path stays within destination directory\n * @kind problem\n * @problem.severity error\n * @id java/zip-slip-no-canonical-check\n * @tags security\n *       external/cwe/cwe-022\n */\n\nimport java\nimport semmle.code.java.dataflow.TaintTracking\nimport semmle.code.java.dataflow.DataFlow\n\n// Find File constructions derived from ZipEntry.getName() in extraction methods\nfrom MethodCall getName, ClassInstanceExpr fileExpr, Method enclosing\nwhere\n  // Source: ZipEntry.getName()\n  getName.getMethod().hasName(\"getName\") and\n  getName.getMethod().getDeclaringType().hasQualifiedName(\"java.util.zip\", \"ZipEntry\") and\n  // Sink: File constructor argument\n  fileExpr.getConstructor().getDeclaringType().hasQualifiedName(\"java.io\", \"File\") and\n  // The File constructor is in the same method as the getName call or a called helper\n  enclosing = fileExpr.getEnclosingCallable() and\n  // Check if getCanonicalPath is NOT called nearby (no check)\n  not exists(MethodCall canon |\n    canon.getMethod().hasName(\"getCanonicalPath\") and\n    canon.getEnclosingCallable() = enclosing\n  ) and\n  not exists(MethodCall canon |\n    canon.getMethod().hasName(\"toRealPath\") and\n    canon.getEnclosingCallable() = enclosing\n  ) and\n  // Taint flows from getName to the file constructor arg\n  TaintTracking::localTaint(DataFlow::exprNode(getName), DataFlow::exprNode(fileExpr.getAnArgument()))\nselect fileExpr, \"File constructed from ZipEntry name in method '\" + enclosing.getName() + \"' without canonical path verification - potential Zip Slip.\"\n",
+      "hypothesis": "File constructed from ZipEntry.getName() without getCanonicalPath() containment check in the same method",
+      "severity": "critical",
+      "cwe_ids": [],
+      "results_count": 1,
+      "results": [
+        {
+          "ruleId": "java/zip-slip-no-canonical-check",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/zip-slip-no-canonical-check",
+            "index": 0
+          },
+          "message": {
+            "text": "File constructed from ZipEntry name in method 'process' without canonical path verification - potential Zip Slip."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/zeroturnaround/zip/Zips.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 683,
+                  "startColumn": 19,
+                  "endColumn": 51
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "29f4adffdf98fd72:1",
+            "primaryLocationStartColumnFingerprint": "12"
+          }
+        }
+      ]
+    },
+    {
+      "codeql_query_uuid": "20260409122438",
+      "codeql_raw_query": "/**\n * @name ZipUtil extraction methods - canonical path check analysis\n * @description Find all File constructions from ZipEntry names in ZipUtil, showing whether canonical path check exists\n * @kind problem\n * @problem.severity error\n * @id java/ziputil-extraction-analysis\n * @tags security\n *       external/cwe/cwe-022\n */\n\nimport java\nimport semmle.code.java.dataflow.TaintTracking\nimport semmle.code.java.dataflow.DataFlow\n\npredicate hasCanonicalPathCheck(Callable enclosing) {\n  exists(MethodCall canon |\n    canon.getMethod().hasName(\"getCanonicalPath\") and\n    canon.getEnclosingCallable() = enclosing\n  )\n}\n\nstring canonicalCheckResult(Callable enclosing) {\n  if hasCanonicalPathCheck(enclosing) then result = \"true\" else result = \"false\"\n}\n\nfrom MethodCall getName, ClassInstanceExpr fileExpr, Callable enclosing\nwhere\n  // Source: ZipEntry.getName()\n  getName.getMethod().hasName(\"getName\") and\n  getName.getMethod().getDeclaringType().hasQualifiedName(\"java.util.zip\", \"ZipEntry\") and\n  // Sink: File constructor argument\n  fileExpr.getConstructor().getDeclaringType().hasQualifiedName(\"java.io\", \"File\") and\n  enclosing = fileExpr.getEnclosingCallable() and\n  enclosing.getDeclaringType().hasQualifiedName(\"org.zeroturnaround.zip\", \"ZipUtil\") and\n  // Taint flows from getName to the file constructor arg\n  TaintTracking::localTaint(DataFlow::exprNode(getName), DataFlow::exprNode(fileExpr.getAnArgument()))\nselect fileExpr,\n  \"ZipUtil.\" + enclosing.getName() + \"() constructs File from ZipEntry name. CanonicalPath check in method: \" +\n  canonicalCheckResult(enclosing)\n",
+      "hypothesis": "Find all ZipUtil extraction methods that construct File from ZipEntry names, and check if canonical path validation exists",
+      "severity": "critical",
+      "cwe_ids": [],
+      "results_count": 0,
+      "results": []
+    },
+    {
+      "codeql_query_uuid": "20260409122532",
+      "codeql_raw_query": "/**\n * @name ZipEntry name to File construction in any zt-zip class\n * @description Find all places where ZipEntry.getName() derived values reach File constructors across all zt-zip classes\n * @kind problem\n * @problem.severity error\n * @id java/ztzip-zipentry-to-file\n * @tags security\n *       external/cwe/cwe-022\n */\n\nimport java\nimport semmle.code.java.dataflow.TaintTracking\nimport semmle.code.java.dataflow.DataFlow\n\n// Find File constructions in unpack/extract methods that take ZipEntry as parameter\nfrom Callable enclosing, ClassInstanceExpr fileExpr, Parameter zipEntryParam\nwhere\n  // Method has a ZipEntry parameter\n  zipEntryParam.getCallable() = enclosing and\n  zipEntryParam.getType().(RefType).getASupertype*().hasQualifiedName(\"java.util.zip\", \"ZipEntry\") and\n  // Constructs a File\n  fileExpr.getConstructor().getDeclaringType().hasQualifiedName(\"java.io\", \"File\") and\n  fileExpr.getEnclosingCallable() = enclosing and\n  // In zt-zip source\n  enclosing.getDeclaringType().getPackage().getName().matches(\"org.zeroturnaround.zip%\") and\n  // Taint from ZipEntry parameter to File constructor\n  TaintTracking::localTaint(DataFlow::parameterNode(zipEntryParam), DataFlow::exprNode(fileExpr.getAnArgument()))\nselect fileExpr, enclosing.getDeclaringType().getName() + \".\" + enclosing.getName() + \n  \"() at line \" + fileExpr.getLocation().getStartLine() + \n  \" constructs File from ZipEntry parameter '\" + zipEntryParam.getName() + \"'\"\n",
+      "hypothesis": "ZipEntry parameter taint flows to File construction in zt-zip extraction helper methods",
+      "severity": "critical",
+      "cwe_ids": [],
+      "results_count": 1,
+      "results": [
+        {
+          "ruleId": "java/ztzip-zipentry-to-file",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/ztzip-zipentry-to-file",
+            "index": 0
+          },
+          "message": {
+            "text": "UnpackingCallback.process() at line 683 constructs File from ZipEntry parameter 'zipEntry'"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/zeroturnaround/zip/Zips.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 683,
+                  "startColumn": 19,
+                  "endColumn": 51
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "29f4adffdf98fd72:1",
+            "primaryLocationStartColumnFingerprint": "12"
+          }
+        }
+      ]
+    },
+    {
+      "codeql_query_uuid": "20260409122626",
+      "codeql_raw_query": "/**\n * @name ZipEntry name flows to File without any containment check\n * @description Find extraction code where ZipEntry name reaches File construction with no startsWith or canonical path guard\n * @kind problem\n * @problem.severity error\n * @id java/zip-no-containment-check\n * @tags security\n *       external/cwe/cwe-022\n */\n\nimport java\nimport semmle.code.java.dataflow.TaintTracking\nimport semmle.code.java.dataflow.DataFlow\n\n// Check if a method has any path containment guard (startsWith, getCanonicalPath, toRealPath, normalize)\npredicate hasContainmentCheck(Callable c) {\n  exists(MethodCall mc | mc.getEnclosingCallable() = c |\n    mc.getMethod().hasName(\"getCanonicalPath\") or\n    mc.getMethod().hasName(\"toRealPath\") or\n    mc.getMethod().hasName(\"normalize\") or\n    mc.getMethod().hasName(\"startsWith\")\n  )\n}\n\nfrom MethodCall getName, ClassInstanceExpr fileExpr, Callable enclosing\nwhere\n  // ZipEntry.getName() source\n  getName.getMethod().hasName(\"getName\") and\n  getName.getMethod().getDeclaringType().getASupertype*().hasQualifiedName(\"java.util.zip\", \"ZipEntry\") and\n  // File constructor sink\n  fileExpr.getConstructor().getDeclaringType().hasQualifiedName(\"java.io\", \"File\") and\n  enclosing = fileExpr.getEnclosingCallable() and\n  // In zt-zip source\n  enclosing.getDeclaringType().getPackage().getName().matches(\"org.zeroturnaround.zip%\") and\n  // No containment check in the enclosing method\n  not hasContainmentCheck(enclosing) and\n  // Local taint flow\n  TaintTracking::localTaint(DataFlow::exprNode(getName), DataFlow::exprNode(fileExpr.getAnArgument()))\nselect fileExpr, enclosing.getDeclaringType().getName() + \".\" + enclosing.getName() +\n  \"() constructs File from ZipEntry name with NO containment check (no startsWith/getCanonicalPath/toRealPath)\"\n",
+      "hypothesis": "File constructed from ZipEntry name with no containment check (no startsWith, getCanonicalPath, or toRealPath) in the method",
+      "severity": "critical",
+      "cwe_ids": [],
+      "results_count": 1,
+      "results": [
+        {
+          "ruleId": "java/zip-no-containment-check",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/zip-no-containment-check",
+            "index": 0
+          },
+          "message": {
+            "text": "UnpackingCallback.process() constructs File from ZipEntry name with NO containment check (no startsWith/getCanonicalPath/toRealPath)"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/zeroturnaround/zip/Zips.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 683,
+                  "startColumn": 19,
+                  "endColumn": 51
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "29f4adffdf98fd72:1",
+            "primaryLocationStartColumnFingerprint": "12"
+          }
+        }
+      ]
+    },
+    {
+      "codeql_query_uuid": "20260409122723",
+      "codeql_raw_query": "/**\n * @name ZipUtil unpack methods - identify all File construction from ZipEntry with or without checks\n * @description Enumerate all methods in ZipUtil that construct Files from ZipEntry names, noting what checks exist\n * @kind problem\n * @problem.severity error\n * @id java/ziputil-unpack-file-construction\n * @tags security\n *       external/cwe/cwe-022\n */\n\nimport java\nimport semmle.code.java.dataflow.TaintTracking\nimport semmle.code.java.dataflow.DataFlow\n\npredicate hasCanonicalCheck(Callable c) {\n  exists(MethodCall mc | mc.getEnclosingCallable() = c |\n    mc.getMethod().hasName(\"getCanonicalPath\") or\n    mc.getMethod().hasName(\"toRealPath\")\n  )\n}\n\npredicate hasStartsWithCheck(Callable c) {\n  exists(MethodCall mc | mc.getEnclosingCallable() = c |\n    mc.getMethod().hasName(\"startsWith\")\n  )\n}\n\nstring checkSummary(Callable c) {\n  if hasCanonicalCheck(c) and hasStartsWithCheck(c)\n  then result = \"HAS_CANONICAL+STARTSWITH\"\n  else if hasCanonicalCheck(c)\n  then result = \"HAS_CANONICAL_ONLY\"\n  else if hasStartsWithCheck(c)\n  then result = \"HAS_STARTSWITH_ONLY\"\n  else result = \"NO_CHECK\"\n}\n\nfrom ClassInstanceExpr fileExpr, Callable enclosing, MethodCall getName\nwhere\n  getName.getMethod().hasName(\"getName\") and\n  getName.getMethod().getDeclaringType().getASupertype*().hasQualifiedName(\"java.util.zip\", \"ZipEntry\") and\n  fileExpr.getConstructor().getDeclaringType().hasQualifiedName(\"java.io\", \"File\") and\n  enclosing = fileExpr.getEnclosingCallable() and\n  enclosing.getDeclaringType().getPackage().getName().matches(\"org.zeroturnaround.zip%\") and\n  TaintTracking::localTaint(DataFlow::exprNode(getName), DataFlow::exprNode(fileExpr.getAnArgument()))\nselect fileExpr,\n  enclosing.getDeclaringType().getName() + \".\" + enclosing.getName() +\n  \"() line \" + fileExpr.getLocation().getStartLine() +\n  \" check=\" + checkSummary(enclosing)\n",
+      "hypothesis": "Understand what path validation checks exist in each extraction method that constructs Files from ZipEntry names",
+      "severity": "critical",
+      "cwe_ids": [],
+      "results_count": 1,
+      "results": [
+        {
+          "ruleId": "java/ziputil-unpack-file-construction",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/ziputil-unpack-file-construction",
+            "index": 0
+          },
+          "message": {
+            "text": "UnpackingCallback.process() line 683 check=NO_CHECK"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/zeroturnaround/zip/Zips.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 683,
+                  "startColumn": 19,
+                  "endColumn": 51
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "29f4adffdf98fd72:1",
+            "primaryLocationStartColumnFingerprint": "12"
+          }
+        }
+      ]
+    },
+    {
+      "codeql_query_uuid": "20260409122947",
+      "codeql_raw_query": "/**\n * @name ZipUtil unpack methods containment check inventory\n * @description Find unpack/extract methods in ZipUtil and whether they call getCanonicalPath or startsWith\n * @kind problem\n * @problem.severity warning\n * @id java/ziputil-unpack-method-checks\n * @tags security\n *       external/cwe/cwe-022\n */\n\nimport java\n\nstring hasCanonicalStr(Method m) {\n  if exists(MethodCall cc |\n    cc.getEnclosingCallable() = m and\n    cc.getMethod().hasName(\"getCanonicalPath\")\n  )\n  then result = \"true\"\n  else result = \"false\"\n}\n\nstring hasStartsWithStr(Method m) {\n  if exists(MethodCall sw |\n    sw.getEnclosingCallable() = m and\n    sw.getMethod().hasName(\"startsWith\")\n  )\n  then result = \"true\"\n  else result = \"false\"\n}\n\nstring hasNormalizeStr(Method m) {\n  if exists(MethodCall nn |\n    nn.getEnclosingCallable() = m and\n    nn.getMethod().hasName(\"normalize\")\n  )\n  then result = \"true\"\n  else result = \"false\"\n}\n\nfrom Method m, ClassInstanceExpr fileConstruct\nwhere\n  m.getDeclaringType().hasQualifiedName(\"org.zeroturnaround.zip\", \"ZipUtil\") and\n  fileConstruct.getConstructor().getDeclaringType().hasQualifiedName(\"java.io\", \"File\") and\n  fileConstruct.getEnclosingCallable() = m and\n  exists(MethodCall mc |\n    mc.getEnclosingCallable() = m and\n    mc.getMethod().hasName(\"getName\") and\n    mc.getMethod().getDeclaringType().getASupertype*().hasQualifiedName(\"java.util.zip\", \"ZipEntry\")\n  )\nselect fileConstruct,\n  \"ZipUtil.\" + m.getName() + \"() line \" + fileConstruct.getLocation().getStartLine().toString() +\n  \" | hasCanonical=\" + hasCanonicalStr(m) +\n  \" | hasStartsWith=\" + hasStartsWithStr(m) +\n  \" | hasNormalize=\" + hasNormalizeStr(m)\n",
+      "hypothesis": "Inventory of ZipUtil unpack methods and their path validation patterns",
+      "severity": "critical",
+      "cwe_ids": [],
+      "results_count": 0,
+      "results": []
+    },
+    {
+      "codeql_query_uuid": "20260409123047",
+      "codeql_raw_query": "/**\n * @name Zips and ZipUtil - all File construction from ZipEntry name without canonical check\n * @description Find extraction methods that build File from ZipEntry name without canonical path guard\n * @kind problem\n * @problem.severity error\n * @id java/ztzip-unpack-no-canonical\n * @tags security\n *       external/cwe/cwe-022\n */\n\nimport java\n\nfrom Method m, ClassInstanceExpr fileExpr\nwhere\n  m.getDeclaringType().getPackage().getName().matches(\"org.zeroturnaround.zip%\") and\n  fileExpr.getConstructor().getDeclaringType().hasQualifiedName(\"java.io\", \"File\") and\n  fileExpr.getEnclosingCallable() = m and\n  // Method interacts with ZipEntry getName\n  exists(MethodCall gn |\n    gn.getEnclosingCallable() = m and\n    gn.getMethod().hasName(\"getName\")\n  ) and\n  // No canonical path check in this method\n  not exists(MethodCall cc |\n    cc.getEnclosingCallable() = m and\n    (cc.getMethod().hasName(\"getCanonicalPath\") or cc.getMethod().hasName(\"toRealPath\"))\n  )\nselect fileExpr, m.getDeclaringType().getName() + \".\" + m.getName() + \"() constructs File from potential ZipEntry name without canonical path check\"\n",
+      "hypothesis": "Extraction methods in zt-zip that construct File objects using ZipEntry names without canonical path validation",
+      "severity": "critical",
+      "cwe_ids": [],
+      "results_count": 10,
+      "results": [
+        {
+          "ruleId": "java/ztzip-unpack-no-canonical",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/ztzip-unpack-no-canonical",
+            "index": 0
+          },
+          "message": {
+            "text": "Unpacker.process() constructs File from potential ZipEntry name without canonical path check"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/zeroturnaround/zip/ZipUtil.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 1152,
+                  "startColumn": 21,
+                  "endColumn": 46
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "e874bbc06f9156e3:1",
+            "primaryLocationStartColumnFingerprint": "12"
+          }
+        },
+        {
+          "ruleId": "java/ztzip-unpack-no-canonical",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/ztzip-unpack-no-canonical",
+            "index": 0
+          },
+          "message": {
+            "text": "BackslashUnpacker.process() constructs File from potential ZipEntry name without canonical path check"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/zeroturnaround/zip/ZipUtil.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 1220,
+                  "startColumn": 27,
+                  "endColumn": 75
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "c7588b935c1897f4:1",
+            "primaryLocationStartColumnFingerprint": "16"
+          }
+        },
+        {
+          "ruleId": "java/ztzip-unpack-no-canonical",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/ztzip-unpack-no-canonical",
+            "index": 0
+          },
+          "message": {
+            "text": "BackslashUnpacker.process() constructs File from potential ZipEntry name without canonical path check"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/zeroturnaround/zip/ZipUtil.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 1214,
+                  "startColumn": 25,
+                  "endColumn": 59
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "12cec3b5ebb717c0:1",
+            "primaryLocationStartColumnFingerprint": "12"
+          }
+        },
+        {
+          "ruleId": "java/ztzip-unpack-no-canonical",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/ztzip-unpack-no-canonical",
+            "index": 0
+          },
+          "message": {
+            "text": "BackslashUnpacker.process() constructs File from potential ZipEntry name without canonical path check"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/zeroturnaround/zip/ZipUtil.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 1225,
+                  "startColumn": 27,
+                  "endColumn": 52
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "6ed8e92f37742e15:1",
+            "primaryLocationStartColumnFingerprint": "16"
+          }
+        },
+        {
+          "ruleId": "java/ztzip-unpack-no-canonical",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/ztzip-unpack-no-canonical",
+            "index": 0
+          },
+          "message": {
+            "text": "Unwraper.process() constructs File from potential ZipEntry name without canonical path check"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/zeroturnaround/zip/ZipUtil.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 1260,
+                  "startColumn": 21,
+                  "endColumn": 46
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "e874bbc06f9156e3:2",
+            "primaryLocationStartColumnFingerprint": "12"
+          }
+        },
+        {
+          "ruleId": "java/ztzip-unpack-no-canonical",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/ztzip-unpack-no-canonical",
+            "index": 0
+          },
+          "message": {
+            "text": "ZipUtil.pack() constructs File from potential ZipEntry name without canonical path check"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/zeroturnaround/zip/ZipUtil.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 1730,
+                  "startColumn": 19,
+                  "endColumn": 42
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "7990f42a8c42a018:1",
+            "primaryLocationStartColumnFingerprint": "12"
+          }
+        },
+        {
+          "ruleId": "java/ztzip-unpack-no-canonical",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/ztzip-unpack-no-canonical",
+            "index": 0
+          },
+          "message": {
+            "text": "UnpackingCallback.process() constructs File from potential ZipEntry name without canonical path check"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/zeroturnaround/zip/Zips.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 1
+                },
+                "region": {
+                  "startLine": 683,
+                  "startColumn": 19,
+                  "endColumn": 51
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "29f4adffdf98fd72:1",
+            "primaryLocationStartColumnFingerprint": "12"
+          }
+        },
+        {
+          "ruleId": "java/ztzip-unpack-no-canonical",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/ztzip-unpack-no-canonical",
+            "index": 0
+          },
+          "message": {
+            "text": "FileUtils.getTempFileFor() constructs File from potential ZipEntry name without canonical path check"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/zeroturnaround/zip/commons/FileUtils.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 2
+                },
+                "region": {
+                  "startLine": 75,
+                  "startColumn": 16,
+                  "endColumn": 54
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "7a3c162351b059b:1",
+            "primaryLocationStartColumnFingerprint": "9"
+          }
+        },
+        {
+          "ruleId": "java/ztzip-unpack-no-canonical",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/ztzip-unpack-no-canonical",
+            "index": 0
+          },
+          "message": {
+            "text": "FileUtilsV2_2.copyFileToDirectory() constructs File from potential ZipEntry name without canonical path check"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/zeroturnaround/zip/commons/FileUtilsV2_2.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 3
+                },
+                "region": {
+                  "startLine": 327,
+                  "startColumn": 21,
+                  "endColumn": 57
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "b35910d4957653e3:1",
+            "primaryLocationStartColumnFingerprint": "16"
+          }
+        },
+        {
+          "ruleId": "java/ztzip-unpack-no-canonical",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/ztzip-unpack-no-canonical",
+            "index": 0
+          },
+          "message": {
+            "text": "FileUtilsV2_2.isSymlink() constructs File from potential ZipEntry name without canonical path check"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/zeroturnaround/zip/commons/FileUtilsV2_2.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 3
+                },
+                "region": {
+                  "startLine": 1081,
+                  "startColumn": 28,
+                  "endColumn": 66
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "30d5956077ad7f6f:1",
+            "primaryLocationStartColumnFingerprint": "21"
+          }
+        }
+      ]
+    },
+    {
+      "codeql_query_uuid": "20260409123132",
+      "codeql_raw_query": "/**\n * @name Zip Slip - confirmed inter-procedural taint from ZipEntry name to File (no canonical guard)\n * @description ZipEntry.getName() taint flows inter-procedurally to File construction without canonical path check\n * @kind path-problem\n * @problem.severity error\n * @id java/zip-slip-confirmed\n * @tags security\n *       external/cwe/cwe-022\n *       external/cwe/cwe-023\n */\n\nimport java\nimport semmle.code.java.dataflow.TaintTracking\nimport semmle.code.java.dataflow.DataFlow\n\nmodule ZipSlipConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    exists(MethodCall mc |\n      mc.getMethod().hasName(\"getName\") and\n      mc.getMethod().getDeclaringType().getASupertype*().hasQualifiedName(\"java.util.zip\", \"ZipEntry\") and\n      source.asExpr() = mc\n    )\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    // File constructor with the entry name as argument\n    exists(ClassInstanceExpr ce |\n      ce.getConstructor().getDeclaringType().hasQualifiedName(\"java.io\", \"File\") and\n      sink.asExpr() = ce.getAnArgument()\n    )\n  }\n\n  // Block flow if canonical path check is performed (getCanonicalPath followed by startsWith)\n  predicate isBarrier(DataFlow::Node node) {\n    exists(MethodCall mc |\n      mc.getMethod().hasName(\"getCanonicalPath\") and\n      node.asExpr() = mc\n    )\n    or\n    exists(MethodCall mc |\n      mc.getMethod().hasName(\"toRealPath\") and\n      node.asExpr() = mc\n    )\n  }\n}\n\nmodule ZipSlipFlow = TaintTracking::Global<ZipSlipConfig>;\nimport ZipSlipFlow::PathGraph\n\nfrom ZipSlipFlow::PathNode source, ZipSlipFlow::PathNode sink\nwhere\n  ZipSlipFlow::flowPath(source, sink) and\n  // Only in zt-zip source files\n  sink.getNode().getEnclosingCallable().getDeclaringType().getPackage().getName().matches(\"org.zeroturnaround.zip%\")\nselect sink.getNode(), source, sink,\n  \"Zip Slip: ZipEntry name flows to File construction without canonical path verification - path traversal possible.\"\n",
+      "hypothesis": "Inter-procedural taint from ZipEntry.getName() to File constructor without any canonical path guard - confirmed Zip Slip",
+      "severity": "critical",
+      "cwe_ids": [],
+      "results_count": 8,
+      "results": [
+        {
+          "ruleId": "java/zip-slip-confirmed",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/zip-slip-confirmed",
+            "index": 0
+          },
+          "message": {
+            "text": "Zip Slip: ZipEntry name flows to File construction without canonical path verification - path traversal possible."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/zeroturnaround/zip/ZipUtil.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 1152,
+                  "startColumn": 41,
+                  "endColumn": 45
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "e874bbc06f9156e3:1",
+            "primaryLocationStartColumnFingerprint": "32"
+          },
+          "codeFlows": [
+            {
+              "threadFlows": [
+                {
+                  "locations": [
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/zeroturnaround/zip/ZipUtil.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 1150,
+                            "startColumn": 32,
+                            "endColumn": 50
+                          }
+                        },
+                        "message": {
+                          "text": "getName(...) : String"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/zeroturnaround/zip/IdentityNameMapper.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 1
+                          },
+                          "region": {
+                            "startLine": 31,
+                            "startColumn": 21,
+                            "endColumn": 32
+                          }
+                        },
+                        "message": {
+                          "text": "name : String"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/zeroturnaround/zip/IdentityNameMapper.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 1
+                          },
+                          "region": {
+                            "startLine": 32,
+                            "startColumn": 12,
+                            "endColumn": 16
+                          }
+                        },
+                        "message": {
+                          "text": "name : String"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/zeroturnaround/zip/ZipUtil.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 1150,
+                            "startColumn": 21,
+                            "endColumn": 51
+                          }
+                        },
+                        "message": {
+                          "text": "map(...) : String"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/zeroturnaround/zip/ZipUtil.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 1152,
+                            "startColumn": 41,
+                            "endColumn": 45
+                          }
+                        },
+                        "message": {
+                          "text": "name"
+                        }
+                      }
+                    }
+                  ]
+                }
+              ]
+            }
+          ],
+          "relatedLocations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/zeroturnaround/zip/ZipUtil.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 1150,
+                  "startColumn": 32,
+                  "endColumn": 50
+                }
+              }
+            }
+          ]
+        },
+        {
+          "ruleId": "java/zip-slip-confirmed",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/zip-slip-confirmed",
+            "index": 0
+          },
+          "message": {
+            "text": "Zip Slip: ZipEntry name flows to File construction without canonical path verification - path traversal possible."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/zeroturnaround/zip/ZipUtil.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 1220,
+                  "startColumn": 36,
+                  "endColumn": 51
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "c7588b935c1897f4:1",
+            "primaryLocationStartColumnFingerprint": "25"
+          },
+          "codeFlows": [
+            {
+              "threadFlows": [
+                {
+                  "locations": [
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/zeroturnaround/zip/ZipUtil.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 1196,
+                            "startColumn": 32,
+                            "endColumn": 50
+                          }
+                        },
+                        "message": {
+                          "text": "getName(...) : String"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/zeroturnaround/zip/IdentityNameMapper.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 1
+                          },
+                          "region": {
+                            "startLine": 31,
+                            "startColumn": 21,
+                            "endColumn": 32
+                          }
+                        },
+                        "message": {
+                          "text": "name : String"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/zeroturnaround/zip/IdentityNameMapper.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 1
+                          },
+                          "region": {
+                            "startLine": 32,
+                            "startColumn": 12,
+                            "endColumn": 16
+                          }
+                        },
+                        "message": {
+                          "text": "name : String"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/zeroturnaround/zip/ZipUtil.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 1196,
+                            "startColumn": 21,
+                            "endColumn": 51
+                          }
+                        },
+                        "message": {
+                          "text": "map(...) : String"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/zeroturnaround/zip/ZipUtil.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 1210,
+                            "startColumn": 27,
+                            "endColumn": 31
+                          }
+                        },
+                        "message": {
+                          "text": "name : String"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/zeroturnaround/zip/ZipUtil.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 1210,
+                            "startColumn": 27,
+                            "endColumn": 45
+                          }
+                        },
+                        "message": {
+                          "text": "split(...) : String[]"
+                        }
+                      },
+                      "taxa": [
+                        {
+                          "index": 0,
+                          "toolComponent": {
+                            "index": 1
+                          },
+                          "properties": {
+                            "CodeQL/DataflowRole": "step"
+                          }
+                        }
+                      ]
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/zeroturnaround/zip/ZipUtil.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 1220,
+                            "startColumn": 36,
+                            "endColumn": 51
+                          }
+                        },
+                        "message": {
+                          "text": "parentDirectory"
+                        }
+                      },
+                      "taxa": [
+                        {
+                          "id": "AdditionalTaintStep",
+                          "properties": {
+                            "CodeQL/DataflowRole": "step"
+                          }
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "threadFlows": [
+                {
+                  "locations": [
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/zeroturnaround/zip/ZipUtil.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 1196,
+                            "startColumn": 32,
+                            "endColumn": 50
+                          }
+                        },
+                        "message": {
+                          "text": "getName(...) : String"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/zeroturnaround/zip/IdentityNameMapper.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 1
+                          },
+                          "region": {
+                            "startLine": 31,
+                            "startColumn": 21,
+                            "endColumn": 32
+                          }
+                        },
+                        "message": {
+                          "text": "name : String"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/zeroturnaround/zip/IdentityNameMapper.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 1
+                          },
+                          "region": {
+                            "startLine": 32,
+                            "startColumn": 12,
+                            "endColumn": 16
+                          }
+                        },
+                        "message": {
+                          "text": "name : String"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/zeroturnaround/zip/ZipUtil.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 1196,
+                            "startColumn": 21,
+                            "endColumn": 51
+                          }
+                        },
+                        "message": {
+                          "text": "map(...) : String"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/zeroturnaround/zip/ZipUtil.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 1210,
+                            "startColumn": 27,
+                            "endColumn": 31
+                          }
+                        },
+                        "message": {
+                          "text": "name : String"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/zeroturnaround/zip/ZipUtil.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 1210,
+                            "startColumn": 27,
+                            "endColumn": 45
+                          }
+                        },
+                        "message": {
+                          "text": "split(...) : String[]"
+                        }
+                      },
+                      "taxa": [
+                        {
+                          "index": 0,
+                          "toolComponent": {
+                            "index": 1
+                          },
+                          "properties": {
+                            "CodeQL/DataflowRole": "step"
+                          }
+                        }
+                      ]
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/zeroturnaround/zip/ZipUtil.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 1214,
+                            "startColumn": 34,
+                            "endColumn": 49
+                          }
+                        },
+                        "message": {
+                          "text": "parentDirectory : File"
+                        }
+                      },
+                      "taxa": [
+                        {
+                          "id": "AdditionalTaintStep",
+                          "properties": {
+                            "CodeQL/DataflowRole": "step"
+                          }
+                        }
+                      ]
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/zeroturnaround/zip/ZipUtil.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 1214,
+                            "startColumn": 25,
+                            "endColumn": 59
+                          }
+                        },
+                        "message": {
+                          "text": "new File(...) : File"
+                        }
+                      },
+                      "taxa": [
+                        {
+                          "index": 1,
+                          "toolComponent": {
+                            "index": 1
+                          },
+                          "properties": {
+                            "CodeQL/DataflowRole": "step"
+                          }
+                        }
+                      ]
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/zeroturnaround/zip/ZipUtil.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 1220,
+                            "startColumn": 36,
+                            "endColumn": 51
+                          }
+                        },
+                        "message": {
+                          "text": "parentDirectory"
+                        }
+                      }
+                    }
+                  ]
+                }
+              ]
+            }
+          ],
+          "relatedLocations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/zeroturnaround/zip/ZipUtil.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 1196,
+                  "startColumn": 32,
+                  "endColumn": 50
+                }
+              }
+            }
+          ]
+        },
+        {
+          "ruleId": "java/zip-slip-confirmed",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/zip-slip-confirmed",
+            "index": 0
+          },
+          "message": {
+            "text": "Zip Slip: ZipEntry name flows to File construction without canonical path verification - path traversal possible."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/zeroturnaround/zip/ZipUtil.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 1220,
+                  "startColumn": 53,
+                  "endColumn": 74
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "c7588b935c1897f4:1",
+            "primaryLocationStartColumnFingerprint": "42"
+          },
+          "codeFlows": [
+            {
+              "threadFlows": [
+                {
+                  "locations": [
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/zeroturnaround/zip/ZipUtil.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 1196,
+                            "startColumn": 32,
+                            "endColumn": 50
+                          }
+                        },
+                        "message": {
+                          "text": "getName(...) : String"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/zeroturnaround/zip/IdentityNameMapper.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 1
+                          },
+                          "region": {
+                            "startLine": 31,
+                            "startColumn": 21,
+                            "endColumn": 32
+                          }
+                        },
+                        "message": {
+                          "text": "name : String"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/zeroturnaround/zip/IdentityNameMapper.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 1
+                          },
+                          "region": {
+                            "startLine": 32,
+                            "startColumn": 12,
+                            "endColumn": 16
+                          }
+                        },
+                        "message": {
+                          "text": "name : String"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/zeroturnaround/zip/ZipUtil.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 1196,
+                            "startColumn": 21,
+                            "endColumn": 51
+                          }
+                        },
+                        "message": {
+                          "text": "map(...) : String"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/zeroturnaround/zip/ZipUtil.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 1210,
+                            "startColumn": 27,
+                            "endColumn": 31
+                          }
+                        },
+                        "message": {
+                          "text": "name : String"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/zeroturnaround/zip/ZipUtil.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 1210,
+                            "startColumn": 27,
+                            "endColumn": 45
+                          }
+                        },
+                        "message": {
+                          "text": "split(...) : String[]"
+                        }
+                      },
+                      "taxa": [
+                        {
+                          "index": 0,
+                          "toolComponent": {
+                            "index": 1
+                          },
+                          "properties": {
+                            "CodeQL/DataflowRole": "step"
+                          }
+                        }
+                      ]
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/zeroturnaround/zip/ZipUtil.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 1220,
+                            "startColumn": 53,
+                            "endColumn": 74
+                          }
+                        },
+                        "message": {
+                          "text": "...[...]"
+                        }
+                      }
+                    }
+                  ]
+                }
+              ]
+            }
+          ],
+          "relatedLocations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/zeroturnaround/zip/ZipUtil.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 1196,
+                  "startColumn": 32,
+                  "endColumn": 50
+                }
+              }
+            }
+          ]
+        },
+        {
+          "ruleId": "java/zip-slip-confirmed",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/zip-slip-confirmed",
+            "index": 0
+          },
+          "message": {
+            "text": "Zip Slip: ZipEntry name flows to File construction without canonical path verification - path traversal possible."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/zeroturnaround/zip/ZipUtil.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 1214,
+                  "startColumn": 34,
+                  "endColumn": 49
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "12cec3b5ebb717c0:1",
+            "primaryLocationStartColumnFingerprint": "21"
+          },
+          "codeFlows": [
+            {
+              "threadFlows": [
+                {
+                  "locations": [
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/zeroturnaround/zip/ZipUtil.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 1196,
+                            "startColumn": 32,
+                            "endColumn": 50
+                          }
+                        },
+                        "message": {
+                          "text": "getName(...) : String"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/zeroturnaround/zip/IdentityNameMapper.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 1
+                          },
+                          "region": {
+                            "startLine": 31,
+                            "startColumn": 21,
+                            "endColumn": 32
+                          }
+                        },
+                        "message": {
+                          "text": "name : String"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/zeroturnaround/zip/IdentityNameMapper.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 1
+                          },
+                          "region": {
+                            "startLine": 32,
+                            "startColumn": 12,
+                            "endColumn": 16
+                          }
+                        },
+                        "message": {
+                          "text": "name : String"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/zeroturnaround/zip/ZipUtil.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 1196,
+                            "startColumn": 21,
+                            "endColumn": 51
+                          }
+                        },
+                        "message": {
+                          "text": "map(...) : String"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/zeroturnaround/zip/ZipUtil.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 1210,
+                            "startColumn": 27,
+                            "endColumn": 31
+                          }
+                        },
+                        "message": {
+                          "text": "name : String"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/zeroturnaround/zip/ZipUtil.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 1210,
+                            "startColumn": 27,
+                            "endColumn": 45
+                          }
+                        },
+                        "message": {
+                          "text": "split(...) : String[]"
+                        }
+                      },
+                      "taxa": [
+                        {
+                          "index": 0,
+                          "toolComponent": {
+                            "index": 1
+                          },
+                          "properties": {
+                            "CodeQL/DataflowRole": "step"
+                          }
+                        }
+                      ]
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/zeroturnaround/zip/ZipUtil.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 1214,
+                            "startColumn": 34,
+                            "endColumn": 49
+                          }
+                        },
+                        "message": {
+                          "text": "parentDirectory"
+                        }
+                      },
+                      "taxa": [
+                        {
+                          "id": "AdditionalTaintStep",
+                          "properties": {
+                            "CodeQL/DataflowRole": "step"
+                          }
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "threadFlows": [
+                {
+                  "locations": [
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/zeroturnaround/zip/ZipUtil.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 1196,
+                            "startColumn": 32,
+                            "endColumn": 50
+                          }
+                        },
+                        "message": {
+                          "text": "getName(...) : String"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/zeroturnaround/zip/IdentityNameMapper.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 1
+                          },
+                          "region": {
+                            "startLine": 31,
+                            "startColumn": 21,
+                            "endColumn": 32
+                          }
+                        },
+                        "message": {
+                          "text": "name : String"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/zeroturnaround/zip/IdentityNameMapper.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 1
+                          },
+                          "region": {
+                            "startLine": 32,
+                            "startColumn": 12,
+                            "endColumn": 16
+                          }
+                        },
+                        "message": {
+                          "text": "name : String"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/zeroturnaround/zip/ZipUtil.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 1196,
+                            "startColumn": 21,
+                            "endColumn": 51
+                          }
+                        },
+                        "message": {
+                          "text": "map(...) : String"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/zeroturnaround/zip/ZipUtil.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 1210,
+                            "startColumn": 27,
+                            "endColumn": 31
+                          }
+                        },
+                        "message": {
+                          "text": "name : String"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/zeroturnaround/zip/ZipUtil.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 1210,
+                            "startColumn": 27,
+                            "endColumn": 45
+                          }
+                        },
+                        "message": {
+                          "text": "split(...) : String[]"
+                        }
+                      },
+                      "taxa": [
+                        {
+                          "index": 0,
+                          "toolComponent": {
+                            "index": 1
+                          },
+                          "properties": {
+                            "CodeQL/DataflowRole": "step"
+                          }
+                        }
+                      ]
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/zeroturnaround/zip/ZipUtil.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 1214,
+                            "startColumn": 34,
+                            "endColumn": 49
+                          }
+                        },
+                        "message": {
+                          "text": "parentDirectory : File"
+                        }
+                      },
+                      "taxa": [
+                        {
+                          "id": "AdditionalTaintStep",
+                          "properties": {
+                            "CodeQL/DataflowRole": "step"
+                          }
+                        }
+                      ]
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/zeroturnaround/zip/ZipUtil.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 1214,
+                            "startColumn": 25,
+                            "endColumn": 59
+                          }
+                        },
+                        "message": {
+                          "text": "new File(...) : File"
+                        }
+                      },
+                      "taxa": [
+                        {
+                          "index": 1,
+                          "toolComponent": {
+                            "index": 1
+                          },
+                          "properties": {
+                            "CodeQL/DataflowRole": "step"
+                          }
+                        }
+                      ]
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/zeroturnaround/zip/ZipUtil.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 1214,
+                            "startColumn": 34,
+                            "endColumn": 49
+                          }
+                        },
+                        "message": {
+                          "text": "parentDirectory"
+                        }
+                      }
+                    }
+                  ]
+                }
+              ]
+            }
+          ],
+          "relatedLocations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/zeroturnaround/zip/ZipUtil.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 1196,
+                  "startColumn": 32,
+                  "endColumn": 50
+                }
+              }
+            }
+          ]
+        },
+        {
+          "ruleId": "java/zip-slip-confirmed",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/zip-slip-confirmed",
+            "index": 0
+          },
+          "message": {
+            "text": "Zip Slip: ZipEntry name flows to File construction without canonical path verification - path traversal possible."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/zeroturnaround/zip/ZipUtil.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 1214,
+                  "startColumn": 51,
+                  "endColumn": 58
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "12cec3b5ebb717c0:1",
+            "primaryLocationStartColumnFingerprint": "38"
+          },
+          "codeFlows": [
+            {
+              "threadFlows": [
+                {
+                  "locations": [
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/zeroturnaround/zip/ZipUtil.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 1196,
+                            "startColumn": 32,
+                            "endColumn": 50
+                          }
+                        },
+                        "message": {
+                          "text": "getName(...) : String"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/zeroturnaround/zip/IdentityNameMapper.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 1
+                          },
+                          "region": {
+                            "startLine": 31,
+                            "startColumn": 21,
+                            "endColumn": 32
+                          }
+                        },
+                        "message": {
+                          "text": "name : String"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/zeroturnaround/zip/IdentityNameMapper.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 1
+                          },
+                          "region": {
+                            "startLine": 32,
+                            "startColumn": 12,
+                            "endColumn": 16
+                          }
+                        },
+                        "message": {
+                          "text": "name : String"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/zeroturnaround/zip/ZipUtil.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 1196,
+                            "startColumn": 21,
+                            "endColumn": 51
+                          }
+                        },
+                        "message": {
+                          "text": "map(...) : String"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/zeroturnaround/zip/ZipUtil.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 1210,
+                            "startColumn": 27,
+                            "endColumn": 31
+                          }
+                        },
+                        "message": {
+                          "text": "name : String"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/zeroturnaround/zip/ZipUtil.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 1210,
+                            "startColumn": 27,
+                            "endColumn": 45
+                          }
+                        },
+                        "message": {
+                          "text": "split(...) : String[]"
+                        }
+                      },
+                      "taxa": [
+                        {
+                          "index": 0,
+                          "toolComponent": {
+                            "index": 1
+                          },
+                          "properties": {
+                            "CodeQL/DataflowRole": "step"
+                          }
+                        }
+                      ]
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/zeroturnaround/zip/ZipUtil.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 1214,
+                            "startColumn": 51,
+                            "endColumn": 58
+                          }
+                        },
+                        "message": {
+                          "text": "...[...]"
+                        }
+                      }
+                    }
+                  ]
+                }
+              ]
+            }
+          ],
+          "relatedLocations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/zeroturnaround/zip/ZipUtil.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 1196,
+                  "startColumn": 32,
+                  "endColumn": 50
+                }
+              }
+            }
+          ]
+        },
+        {
+          "ruleId": "java/zip-slip-confirmed",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/zip-slip-confirmed",
+            "index": 0
+          },
+          "message": {
+            "text": "Zip Slip: ZipEntry name flows to File construction without canonical path verification - path traversal possible."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/zeroturnaround/zip/ZipUtil.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 1225,
+                  "startColumn": 47,
+                  "endColumn": 51
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "6ed8e92f37742e15:1",
+            "primaryLocationStartColumnFingerprint": "36"
+          },
+          "codeFlows": [
+            {
+              "threadFlows": [
+                {
+                  "locations": [
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/zeroturnaround/zip/ZipUtil.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 1196,
+                            "startColumn": 32,
+                            "endColumn": 50
+                          }
+                        },
+                        "message": {
+                          "text": "getName(...) : String"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/zeroturnaround/zip/IdentityNameMapper.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 1
+                          },
+                          "region": {
+                            "startLine": 31,
+                            "startColumn": 21,
+                            "endColumn": 32
+                          }
+                        },
+                        "message": {
+                          "text": "name : String"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/zeroturnaround/zip/IdentityNameMapper.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 1
+                          },
+                          "region": {
+                            "startLine": 32,
+                            "startColumn": 12,
+                            "endColumn": 16
+                          }
+                        },
+                        "message": {
+                          "text": "name : String"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/zeroturnaround/zip/ZipUtil.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 1196,
+                            "startColumn": 21,
+                            "endColumn": 51
+                          }
+                        },
+                        "message": {
+                          "text": "map(...) : String"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/zeroturnaround/zip/ZipUtil.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 1225,
+                            "startColumn": 47,
+                            "endColumn": 51
+                          }
+                        },
+                        "message": {
+                          "text": "name"
+                        }
+                      }
+                    }
+                  ]
+                }
+              ]
+            }
+          ],
+          "relatedLocations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/zeroturnaround/zip/ZipUtil.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 1196,
+                  "startColumn": 32,
+                  "endColumn": 50
+                }
+              }
+            }
+          ]
+        },
+        {
+          "ruleId": "java/zip-slip-confirmed",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/zip-slip-confirmed",
+            "index": 0
+          },
+          "message": {
+            "text": "Zip Slip: ZipEntry name flows to File construction without canonical path verification - path traversal possible."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/zeroturnaround/zip/ZipUtil.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 1260,
+                  "startColumn": 41,
+                  "endColumn": 45
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "e874bbc06f9156e3:2",
+            "primaryLocationStartColumnFingerprint": "32"
+          },
+          "codeFlows": [
+            {
+              "threadFlows": [
+                {
+                  "locations": [
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/zeroturnaround/zip/ZipUtil.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 1258,
+                            "startColumn": 54,
+                            "endColumn": 72
+                          }
+                        },
+                        "message": {
+                          "text": "getName(...) : String"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/zeroturnaround/zip/ZipUtil.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 1276,
+                            "startColumn": 49,
+                            "endColumn": 60
+                          }
+                        },
+                        "message": {
+                          "text": "name : String"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/zeroturnaround/zip/ZipUtil.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 1277,
+                            "startColumn": 14,
+                            "endColumn": 18
+                          }
+                        },
+                        "message": {
+                          "text": "name : String"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/zeroturnaround/zip/ZipUtil.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 1277,
+                            "startColumn": 14,
+                            "endColumn": 43
+                          }
+                        },
+                        "message": {
+                          "text": "substring(...) : String"
+                        }
+                      },
+                      "taxa": [
+                        {
+                          "index": 2,
+                          "toolComponent": {
+                            "index": 1
+                          },
+                          "properties": {
+                            "CodeQL/DataflowRole": "step"
+                          }
+                        }
+                      ]
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/zeroturnaround/zip/ZipUtil.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 1258,
+                            "startColumn": 32,
+                            "endColumn": 73
+                          }
+                        },
+                        "message": {
+                          "text": "getUnrootedName(...) : String"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/zeroturnaround/zip/IdentityNameMapper.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 1
+                          },
+                          "region": {
+                            "startLine": 31,
+                            "startColumn": 21,
+                            "endColumn": 32
+                          }
+                        },
+                        "message": {
+                          "text": "name : String"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/zeroturnaround/zip/IdentityNameMapper.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 1
+                          },
+                          "region": {
+                            "startLine": 32,
+                            "startColumn": 12,
+                            "endColumn": 16
+                          }
+                        },
+                        "message": {
+                          "text": "name : String"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/zeroturnaround/zip/ZipUtil.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 1258,
+                            "startColumn": 21,
+                            "endColumn": 74
+                          }
+                        },
+                        "message": {
+                          "text": "map(...) : String"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/zeroturnaround/zip/ZipUtil.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 0
+                          },
+                          "region": {
+                            "startLine": 1260,
+                            "startColumn": 41,
+                            "endColumn": 45
+                          }
+                        },
+                        "message": {
+                          "text": "name"
+                        }
+                      }
+                    }
+                  ]
+                }
+              ]
+            }
+          ],
+          "relatedLocations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/zeroturnaround/zip/ZipUtil.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 0
+                },
+                "region": {
+                  "startLine": 1258,
+                  "startColumn": 54,
+                  "endColumn": 72
+                }
+              }
+            }
+          ]
+        },
+        {
+          "ruleId": "java/zip-slip-confirmed",
+          "ruleIndex": 0,
+          "rule": {
+            "id": "java/zip-slip-confirmed",
+            "index": 0
+          },
+          "message": {
+            "text": "Zip Slip: ZipEntry name flows to File construction without canonical path verification - path traversal possible."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/zeroturnaround/zip/Zips.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 2
+                },
+                "region": {
+                  "startLine": 683,
+                  "startColumn": 41,
+                  "endColumn": 50
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "29f4adffdf98fd72:1",
+            "primaryLocationStartColumnFingerprint": "34"
+          },
+          "codeFlows": [
+            {
+              "threadFlows": [
+                {
+                  "locations": [
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/zeroturnaround/zip/Zips.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 2
+                          },
+                          "region": {
+                            "startLine": 676,
+                            "startColumn": 26,
+                            "endColumn": 44
+                          }
+                        },
+                        "message": {
+                          "text": "getName(...) : String"
+                        }
+                      }
+                    },
+                    {
+                      "location": {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "src/main/java/org/zeroturnaround/zip/Zips.java",
+                            "uriBaseId": "%SRCROOT%",
+                            "index": 2
+                          },
+                          "region": {
+                            "startLine": 683,
+                            "startColumn": 41,
+                            "endColumn": 50
+                          }
+                        },
+                        "message": {
+                          "text": "entryName"
+                        }
+                      }
+                    }
+                  ]
+                }
+              ]
+            }
+          ],
+          "relatedLocations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main/java/org/zeroturnaround/zip/Zips.java",
+                  "uriBaseId": "%SRCROOT%",
+                  "index": 2
+                },
+                "region": {
+                  "startLine": 676,
+                  "startColumn": 26,
+                  "endColumn": 44
+                }
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
