@@ -83,6 +83,10 @@ qrs-outputs/
 │   ├── q_agent_query_tools.py
 │   ├── r_agent_review_tools.py
 │   └── search_cve.py
+├── sast_reports/
+│   ├── bandit_scan.json
+│   ├── codeql_scan.json
+│   └── opengrep_scan.json
 └── visualizations/
     ├── cwe_java_bench/    (8 PDF charts)
     ├── hist20/            (8 PDF charts)
@@ -141,6 +145,14 @@ Note: Includes anonymized artifacts for 4 configurations on the Hist20 dataset.
 Sample reports for 6 model configurations (claude-0, claude-1, deepseek-reasoner-1, gemini-0, gemini-1, gpt-0) across select Top100 packages.
 
 Note: Regarding Top100 we include public knowledge that has already been addressed or patched. We cannot publicly disclose all of the scans, as they contain package internals and exploitation snippets. Contact in private if more artifacts are needed for this purpose.
+
+## SAST Reports
+
+Consolidated SAST scan result files used as baselines or comparisons in QRS:
+
+- `bandit_scan.json` — Bandit static analysis scan results.
+- `codeql_scan.json` — CodeQL scan results.
+- `opengrep_scan.json` — Opengrep scan results.
 
 ## Visualizations
 
