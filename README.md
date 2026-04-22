@@ -44,6 +44,13 @@ qrs-outputs/
 │   │   └── knowledge.md
 │   └── python/
 │       └── knowledge.md
+├── metrics/
+│   ├── cwe_bench_java.txt
+│   ├── cwe_bench_java.md
+│   ├── hist20.txt
+│   ├── hist20.md
+│   ├── top100.txt
+│   └── top100.md
 ├── reports/
 │   ├── cwe_java_workbench/
 │   │   └── <vendor>__<package>_<version>/
@@ -153,6 +160,25 @@ Consolidated SAST scan result files used as baselines or comparisons in QRS:
 - `bandit_scan.json` — Bandit static analysis scan results.
 - `codeql_scan.json` — CodeQL scan results.
 - `opengrep_scan.json` — Opengrep scan results.
+
+## Metrics
+
+Aggregated evaluation metrics for each dataset, available as both plain-text and GitHub-compatible Markdown:
+
+| Dataset | Plain Text | Markdown |
+|---------|-----------|----------|
+| CWE Bench Java | [metrics/cwe_bench_java.txt](metrics/cwe_bench_java.txt) | [metrics/cwe_bench_java.md](metrics/cwe_bench_java.md) |
+| Hist20 | [metrics/hist20.txt](metrics/hist20.txt) | [metrics/hist20.md](metrics/hist20.md) |
+| Top100 | [metrics/top100.txt](metrics/top100.txt) | [metrics/top100.md](metrics/top100.md) |
+
+Each metrics file contains six sections:
+
+1. **Overall Summary** — total runtime, cost, tokens, and iterations across all configurations.
+2. **Average Metrics by Model Family and Temperature** — per-model averages for runtime, cost, tokens, and agent iteration counts.
+3. **Q Agent Query Efficiency** — query totals broken down by results, no-results, and failures.
+4. **Average Tool Call Counts** — mean invocation counts for every Q, R, and S agent tool.
+5. **Performance Metrics** — prediction counts with accuracy, precision, recall, and F1 score.
+6. **TP/MR Finding Reduction** — finding count delta between the Reviewer (R) and Sanity (S) agents.
 
 ## Visualizations
 
