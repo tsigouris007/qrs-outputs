@@ -202,3 +202,9 @@ A subset of core utility scripts used in QRS:
 - `search_cve.py` — CVE search utility.
 - `java/profiler_minimal.py` — Minimal Java package profiler.
 - `python/profiler_minimal.py` — Minimal Python package profiler.
+
+---
+
+_This README file has been generated via Claude Sonnet 4.6_
+
+All artifacts were produced via QRS.
