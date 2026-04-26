@@ -18,8 +18,11 @@ qrs-outputs/
 │   └── agent-config-gpt-5.1-1.yml
 ├── datasets/
 │   ├── cwe_bench_java_dataset.json
+│   ├── cwe_bench_java_dataset.md
 │   ├── hist20_dataset.json
-│   └── top100_dataset.json
+│   ├── hist20_dataset.md
+│   ├── top100_dataset.json
+│   └── top100_dataset.md
 ├── instructions/
 │   ├── agents/
 │   │   ├── q_agent.md
@@ -103,6 +106,12 @@ qrs-outputs/
 ## Datasets
 
 Includes the 3 datasets: Hist20, Top100, and CWE Bench Java.
+
+| Dataset | JSON | Markdown |
+|---------|------|----------|
+| Hist20 | [datasets/hist20_dataset.json](datasets/hist20_dataset.json) | [datasets/hist20_dataset.md](datasets/hist20_dataset.md) |
+| Top100 | [datasets/top100_dataset.json](datasets/top100_dataset.json) | [datasets/top100_dataset.md](datasets/top100_dataset.md) |
+| CWE Bench Java | [datasets/cwe_bench_java_dataset.json](datasets/cwe_bench_java_dataset.json) | [datasets/cwe_bench_java_dataset.md](datasets/cwe_bench_java_dataset.md) |
 
 - `hist20_dataset.json` — 20 historical Python packages with known CVEs.
 - `top100_dataset.json` — Top 100 PyPI packages.
@@ -205,6 +214,21 @@ A subset of core utility scripts used in QRS:
 
 ---
 
-_This README file has been generated via Claude Sonnet 4.6_
+QRS used:
+- `configs`
+- `datasets`
+- `instructions`
+- `knowledge`
+- `tools`
 
-All artifacts were produced via QRS.
+QRS produced:
+- `reports`
+
+SAST scans produced:
+- `sast_reports`
+
+QRS evaluations:
+- `metrics`
+- `visualizations`
+
+_This README file has been generated via Claude Sonnet 4.6_
