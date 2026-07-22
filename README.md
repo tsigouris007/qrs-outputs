@@ -4,6 +4,11 @@ This repository contains artifacts produced by QRS.
 
 ```
 qrs-outputs/
+├── ablation/
+│   ├── ablation_findings_aggregate.md
+│   ├── ablation_load_aggregate.md
+│   ├── ablation_tool_aggregate.md
+│   └── code_reduction_aggregate.md
 ├── configs/
 │   ├── agent-config-claude-4.5-0.yml
 │   ├── agent-config-claude-4.5-1.yml
@@ -102,6 +107,15 @@ qrs-outputs/
     ├── hist20/            (8 PDF charts)
     └── top100/            (8 PDF charts)
 ```
+
+## Ablation
+
+Ablation studies mined from the existing 1000-scan production logs (no new LLM calls), evaluating the QRS pipeline design choices across all 10 model/run configurations:
+
+- `ablation_findings_aggregate.md` — Per-configuration and aggregate findings comparison across pipeline stages (Q / Q+R / Q+R+S), reporting TP/FP/TN/FN and accuracy/precision/recall/F1 against the human-reviewed ground truth.
+- `ablation_load_aggregate.md` — Single-agent load and tool-preference ablation: evidence that a single agent cannot absorb the combined Q+R+S workload, and that models default to raw code reading over structured/symbolic tools when given the choice.
+- `ablation_tool_aggregate.md` — Per-configuration, per-tool average usage (calls, tokens, cost, execution time) broken down by agent (Query / Review / Sanity) and tool.
+- `code_reduction_aggregate.md` — Code reduction ablation quantifying how much of a package's source the Reviewer agent actually reads (via `extract_code_snippet`) versus total package size, demonstrating the benefit of CodeQL-first triage.
 
 ## Datasets
 
@@ -230,5 +244,6 @@ SAST scans produced:
 QRS evaluations:
 - `metrics`
 - `visualizations`
+- `ablation`
 
 _This README file has been generated via Claude Sonnet 4.6_
