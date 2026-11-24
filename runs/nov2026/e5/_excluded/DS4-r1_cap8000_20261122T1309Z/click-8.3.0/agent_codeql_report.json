@@ -1,0 +1,579 @@
+{
+ "session_id": "20261122115218",
+ "package_name": "click-8.3.0",
+ "package_path": "packages/click-8.3.0",
+ "database_path": "databases/click-8.3.0-db",
+ "model": "deepseek/deepseek-v4-pro",
+ "temperature": null,
+ "max_tokens": 8000,
+ "iterations": 19,
+ "total_input_tokens": 120228,
+ "total_output_tokens": 53935,
+ "total_tokens": 174163,
+ "elapsed_time_seconds": 1389.0,
+ "estimated_cost_usd": 0.0,
+ "summary": "## Security Analysis: click 8.3.0\n\n### Scope\nAnalyzed the `click` 8.3.0 PyPI package (16 files, ~7,842 LOC) using CodeQL, focusing on the major Python vulnerability classes: code execution, command injection, unsafe deserialization, path traversal, SQL/NoSQL injection, and shell usage.\n\n### Key Finding (High — CWE-78: OS Command Injection)\n\n**Location:** `src/click/_termui_impl.py` (lines ~451–458 and ~602–604)\n\nThe `Editor` class builds a shell command by interpolating the configured editor string and passes it to `subprocess.Popen(..., shell=True)` without sanitization. The editor string is sourced from:\n\n1. A caller-supplied `editor` argument (`Editor(editor=...)`), or\n2. The environment variables `VISUAL` / `EDITOR` via `os.environ.get(...)`.\n\nBecause the command is executed via `shell=True` (confirmed via CodeQL), an attacker who can control `VISUAL`/`EDITOR`/`PAGER` environment variables — or any application that forwards untrusted values into `Editor(...)` — can inject arbitrary OS commands. Example: `EDITOR='vi; rm -rf ~'` would execute both commands.\n\nThis is a known design tradeoff in click (shell string interpolation is used to support editors with command-line flags), but it is still a genuine command-injection sink when the environment is attacker-influenced (e.g., services, CI/CD, web apps that inherit user-controlled env).\n\n**Recommended mitigation:** Avoid `shell=True`; pass an argument list (parsing the editor string with `shlex.split`) so user-influenced values cannot be interpreted by the shell.\n\n### Other checks performed (no findings)\n- `eval`/`exec` code execution — none.\n- Unsafe deserialization (`pickle`, `yaml.load`, `marshal`, `shelve`) — none.\n- Path traversal via `os.path`/`open` with remote input — none found.\n- SQL/NoSQL injection sinks — none present.\n- `webbrowser.open` usage — one call found (line ~737), not a high-risk sink in normal usage.\n- `shell=True` was found **only** in the two `_termui_impl.py` locations above.\n\n### Conclusion\n`click` is generally a well-hardened, widely used CLI toolkit. The primary security-relevant finding is the `shell=True` subprocess usage in the `Editor`/pager path, which is a command-injection risk **only when editor-related environment variables or the `editor` argument are attacker-controlled**. No critical RCE, deserialization, or injection flaws were otherwise identified in the package's own code.",
+ "package_classification": {
+  "type": [
+   "library",
+   "framework"
+  ],
+  "layer": [
+   "library"
+  ]
+ },
+ "tool_calls": {
+  "get_package_profile_info": 1,
+  "execute_codeql_query": 25,
+  "validate_codeql_query": 0,
+  "fixup_codeql_query": 0,
+  "finalize_report": 1
+ },
+ "queries_executed": {
+  "critical": 4,
+  "high": 3,
+  "medium": 1,
+  "low": 3,
+  "total_executed": 25,
+  "total_with_results": 11,
+  "total_failed": 14
+ },
+ "query_findings": {
+  "critical": 0,
+  "high": 0,
+  "medium": 2,
+  "low": 9,
+  "total": 11
+ },
+ "findings": [
+  {
+   "codeql_query_uuid": "20261122115254",
+   "codeql_raw_query": "/**\n * @name Unsafe deserialization in click\n * @description Detect potentially unsafe deserialization using pickle/yaml/marshal/shelve\n * @kind problem\n * @problem.severity error\n * @id py/unsafe-deserialization\n * @tags security\n *        external/cwe/cwe-502\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"pickle\").getMember([\"load\", \"loads\", \"Unpickler\"]).getACall() or\n  call = API::moduleImport(\"yaml\").getMember([\"load\", \"unsafe_load\"]).getACall() or\n  call = API::moduleImport(\"marshal\").getMember([\"load\", \"loads\"]).getACall() or\n  call = API::moduleImport(\"shelve\").getMember(\"open\").getACall()\nselect call, \"Potentially unsafe deserialization operation that could execute arbitrary code.\"\n",
+   "hypothesis": "Package may use unsafe deserialization functions",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-502"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20261122115507",
+   "codeql_raw_query": "/**\n * @name Code injection via eval/exec/compile from environment or argv\n * @description Environment variables or command-line arguments flowing to dynamic code execution may allow arbitrary code execution.\n * @kind path-problem\n * @problem.severity error\n * @id click/code-injection-env\n * @tags security\n *       external/cwe/cwe-094\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.ApiGraphs\nimport semmle.python.Concepts\n\nmodule EnvCodeInjectionConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    source = API::moduleImport(\"sys\").getMember(\"argv\").asSource()\n    or\n    source = API::moduleImport(\"os\").getMember(\"environ\").getMember(\"get\").getACall()\n    or\n    source = API::moduleImport(\"os\").getMember(\"getenv\").getACall()\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    sink = any(CodeExecution ce).getCode()\n  }\n}\n\nmodule EnvCodeInjectionFlow = TaintTracking::Global<EnvCodeInjectionConfig>;\nimport EnvCodeInjectionFlow::PathGraph\n\nfrom EnvCodeInjectionFlow::PathNode source, EnvCodeInjectionFlow::PathNode sink\nwhere EnvCodeInjectionFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"Code injection from $@.\", source.getNode(), \"environment/argv input\"\n",
+   "hypothesis": "Untrusted environment variables or argv flow into dynamic code execution (CWE-94 code injection)",
+   "severity": "critical",
+   "cwe_ids": [
+    "cwe-094"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20261122115555",
+   "codeql_raw_query": "/**\n * @name Unsafe deserialization\n * @description Deserializing untrusted data using pickle/yaml/marshal/shelve can lead to arbitrary code execution.\n * @kind problem\n * @problem.severity error\n * @id click/unsafe-deserialization\n * @tags security\n *       external/cwe/cwe-502\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"pickle\").getMember([\"load\", \"loads\", \"Unpickler\"]).getACall()\n  or\n  call = API::moduleImport(\"yaml\").getMember([\"load\", \"unsafe_load\"]).getACall()\n  or\n  call = API::moduleImport(\"marshal\").getMember([\"load\", \"loads\"]).getACall()\n  or\n  call = API::moduleImport(\"shelve\").getMember(\"open\").getACall()\nselect call, \"Potentially unsafe deserialization operation that could execute arbitrary code.\"\n",
+   "hypothesis": "Unsafe deserialization via pickle/yaml/marshal/shelve (CWE-502)",
+   "severity": "critical",
+   "cwe_ids": [
+    "cwe-502"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20261122115939",
+   "codeql_raw_query": "/**\n * @name Path traversal via file system access\n * @description Untrusted input flowing to a file path can lead to path traversal.\n * @kind path-problem\n * @problem.severity error\n * @id audit/path-traversal\n * @tags security\n *       external/cwe/cwe-022\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.dataflow.new.RemoteFlowSources\nimport semmle.python.Concepts\n\nmodule PathTravConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    source instanceof RemoteFlowSource\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    sink = any(FileSystemAccess fa).getAPathArgument()\n  }\n}\n\nmodule PathTravFlow = TaintTracking::Global<PathTravConfig>;\nimport PathTravFlow::PathGraph\n\nfrom PathTravFlow::PathNode source, PathTravFlow::PathNode sink\nwhere PathTravFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"Path traversal from $@.\", source.getNode(), \"untrusted input\"\n",
+   "hypothesis": "Untrusted input reaches a file system path argument (path traversal)",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-022"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20261122120037",
+   "codeql_raw_query": "/**\n * @name Code injection via dynamic evaluation\n * @description Untrusted input flowing to eval/exec/compile can lead to arbitrary code execution.\n * @kind path-problem\n * @problem.severity error\n * @id audit/code-injection\n * @tags security\n *       external/cwe/cwe-094\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.dataflow.new.RemoteFlowSources\nimport semmle.python.Concepts\n\nmodule CodeInjConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    source instanceof RemoteFlowSource\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    sink = any(CodeExecution ce).getCode()\n  }\n}\n\nmodule CodeInjFlow = TaintTracking::Global<CodeInjConfig>;\nimport CodeInjFlow::PathGraph\n\nfrom CodeInjFlow::PathNode source, CodeInjFlow::PathNode sink\nwhere CodeInjFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"Code injection from $@.\", source.getNode(), \"untrusted input\"\n",
+   "hypothesis": "Untrusted input reaches a dynamic code execution sink (code injection)",
+   "severity": "critical",
+   "cwe_ids": [
+    "cwe-094"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20261122120128",
+   "codeql_raw_query": "/**\n * @name Unsafe deserialization\n * @description Deserializing untrusted data using unsafe methods can lead to arbitrary code execution.\n * @kind problem\n * @problem.severity error\n * @id audit/unsafe-deserialization\n * @tags security\n *       external/cwe/cwe-502\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"pickle\").getMember([\"load\", \"loads\", \"Unpickler\"]).getACall() or\n  call = API::moduleImport(\"yaml\").getMember([\"load\", \"unsafe_load\"]).getACall() or\n  call = API::moduleImport(\"marshal\").getMember([\"load\", \"loads\"]).getACall() or\n  call = API::moduleImport(\"shelve\").getMember(\"open\").getACall()\nselect call, \"Potentially unsafe deserialization operation.\"\n",
+   "hypothesis": "Unsafe deserialization via pickle/yaml/marshal/shelve",
+   "severity": "critical",
+   "cwe_ids": [
+    "cwe-502"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20261122120359",
+   "codeql_raw_query": "/**\n * @name Enumerate subprocess call sites\n * @description List all calls to subprocess module functions and os.system in the package\n * @kind problem\n * @problem.severity warning\n * @id click/audit/subprocess-calls\n */\n\nimport python\n\nfrom Call call, Attribute attr\nwhere\n  call.getFunc() = attr and\n  (\n    attr.getObject().(Name).getId() = \"subprocess\" and\n    attr.getName() in [\"Popen\", \"call\", \"run\", \"check_call\", \"check_output\", \"getoutput\", \"getstatusoutput\"]\n    or\n    attr.getObject().(Name).getId() = \"os\" and\n    attr.getName() in [\"system\", \"popen\", \"spawnl\", \"spawnlp\", \"spawnv\", \"spawnvp\", \"execl\", \"execlp\", \"execv\", \"execvp\"]\n  )\nselect call, \"Potential subprocess/command call: \" + attr.getName()\n",
+   "hypothesis": "Enumerate command execution call sites in click to assess injection risk",
+   "severity": "low",
+   "cwe_ids": [
+    "cwe-78"
+   ],
+   "results_count": 8,
+   "results": [
+    {
+     "ruleId": "click/audit/subprocess-calls",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "click/audit/subprocess-calls",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential subprocess/command call: Popen"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/click/_termui_impl.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 451,
+         "startColumn": 9,
+         "endLine": 458,
+         "endColumn": 6
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "a66be2c49de7e5bf:1",
+      "primaryLocationStartColumnFingerprint": "4"
+     }
+    },
+    {
+     "ruleId": "click/audit/subprocess-calls",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "click/audit/subprocess-calls",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential subprocess/command call: call"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/click/_termui_impl.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 538,
+         "startColumn": 9,
+         "endColumn": 51
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "727f60ade7f091d8:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "click/audit/subprocess-calls",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "click/audit/subprocess-calls",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential subprocess/command call: Popen"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/click/_termui_impl.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 602,
+         "startColumn": 17,
+         "endLine": 604,
+         "endColumn": 14
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "842ebe5dcf233b3a:1",
+      "primaryLocationStartColumnFingerprint": "4"
+     }
+    },
+    {
+     "ruleId": "click/audit/subprocess-calls",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "click/audit/subprocess-calls",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential subprocess/command call: Popen"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/click/_termui_impl.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 691,
+         "startColumn": 20,
+         "endColumn": 55
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "5c7d167b7418bc5e:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "click/audit/subprocess-calls",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "click/audit/subprocess-calls",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential subprocess/command call: call"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/click/_termui_impl.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 705,
+         "startColumn": 20,
+         "endColumn": 41
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "4bce038b634085d0:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "click/audit/subprocess-calls",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "click/audit/subprocess-calls",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential subprocess/command call: call"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/click/_termui_impl.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 719,
+         "startColumn": 20,
+         "endColumn": 41
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "6a2e40b20d72c165:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "click/audit/subprocess-calls",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "click/audit/subprocess-calls",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential subprocess/command call: Popen"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/click/_termui_impl.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 729,
+         "startColumn": 13,
+         "endColumn": 48
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "f6622020418feabe:1",
+      "primaryLocationStartColumnFingerprint": "4"
+     }
+    },
+    {
+     "ruleId": "click/audit/subprocess-calls",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "click/audit/subprocess-calls",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential subprocess/command call: run"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/click/shell_completion.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 320,
+         "startColumn": 22,
+         "endLine": 323,
+         "endColumn": 14
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "5990e770e5706654:1",
+      "primaryLocationStartColumnFingerprint": "9"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20261122120430",
+   "codeql_raw_query": "/**\n * @name Enumerate webbrowser.open call sites\n * @description List calls to webbrowser.open in the package\n * @kind problem\n * @problem.severity warning\n * @id click/audit/webbrowser-calls\n */\n\nimport python\n\nfrom Call call, Attribute attr\nwhere\n  call.getFunc() = attr and\n  attr.getObject().(Name).getId() = \"webbrowser\" and\n  attr.getName() in [\"open\", \"open_new\", \"open_new_tab\"]\nselect call, \"webbrowser launch call\"\n",
+   "hypothesis": "Enumerate webbrowser.open call sites to assess URL handling risk",
+   "severity": "low",
+   "cwe_ids": [
+    "cwe-79"
+   ],
+   "results_count": 1,
+   "results": [
+    {
+     "ruleId": "click/audit/webbrowser-calls",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "click/audit/webbrowser-calls",
+      "index": 0
+     },
+     "message": {
+      "text": "webbrowser launch call"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/click/_termui_impl.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 737,
+         "startColumn": 13,
+         "endColumn": 33
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "4f23626cc98b858a:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20261122120509",
+   "codeql_raw_query": "/**\n * @name Audit subprocess shell=True usage\n * @description Find subprocess calls using shell=True\n * @kind problem\n * @problem.severity warning\n * @id click/audit/shell-true\n */\n\nimport python\n\nfrom Call c, string name\nwhere\n  name = c.getFunc().toString() and\n  name in [\"Popen\", \"run\", \"call\", \"check_call\", \"check_output\", \"system\"]\nselect c, \"subprocess call with func: \" + name + \" at $@\", c.getLocation(), c.getLocation().toString()\n",
+   "hypothesis": "Enumerate all subprocess-related calls to inspect context",
+   "severity": "low",
+   "cwe_ids": [
+    "cwe-78"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20261122120954",
+   "codeql_raw_query": "/**\n * @name Shell string command execution via os.system/popen\n * @description Find os.system and os.popen calls\n * @kind problem\n * @problem.severity warning\n * @id click/audit/os-shell\n * @tags security\n *        external/cwe/cwe-078\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::builtin(\"system\").getACall()\n  or call = API::moduleImport(\"os\").getMember([\"system\", \"popen\"]).getACall()\nselect call, \"Shell command execution\"\n",
+   "hypothesis": "os.system/os.popen shell command execution",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-078"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20261122121239",
+   "codeql_raw_query": "/**\n * @name Subprocess shell=True usage\n * @description Finds subprocess calls that enable the shell, which can lead to command injection if arguments are influenced by untrusted input.\n * @kind problem\n * @problem.severity warning\n * @id click/audit/subprocess-shell-true\n */\n\nimport python\nimport semmle.python.ApiGraphs\nimport semmle.python.dataflow.new.DataFlow\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"subprocess\").getMember([\"Popen\", \"run\", \"call\", \"check_call\", \"check_output\"]).getACall() and\n  exists(DataFlow::Node arg |\n    arg = call.getArgByName(\"shell\") and\n    arg.asExpr().(Name).getId() = \"True\"\n  )\nselect call, \"subprocess call with shell=True\"\n",
+   "hypothesis": "Subprocess calls with shell=True could enable command injection if command strings are influenced by untrusted input (e.g., env vars like EDITOR/VISUAL).",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-78"
+   ],
+   "results_count": 2,
+   "results": [
+    {
+     "ruleId": "click/audit/subprocess-shell-true",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "click/audit/subprocess-shell-true",
+      "index": 0
+     },
+     "message": {
+      "text": "subprocess call with shell=True"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/click/_termui_impl.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 451,
+         "startColumn": 9,
+         "endLine": 458,
+         "endColumn": 6
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "a66be2c49de7e5bf:1",
+      "primaryLocationStartColumnFingerprint": "4"
+     }
+    },
+    {
+     "ruleId": "click/audit/subprocess-shell-true",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "click/audit/subprocess-shell-true",
+      "index": 0
+     },
+     "message": {
+      "text": "subprocess call with shell=True"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/click/_termui_impl.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 602,
+         "startColumn": 17,
+         "endLine": 604,
+         "endColumn": 14
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "842ebe5dcf233b3a:1",
+      "primaryLocationStartColumnFingerprint": "4"
+     }
+    }
+   ]
+  }
+ ],
+ "cache_usage": {
+  "prompt_tokens_total": 120228,
+  "uncached_input_tokens": 5924,
+  "cache_creation_input_tokens": 0,
+  "cache_read_input_tokens": 114304,
+  "output_tokens": 53935,
+  "calls": 19,
+  "caching_enabled": false,
+  "cost_usd_with_cache": 0.113216,
+  "cost_usd_no_cache": 0.186142,
+  "cache_read_share_of_prompt": 0.9507,
+  "prices_per_mtok": {
+   "claude-sonnet-4-5-20250929": {
+    "input": 3.0,
+    "output": 15.0
+   },
+   "claude-haiku-4-5-20251001": {
+    "input": 1.0,
+    "output": 5.0
+   },
+   "deepseek/deepseek-reasoner": {
+    "input": 0.15,
+    "output": 0.6,
+    "cache_read": 0.003,
+    "cache_write_mult": 1.0,
+    "peak_mult": 2.0
+   },
+   "gpt-5.1": {
+    "input": 1.25,
+    "output": 10.0,
+    "cache_read": 0.125,
+    "cache_write_mult": 1.0
+   },
+   "gpt-4.1": {
+    "input": 2.0,
+    "output": 8.0,
+    "cache_read": 0.5,
+    "cache_write_mult": 1.0
+   },
+   "deepseek/deepseek-v4-pro": {
+    "input": 0.66,
+    "output": 1.98,
+    "cache_read": 0.022,
+    "cache_write_mult": 1.0,
+    "peak_mult": 2.0
+   },
+   "deepseek/deepseek-flash": {
+    "input": 0.15,
+    "output": 0.6,
+    "cache_read": 0.003,
+    "cache_write_mult": 1.0,
+    "peak_mult": 2.0
+   }
+  },
+  "cache_multipliers": {
+   "write_5m": 1.25,
+   "read": 0.1
+  }
+ }
+}

@@ -1,0 +1,2735 @@
+{
+ "session_id": "20261122211504",
+ "package_name": "pyasn1-0.6.1",
+ "package_path": "packages/pyasn1-0.6.1",
+ "database_path": "databases/pyasn1-0.6.1-db",
+ "model": "gemini/gemini-4-carbon",
+ "temperature": null,
+ "max_tokens": 16000,
+ "iterations": 19,
+ "total_input_tokens": 266366,
+ "total_output_tokens": 7483,
+ "total_tokens": 273849,
+ "elapsed_time_seconds": 408.45,
+ "estimated_cost_usd": 0.0,
+ "summary": "# Security Analysis Report: pyasn1-0.6.1\n\n## Overview\n`pyasn1` (v0.6.1) is a pure-Python implementation of ASN.1 types and DER/BER/CER/native codecs. It relies exclusively on standard library modules (`collections`, `datetime`, `io`, `logging`, `math`, `os`, `sys`, `warnings`) and does not invoke OS commands, filesystem path manipulations on untrusted input, network sockets, SQL queries, or unsafe Python deserializers (`pickle`, `eval`, `exec`, `marshal`).\n\nConsequently, classic injection and arbitrary code execution classes (CWE-78, CWE-89, CWE-94, CWE-502, CWE-22) were verified absent via CodeQL API Graph analysis (only benign `getattr`/`setattr` usages in `pyasn1/type/base.py` metaclass construction and `pyasn1/debug.py` logger setup were present).\n\n## Key Security Findings (Denial of Service / Resource Exhaustion - CWE-400, CWE-770, CWE-834)\n\nAs an ASN.1 binary parser frequently exposed to untrusted network payloads (e.g., X.509 certificates, LDAP, SNMP, Kerberos), `pyasn1`'s primary attack surface is Algorithmic Complexity and Uncontrolled Resource Consumption during BER/CER/DER decoding and encoding:\n\n1. **Unbounded Base-128 Continuation Loops in OID, Relative-OID, and Tag Decoders (`pyasn1/codec/ber/decoder.py`)**\n   - **Locations**:\n     - `ObjectIdentifierPayloadDecoder.valueDecoder` (lines 421–438)\n     - `RelativeOIDPayloadDecoder.valueDecoder` (lines 479–496)\n     - `SingleItemDecoder.__call__` high-tag-number form decoding (lines 1608–1620)\n   - **Details**: When decoding ASN.1 OBJECT IDENTIFIERs, RELATIVE-OIDs, or multi-byte tags with continuation bits (`0x80`), the decoder shifts the accumulated arbitrary-precision Python integer left by 7 bits (`subId = (subId << 7) + ...` or `tagId = (tagId << 7) | ...`) per byte in a `while` loop without an upper bound on the byte count or integer bit-length.\n   - **Impact (CWE-400 / CWE-770)**: Crafting a payload filled with `0x81` continuation bytes causes quadratic $O(N^2)$ CPU time during big-integer bit-shifting (and potentially $O(N^2)$ decimal string conversion in Python if rendered as an OID string, or `ValueError` exceeding `sys.int_info.default_max_str_digits`), leading to Denial of Service.\n\n2. **Unbounded Arbitrary-Precision Integer Accumulation and Scaling in REAL Payload Decoder & Encoder (`pyasn1/codec/ber/decoder.py`, `pyasn1/codec/ber/encoder.py`)**\n   - **Locations**:\n     - `RealPayloadDecoder.valueDecoder` (`pyasn1/codec/ber/decoder.py`, lines 547–574)\n     - `RealEncoder._dropFloatingPoint` (`pyasn1/codec/ber/encoder.py`, lines 403–407)\n   - **Details**: In `RealPayloadDecoder.valueDecoder`, both the exponent `e` (line 548: `e = (e << 8) | ...`) and mantissa `p` (line 565: `p = (p << 8) | ...`) are accumulated over arbitrary-length chunks without length caps, followed by `p = p * 2**sf` (line 573). Similarly, `RealEncoder` computes `10 ** ...` or `base ** ...` during normalization.\n   - **Impact (CWE-400)**: Specially crafted ASN.1 `REAL` encodings with multi-kilobyte exponent or mantissa fields trigger expensive big-integer allocations and arithmetic operations, causing CPU/memory exhaustion.\n\n3. **Indefinite-Length Nested Construct Decoding (`pyasn1/codec/ber/decoder.py`)**\n   - **Locations**: `indefLenValueDecoder` implementations across `pyasn1/codec/ber/decoder.py` (lines 115, 263, 358, 957, 1114, 1243, 1381) and `SingleItemDecoder.__call__` (line 1582).\n   - **Details**: Deeply nested indefinite-length BER encodings rely on Python's call stack (`RecursionError`) unless constrained by caller limits, and repeated concatenation/chunk accumulation in constructed types can amplify memory usage on malformed streams.\n\n## Recommendations\n- Enforce strict upper bounds (e.g., maximum continuation bytes / bit length) on OID sub-identifiers, tag IDs, BER length octets, and `REAL` exponent/mantissa byte lengths in `pyasn1/codec/ber/decoder.py`.\n- Enforce explicit maximum recursion/nesting depth parameters in `SingleItemDecoder` to prevent stack exhaustion (`RecursionError`) without relying on Python's interpreter stack limit.",
+ "package_classification": {
+  "layer": [
+   "library",
+   "data-processing",
+   "serialization"
+  ],
+  "type": [
+   "asn1-codec",
+   "parser",
+   "encoding-library"
+  ]
+ },
+ "tool_calls": {
+  "get_package_profile_info": 1,
+  "execute_codeql_query": 8,
+  "validate_codeql_query": 0,
+  "fixup_codeql_query": 0,
+  "finalize_report": 1
+ },
+ "queries_executed": {
+  "critical": 0,
+  "high": 6,
+  "medium": 1,
+  "low": 0,
+  "total_executed": 8,
+  "total_with_results": 7,
+  "total_failed": 1
+ },
+ "query_findings": {
+  "critical": 0,
+  "high": 71,
+  "medium": 9,
+  "low": 0,
+  "total": 80
+ },
+ "findings": [
+  {
+   "codeql_query_uuid": "20261122211530",
+   "codeql_raw_query": "/**\n * @name Dangerous builtins and OS operations\n * @description Check for eval, exec, compile, __import__, os calls, open, setattr\n * @kind problem\n * @problem.severity warning\n * @id py/dangerous-calls\n * @tags security\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call, string name\nwhere\n  (\n    name = [\"eval\", \"exec\", \"compile\", \"__import__\", \"open\", \"setattr\", \"getattr\"] and\n    call = API::builtin(name).getACall()\n  )\n  or\n  exists(string member |\n    call = API::moduleImport(\"os\").getMember(member).getACall() and\n    name = \"os.\" + member\n  )\n  or\n  exists(string member |\n    call = API::moduleImport(\"os\").getMember(\"path\").getMember(member).getACall() and\n    name = \"os.path.\" + member\n  )\nselect call, \"Call to potentially sensitive API: \" + name",
+   "hypothesis": "Check for any code execution, dynamic attribute modification, file operations, or OS module usage in pyasn1",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-94",
+    "cwe-78",
+    "cwe-915",
+    "cwe-22"
+   ],
+   "results_count": 3,
+   "results": [
+    {
+     "ruleId": "py/dangerous-calls",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/dangerous-calls",
+      "index": 0
+     },
+     "message": {
+      "text": "Call to potentially sensitive API: getattr"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pyasn1/type/base.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 222,
+         "startColumn": 38,
+         "endColumn": 56
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "56abbb918e1087:1",
+      "primaryLocationStartColumnFingerprint": "9"
+     }
+    },
+    {
+     "ruleId": "py/dangerous-calls",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/dangerous-calls",
+      "index": 0
+     },
+     "message": {
+      "text": "Call to potentially sensitive API: setattr"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pyasn1/type/base.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 225,
+         "startColumn": 17,
+         "endColumn": 50
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "6fd51dcdb7a22d3e:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/dangerous-calls",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/dangerous-calls",
+      "index": 0
+     },
+     "message": {
+      "text": "Call to potentially sensitive API: setattr"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pyasn1/debug.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 117,
+         "startColumn": 9,
+         "endColumn": 67
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "9fa13a0a13bc94e8:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20261122211606",
+   "codeql_raw_query": "/**\n * @name Inspect setattr, os, sys, and io calls\n * @description Inspects calls to setattr and os/sys/io functions with argument details\n * @kind problem\n * @problem.severity warning\n * @id py/inspect-sensitive-usage\n * @tags security\n *        external/cwe/cwe-915\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call, Function enclosing, string info\nwhere\n  call.getScope() = enclosing and\n  (\n    exists(string fn |\n      fn in [\"setattr\", \"getattr\"] and\n      call = API::builtin(fn).getACall() and\n      info = fn + \" in \" + enclosing.getName() + \" arg1=\" + call.getArg(1).asExpr().toString()\n    )\n    or\n    exists(string mod, string member |\n      mod in [\"os\", \"sys\", \"io\"] and\n      call = API::moduleImport(mod).getMember(member).getACall() and\n      info = mod + \".\" + member + \" in \" + enclosing.getName()\n    )\n  )\nselect call, info\n",
+   "hypothesis": "Inspect dynamic attribute modifications and OS/IO interactions to check if external input can influence object attributes or file/system state.",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-915",
+    "cwe-22"
+   ],
+   "results_count": 9,
+   "results": [
+    {
+     "ruleId": "py/inspect-sensitive-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/inspect-sensitive-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "getattr in listcomp arg1=name"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pyasn1/type/base.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 222,
+         "startColumn": 38,
+         "endColumn": 56
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "56abbb918e1087:1",
+      "primaryLocationStartColumnFingerprint": "9"
+     }
+    },
+    {
+     "ruleId": "py/inspect-sensitive-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/inspect-sensitive-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "setattr in __new__ arg1=name"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pyasn1/type/base.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 225,
+         "startColumn": 17,
+         "endColumn": 50
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "6fd51dcdb7a22d3e:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/inspect-sensitive-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/inspect-sensitive-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "setattr in setLogger arg1=name"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pyasn1/debug.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 117,
+         "startColumn": 9,
+         "endColumn": 67
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "9fa13a0a13bc94e8:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/inspect-sensitive-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/inspect-sensitive-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "io.BytesIO in __init__"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pyasn1/codec/streaming.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 25,
+         "startColumn": 23,
+         "endColumn": 35
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "c221433854d54030:1",
+      "primaryLocationStartColumnFingerprint": "14"
+     }
+    },
+    {
+     "ruleId": "py/inspect-sensitive-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/inspect-sensitive-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "io.BytesIO in markedPosition"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pyasn1/codec/streaming.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 74,
+         "startColumn": 27,
+         "endColumn": 57
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "a6325c445036e34f:1",
+      "primaryLocationStartColumnFingerprint": "14"
+     }
+    },
+    {
+     "ruleId": "py/inspect-sensitive-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/inspect-sensitive-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "io.BytesIO in asSeekableStream"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pyasn1/codec/streaming.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 101,
+         "startColumn": 16,
+         "endColumn": 37
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "c9606b9df8fb11fc:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/inspect-sensitive-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/inspect-sensitive-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "io.BytesIO in asSeekableStream"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pyasn1/codec/streaming.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 104,
+         "startColumn": 16,
+         "endColumn": 48
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "4ef796a2f1f234fa:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/inspect-sensitive-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/inspect-sensitive-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "sys.exc_info in prettyIn"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pyasn1/type/univ.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 3
+        },
+        "region": {
+         "startLine": 1136,
+         "startColumn": 91,
+         "endColumn": 105
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "84f6d7e91dcd30dc:1",
+      "primaryLocationStartColumnFingerprint": "70"
+     }
+    },
+    {
+     "ruleId": "py/inspect-sensitive-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/inspect-sensitive-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "sys.exc_info in prettyIn"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pyasn1/type/univ.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 3
+        },
+        "region": {
+         "startLine": 1265,
+         "startColumn": 94,
+         "endColumn": 108
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "c48eec08c5a52470:1",
+      "primaryLocationStartColumnFingerprint": "73"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20261122211647",
+   "codeql_raw_query": "/**\n * @name Potentially expensive arithmetic or shift operations in decoders and types\n * @description Large shifts, exponentiations, or multiplications on decoded values can cause CPU or memory exhaustion (DoS).\n * @kind problem\n * @problem.severity warning\n * @id py/expensive-arithmetic-dos\n * @tags security\n *        external/cwe/cwe-400\n */\n\nimport python\n\nfrom BinaryExpr expr\nwhere\n  (\n    expr.getOp() instanceof Pow or\n    expr.getOp() instanceof LShift\n  ) and\n  expr.getLocation().getFile().getRelativePath().regexpMatch(\"pyasn1/(codec|type)/.*\")\nselect expr,\n  \"Operation \" + expr.getOp().toString() + \" in \" + expr.getScope().getName() + \" (\" +\n    expr.getLeft().toString() + \" op \" + expr.getRight().toString() + \")\"\n",
+   "hypothesis": "Check for exponentiation (Pow) or bit-shift (LShift) operations in ASN.1 codecs and types that could lead to resource exhaustion (DoS) when given attacker-controlled exponents or varints (e.g., REAL type or OID decoding).",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-400",
+    "cwe-770"
+   ],
+   "results_count": 23,
+   "results": [
+    {
+     "ruleId": "py/expensive-arithmetic-dos",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/expensive-arithmetic-dos",
+      "index": 0
+     },
+     "message": {
+      "text": "Operation LShift in valueDecoder (subId op IntegerLiteral)"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pyasn1/codec/ber/decoder.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 431,
+         "startColumn": 30,
+         "endColumn": 40
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "bfe5c53ae1cd5c37:1",
+      "primaryLocationStartColumnFingerprint": "9"
+     }
+    },
+    {
+     "ruleId": "py/expensive-arithmetic-dos",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/expensive-arithmetic-dos",
+      "index": 0
+     },
+     "message": {
+      "text": "Operation LShift in valueDecoder (subId op IntegerLiteral)"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pyasn1/codec/ber/decoder.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 438,
+         "startColumn": 26,
+         "endColumn": 36
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "ac12e4e258010dca:1",
+      "primaryLocationStartColumnFingerprint": "9"
+     }
+    },
+    {
+     "ruleId": "py/expensive-arithmetic-dos",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/expensive-arithmetic-dos",
+      "index": 0
+     },
+     "message": {
+      "text": "Operation LShift in valueDecoder (subId op IntegerLiteral)"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pyasn1/codec/ber/decoder.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 489,
+         "startColumn": 30,
+         "endColumn": 40
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "bfe5c53ae1cd5c37:2",
+      "primaryLocationStartColumnFingerprint": "9"
+     }
+    },
+    {
+     "ruleId": "py/expensive-arithmetic-dos",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/expensive-arithmetic-dos",
+      "index": 0
+     },
+     "message": {
+      "text": "Operation LShift in valueDecoder (subId op IntegerLiteral)"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pyasn1/codec/ber/decoder.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 496,
+         "startColumn": 29,
+         "endColumn": 39
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "b0f1a1743f4bde7d:1",
+      "primaryLocationStartColumnFingerprint": "12"
+     }
+    },
+    {
+     "ruleId": "py/expensive-arithmetic-dos",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/expensive-arithmetic-dos",
+      "index": 0
+     },
+     "message": {
+      "text": "Operation LShift in valueDecoder (e op IntegerLiteral)"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pyasn1/codec/ber/decoder.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 548,
+         "startColumn": 17,
+         "endColumn": 24
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "80e5fcde2775cd0d:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/expensive-arithmetic-dos",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/expensive-arithmetic-dos",
+      "index": 0
+     },
+     "message": {
+      "text": "Operation LShift in valueDecoder (p op IntegerLiteral)"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pyasn1/codec/ber/decoder.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 565,
+         "startColumn": 17,
+         "endColumn": 24
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "ca693f0abb0387a3:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/expensive-arithmetic-dos",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/expensive-arithmetic-dos",
+      "index": 0
+     },
+     "message": {
+      "text": "Operation Pow in valueDecoder (IntegerLiteral op sf)"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pyasn1/codec/ber/decoder.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 573,
+         "startColumn": 18,
+         "endColumn": 25
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "8975e13b7fec5206:1",
+      "primaryLocationStartColumnFingerprint": "5"
+     }
+    },
+    {
+     "ruleId": "py/expensive-arithmetic-dos",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/expensive-arithmetic-dos",
+      "index": 0
+     },
+     "message": {
+      "text": "Operation LShift in __call__ (tagId op IntegerLiteral)"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pyasn1/codec/ber/decoder.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 1620,
+         "startColumn": 29,
+         "endColumn": 40
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "8fd3d1f72fc08756:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/expensive-arithmetic-dos",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/expensive-arithmetic-dos",
+      "index": 0
+     },
+     "message": {
+      "text": "Operation LShift in __call__ (length op IntegerLiteral)"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pyasn1/codec/ber/decoder.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 1681,
+         "startColumn": 25,
+         "endColumn": 37
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "d29e8039aa8481aa:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/expensive-arithmetic-dos",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/expensive-arithmetic-dos",
+      "index": 0
+     },
+     "message": {
+      "text": "Operation LShift in encodeValue (value op BinaryExpr)"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pyasn1/codec/ber/encoder.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 194,
+         "startColumn": 28,
+         "endColumn": 58
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "95d0e0d5731bfd1e:1",
+      "primaryLocationStartColumnFingerprint": "15"
+     }
+    },
+    {
+     "ruleId": "py/expensive-arithmetic-dos",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/expensive-arithmetic-dos",
+      "index": 0
+     },
+     "message": {
+      "text": "Operation Pow in _dropFloatingPoint (IntegerLiteral op BinaryExpr)"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pyasn1/codec/ber/encoder.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 403,
+         "startColumn": 18,
+         "endColumn": 40
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "1124be098075fded:1",
+      "primaryLocationStartColumnFingerprint": "5"
+     }
+    },
+    {
+     "ruleId": "py/expensive-arithmetic-dos",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/expensive-arithmetic-dos",
+      "index": 0
+     },
+     "message": {
+      "text": "Operation Pow in _dropFloatingPoint (IntegerLiteral op BinaryExpr)"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pyasn1/codec/ber/encoder.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 407,
+         "startColumn": 18,
+         "endColumn": 40
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "25599efb42beede3:1",
+      "primaryLocationStartColumnFingerprint": "5"
+     }
+    },
+    {
+     "ruleId": "py/expensive-arithmetic-dos",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/expensive-arithmetic-dos",
+      "index": 0
+     },
+     "message": {
+      "text": "Operation LShift in encodeValue (sf op IntegerLiteral)"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pyasn1/codec/ber/encoder.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 507,
+         "startColumn": 19,
+         "endColumn": 26
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "30452a96213983c1:1",
+      "primaryLocationStartColumnFingerprint": "6"
+     }
+    },
+    {
+     "ruleId": "py/expensive-arithmetic-dos",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/expensive-arithmetic-dos",
+      "index": 0
+     },
+     "message": {
+      "text": "Operation LShift in __lshift__ (Attribute op value)"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pyasn1/type/univ.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 126,
+         "startColumn": 27,
+         "endColumn": 47
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "34315c9a6438a578:1",
+      "primaryLocationStartColumnFingerprint": "18"
+     }
+    },
+    {
+     "ruleId": "py/expensive-arithmetic-dos",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/expensive-arithmetic-dos",
+      "index": 0
+     },
+     "message": {
+      "text": "Operation LShift in __add__ (Attribute op len())"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pyasn1/type/univ.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 507,
+         "startColumn": 40,
+         "endColumn": 65
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "b3826a22d8176fdb:1",
+      "primaryLocationStartColumnFingerprint": "31"
+     }
+    },
+    {
+     "ruleId": "py/expensive-arithmetic-dos",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/expensive-arithmetic-dos",
+      "index": 0
+     },
+     "message": {
+      "text": "Operation LShift in __radd__ (value op len())"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pyasn1/type/univ.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 511,
+         "startColumn": 40,
+         "endColumn": 65
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "9147475e96198645:1",
+      "primaryLocationStartColumnFingerprint": "31"
+     }
+    },
+    {
+     "ruleId": "py/expensive-arithmetic-dos",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/expensive-arithmetic-dos",
+      "index": 0
+     },
+     "message": {
+      "text": "Operation LShift in __mul__ (bitString op len())"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pyasn1/type/univ.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 516,
+         "startColumn": 13,
+         "endColumn": 43
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "32c41510e2279ca0:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/expensive-arithmetic-dos",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/expensive-arithmetic-dos",
+      "index": 0
+     },
+     "message": {
+      "text": "Operation LShift in __lshift__ (Attribute op count)"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pyasn1/type/univ.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 525,
+         "startColumn": 40,
+         "endColumn": 60
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "17a5d2280ae1c4e2:1",
+      "primaryLocationStartColumnFingerprint": "31"
+     }
+    },
+    {
+     "ruleId": "py/expensive-arithmetic-dos",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/expensive-arithmetic-dos",
+      "index": 0
+     },
+     "message": {
+      "text": "Operation LShift in fromHexString (SizedInteger() op len())"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pyasn1/type/univ.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 580,
+         "startColumn": 18,
+         "endColumn": 53
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "5dc87c064a692be9:1",
+      "primaryLocationStartColumnFingerprint": "1"
+     }
+    },
+    {
+     "ruleId": "py/expensive-arithmetic-dos",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/expensive-arithmetic-dos",
+      "index": 0
+     },
+     "message": {
+      "text": "Operation LShift in fromBinaryString (SizedInteger() op len())"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pyasn1/type/univ.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 605,
+         "startColumn": 18,
+         "endColumn": 53
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "5dc87c064a692be9:2",
+      "primaryLocationStartColumnFingerprint": "1"
+     }
+    },
+    {
+     "ruleId": "py/expensive-arithmetic-dos",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/expensive-arithmetic-dos",
+      "index": 0
+     },
+     "message": {
+      "text": "Operation LShift in fromOctetString (SizedInteger() op len())"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pyasn1/type/univ.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 626,
+         "startColumn": 18,
+         "endColumn": 53
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "5dc87c064a692be9:3",
+      "primaryLocationStartColumnFingerprint": "1"
+     }
+    },
+    {
+     "ruleId": "py/expensive-arithmetic-dos",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/expensive-arithmetic-dos",
+      "index": 0
+     },
+     "message": {
+      "text": "Operation LShift in prettyIn (IntegerLiteral op BinaryExpr)"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pyasn1/type/univ.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 665,
+         "startColumn": 31,
+         "endColumn": 69
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "fbe1fdf48390c765:1",
+      "primaryLocationStartColumnFingerprint": "10"
+     }
+    },
+    {
+     "ruleId": "py/expensive-arithmetic-dos",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/expensive-arithmetic-dos",
+      "index": 0
+     },
+     "message": {
+      "text": "Operation LShift in fromBinaryString (v op bitNo)"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pyasn1/type/univ.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 904,
+         "startColumn": 21,
+         "endColumn": 31
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "9188ab7b5ab4da9d:1",
+      "primaryLocationStartColumnFingerprint": "8"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20261122211817",
+   "codeql_raw_query": "/**\n * @name Check assignments in RealPayloadDecoder\n * @description Check assignments in RealPayloadDecoder between lines 530 and 590\n * @kind problem\n * @problem.severity warning\n * @id py/real-decoder-assigns\n * @tags security\n *        external/cwe/cwe-400\n */\n\nimport python\n\nfrom AssignStmt a\nwhere\n  a.getLocation().getFile().getShortName() = \"decoder.py\" and\n  a.getLocation().getStartLine() >= 530 and\n  a.getLocation().getStartLine() <= 590\nselect a, \"Line \" + a.getLocation().getStartLine().toString() + \": \" + a.getATarget().toString() + \" = \" + a.getValue().toString()\n",
+   "hypothesis": "Check exponent and mantissa computation in RealPayloadDecoder for unbounded arithmetic DoS",
+   "severity": "high",
+   "cwe_ids": [
+    "CWE-400"
+   ],
+   "results_count": 13,
+   "results": [
+    {
+     "ruleId": "py/real-decoder-assigns",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/real-decoder-assigns",
+      "index": 0
+     },
+     "message": {
+      "text": "Line 534: n = BinaryExpr"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pyasn1/codec/ber/decoder.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 534,
+         "startColumn": 13,
+         "endColumn": 32
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "4a9bf54e106ab678:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/real-decoder-assigns",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/real-decoder-assigns",
+      "index": 0
+     },
+     "message": {
+      "text": "Line 537: n = Subscript"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pyasn1/codec/ber/decoder.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 537,
+         "startColumn": 17,
+         "endColumn": 29
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "4149225dcdf62fd1:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/real-decoder-assigns",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/real-decoder-assigns",
+      "index": 0
+     },
+     "message": {
+      "text": "Line 538: chunk = Subscript"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pyasn1/codec/ber/decoder.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 538,
+         "startColumn": 17,
+         "endColumn": 34
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "7dcdf7a78d7fbaf5:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/real-decoder-assigns",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/real-decoder-assigns",
+      "index": 0
+     },
+     "message": {
+      "text": "Line 540: Tuple = Tuple"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pyasn1/codec/ber/decoder.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 540,
+         "startColumn": 13,
+         "endColumn": 45
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "9e38ee5f5bd68d0c:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/real-decoder-assigns",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/real-decoder-assigns",
+      "index": 0
+     },
+     "message": {
+      "text": "Line 545: e = BoolExpr"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pyasn1/codec/ber/decoder.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 545,
+         "startColumn": 13,
+         "endColumn": 41
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "2079255d91868888:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/real-decoder-assigns",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/real-decoder-assigns",
+      "index": 0
+     },
+     "message": {
+      "text": "Line 550: eo = Subscript"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pyasn1/codec/ber/decoder.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 550,
+         "startColumn": 17,
+         "endColumn": 28
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "ec1fa86ed562f47b:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/real-decoder-assigns",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/real-decoder-assigns",
+      "index": 0
+     },
+     "message": {
+      "text": "Line 552: b = BinaryExpr"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pyasn1/codec/ber/decoder.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 552,
+         "startColumn": 13,
+         "endColumn": 31
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "9b3fe743e60e671a:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/real-decoder-assigns",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/real-decoder-assigns",
+      "index": 0
+     },
+     "message": {
+      "text": "Line 562: p = IntegerLiteral"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pyasn1/codec/ber/decoder.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 562,
+         "startColumn": 13,
+         "endColumn": 18
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "e16f846e8e515d4b:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/real-decoder-assigns",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/real-decoder-assigns",
+      "index": 0
+     },
+     "message": {
+      "text": "Line 567: chunk = Subscript"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pyasn1/codec/ber/decoder.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 567,
+         "startColumn": 17,
+         "endColumn": 34
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "9f57fbe6d27b723:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/real-decoder-assigns",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/real-decoder-assigns",
+      "index": 0
+     },
+     "message": {
+      "text": "Line 570: p = UnaryExpr"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pyasn1/codec/ber/decoder.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 570,
+         "startColumn": 17,
+         "endColumn": 23
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "3c73845b7a57747a:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/real-decoder-assigns",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/real-decoder-assigns",
+      "index": 0
+     },
+     "message": {
+      "text": "Line 572: sf = BinaryExpr"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pyasn1/codec/ber/decoder.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 572,
+         "startColumn": 13,
+         "endColumn": 32
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "10ad38e9c1aac89b:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/real-decoder-assigns",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/real-decoder-assigns",
+      "index": 0
+     },
+     "message": {
+      "text": "Line 574: value = Tuple"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pyasn1/codec/ber/decoder.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 574,
+         "startColumn": 13,
+         "endColumn": 30
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "de330fd25cdc5871:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/real-decoder-assigns",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/real-decoder-assigns",
+      "index": 0
+     },
+     "message": {
+      "text": "Line 580: value = BoolExpr"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pyasn1/codec/ber/decoder.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 580,
+         "startColumn": 13,
+         "endColumn": 50
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "c0309a26644743b:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20261122211922",
+   "codeql_raw_query": "/**\n * @name Check Real evaluation and OID decoding\n * @description Inspect binary operations in Real and ObjectIdentifier decoding/evaluation\n * @kind problem\n * @problem.severity warning\n * @id py/check-real-oid-ops\n * @tags security\n *       external/cwe/cwe-400\n */\n\nimport python\n\nfrom BinaryExpr b, Function f\nwhere\n  b.getScope() = f and\n  (\n    (b.getLocation().getFile().getShortName() = \"univ.py\" and b.getOp() instanceof Pow)\n    or\n    (b.getLocation().getFile().getShortName() = \"decoder.py\" and b.getLocation().getStartLine() >= 420 and b.getLocation().getStartLine() <= 580 and (b.getOp() instanceof Pow or b.getOp() instanceof Mult or b.getOp() instanceof Div))\n  )\nselect b, \"Func \" + f.getName() + \" line \" + b.getLocation().getStartLine().toString() + \": \" + b.getLeft().toString() + \" op \" + b.getRight().toString()\n",
+   "hypothesis": "Check exponentiation and multiplication in Real type and BER decoder for unbounded resource consumption (CPU/memory DoS)",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-400"
+   ],
+   "results_count": 4,
+   "results": [
+    {
+     "ruleId": "py/check-real-oid-ops",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/check-real-oid-ops",
+      "index": 0
+     },
+     "message": {
+      "text": "Func valueDecoder line 558: e op IntegerLiteral"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pyasn1/codec/ber/decoder.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 558,
+         "startColumn": 17,
+         "endColumn": 23
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "a62fcd2b78711db:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/check-real-oid-ops",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/check-real-oid-ops",
+      "index": 0
+     },
+     "message": {
+      "text": "Func valueDecoder line 561: e op IntegerLiteral"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pyasn1/codec/ber/decoder.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 561,
+         "startColumn": 17,
+         "endColumn": 23
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "bfe2575fa0a7eb60:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/check-real-oid-ops",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/check-real-oid-ops",
+      "index": 0
+     },
+     "message": {
+      "text": "Func valueDecoder line 573: p op BinaryExpr"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pyasn1/codec/ber/decoder.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 573,
+         "startColumn": 13,
+         "endColumn": 25
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "8975e13b7fec5206:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/check-real-oid-ops",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/check-real-oid-ops",
+      "index": 0
+     },
+     "message": {
+      "text": "Func valueDecoder line 573: IntegerLiteral op sf"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pyasn1/codec/ber/decoder.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 573,
+         "startColumn": 18,
+         "endColumn": 25
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "8975e13b7fec5206:1",
+      "primaryLocationStartColumnFingerprint": "5"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20261122212041",
+   "codeql_raw_query": "/**\n * @name Potentially unbounded while loops in ASN.1 BER decoder\n * @description Inspects while loops in BER decoder for potential resource exhaustion or infinite loop conditions\n * @kind problem\n * @problem.severity warning\n * @id py/ber-decoder-while-loops\n * @tags security\n *       external/cwe/cwe-400\n *       external/cwe/cwe-835\n */\n\nimport python\n\nfrom While w, Function f\nwhere\n  w.getScope() = f and\n  w.getLocation().getFile().getShortName() = \"decoder.py\"\nselect w, \"While loop in decoder function \" + f.getName() + \" at line \" + w.getLocation().getStartLine().toString()\n",
+   "hypothesis": "Check while loops in BER/CER/DER/native decoders for unbounded iteration, memory amplification (indefinite-length or chunked substrate concatenation), or OID/tag/length parsing DoS.",
+   "severity": "high",
+   "cwe_ids": [
+    "CWE-400",
+    "CWE-835"
+   ],
+   "results_count": 21,
+   "results": [
+    {
+     "ruleId": "py/ber-decoder-while-loops",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/ber-decoder-while-loops",
+      "index": 0
+     },
+     "message": {
+      "text": "While loop in decoder function indefLenValueDecoder at line 115"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pyasn1/codec/ber/decoder.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 115,
+         "startColumn": 9,
+         "endColumn": 20
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "12690f2982a33f24:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/ber-decoder-while-loops",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/ber-decoder-while-loops",
+      "index": 0
+     },
+     "message": {
+      "text": "While loop in decoder function valueDecoder at line 225"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pyasn1/codec/ber/decoder.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 225,
+         "startColumn": 9,
+         "endColumn": 60
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "b394067b6f8ddd90:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/ber-decoder-while-loops",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/ber-decoder-while-loops",
+      "index": 0
+     },
+     "message": {
+      "text": "While loop in decoder function indefLenValueDecoder at line 263"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pyasn1/codec/ber/decoder.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 263,
+         "startColumn": 9,
+         "endColumn": 20
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "b851ac12c9704986:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/ber-decoder-while-loops",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/ber-decoder-while-loops",
+      "index": 0
+     },
+     "message": {
+      "text": "While loop in decoder function valueDecoder at line 330"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pyasn1/codec/ber/decoder.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 330,
+         "startColumn": 9,
+         "endColumn": 61
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "51f14a0135d0a9c:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/ber-decoder-while-loops",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/ber-decoder-while-loops",
+      "index": 0
+     },
+     "message": {
+      "text": "While loop in decoder function indefLenValueDecoder at line 358"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pyasn1/codec/ber/decoder.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 358,
+         "startColumn": 9,
+         "endColumn": 20
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "b851ac12c9704986:2",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/ber-decoder-while-loops",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/ber-decoder-while-loops",
+      "index": 0
+     },
+     "message": {
+      "text": "While loop in decoder function valueDecoder at line 421"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pyasn1/codec/ber/decoder.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 421,
+         "startColumn": 9,
+         "endColumn": 36
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "a1d62ef679370f38:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/ber-decoder-while-loops",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/ber-decoder-while-loops",
+      "index": 0
+     },
+     "message": {
+      "text": "While loop in decoder function valueDecoder at line 430"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pyasn1/codec/ber/decoder.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 430,
+         "startColumn": 17,
+         "endColumn": 40
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "c655377394d8f3b1:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/ber-decoder-while-loops",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/ber-decoder-while-loops",
+      "index": 0
+     },
+     "message": {
+      "text": "While loop in decoder function valueDecoder at line 479"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pyasn1/codec/ber/decoder.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 479,
+         "startColumn": 9,
+         "endColumn": 36
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "184dafb0639bb3e3:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/ber-decoder-while-loops",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/ber-decoder-while-loops",
+      "index": 0
+     },
+     "message": {
+      "text": "While loop in decoder function valueDecoder at line 488"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pyasn1/codec/ber/decoder.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 488,
+         "startColumn": 17,
+         "endColumn": 40
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "c655377394d8f3b1:2",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/ber-decoder-while-loops",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/ber-decoder-while-loops",
+      "index": 0
+     },
+     "message": {
+      "text": "While loop in decoder function valueDecoder at line 547"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pyasn1/codec/ber/decoder.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 547,
+         "startColumn": 13,
+         "endColumn": 22
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "63d1a09b90fc1f91:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/ber-decoder-while-loops",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/ber-decoder-while-loops",
+      "index": 0
+     },
+     "message": {
+      "text": "While loop in decoder function valueDecoder at line 564"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pyasn1/codec/ber/decoder.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 564,
+         "startColumn": 13,
+         "endColumn": 25
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "d2cf0848dc264882:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/ber-decoder-while-loops",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/ber-decoder-while-loops",
+      "index": 0
+     },
+     "message": {
+      "text": "While loop in decoder function _decodeComponentsSchemaless at line 642"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pyasn1/codec/ber/decoder.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 642,
+         "startColumn": 9,
+         "endColumn": 77
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "468e85793788be8e:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/ber-decoder-while-loops",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/ber-decoder-while-loops",
+      "index": 0
+     },
+     "message": {
+      "text": "While loop in decoder function valueDecoder at line 745"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pyasn1/codec/ber/decoder.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 745,
+         "startColumn": 13,
+         "endColumn": 65
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "6692672001f9d1c4:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/ber-decoder-while-loops",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/ber-decoder-while-loops",
+      "index": 0
+     },
+     "message": {
+      "text": "While loop in decoder function valueDecoder at line 888"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pyasn1/codec/ber/decoder.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 888,
+         "startColumn": 13,
+         "endColumn": 65
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "8b43fe0fe76f6d81:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/ber-decoder-while-loops",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/ber-decoder-while-loops",
+      "index": 0
+     },
+     "message": {
+      "text": "While loop in decoder function indefLenValueDecoder at line 957"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pyasn1/codec/ber/decoder.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 957,
+         "startColumn": 13,
+         "endColumn": 24
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "500b87d5e63fbf79:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/ber-decoder-while-loops",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/ber-decoder-while-loops",
+      "index": 0
+     },
+     "message": {
+      "text": "While loop in decoder function indefLenValueDecoder at line 1114"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pyasn1/codec/ber/decoder.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 1114,
+         "startColumn": 13,
+         "endColumn": 24
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "58d933306961e8bb:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/ber-decoder-while-loops",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/ber-decoder-while-loops",
+      "index": 0
+     },
+     "message": {
+      "text": "While loop in decoder function indefLenValueDecoder at line 1243"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pyasn1/codec/ber/decoder.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 1243,
+         "startColumn": 9,
+         "endColumn": 20
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "a77df07b93cd3d4f:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/ber-decoder-while-loops",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/ber-decoder-while-loops",
+      "index": 0
+     },
+     "message": {
+      "text": "While loop in decoder function indefLenValueDecoder at line 1381"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pyasn1/codec/ber/decoder.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 1381,
+         "startColumn": 9,
+         "endColumn": 20
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "3711df1e01d8760b:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/ber-decoder-while-loops",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/ber-decoder-while-loops",
+      "index": 0
+     },
+     "message": {
+      "text": "While loop in decoder function __call__ at line 1582"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pyasn1/codec/ber/decoder.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 1582,
+         "startColumn": 9,
+         "endColumn": 35
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "85f85e0bef9e7b13:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/ber-decoder-while-loops",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/ber-decoder-while-loops",
+      "index": 0
+     },
+     "message": {
+      "text": "While loop in decoder function __call__ at line 1608"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pyasn1/codec/ber/decoder.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 1608,
+         "startColumn": 25,
+         "endColumn": 36
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "daf4c120beafb46a:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/ber-decoder-while-loops",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/ber-decoder-while-loops",
+      "index": 0
+     },
+     "message": {
+      "text": "While loop in decoder function __iter__ at line 1974"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pyasn1/codec/ber/decoder.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 1974,
+         "startColumn": 9,
+         "endColumn": 20
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "44baa2e45ae4d58e:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20261122212113",
+   "codeql_raw_query": "/**\n * @name Check bounds in BER OID, Tag, and Length continuation loops\n * @description Check if continuation loops in BER decoder enforce maximum length or shift bounds to prevent DoS\n * @kind problem\n * @problem.severity warning\n * @id py/ber-unbounded-continuation-loop\n * @tags security\n *        external/cwe/cwe-400\n */\n\nimport python\n\nfrom While w\nwhere\n  w.getLocation().getFile().getShortName() = \"decoder.py\" and\n  w.getLocation().getStartLine() in [421, 430, 479, 488, 547, 564, 1608] and\n  not exists(Compare cmp |\n    cmp.getParentNode+() = w and\n    exists(IntegerLiteral lim | lim = cmp.getAChildNode() and lim.getValue() > 128)\n  )\nselect w, \"Continuation loop in BER decoder at line \" + w.getLocation().getStartLine().toString() + \" lacks upper bound check on accumulated integer size or byte count.\"\n",
+   "hypothesis": "Check whether BER continuation-byte decoding loops for OID sub-identifiers, high-tag-number tags, and Real exponents/mantissas enforce upper bounds on byte counts or integer bit-widths to prevent quadratic CPU/memory exhaustion (DoS).",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-400",
+    "cwe-770"
+   ],
+   "results_count": 7,
+   "results": [
+    {
+     "ruleId": "py/ber-unbounded-continuation-loop",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/ber-unbounded-continuation-loop",
+      "index": 0
+     },
+     "message": {
+      "text": "Continuation loop in BER decoder at line 421 lacks upper bound check on accumulated integer size or byte count."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pyasn1/codec/ber/decoder.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 421,
+         "startColumn": 9,
+         "endColumn": 36
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "a1d62ef679370f38:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/ber-unbounded-continuation-loop",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/ber-unbounded-continuation-loop",
+      "index": 0
+     },
+     "message": {
+      "text": "Continuation loop in BER decoder at line 430 lacks upper bound check on accumulated integer size or byte count."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pyasn1/codec/ber/decoder.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 430,
+         "startColumn": 17,
+         "endColumn": 40
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "c655377394d8f3b1:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/ber-unbounded-continuation-loop",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/ber-unbounded-continuation-loop",
+      "index": 0
+     },
+     "message": {
+      "text": "Continuation loop in BER decoder at line 479 lacks upper bound check on accumulated integer size or byte count."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pyasn1/codec/ber/decoder.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 479,
+         "startColumn": 9,
+         "endColumn": 36
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "184dafb0639bb3e3:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/ber-unbounded-continuation-loop",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/ber-unbounded-continuation-loop",
+      "index": 0
+     },
+     "message": {
+      "text": "Continuation loop in BER decoder at line 488 lacks upper bound check on accumulated integer size or byte count."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pyasn1/codec/ber/decoder.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 488,
+         "startColumn": 17,
+         "endColumn": 40
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "c655377394d8f3b1:2",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/ber-unbounded-continuation-loop",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/ber-unbounded-continuation-loop",
+      "index": 0
+     },
+     "message": {
+      "text": "Continuation loop in BER decoder at line 547 lacks upper bound check on accumulated integer size or byte count."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pyasn1/codec/ber/decoder.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 547,
+         "startColumn": 13,
+         "endColumn": 22
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "63d1a09b90fc1f91:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/ber-unbounded-continuation-loop",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/ber-unbounded-continuation-loop",
+      "index": 0
+     },
+     "message": {
+      "text": "Continuation loop in BER decoder at line 564 lacks upper bound check on accumulated integer size or byte count."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pyasn1/codec/ber/decoder.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 564,
+         "startColumn": 13,
+         "endColumn": 25
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "d2cf0848dc264882:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/ber-unbounded-continuation-loop",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/ber-unbounded-continuation-loop",
+      "index": 0
+     },
+     "message": {
+      "text": "Continuation loop in BER decoder at line 1608 lacks upper bound check on accumulated integer size or byte count."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pyasn1/codec/ber/decoder.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 1608,
+         "startColumn": 25,
+         "endColumn": 36
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "daf4c120beafb46a:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    }
+   ]
+  }
+ ],
+ "cache_usage": {
+  "prompt_tokens_total": 266366,
+  "uncached_input_tokens": 258946,
+  "cache_creation_input_tokens": 0,
+  "cache_read_input_tokens": 7420,
+  "output_tokens": 7483,
+  "calls": 19,
+  "caching_enabled": false,
+  "cost_usd_with_cache": 0.593464,
+  "cost_usd_no_cache": 0.607562,
+  "cache_read_share_of_prompt": 0.0279,
+  "prices_per_mtok": {
+   "claude-sonnet-4-5-20250929": {
+    "input": 3.0,
+    "output": 15.0
+   },
+   "claude-haiku-4-5-20251001": {
+    "input": 1.0,
+    "output": 5.0
+   },
+   "deepseek/deepseek-reasoner": {
+    "input": 0.15,
+    "output": 0.6,
+    "cache_read": 0.003,
+    "cache_write_mult": 1.0,
+    "peak_mult": 2.0
+   },
+   "gpt-5.1": {
+    "input": 1.25,
+    "output": 10.0,
+    "cache_read": 0.125,
+    "cache_write_mult": 1.0
+   },
+   "gpt-4.1": {
+    "input": 2.0,
+    "output": 8.0,
+    "cache_read": 0.5,
+    "cache_write_mult": 1.0
+   },
+   "deepseek/deepseek-v4-pro": {
+    "input": 0.66,
+    "output": 1.98,
+    "cache_read": 0.022,
+    "cache_write_mult": 1.0,
+    "peak_mult": 2.0
+   },
+   "deepseek/deepseek-flash": {
+    "input": 0.15,
+    "output": 0.6,
+    "cache_read": 0.003,
+    "cache_write_mult": 1.0,
+    "peak_mult": 2.0
+   },
+   "gemini/gemini-4-carbon": {
+    "input": 2.0,
+    "output": 10.0,
+    "cache_read": 0.1,
+    "cache_write_mult": 1.0
+   },
+   "gemini/gemini-3.8-flash": {
+    "input": 0.75,
+    "output": 3.75,
+    "cache_read": 0.075,
+    "cache_write_mult": 1.0
+   },
+   "openai/gpt-6.2-sol": {
+    "input": 2.0,
+    "output": 10.0,
+    "cache_read": 0.1,
+    "cache_write_mult": 1.0,
+    "long_threshold": 272000,
+    "long": {
+     "input": 4.0,
+     "output": 15.0,
+     "cache_read": 0.2
+    }
+   },
+   "openai/gpt-6-luna": {
+    "input": 0.1,
+    "output": 0.5,
+    "cache_read": 0.01,
+    "cache_write_mult": 1.0,
+    "long_threshold": 272000,
+    "long": {
+     "input": 0.2,
+     "output": 0.75,
+     "cache_read": 0.02
+    }
+   },
+   "claude-sonnet-5-5": {
+    "input": 2.0,
+    "output": 10.0,
+    "cache_read": 0.1
+   },
+   "claude-haiku-5-5": {
+    "input": 0.1,
+    "output": 0.5,
+    "cache_read": 0.01,
+    "long_threshold": 100000,
+    "long": {
+     "input": 0.5,
+     "output": 2.5,
+     "cache_read": 0.05
+    }
+   }
+  },
+  "cache_multipliers": {
+   "write_5m": 1.25,
+   "read": 0.1
+  }
+ }
+}

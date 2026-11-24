@@ -1,0 +1,1045 @@
+{
+ "session_id": "20251217164937",
+ "package_name": "pillow-12.0.0",
+ "package_path": "packages/pillow-12.0.0",
+ "database_path": "databases/pillow-12.0.0-db",
+ "model": "gpt-5.1",
+ "temperature": 0.0,
+ "max_tokens": 8000,
+ "iterations": 13,
+ "total_input_tokens": 180177,
+ "total_output_tokens": 11021,
+ "total_tokens": 191198,
+ "elapsed_time_seconds": 493.66,
+ "estimated_cost_usd": 0.3354,
+ "summary": "## Overview\n\nAnalyzed `pillow` 12.0.0 (Python Imaging Library fork) using CodeQL with a focus on security-relevant patterns in the core library under `src/PIL/` and selected tooling/checks. The package is a mature, widely used image-processing library that exposes a large API surface for opening, decoding, transforming, and saving images, plus some helper utilities (screen capture, external viewers, Ghostscript integration, etc.).\n\nWithin the iteration budget, I concentrated on:\n- Dynamic code execution (eval/exec)\n- OS command execution (os.system / subprocess)\n- Remote/tainted data flows into those sinks\n- High-level file/path usage patterns that could be relevant to path traversal\n- Obvious unsafe deserialization patterns\n\nNo direct, exploitable remote-code-execution or command-injection flows were identified in the library code with the generic remote-source models used. However, there are several security-relevant patterns that require careful use by callers.\n\n---\n\n## Key Findings\n\n### 1. Use of `eval` in `ImageMath` (CWE-94: Code Injection)\n\n**Location (from CodeQL):**\n- `src/PIL/ImageMath.py`, around line 310\n\n**Pattern:**\n- CodeQL query `py/pillow-eval-exec` flagged a call to Python builtins `eval`/`exec` in `ImageMath.py`.\n- This is part of Pillow’s `ImageMath` module, which evaluates mathematical expressions over images.\n\n**Risk:**\n- `eval`/`exec` are inherently dangerous if invoked on untrusted input. If an application passes user-controlled expression strings into `ImageMath` (or any wrapper that ultimately reaches this `eval`), this can lead to arbitrary code execution.\n- The CodeQL taint-tracking query `py/pillow-eval-exec-remote` (which traces generic remote sources into `eval`/`exec`) did **not** find any flows within Pillow itself. That is, Pillow does not appear to fetch remote data and feed it into `eval` internally.\n\n**Assessment:**\n- **Severity (library-internal):** Low–Medium. The library does not itself connect remote input to `eval`.\n- **Severity (for consumers):** Potentially **high** if they pass unvalidated user input into the `ImageMath` expression interface.\n\n**Recommendation for users:**\n- Treat any expression string passed into `ImageMath` as code. Do **not** pass raw user input; if you must, restrict to a safe grammar and validate/whitelist allowed tokens before calling into Pillow.\n- Prefer higher-level, non-expression APIs when possible.\n\n---\n\n### 2. OS Command Execution in Core Modules (CWE-78: OS Command Injection)\n\n**Query:** `py/pillow-command-exec` (library-only)\n\n**Flagged locations (non-exhaustive, representative):**\n- `src/PIL/EpsImagePlugin.py`\n  - Around line 61\n  - Around line 159\n- `src/PIL/GifImagePlugin.py`\n  - Around lines 886–902\n- `src/PIL/ImageGrab.py`\n  - Around lines 49, 100, 120–123, 169\n- `src/PIL/ImageShow.py`\n  - Multiple locations around lines 120, 146–150, 177–189, 225, 255, 273, 291, 323\n- `src/PIL/JpegImagePlugin.py`\n  - Around line 467\n\n**Pattern:**\n- These modules use `os.system` and/or `subprocess` functions to:\n  - Invoke external tools (e.g., Ghostscript for EPS, external viewers, platform-specific screen capture utilities).\n  - Integrate with system-level capabilities.\n\n**Risk:**\n- If any of the command arguments (program path, flags, or file paths) are derived from untrusted input without proper validation/escaping, this can lead to command injection.\n- A taint-tracking query (`py/pillow-command-exec-remote`) could not be successfully validated in this environment, so I relied on the structural command-usage query and manual reasoning.\n- In typical Pillow usage, the arguments to these commands are constructed from:\n  - Internal constants\n  - File paths or options provided by the caller\n- Pillow itself does not appear to fetch remote data and directly pass it to these commands.\n\n**Assessment:**\n- **Severity (library-internal):** Medium (use of dangerous primitives, but not obviously wired to remote sources inside Pillow).\n- **Severity (for consumers):** Medium–High if they allow untrusted users to control filenames, viewer commands, or EPS content without validation.\n\n**Recommendations for users:**\n- When using features that rely on external commands (EPS handling, `ImageShow`, `ImageGrab`, etc.):\n  - Ensure that any file paths or command-line options derived from user input are validated and normalized.\n  - Avoid allowing users to specify arbitrary viewer commands or shell fragments.\n  - Prefer APIs that do not spawn external processes when possible.\n\n**Recommendations for maintainers:**\n- Where feasible, prefer `subprocess` with `shell=False` and pass arguments as lists to reduce shell injection risk.\n- Centralize command construction and escaping, and document clearly which parameters are expected to be trusted.\n\n---\n\n### 3. Path-Heavy File Operations (Potential Path Traversal Concerns – CWE-22)\n\n**Query:** `py/pillow-path-traversal-open`\n\n**Result:**\n- The query was intentionally broad and returned **1349** matches across the repository, including:\n  - `checks/` scripts\n  - Tests\n  - Core image plugins and I/O modules\n\n**Pattern:**\n- Pillow exposes many APIs that accept filesystem paths for opening and saving images (e.g., `Image.open`, plugin-specific loaders, etc.).\n- The CodeQL query was designed to highlight that these are path-based operations that *could* be abused by callers if they pass unvalidated user-controlled paths.\n\n**Risk:**\n- Pillow itself does not implement a web server or remote interface; it operates on paths given by the caller.\n- Path traversal vulnerabilities are therefore primarily a concern in the **calling application**, not in Pillow’s own logic.\n\n**Assessment:**\n- **Severity (library-internal):** Low. The library behaves as expected for a filesystem-based imaging library.\n- **Severity (for consumers):** Depends entirely on how they obtain and validate paths. If they accept arbitrary user-supplied paths and pass them directly to Pillow, they may expose path traversal or arbitrary file read/write issues.\n\n**Recommendations for users:**\n- Validate and normalize any user-supplied paths before passing them to Pillow APIs.\n- Consider restricting operations to a specific directory tree and rejecting `..` segments or absolute paths when handling untrusted input.\n\n---\n\n### 4. Unsafe Deserialization Patterns (CWE-502)\n\n**Query:** `py/pillow-unsafe-deserialization`\n\n**Results:**\n- All matches were in **test code**, e.g.:\n  - `Tests/test_file_gif.py` (around line 1436)\n  - `Tests/test_pickle.py` (multiple locations around lines 29, 42, 81, 101, 112, 144, 161, 168)\n\n**Pattern:**\n- Use of `pickle` and similar mechanisms in tests to verify serialization behavior.\n\n**Risk:**\n- These are test-only and not part of the installed library.\n- They do not represent a vulnerability in production use of Pillow.\n\n**Assessment:**\n- **Severity:** Not applicable for end users; tests are not shipped as part of the runtime library.\n\n**Recommendation:**\n- None for consumers. For maintainers, continue to keep unsafe deserialization confined to tests and clearly separated from runtime code.\n\n---\n\n### 5. Remote-Source Taint Tracking into `eval`/`exec` and Command Execution\n\n**Queries:**\n- `py/pillow-eval-exec-remote` (path-problem, taint from `RemoteFlowSource` to `eval`/`exec`)\n- `py/pillow-command-exec-remote` (path-problem, taint from `RemoteFlowSource` to os/subprocess) – this query could not be successfully validated in this environment.\n\n**Results:**\n- `py/pillow-eval-exec-remote`: **0 results**.\n  - Under the generic `RemoteFlowSource` model, no flows from remote sources into `eval`/`exec` were detected in Pillow’s code.\n- `py/pillow-command-exec-remote`: could not be compiled/fixed successfully here, so I could not obtain definitive taint-path results for command execution.\n\n**Interpretation:**\n- Within the limits of the generic remote-source model and the environment, Pillow does not appear to:\n  - Fetch remote data itself and feed it into `eval`/`exec`.\n  - Obviously wire remote data directly into command execution.\n- The main risk remains **how callers use these APIs**.\n\n---\n\n## Overall Security Posture\n\n- Pillow 12.0.0 is primarily a **library** for image processing. It does not implement its own network stack or remote interfaces.\n- The most security-relevant aspects are:\n  1. Use of `eval` in `ImageMath` (CWE-94) – dangerous if fed untrusted expressions by the caller.\n  2. Use of `os.system` / `subprocess` in several modules (CWE-78) – dangerous if callers allow untrusted input to influence command arguments.\n  3. Extensive filesystem path handling – can be part of path traversal issues in applications that do not validate user-supplied paths.\n- No direct, self-contained RCE or command injection vulnerabilities were identified **inside** Pillow under the generic remote-source model used.\n- Unsafe deserialization is confined to tests and not part of the runtime library.\n\n---\n\n## Practical Guidance\n\n### For Application Developers Using Pillow\n\n1. **Do not pass untrusted expressions to `ImageMath`**\n   - Treat expression strings as code.\n   - If you must accept user input, implement strict whitelisting and parsing; do not forward raw strings.\n\n2. **Validate all file paths before calling Pillow APIs**\n   - Normalize paths and restrict them to allowed directories.\n   - Reject `..` segments and absolute paths when handling untrusted input.\n\n3. **Be cautious with features that spawn external commands**\n   - EPS handling, `ImageShow`, `ImageGrab`, and similar modules may invoke external tools.\n   - Do not let untrusted users control viewer commands, Ghostscript options, or similar command-line fragments.\n\n### For Pillow Maintainers\n\n1. **Document security-sensitive APIs clearly**\n   - Highlight that `ImageMath` evaluates expressions and should not be used with untrusted input.\n   - Document which functions spawn external processes and what parameters are expected to be trusted.\n\n2. **Harden command execution where possible**\n   - Prefer `subprocess` with `shell=False` and argument lists.\n   - Avoid constructing shell command strings when not necessary.\n\n3. **Consider adding internal validation helpers**\n   - For paths and command arguments, provide helper functions that enforce safe patterns, which downstream users can reuse.\n\n---\n\n## Classification\n\n- **Package type:** `library`\n- **Primary layer:** image processing / multimedia utilities\n\nWithin the scope of this automated CodeQL-based review and the available iteration budget, no new critical vulnerabilities were discovered in Pillow 12.0.0 itself, but several security-sensitive patterns were identified that require careful handling by consumers to avoid CWE-94 and CWE-78 style issues in their own applications.",
+ "package_classification": {
+  "type": "library",
+  "layer": [
+   "image-processing",
+   "multimedia",
+   "utilities"
+  ]
+ },
+ "tool_calls": {
+  "get_package_profile_info": 1,
+  "execute_codeql_query": 10,
+  "validate_codeql_query": 0,
+  "fixup_codeql_query": 5,
+  "finalize_report": 1
+ },
+ "queries_executed": {
+  "critical": 1,
+  "high": 4,
+  "medium": 0,
+  "low": 0,
+  "total_executed": 13,
+  "total_with_results": 5,
+  "total_failed": 14
+ },
+ "query_findings": {
+  "critical": 0,
+  "high": 30,
+  "medium": 0,
+  "low": 0,
+  "total": 30
+ },
+ "findings": [
+  {
+   "codeql_query_uuid": "20251217164956",
+   "codeql_raw_query": "/**\n * @name Unsafe use of eval/exec in Pillow\n * @description Detect any use of eval or exec which could lead to code injection if used with untrusted input.\n * @kind problem\n * @problem.severity error\n * @id py/pillow-eval-exec\n * @tags security\n *       external/cwe/cwe-094\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::builtin([\"eval\", \"exec\"]).getACall()\nselect call, \"Use of eval/exec may lead to code injection if used with untrusted input.\"",
+   "hypothesis": "Pillow may use eval/exec in plugins or tooling, which could be dangerous if fed untrusted data.",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-094"
+   ],
+   "results_count": 1,
+   "results": [
+    {
+     "ruleId": "py/pillow-eval-exec",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pillow-eval-exec",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of eval/exec may lead to code injection if used with untrusted input."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/PIL/ImageMath.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 310,
+         "startColumn": 11,
+         "endColumn": 72
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "2ae099923f9a4f0d:1",
+      "primaryLocationStartColumnFingerprint": "6"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251217165040",
+   "codeql_raw_query": "/**\n * @name Pillow unsafe eval/exec usage\n * @description Detect uses of eval or exec in Pillow that could lead to code injection\n * @kind problem\n * @problem.severity error\n * @id py/pillow-eval-exec\n * @tags security\n *       external/cwe/cwe-094\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere call = API::builtin([\"eval\", \"exec\"]).getACall()\nselect call, \"Use of eval/exec may lead to code injection if used with untrusted input.\"\n",
+   "hypothesis": "Pillow uses eval/exec, which could enable code injection if passed untrusted data.",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-094"
+   ],
+   "results_count": 1,
+   "results": [
+    {
+     "ruleId": "py/pillow-eval-exec",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pillow-eval-exec",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of eval/exec may lead to code injection if used with untrusted input."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/PIL/ImageMath.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 310,
+         "startColumn": 11,
+         "endColumn": 72
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "2ae099923f9a4f0d:1",
+      "primaryLocationStartColumnFingerprint": "6"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251217165127",
+   "codeql_raw_query": "/**\n * @name Pillow unsafe deserialization\n * @description Detect uses of pickle, marshal, yaml.load, or shelve that may deserialize untrusted data\n * @kind problem\n * @problem.severity error\n * @id py/pillow-unsafe-deserialization\n * @tags security\n *       external/cwe/cwe-502\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"pickle\").getMember([\"load\", \"loads\", \"Unpickler\"]).getACall() or\n  call = API::moduleImport(\"marshal\").getMember([\"load\", \"loads\"]).getACall() or\n  call = API::moduleImport(\"yaml\").getMember([\"load\", \"unsafe_load\"]).getACall() or\n  call = API::moduleImport(\"shelve\").getMember(\"open\").getACall()\nselect call, \"Potentially unsafe deserialization operation that could execute arbitrary code.\"\n",
+   "hypothesis": "Pillow may use unsafe deserialization libraries on attacker-controlled data",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-502"
+   ],
+   "results_count": 9,
+   "results": [
+    {
+     "ruleId": "py/pillow-unsafe-deserialization",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pillow-unsafe-deserialization",
+      "index": 0
+     },
+     "message": {
+      "text": "Potentially unsafe deserialization operation that could execute arbitrary code."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "Tests/test_file_gif.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 1436,
+         "startColumn": 32,
+         "endColumn": 46
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "506e6c96f5a1e863:1",
+      "primaryLocationStartColumnFingerprint": "23"
+     }
+    },
+    {
+     "ruleId": "py/pillow-unsafe-deserialization",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pillow-unsafe-deserialization",
+      "index": 0
+     },
+     "message": {
+      "text": "Potentially unsafe deserialization operation that could execute arbitrary code."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "Tests/test_pickle.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 29,
+         "startColumn": 25,
+         "endColumn": 39
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "c52d58825e82d7e6:1",
+      "primaryLocationStartColumnFingerprint": "12"
+     }
+    },
+    {
+     "ruleId": "py/pillow-unsafe-deserialization",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pillow-unsafe-deserialization",
+      "index": 0
+     },
+     "message": {
+      "text": "Potentially unsafe deserialization operation that could execute arbitrary code."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "Tests/test_pickle.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 42,
+         "startColumn": 21,
+         "endColumn": 48
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "d9b83f10e8a040a3:1",
+      "primaryLocationStartColumnFingerprint": "12"
+     }
+    },
+    {
+     "ruleId": "py/pillow-unsafe-deserialization",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pillow-unsafe-deserialization",
+      "index": 0
+     },
+     "message": {
+      "text": "Potentially unsafe deserialization operation that could execute arbitrary code."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "Tests/test_pickle.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 81,
+         "startColumn": 27,
+         "endColumn": 60
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "ac3011a0c8e5d6dc:1",
+      "primaryLocationStartColumnFingerprint": "18"
+     }
+    },
+    {
+     "ruleId": "py/pillow-unsafe-deserialization",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pillow-unsafe-deserialization",
+      "index": 0
+     },
+     "message": {
+      "text": "Potentially unsafe deserialization operation that could execute arbitrary code."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "Tests/test_pickle.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 101,
+         "startColumn": 25,
+         "endColumn": 39
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "dc1ca81d445a1c4:1",
+      "primaryLocationStartColumnFingerprint": "12"
+     }
+    },
+    {
+     "ruleId": "py/pillow-unsafe-deserialization",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pillow-unsafe-deserialization",
+      "index": 0
+     },
+     "message": {
+      "text": "Potentially unsafe deserialization operation that could execute arbitrary code."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "Tests/test_pickle.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 112,
+         "startColumn": 27,
+         "endColumn": 60
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "a428671d0ea3e0f9:1",
+      "primaryLocationStartColumnFingerprint": "18"
+     }
+    },
+    {
+     "ruleId": "py/pillow-unsafe-deserialization",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pillow-unsafe-deserialization",
+      "index": 0
+     },
+     "message": {
+      "text": "Potentially unsafe deserialization operation that could execute arbitrary code."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "Tests/test_pickle.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 144,
+         "startColumn": 22,
+         "endColumn": 48
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "1f8fa9b6d743c5b5:1",
+      "primaryLocationStartColumnFingerprint": "17"
+     }
+    },
+    {
+     "ruleId": "py/pillow-unsafe-deserialization",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pillow-unsafe-deserialization",
+      "index": 0
+     },
+     "message": {
+      "text": "Potentially unsafe deserialization operation that could execute arbitrary code."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "Tests/test_pickle.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 161,
+         "startColumn": 26,
+         "endColumn": 40
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "c611cfe34604de93:1",
+      "primaryLocationStartColumnFingerprint": "17"
+     }
+    },
+    {
+     "ruleId": "py/pillow-unsafe-deserialization",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pillow-unsafe-deserialization",
+      "index": 0
+     },
+     "message": {
+      "text": "Potentially unsafe deserialization operation that could execute arbitrary code."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "Tests/test_pickle.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 168,
+         "startColumn": 10,
+         "endLine": 172,
+         "endColumn": 6
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "beeec59a7848493c:1",
+      "primaryLocationStartColumnFingerprint": "5"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251217165228",
+   "codeql_raw_query": "/**\n * @name Pillow command execution usage (library code only)\n * @description Detect uses of os.system and subprocess in Pillow library code, excluding tests and tooling\n * @kind problem\n * @problem.severity warning\n * @id py/pillow-command-exec\n * @tags security\n *       external/cwe/cwe-078\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom API::CallNode apiCall\nwhere\n  apiCall =\n    API::moduleImport(\"os\").getMember(\"system\").getACall()\n    or apiCall = API::moduleImport(\"subprocess\").getMember([\"run\", \"Popen\", \"call\", \"check_call\", \"check_output\"]).getACall()\n  and apiCall.getLocation().getFile().getRelativePath().matches(\"src/PIL/%\")\nselect apiCall, \"Use of system/subprocess may lead to command injection if used with untrusted input.\"\n",
+   "hypothesis": "Pillow library code may invoke os.system or subprocess.* in ways that could be influenced by untrusted input, leading to command injection.",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-078"
+   ],
+   "results_count": 19,
+   "results": [
+    {
+     "ruleId": "py/pillow-command-exec",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pillow-command-exec",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of system/subprocess may lead to command injection if used with untrusted input."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/PIL/EpsImagePlugin.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 61,
+         "startColumn": 17,
+         "endColumn": 86
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "6aef2796d1960a9c:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/pillow-command-exec",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pillow-command-exec",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of system/subprocess may lead to command injection if used with untrusted input."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/PIL/EpsImagePlugin.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 159,
+         "startColumn": 9,
+         "endColumn": 64
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "28f2b16552131465:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/pillow-command-exec",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pillow-command-exec",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of system/subprocess may lead to command injection if used with untrusted input."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/PIL/GifImagePlugin.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 886,
+         "startColumn": 17,
+         "endLine": 888,
+         "endColumn": 18
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "2555b00147610953:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/pillow-command-exec",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pillow-command-exec",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of system/subprocess may lead to command injection if used with untrusted input."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/PIL/GifImagePlugin.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 894,
+         "startColumn": 30,
+         "endLine": 896,
+         "endColumn": 18
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "1779436231f2d744:1",
+      "primaryLocationStartColumnFingerprint": "13"
+     }
+    },
+    {
+     "ruleId": "py/pillow-command-exec",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pillow-command-exec",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of system/subprocess may lead to command injection if used with untrusted input."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/PIL/GifImagePlugin.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 897,
+         "startColumn": 30,
+         "endLine": 902,
+         "endColumn": 18
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "70efb7f34bac16ce:1",
+      "primaryLocationStartColumnFingerprint": "13"
+     }
+    },
+    {
+     "ruleId": "py/pillow-command-exec",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pillow-command-exec",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of system/subprocess may lead to command injection if used with untrusted input."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/PIL/ImageGrab.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 100,
+         "startColumn": 13,
+         "endColumn": 47
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "c6973cd9ff97bc91:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/pillow-command-exec",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pillow-command-exec",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of system/subprocess may lead to command injection if used with untrusted input."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/PIL/ImageGrab.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 49,
+         "startColumn": 13,
+         "endColumn": 53
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "2ddb8bff0437f410:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/pillow-command-exec",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pillow-command-exec",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of system/subprocess may lead to command injection if used with untrusted input."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/PIL/ImageGrab.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 120,
+         "startColumn": 13,
+         "endLine": 123,
+         "endColumn": 10
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "da112600d019b1ce:1",
+      "primaryLocationStartColumnFingerprint": "4"
+     }
+    },
+    {
+     "ruleId": "py/pillow-command-exec",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pillow-command-exec",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of system/subprocess may lead to command injection if used with untrusted input."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/PIL/ImageGrab.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 169,
+         "startColumn": 13,
+         "endColumn": 54
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "af4ab09e64ef4f31:1",
+      "primaryLocationStartColumnFingerprint": "4"
+     }
+    },
+    {
+     "ruleId": "py/pillow-command-exec",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pillow-command-exec",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of system/subprocess may lead to command injection if used with untrusted input."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/PIL/ImageShow.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 3
+        },
+        "region": {
+         "startLine": 120,
+         "startColumn": 9,
+         "endColumn": 53
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "4de355b7dcf3f5a8:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/pillow-command-exec",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pillow-command-exec",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of system/subprocess may lead to command injection if used with untrusted input."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/PIL/ImageShow.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 3
+        },
+        "region": {
+         "startLine": 146,
+         "startColumn": 9,
+         "endLine": 150,
+         "endColumn": 10
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "9e23ba6991e8978e:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/pillow-command-exec",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pillow-command-exec",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of system/subprocess may lead to command injection if used with untrusted input."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/PIL/ImageShow.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 3
+        },
+        "region": {
+         "startLine": 177,
+         "startColumn": 9,
+         "endColumn": 61
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "b0e352da3a0c817a:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/pillow-command-exec",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pillow-command-exec",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of system/subprocess may lead to command injection if used with untrusted input."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/PIL/ImageShow.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 3
+        },
+        "region": {
+         "startLine": 182,
+         "startColumn": 13,
+         "endLine": 189,
+         "endColumn": 14
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "44478aa992623aa8:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/pillow-command-exec",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pillow-command-exec",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of system/subprocess may lead to command injection if used with untrusted input."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/PIL/ImageShow.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 3
+        },
+        "region": {
+         "startLine": 225,
+         "startColumn": 9,
+         "endColumn": 45
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "d381994704bfb060:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/pillow-command-exec",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pillow-command-exec",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of system/subprocess may lead to command injection if used with untrusted input."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/PIL/ImageShow.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 3
+        },
+        "region": {
+         "startLine": 255,
+         "startColumn": 9,
+         "endColumn": 31
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "bc15a9795505bab3:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/pillow-command-exec",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pillow-command-exec",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of system/subprocess may lead to command injection if used with untrusted input."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/PIL/ImageShow.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 3
+        },
+        "region": {
+         "startLine": 273,
+         "startColumn": 9,
+         "endColumn": 50
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "78945dc235e3ffda:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/pillow-command-exec",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pillow-command-exec",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of system/subprocess may lead to command injection if used with untrusted input."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/PIL/ImageShow.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 3
+        },
+        "region": {
+         "startLine": 291,
+         "startColumn": 9,
+         "endColumn": 46
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "beff7867c020c4bb:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/pillow-command-exec",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pillow-command-exec",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of system/subprocess may lead to command injection if used with untrusted input."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/PIL/ImageShow.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 3
+        },
+        "region": {
+         "startLine": 323,
+         "startColumn": 9,
+         "endColumn": 31
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "c8cafc7b6a56fdae:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/pillow-command-exec",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pillow-command-exec",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of system/subprocess may lead to command injection if used with untrusted input."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/PIL/JpegImagePlugin.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 4
+        },
+        "region": {
+         "startLine": 467,
+         "startColumn": 13,
+         "endColumn": 78
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "676ac4b55a5cc80f:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251217165515",
+   "codeql_raw_query": "/**\n * @name Pillow eval/exec with remote input (path)\n * @description Trace remote user-controlled data into eval/exec in Pillow\n * @kind path-problem\n * @problem.severity error\n * @id py/pillow-eval-exec-remote\n * @tags security\n *       external/cwe/cwe-094\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.dataflow.new.RemoteFlowSources\nimport semmle.python.ApiGraphs\nimport semmle.python.Concepts\n\nmodule EvalExecConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) { source instanceof RemoteFlowSource }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(API::CallNode call, DataFlow::ExprNode argNode |\n      call = API::builtin([\"eval\", \"exec\"]).getACall() and\n      argNode = call.getArg(0) and\n      sink.asExpr() = argNode.asExpr()\n    )\n  }\n}\n\nmodule EvalExecFlow = TaintTracking::Global<EvalExecConfig>;\nimport EvalExecFlow::PathGraph\n\nfrom EvalExecFlow::PathNode source, EvalExecFlow::PathNode sink\nwhere EvalExecFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"Remote data reaches eval/exec here.\", source, \"remote input\"",
+   "hypothesis": "Remote user input can reach eval/exec in Pillow",
+   "severity": "critical",
+   "cwe_ids": [
+    "cwe-094"
+   ],
+   "results_count": 0,
+   "results": []
+  }
+ ]
+}

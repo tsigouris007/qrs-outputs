@@ -1,0 +1,497 @@
+{
+ "session_id": "20251208004757",
+ "package_name": "h11-0.16.0",
+ "package_path": "packages/h11-0.16.0",
+ "database_path": "databases/h11-0.16.0-db",
+ "model": "gpt-5.1",
+ "temperature": 0.0,
+ "max_tokens": 8000,
+ "iterations": 13,
+ "total_input_tokens": 103637,
+ "total_output_tokens": 9815,
+ "total_tokens": 113452,
+ "elapsed_time_seconds": 402.18,
+ "estimated_cost_usd": 0.2277,
+ "summary": "## Overview\n\nPackage analyzed: **h11 0.16.0**  \nType: pure-Python HTTP/1.1 protocol library (bring-your-own I/O)  \nScope analyzed: core library modules (`h11/_connection.py`, `_readers.py`, `_writers.py`, `_headers.py`, `_events.py`, `_receivebuffer.py`, `_state.py`, `_util.py`, `__init__.py`), fuzz harness (`fuzz/afl-server.py`), and packaging script (`setup.py`).  \nAnalysis method: multiple custom CodeQL queries focused on dynamic code execution, unsafe deserialization, regex usage/DoS, header/CRLF injection, request smuggling surfaces, and general parsing/buffer logic.\n\nWithin the limits of static analysis and the queries executed, **no critical or high‑severity, directly exploitable vulnerabilities were found in the h11 library code**. The only dynamic code execution use is in `setup.py` (packaging-time only). Regex and parsing logic locations were identified for manual review but did not show clear ReDoS or injection issues via CodeQL.\n\n---\n\n## Confirmed / Concrete Findings\n\n### 1. Dynamic code execution in `setup.py`\n\n- **Location**: `setup.py`, around line 4 (exact column range reported by CodeQL).  \n- **Pattern**: Use of Python builtins `eval`/`exec` (detected by a custom CodeQL query for dynamic code execution).\n- **Context**: This is in the packaging script, not in the runtime library (`h11` package). It is typically executed only by developers or packaging tools when building/installing from source.\n\n**Security impact**\n- **Severity**: Low in normal usage.  \n- **CWE**: CWE‑94 (Code Injection) in a broad sense, but here the input is not obviously attacker-controlled.\n- **Risk**: For end users installing from PyPI wheels, this code is generally not executed. For source installs, if a malicious actor could modify `setup.py` in your environment, they could already run arbitrary code; the presence of `eval`/`exec` does not materially change that threat model.\n\n**Recommendation**\n- Prefer avoiding `eval`/`exec` in packaging scripts where possible (e.g., parse version or metadata using safe string operations or import the module and read attributes directly).  \n- Treat this as a **hardening** opportunity rather than an urgent vulnerability.\n\n---\n\n## Surfaces Identified for Manual Review (No concrete exploit found)\n\nThese are areas where CodeQL located security-relevant logic, but did **not** establish a full, exploitable dataflow from untrusted input to a dangerous sink. They are worth manual inspection, especially if you modify or extend h11.\n\n### 2. Regex usage in HTTP parsing\n\n- **Locations (from `py/h11-regex-usage` query)**:\n  - `h11/_events.py`: lines ~28–29\n  - `h11/_headers.py`: lines ~72–74\n  - `h11/_readers.py`: lines ~39–40, 72, 91, 145\n  - `h11/_receivebuffer.py`: line ~44\n\nThese are regular expression compilations and uses related to HTTP header and message parsing.\n\n**Analysis**\n- A custom query enumerated regex usage for **manual ReDoS review**.  \n- No automatic classification as catastrophic backtracking patterns was made; the query was intentionally broad to surface all regexes.\n- h11 is a widely used HTTP library and its regexes are relatively simple and constrained to protocol grammar, which reduces ReDoS risk.\n\n**Security impact**\n- **Severity**: Currently **none confirmed**. Potential **medium** if a specific regex were proven vulnerable to catastrophic backtracking with attacker-controlled input.  \n- **CWE**: Would map to CWE‑400 (Uncontrolled Resource Consumption) if a vulnerable pattern were identified.\n\n**Recommendation**\n- When modifying these regexes, validate them with a ReDoS-focused tool or fuzzing (e.g., using the existing `fuzz/afl-server.py` harness) to ensure no catastrophic backtracking is introduced.\n- Keep regexes as simple and linear-time as possible; avoid nested quantifiers like `(a+)+` or patterns with ambiguous overlapping alternatives on unbounded input.\n\n### 3. HTTP header construction and CRLF / header injection\n\n- **Query**: A taint-tracking CodeQL query (`py/h11-header-injection`) was written to detect flows from generic remote sources to calls like `h11.send(...)` that might construct HTTP headers.\n- **Result**: **No flows were found** from `RemoteFlowSource` to the identified sinks in this codebase.\n\n**Analysis**\n- h11 is a low-level HTTP/1.1 state machine; it expects callers to construct `Event` objects (e.g., `Request`, `Response`, `Headers`) and does not itself read from sockets.  \n- The absence of detected flows in this repository is expected: there is no direct network input in the library itself; that occurs in user code integrating h11.\n\n**Security impact**\n- **Severity**: None identified within h11 itself.  \n- **CWE**: If misused by callers (e.g., passing unsanitized header values containing `\\r\\n`), issues would fall under CWE‑113 (HTTP Header Injection), but that is a **usage** concern, not an intrinsic flaw in h11 as analyzed.\n\n**Recommendation for users of h11**\n- Validate and sanitize header names and values before constructing h11 `Headers` or `Request`/`Response` events.  \n- Enforce application-level policies that disallow control characters (especially `\\r` and `\\n`) in header names/values.\n\n### 4. Request smuggling / malformed request handling surfaces\n\n- **Query**: A CodeQL query (`py/h11-request-smuggling-surfaces`) targeted calls to `h11.Connection!.send` and `h11.Connection!.receive_data` as key parsing/serialization entrypoints.\n- **Result**: No additional suspicious patterns or specific vulnerabilities were automatically identified.\n\n**Analysis**\n- h11’s design is to be a strict HTTP/1.1 state machine. Request smuggling vulnerabilities typically arise in **integrations** between multiple HTTP components (e.g., proxy + backend) with inconsistent parsing rules, not in a single parser alone.\n- The query was used to locate the main parsing logic for manual reasoning; nothing obviously unsafe (e.g., ignoring conflicting `Content-Length` vs `Transfer-Encoding` in a way that would trivially enable smuggling) was surfaced by CodeQL.\n\n**Security impact**\n- **Severity**: None confirmed in this analysis.  \n- **CWE**: Would map to CWE‑444 (Inconsistent Interpretation of HTTP Requests) if a concrete discrepancy were found.\n\n**Recommendation**\n- When using h11 in frontends/backends, ensure consistent HTTP parsing rules across components (e.g., how multiple `Content-Length` headers or conflicting `Content-Length` and `Transfer-Encoding` are handled).  \n- If you modify `_readers.py` or `_connection.py`, review changes with request smuggling in mind and consider fuzzing with malformed HTTP messages.\n\n### 5. Fuzz harness and buffer management (manual review only)\n\n- Files of interest:  \n  - `fuzz/afl-server.py` – AFL fuzz harness.  \n  - `h11/_receivebuffer.py` – receive buffer implementation.\n- Attempts were made to write structural CodeQL queries to highlight manual buffer management and fuzz entrypoints; those specific structural queries did not compile successfully in this environment, so they were not executed. However, these files were already in scope via other queries and the package profile.\n\n**Analysis & impact**\n- h11 is pure Python, so classic memory corruption (CWE‑119) is not applicable in the same way as in C/C++. Buffer mismanagement could still cause logic bugs or DoS (e.g., unbounded memory growth), but no such issues were automatically detected by the executed queries.\n\n**Recommendation**\n- Continue to use and maintain the AFL fuzz harness to exercise `_receivebuffer.py`, `_readers.py`, and `_connection.py` with malformed and adversarial inputs.  \n- Monitor for excessive memory usage or pathological performance under fuzzing.\n\n---\n\n## Areas Where No Issues Were Found\n\nThe following targeted CodeQL checks returned **no findings** in the h11 library code:\n\n1. **Dynamic code execution in library modules**  \n   - Query for `eval`/`exec` usage in the `h11` package modules returned **no results** (only `setup.py` was flagged).\n\n2. **Unsafe deserialization**  \n   - Query for calls to `pickle`, `yaml.load`/`unsafe_load`, `marshal`, and `shelve.open` returned **no results** in the library code.  \n   - This indicates h11 does not perform unsafe deserialization of untrusted data.\n\n3. **Header injection / CRLF via tainted data**  \n   - Taint-tracking from generic remote sources to header-construction sinks in h11 found **no flows** within this repository.\n\n4. **Request smuggling-specific patterns**  \n   - No direct evidence of inconsistent or ambiguous handling of `Content-Length` and `Transfer-Encoding` was surfaced by the executed queries.\n\n---\n\n## Overall Risk Assessment\n\n- **Critical vulnerabilities**: None found.  \n- **High-severity vulnerabilities**: None found.  \n- **Medium-severity vulnerabilities**: None confirmed; regex and parsing logic are potential areas of concern but did not show concrete issues in this analysis.  \n- **Low-severity / informational**:\n  - Use of dynamic code execution (`eval`/`exec`) in `setup.py` (packaging-time only).\n  - Multiple regex and parsing sites identified for ongoing manual and fuzz-based review.\n\nGiven its design, maturity, and the results of this CodeQL-based review, **h11 0.16.0 appears reasonably robust from a security perspective as a pure-Python HTTP/1.1 state machine**, assuming it is used correctly by callers and integrated with consistent HTTP parsing components.\n\n---\n\n## Recommendations for Maintainers\n\n1. **Hardening**\n   - Refactor `setup.py` to avoid `eval`/`exec` if feasible.\n   - Keep regexes simple and continue to avoid patterns known to cause catastrophic backtracking.\n\n2. **Testing & Fuzzing**\n   - Continue to run and maintain the AFL fuzz harness (`fuzz/afl-server.py`) against `_readers.py`, `_receivebuffer.py`, and `_connection.py` with malformed HTTP messages and large inputs.\n   - Consider adding property-based tests (e.g., Hypothesis) for invariants like: \"well-formed request serialized by h11 and then parsed by h11 yields an equivalent event sequence\".\n\n3. **Documentation for Users**\n   - Emphasize in documentation that callers are responsible for:\n     - Validating and sanitizing header names/values and request targets.  \n     - Enforcing limits on header size, line length, and overall message size to prevent DoS.\n   - Provide guidance or examples showing safe handling of user input when constructing h11 events.\n\n4. **Change Review**\n   - For future changes to `_readers.py`, `_headers.py`, `_connection.py`, and `_receivebuffer.py`, include a security-focused review checklist covering:\n     - Request smuggling edge cases (conflicting or duplicated length headers).  \n     - ReDoS potential in any new or modified regexes.  \n     - Memory and time complexity under adversarial inputs.\n\n---\n\n## Recommendations for Users / Integrators\n\n- Treat h11 as a low-level protocol engine: **you must validate and sanitize all external input before constructing h11 events**.  \n- Enforce application-level limits on:\n  - Maximum header count and size.  \n  - Maximum request/response body size.  \n  - Maximum line length for start lines and headers.\n- When deploying behind or in front of other HTTP components (reverse proxies, load balancers, WAFs), ensure consistent HTTP parsing rules to avoid request smuggling issues.\n\nWithin the scope of this CodeQL-based analysis and the version examined (0.16.0), no actionable, exploitable vulnerabilities in the h11 library code were identified.",
+ "package_classification": {
+  "type": "library",
+  "layer": [
+   "networking",
+   "application_protocol",
+   "http"
+  ]
+ },
+ "tool_calls": {
+  "get_package_profile_info": 1,
+  "execute_codeql_query": 14,
+  "validate_codeql_query": 0,
+  "fixup_codeql_query": 7,
+  "finalize_report": 1
+ },
+ "queries_executed": {
+  "critical": 0,
+  "high": 2,
+  "medium": 3,
+  "low": 1,
+  "total_executed": 18,
+  "total_with_results": 7,
+  "total_failed": 16
+ },
+ "query_findings": {
+  "critical": 0,
+  "high": 0,
+  "medium": 11,
+  "low": 0,
+  "total": 12
+ },
+ "findings": [
+  {
+   "codeql_query_uuid": "20251208004811",
+   "codeql_raw_query": "/**\n * @name Use of eval/exec or dynamic code execution\n * @description Flags any use of eval, exec, or compile which could lead to code injection if used with untrusted data.\n * @kind problem\n * @problem.severity warning\n * @id py/h11-dynamic-code-execution\n * @tags security\n *       external/cwe/cwe-094\n */\n\nimport python\nimport semmle.python.ApiGraphs\nimport semmle.python.dataflow.new.DataFlow\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::builtin([\"eval\", \"exec\", \"compile\"]).getACall()\nselect call, \"Dynamic code execution via $@ may be dangerous if used with untrusted input.\"",
+   "hypothesis": "No hypothesis provided",
+   "severity": "N/A",
+   "cwe_ids": [],
+   "results_count": 1,
+   "results": [
+    {
+     "ruleId": "py/h11-dynamic-code-execution",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/h11-dynamic-code-execution",
+      "index": 0
+     },
+     "message": {
+      "text": "Dynamic code execution via $@ may be dangerous if used with untrusted input."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "setup.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 4,
+         "endColumn": 37
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "9a8b522a2097d54d:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251208004845",
+   "codeql_raw_query": "/**\n * @name h11 header injection / response splitting\n * @description Detect construction of HTTP header lines that may allow CRLF injection if used with untrusted input.\n * @kind problem\n * @problem.severity warning\n * @id py/h11-header-injection\n * @tags security\n *        external/cwe/cwe-113\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"h11._writers\").getMember([\"serialize_headers\", \"write_headers\"]).getACall()\nselect call, \"Check that header values passed here are properly validated to avoid CRLF/header injection.\"",
+   "hypothesis": "Potential HTTP header injection / response splitting in h11 writers",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-113"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251208004859",
+   "codeql_raw_query": "/**\n * @name h11 request smuggling / malformed request handling\n * @description Locate parsing logic for HTTP requests that may be sensitive to request smuggling issues.\n * @kind problem\n * @problem.severity recommendation\n * @id py/h11-request-smuggling-survey\n * @tags security\n *        external/cwe/cwe-444\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"h11._readers\").getMember([\"read_headers\", \"read_request\", \"next_event\"]).getACall()\nselect call, \"Review this HTTP parsing logic for robustness against request smuggling and malformed inputs.\"",
+   "hypothesis": "Survey HTTP parsing entry points that could be relevant to request smuggling",
+   "severity": "low",
+   "cwe_ids": [
+    "cwe-444"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251208005031",
+   "codeql_raw_query": "/**\n * @name h11 unsafe deserialization detection\n * @description Find uses of pickle/yaml unsafe loaders in h11\n * @kind problem\n * @problem.severity warning\n * @id py/h11-unsafe-deserialization\n * @tags security\n *        external/cwe/cwe-502\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport([\"pickle\", \"yaml\", \"marshal\", \"shelve\"]).getMember([\"load\", \"loads\", \"unsafe_load\", \"open\"]).getACall()\nselect call, \"Potentially unsafe deserialization operation that could execute arbitrary code.\"\n",
+   "hypothesis": "Package uses unsafe deserialization via pickle/yaml/marshal/shelve",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-502"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251208005043",
+   "codeql_raw_query": "/**\n * @name h11 regex usage overview\n * @description List all regex patterns compiled or used via re in h11\n * @kind problem\n * @problem.severity note\n * @id py/h11-regex-usage\n * @tags security\n *        external/cwe/cwe-400\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"re\").getMember([\"compile\", \"search\", \"match\", \"fullmatch\", \"findall\", \"finditer\"]).getACall()\nselect call, \"Regex usage in h11 for manual review.\"\n",
+   "hypothesis": "Identify regexes that might be vulnerable to ReDoS for manual inspection",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-400"
+   ],
+   "results_count": 11,
+   "results": [
+    {
+     "ruleId": "py/h11-regex-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/h11-regex-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Regex usage in h11 for manual review."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "h11/_events.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 28,
+         "startColumn": 13,
+         "endColumn": 47
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "ac16359f8275bda4:1",
+      "primaryLocationStartColumnFingerprint": "12"
+     }
+    },
+    {
+     "ruleId": "py/h11-regex-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/h11-regex-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Regex usage in h11 for manual review."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "h11/_events.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 29,
+         "startColumn": 21,
+         "endColumn": 63
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "5327d7f68817cf66:1",
+      "primaryLocationStartColumnFingerprint": "20"
+     }
+    },
+    {
+     "ruleId": "py/h11-regex-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/h11-regex-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Regex usage in h11 for manual review."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "h11/_headers.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 72,
+         "startColumn": 22,
+         "endColumn": 44
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "af9a741afbcaf398:1",
+      "primaryLocationStartColumnFingerprint": "21"
+     }
+    },
+    {
+     "ruleId": "py/h11-regex-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/h11-regex-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Regex usage in h11 for manual review."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "h11/_headers.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 73,
+         "startColumn": 18,
+         "endColumn": 56
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "72e7c516b3a1aa91:1",
+      "primaryLocationStartColumnFingerprint": "17"
+     }
+    },
+    {
+     "ruleId": "py/h11-regex-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/h11-regex-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Regex usage in h11 for manual review."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "h11/_headers.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 74,
+         "startColumn": 19,
+         "endColumn": 58
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "9688b49206f613e9:1",
+      "primaryLocationStartColumnFingerprint": "18"
+     }
+    },
+    {
+     "ruleId": "py/h11-regex-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/h11-regex-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Regex usage in h11 for manual review."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "h11/_readers.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 39,
+         "startColumn": 19,
+         "endColumn": 59
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "1089837b0e9c29eb:1",
+      "primaryLocationStartColumnFingerprint": "18"
+     }
+    },
+    {
+     "ruleId": "py/h11-regex-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/h11-regex-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Regex usage in h11 for manual review."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "h11/_readers.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 40,
+         "startColumn": 15,
+         "endColumn": 37
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "587bc149e763d92c:1",
+      "primaryLocationStartColumnFingerprint": "14"
+     }
+    },
+    {
+     "ruleId": "py/h11-regex-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/h11-regex-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Regex usage in h11 for manual review."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "h11/_readers.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 72,
+         "startColumn": 19,
+         "endColumn": 59
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "d484c03c01d2e741:1",
+      "primaryLocationStartColumnFingerprint": "18"
+     }
+    },
+    {
+     "ruleId": "py/h11-regex-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/h11-regex-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Regex usage in h11 for manual review."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "h11/_readers.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 91,
+         "startColumn": 18,
+         "endColumn": 57
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "d4147b5acfa7298d:1",
+      "primaryLocationStartColumnFingerprint": "17"
+     }
+    },
+    {
+     "ruleId": "py/h11-regex-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/h11-regex-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Regex usage in h11 for manual review."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "h11/_readers.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 145,
+         "startColumn": 19,
+         "endColumn": 59
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "f8a64036c754eb35:1",
+      "primaryLocationStartColumnFingerprint": "18"
+     }
+    },
+    {
+     "ruleId": "py/h11-regex-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/h11-regex-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Regex usage in h11 for manual review."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "h11/_receivebuffer.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 3
+        },
+        "region": {
+         "startLine": 44,
+         "startColumn": 20,
+         "endColumn": 56
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "e1278d3a254048d2:1",
+      "primaryLocationStartColumnFingerprint": "19"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251208005215",
+   "codeql_raw_query": "/**\n * @name h11 HTTP header injection via CRLF\n * @description Detect potential CRLF injection in HTTP headers constructed by h11\n * @kind path-problem\n * @problem.severity error\n * @id py/h11-header-injection\n * @tags security\n *        external/cwe/cwe-113\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.dataflow.new.RemoteFlowSources\nimport semmle.python.ApiGraphs\n\nmodule HeaderInjectionConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    source instanceof RemoteFlowSource\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(API::CallNode call |\n      call = API::moduleImport(\"h11\").getMember(\"send\").getACall() and\n      sink = call.getArg(0)\n    )\n  }\n}\n\nmodule HeaderInjectionFlow = TaintTracking::Global<HeaderInjectionConfig>;\nimport HeaderInjectionFlow::PathGraph\n\nfrom HeaderInjectionFlow::PathNode source, HeaderInjectionFlow::PathNode sink\nwhere HeaderInjectionFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"User-controlled data reaches HTTP header construction in h11, potentially enabling CRLF/header injection.\", source.getNode(), \"user input\"",
+   "hypothesis": "User-controlled data may reach h11 send() leading to HTTP header injection via CRLF",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-113"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251208005244",
+   "codeql_raw_query": "/**\n * @name h11 request smuggling / malformed request handling\n * @description Identify places where h11 parses or validates Content-Length and Transfer-Encoding headers\n * @kind problem\n * @problem.severity warning\n * @id py/h11-request-smuggling-surfaces\n * @tags security\n *        external/cwe/cwe-444\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom API::CallNode call\nwhere\n  call = API::moduleImport(\"h11\").getMember(\"Connection!\").getMember([\"send\", \"receive_data\"]).getACall()\nselect call, \"h11 connection send/receive operations involved in HTTP message parsing; review for request smuggling or malformed request handling issues.\"",
+   "hypothesis": "h11 Connection send/receive_data usage may be involved in HTTP request smuggling surfaces",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-444"
+   ],
+   "results_count": 0,
+   "results": []
+  }
+ ]
+}

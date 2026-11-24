@@ -1,0 +1,319 @@
+{
+ "session_id": "20251225201336",
+ "package_name": "fsspec-2025.10.0",
+ "package_path": "packages/fsspec-2025.10.0",
+ "database_path": "databases/fsspec-2025.10.0-db",
+ "model": "gpt-5.1",
+ "temperature": 1.0,
+ "max_tokens": 8000,
+ "iterations": 10,
+ "total_input_tokens": 73002,
+ "total_output_tokens": 7270,
+ "total_tokens": 80272,
+ "elapsed_time_seconds": 414.62,
+ "estimated_cost_usd": 0.164,
+ "summary": "## Overview\n\nTarget package: **fsspec 2025.10.0**  \nType: Python library providing a unified filesystem abstraction (local, HTTP, S3, archives, etc.).\n\nAnalysis used CodeQL with a focus on security-relevant patterns (deserialization, archive handling, command execution, and remote-input-to-filesystem flows). Below are the concrete findings and their security impact.\n\n---\n\n## Confirmed Findings\n\n### 1. Unsafe deserialization in `cache_metadata` (CWE-502)\n\n**Location**  \n- File: `fsspec/implementations/cache_metadata.py`  \n- Approx. line: 64  \n- Detected by query: `py/fsspec/unsafe-deserialization`\n\n**What was found**  \nThe code uses Python’s `pickle` deserialization functions (`pickle.load`/`pickle.loads`) to read cached metadata:\n- Call site at line ~64 in `cache_metadata.py` matched a pattern:\n  - `API::moduleImport(\"pickle\").getMember([\"load\", \"loads\"]).getACall()`\n\nThis is a generic, unsafe deserialization pattern: `pickle` can execute arbitrary code when loading untrusted data.\n\n**Risk and exploitability**  \n- **CWE-502: Deserialization of Untrusted Data**\n- Impact: If an attacker can influence or replace the on-disk cache metadata file that this code reads, they could craft a malicious pickle payload that will be executed when `cache_metadata` loads it. This can lead to arbitrary code execution under the privileges of the running process.\n- Likely threat model: multi-tenant environments, shared filesystems, or situations where an attacker can write to or replace cache files (e.g., insecure `/tmp` usage, NFS shares, containers with shared volumes).\n\n**Mitigations / Recommendations**  \n- Do **not** use `pickle` for data that might be attacker-controlled or live on a writable/shared medium. Prefer a safe, data-only format (e.g. JSON, msgpack, or a restricted schema format) for cache metadata.\n- If you must keep pickle for backward compatibility:\n  - Restrict where cache files are stored (e.g., a directory with strong OS-level permissions, not world-writable or shared).\n  - Add integrity checks (e.g., signer-verified or MAC-protected cache files) to ensure only trusted pickles are loaded.\n  - Document prominently that the cache directory must not be writable by untrusted users.\n\n---\n\n### 2. Archive extraction patterns: potential path traversal risks (CWE-22)\n\n**Locations**  \nDetected by query: `py/fsspec/archive-path-traversal`\n\n1. `fsspec/compression.py`\n   - Around line 58 (use of archive extraction API)\n   - Around line 62 (another archive extraction usage)\n\n2. `fsspec/implementations/zip.py`\n   - Around lines 63–69 (archive extraction logic in a filesystem implementation)\n\n**What was found**  \nCodeQL flagged uses of archive-extraction APIs or functions that unpack contents of archives (e.g. tar/zip) to the filesystem, without the query being able to prove path sanitization.\n\nFrom the report alone we can infer:\n- There are calls that iterate over archive members and write data to the filesystem or expose them via filesystem-like operations.\n- Such patterns can be vulnerable to **path traversal** if:\n  - Filenames in the archive contain `..` segments, absolute paths, or drive prefixes.\n  - The implementation does not normalize and strictly enforce that the final output path stays inside a configured root directory.\n\n**Risk and exploitability**  \n- **CWE-22: Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')**\n- If these fsspec archive helpers are used on archives that may come from untrusted or semi-trusted sources, a crafted archive could:\n  - Escape the intended extraction directory,\n  - Overwrite arbitrary files accessible to the process (e.g., configuration files, SSH keys, Python modules),\n  - Potentially lead to code execution or data compromise.\n\nWhether this is exploitable depends on the surrounding implementation details:\n- If paths are sanitized (e.g., via `os.path.normpath`, checks that the normalized path starts with the destination root, and rejection of absolute/drive-prefixed names), risk is reduced.\n- If the archive filesystem only exposes virtual paths (without writing to disk), the risk becomes more about confusing consumers, not direct file overwrite.\n\n**Mitigations / Recommendations**  \nFor each archive-related code path in `compression.py` and `implementations/zip.py`:\n- Before using an archive member name:\n  - Normalize the path: `normalized = os.path.normpath(member_name)`.\n  - Reject any entry where:\n    - `normalized` is absolute (`os.path.isabs(normalized)`), or\n    - `normalized` starts with `\"..\"` or contains `\"..\"` segments that would escape the target root.\n- When constructing output paths: use `os.path.join(root, normalized)` and then verify that `os.path.commonpath([root, final_path]) == root`.\n- Document clearly that archive-based filesystems should not be used on attacker-supplied archives unless such checks are in place.\n\nGiven only CodeQL’s structural view, these are **potential vulnerabilities** that warrant manual review of the flagged regions.\n\n---\n\n### 3. Command execution usage in test code (`conftest.py`) (CWE-78)\n\n**Location**  \n- File: `fsspec/conftest.py`  \n- Approx. lines: 113–115  \n- Detected by query: `py/fsspec/command-execution`\n\n**What was found**  \nA call to a shell/command execution API (e.g., `subprocess.run`, `os.system`, etc.) was detected inside the test configuration module `conftest.py`.\n\n**Risk and exploitability**  \n- **CWE-78: Improper Neutralization of Special Elements used in an OS Command ('OS Command Injection')**\n- In production packages, such patterns can be dangerous if they incorporate untrusted input into the command string without proper quoting.\n- However, because this is **test-only** infrastructure (not shipped as part of the runtime library API in most deployments), it usually does not affect typical library consumers.\n- Risk is mainly relevant if:\n  - Your test harness is run in untrusted CI environments where external actors can influence environment variables or arguments used in the command; or\n  - You redistribute `conftest.py` in a way that might be imported and executed unintentionally.\n\n**Mitigations / Recommendations**  \n- Prefer `subprocess.run([...], shell=False)` with a list of arguments instead of `shell=True` or `os.system`.\n- Ensure that any arguments interpolated into commands are either hard-coded or strongly validated.\n- If this code is strictly for local developer testing, document that assumption and keep it out of production paths.\n\n---\n\n## Hypotheses tested with no findings\n\nThe following CodeQL hypotheses were tested and **did not** yield results in this codebase (i.e., no evidence of these vulnerabilities was found):\n\n1. **User-controlled paths into `fsspec.open` / `fsspec.open_files`** (CWE-22-like concerns)\n   - Query: `py/fsspec/user-controlled-path` (path-problem)\n   - Pattern: remote data sources (HTTP request parameters, CLI args, etc. modeled as `RemoteFlowSource`) flowing into the first argument of `fsspec.open` / `fsspec.open_files`.\n   - Result: **0 matches**. This suggests that within the fsspec codebase itself, there is no modeled remote input directly passed to these APIs. Note that downstream applications using fsspec may still be vulnerable if they accept untrusted paths, but that is outside this package’s source.\n\n2. **SSRF via `fsspec.implementations.http.HTTPFileSystem` URLs** (CWE-918)\n   - Query: `py/fsspec/ssrf-http` (path-problem)\n   - Pattern: remote user-controlled data flowing into the first argument of `HTTPFileSystem(...)`.\n   - Result: **0 matches**. The library does not appear to create HTTP filesystems using modeled remote sources internally. Again, this does not rule out misuse by library consumers.\n\nThese negative results are reassuring for the internal library code, but they do not speak to security properties of applications built on top of fsspec.\n\n---\n\n## Overall security posture\n\n- The **primary concrete risk** identified in the core library is **unsafe deserialization with `pickle`** (`cache_metadata.py`), which can lead to **arbitrary code execution** if cache files are attacker-controlled. This should be reviewed and, if possible, refactored to a safe format or protected with strict trust and integrity constraints.\n- Archive-handling logic in `compression.py` and `implementations/zip.py` presents a **potential for path traversal** if untrusted archives are processed and if there is insufficient path validation. These locations deserve manual review to confirm that paths are constrained to intended directories.\n- The command execution in `conftest.py` is a **test-only** risk and less critical to typical deployments, but still benefits from safer subprocess use.\n\nNo direct SSRF or remote-input-to-filesystem flows were detected within the fsspec library itself using CodeQL’s standard remote-source models.\n\n---\n\n## Recommended next steps\n\n1. **Review and harden `cache_metadata.py`**\n   - Replace pickle with a safe serialization format (JSON or similar) for cache metadata where feasible.\n   - If that is not possible, enforce trusted cache directories and/or add cryptographic integrity checks.\n\n2. **Audit archive-related code**\n   - Manually inspect the flagged lines in `fsspec/compression.py` and `fsspec/implementations/zip.py`.\n   - Add robust path normalization and root enforcement before writing or exposing any archive member.\n\n3. **Subprocess safety in tests**\n   - Switch to `subprocess.run([...], shell=False)` and avoid string-concatenated shell commands where possible.\n\n4. **Document security assumptions**\n   - Clarify in documentation that fsspec assumes **trusted local filesystem and cache locations**, and that upstream code must validate user-supplied paths and URLs before passing them to fsspec.\n\nIf you’d like, I can next help draft concrete code changes or patches for the unsafe deserialization and archive path validation points.\n",
+ "package_classification": {
+  "type": "library",
+  "layer": [
+   "storage",
+   "io",
+   "filesystem",
+   "data-access"
+  ]
+ },
+ "tool_calls": {
+  "get_package_profile_info": 1,
+  "execute_codeql_query": 10,
+  "validate_codeql_query": 0,
+  "fixup_codeql_query": 3,
+  "finalize_report": 1
+ },
+ "queries_executed": {
+  "critical": 1,
+  "high": 5,
+  "medium": 1,
+  "low": 0,
+  "total_executed": 13,
+  "total_with_results": 7,
+  "total_failed": 4
+ },
+ "query_findings": {
+  "critical": 0,
+  "high": 3,
+  "medium": 3,
+  "low": 0,
+  "total": 6
+ },
+ "findings": [
+  {
+   "codeql_query_uuid": "20251225201603",
+   "codeql_raw_query": "/**\n * @name User-controlled path to filesystem backends\n * @description Detect flow of remote inputs into fsspec filesystem implementations (open, mkdir, rm, etc.)\n * @kind path-problem\n * @problem.severity error\n * @id py/fsspec/user-controlled-path\n * @tags security\n *       external/cwe/cwe-022\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.dataflow.new.RemoteFlowSources\nimport semmle.python.ApiGraphs\n\nmodule FSSpecPathConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    source instanceof RemoteFlowSource\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(API::CallNode call |\n      call = API::moduleImport(\"fsspec\").getMember([\"open\", \"open_files\"]).getACall() and\n      sink = call.getArg(0)\n    )\n  }\n}\n\nmodule FSSpecPathFlow = TaintTracking::Global<FSSpecPathConfig>;\nimport FSSpecPathFlow::PathGraph\n\nfrom FSSpecPathFlow::PathNode source, FSSpecPathFlow::PathNode sink\nwhere FSSpecPathFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"User data flows into fsspec path argument $@.\", source.getNode(), \"user input\"",
+   "hypothesis": "Remote user input may be passed directly as path arguments to fsspec.open/open_files, leading to path traversal or unintended backend access.",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-022"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251225201643",
+   "codeql_raw_query": "/**\n * @name SSRF via fsspec HTTP-based filesystems\n * @description Detect remote user input flowing into HTTP-based fsspec filesystem URLs\n * @kind path-problem\n * @problem.severity error\n * @id py/fsspec/ssrf-http\n * @tags security\n *       external/cwe/cwe-918\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.dataflow.new.RemoteFlowSources\nimport semmle.python.ApiGraphs\n\nmodule FSSpecHTTPConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) { source instanceof RemoteFlowSource }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(API::CallNode call |\n      call = API::moduleImport(\"fsspec.implementations.http\").getMember(\"HTTPFileSystem\").getACall() and\n      sink = call.getArg(0)\n    )\n  }\n}\n\nmodule FSSpecHTTPFlow = TaintTracking::Global<FSSpecHTTPConfig>;\nimport FSSpecHTTPFlow::PathGraph\n\nfrom FSSpecHTTPFlow::PathNode source, FSSpecHTTPFlow::PathNode sink\nwhere FSSpecHTTPFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"User-controlled data flows into HTTPFileSystem URL $@.\", source.getNode(), \"user input\"\n",
+   "hypothesis": "Remote user input may be used to construct URLs for HTTPFileSystem, leading to SSRF risks.",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-918"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251225201723",
+   "codeql_raw_query": "/**\n * @name Insecure YAML/JSON/pickle deserialization in fsspec\n * @description Detect unsafe deserialization (pickle, yaml.load, jsonpickle) inside fsspec codebase\n * @kind problem\n * @problem.severity error\n * @id py/fsspec/unsafe-deserialization\n * @tags security\n *       external/cwe/cwe-502\n */\n\nimport python\nimport semmle.python.ApiGraphs\nimport semmle.python.dataflow.new.DataFlow\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"pickle\").getMember([\"load\", \"loads\", \"Unpickler\"]).getACall()\n  or call = API::moduleImport(\"yaml\").getMember([\"load\", \"unsafe_load\"]).getACall()\n  or call = API::moduleImport(\"jsonpickle\").getMember([\"decode\", \"load\", \"loads\"]).getACall()\nselect call, \"Potentially unsafe deserialization that may execute arbitrary code.\"",
+   "hypothesis": "Look for unsafe deserialization primitives in fsspec",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-502"
+   ],
+   "results_count": 1,
+   "results": [
+    {
+     "ruleId": "py/fsspec/unsafe-deserialization",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/fsspec/unsafe-deserialization",
+      "index": 0
+     },
+     "message": {
+      "text": "Potentially unsafe deserialization that may execute arbitrary code."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "fsspec/implementations/cache_metadata.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 64,
+         "startColumn": 26,
+         "endColumn": 40
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "541732fdddd60ce1:1",
+      "primaryLocationStartColumnFingerprint": "9"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251225201742",
+   "codeql_raw_query": "/**\n * @name Command execution in fsspec\n * @description Detect direct OS command execution that could be influenced by user input\n * @kind path-problem\n * @problem.severity error\n * @id py/fsspec/command-execution\n * @tags security\n *       external/cwe/cwe-078\n */\n\nimport python\nimport semmle.python.ApiGraphs\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.dataflow.new.RemoteFlowSources\n\nmodule FSSpecCmdConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) { source instanceof RemoteFlowSource }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(API::CallNode call |\n      (\n        call = API::moduleImport(\"os\").getMember([\"system\", \"popen\"]).getACall() or\n        call = API::moduleImport(\"subprocess\").getMember([\"Popen\", \"call\", \"run\", \"check_output\"]).getACall()\n      ) and\n      sink = call.getArg(0)\n    )\n  }\n}\n\nmodule FSSpecCmdFlow = TaintTracking::Global<FSSpecCmdConfig>;\nimport FSSpecCmdFlow::PathGraph\n\nfrom FSSpecCmdFlow::PathNode source, FSSpecCmdFlow::PathNode sink\nwhere FSSpecCmdFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"User-controlled data reaches OS command execution $@.\", source.getNode(), \"user input\"",
+   "hypothesis": "Check for any shell/command execution reachable from remote input",
+   "severity": "critical",
+   "cwe_ids": [
+    "cwe-78"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251225201855",
+   "codeql_raw_query": "/**\n * @name Unsafe deserialization in fsspec\n * @description Detect use of pickle, yaml.unsafe_load and similar in fsspec codebase\n * @kind problem\n * @problem.severity error\n * @id py/fsspec/unsafe-deserialization\n * @tags security\n *       external/cwe/cwe-502\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"pickle\").getMember([\"load\", \"loads\"]).getACall()\n  or call = API::moduleImport(\"yaml\").getMember([\"load\", \"unsafe_load\"]).getACall()\n  or call = API::moduleImport(\"marshal\").getMember([\"load\", \"loads\"]).getACall()\nselect call, \"Potentially unsafe deserialization that may execute arbitrary code.\"\n",
+   "hypothesis": "Package uses unsafe deserialization APIs like pickle.load/loads, yaml.load or marshal.load/loads that could lead to code execution if fed untrusted data.",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-502"
+   ],
+   "results_count": 1,
+   "results": [
+    {
+     "ruleId": "py/fsspec/unsafe-deserialization",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/fsspec/unsafe-deserialization",
+      "index": 0
+     },
+     "message": {
+      "text": "Potentially unsafe deserialization that may execute arbitrary code."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "fsspec/implementations/cache_metadata.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 64,
+         "startColumn": 26,
+         "endColumn": 40
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "541732fdddd60ce1:1",
+      "primaryLocationStartColumnFingerprint": "9"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251225201921",
+   "codeql_raw_query": "/**\n * @name Command execution via shell in fsspec\n * @description Find use of os.system, subprocess, or equivalent that may lead to command injection\n * @kind problem\n * @problem.severity error\n * @id py/fsspec/command-execution\n * @tags security\n *       external/cwe/cwe-078\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"os\").getMember([\"system\", \"popen\"]).getACall() or\n  call = API::moduleImport(\"subprocess\").getMember([\"run\", \"Popen\", \"call\", \"check_call\", \"check_output\"]).getACall()\nselect call, \"Potentially dangerous shell command execution.\"",
+   "hypothesis": "Look for direct shell command execution that could be controllable by users",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-78"
+   ],
+   "results_count": 1,
+   "results": [
+    {
+     "ruleId": "py/fsspec/command-execution",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/fsspec/command-execution",
+      "index": 0
+     },
+     "message": {
+      "text": "Potentially dangerous shell command execution."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "fsspec/conftest.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 113,
+         "startColumn": 9,
+         "endLine": 115,
+         "endColumn": 6
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "ac5aef22fde77ef3:1",
+      "primaryLocationStartColumnFingerprint": "4"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251225201940",
+   "codeql_raw_query": "/**\n * @name Path traversal in archive extraction\n * @description Detect use of tarfile or zipfile extraction without path sanitization\n * @kind problem\n * @problem.severity error\n * @id py/fsspec/archive-path-traversal\n * @tags security\n *       external/cwe/cwe-022\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"tarfile\").getMember([\"open\"]).getACall() or\n  call = API::moduleImport(\"zipfile\").getMember([\"ZipFile\"]).getACall()\nselect call, \"Use of archive extraction; verify paths are sanitized to prevent traversal.\"",
+   "hypothesis": "Archives or reference filesystems might write/expose arbitrary paths; look for unsafe tar/zip use",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-22"
+   ],
+   "results_count": 3,
+   "results": [
+    {
+     "ruleId": "py/fsspec/archive-path-traversal",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/fsspec/archive-path-traversal",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of archive extraction; verify paths are sanitized to prevent traversal."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "fsspec/compression.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 58,
+         "startColumn": 13,
+         "endColumn": 48
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "972844f2bf2c8f4d:1",
+      "primaryLocationStartColumnFingerprint": "4"
+     }
+    },
+    {
+     "ruleId": "py/fsspec/archive-path-traversal",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/fsspec/archive-path-traversal",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of archive extraction; verify paths are sanitized to prevent traversal."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "fsspec/compression.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 62,
+         "startColumn": 9,
+         "endColumn": 24
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "b3ee4b2fbfc6865c:1",
+      "primaryLocationStartColumnFingerprint": "4"
+     }
+    },
+    {
+     "ruleId": "py/fsspec/archive-path-traversal",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/fsspec/archive-path-traversal",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of archive extraction; verify paths are sanitized to prevent traversal."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "fsspec/implementations/zip.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 63,
+         "startColumn": 20,
+         "endLine": 69,
+         "endColumn": 10
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "800c48705e9599e6:1",
+      "primaryLocationStartColumnFingerprint": "11"
+     }
+    }
+   ]
+  }
+ ]
+}

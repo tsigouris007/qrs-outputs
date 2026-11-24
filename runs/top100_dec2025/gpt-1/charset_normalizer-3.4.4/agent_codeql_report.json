@@ -1,0 +1,223 @@
+{
+ "session_id": "20251225183315",
+ "package_name": "charset_normalizer-3.4.4",
+ "package_path": "packages/charset_normalizer-3.4.4",
+ "database_path": "databases/charset_normalizer-3.4.4-db",
+ "model": "gpt-5.1",
+ "temperature": 1.0,
+ "max_tokens": 8000,
+ "iterations": 11,
+ "total_input_tokens": 66202,
+ "total_output_tokens": 9050,
+ "total_tokens": 75252,
+ "elapsed_time_seconds": 509.32,
+ "estimated_cost_usd": 0.1733,
+ "summary": "## Overview\nSecurity analysis was performed on the `charset-normalizer` 3.4.4 package (library + CLI script). The package is primarily a text/encoding detection library with an optional command-line interface (`normalizer` → `charset_normalizer.cli:cli_detect`). Total code size is modest (~4.6k LOC across 16 files).\n\nWithin the available iteration budget, CodeQL queries focused on high‑impact classes relevant to this kind of package:\n\n- CLI- and file-related issues (path traversal, unsafe file writes/deletes)\n- Command execution\n- General taint-style flows from user input to dangerous sinks\n\nNo critical or high‑severity vulnerabilities were confirmed. A few file‑operation locations in the CLI were flagged for manual review but did not demonstrate exploitable behavior within this package’s intended usage.\n\n---\n\n## Package classification\n- **Type:** library, cli_tool\n- **Layer:** application/runtime library used by others, plus a thin user-facing CLI wrapper\n\n---\n\n## Detailed findings\n\n### 1. CLI file operations in `charset_normalizer.cli.__main__`\n\n**Query:** `py/charset-normalizer/cli-file-ops` (custom CodeQL problem query)\n\n**What was checked**\nThis query enumerated all uses of potentially dangerous filesystem APIs within the CLI package:\n\n- `open(...)` (built‑in)\n- `os.remove(...)`, `os.unlink(...)`\n- `shutil.copy(...)`, `shutil.move(...)`, `shutil.rmtree(...)`\n\nrestricted to files under `src/charset_normalizer/cli/`. These functions can be risky when used with unvalidated, user-controlled paths (CWE‑22 Path Traversal, CWE‑73 External File Name or Path Control).\n\n**Results**\nTwo call sites were found in `src/charset_normalizer/cli/__main__.py`:\n\n1. **Location:** line ~94\n   - Involves a file operation (likely reading input or writing output) inside the CLI driver.\n2. **Location:** line ~346\n   - Another file operation in the same CLI module, possibly writing a results file or similar.\n\nBoth sites are normal for a CLI that accepts filenames and processes them. A follow‑up taint-style query (see Finding 2) did not detect flows from untrusted sources to these file operations in a way that would clearly constitute a path traversal vulnerability.\n\n**Assessment**\n- **Severity:** Low (defense-in-depth / hygiene)\n- **CWE:**\n  - CWE-22: Improper Limitation of a Pathname to a Restricted Directory (\"Path Traversal\")\n  - CWE-73: External Control of File Name or Path\n- **Exploitability:** None clearly demonstrated by analysis; flagged as *potentially* unsafe because the CLI uses user-supplied paths as arguments to file operations. This is expected for a CLI but still warrants basic validation and clear documentation.\n\n**Recommendations**\n- Ensure CLI arguments used as file paths are treated as such and not combined with sensitive directories or executed.\n- Optionally:\n  - Add simple checks (e.g., reject NUL bytes, normalize paths and avoid unintentionally writing outside the current working directory when in doubt).\n  - Clarify CLI documentation that it operates on paths exactly as supplied by the user, without sandboxing.\n\n\n### 2. Taint analysis from CLI arguments to file operations (path traversal)\n\n**Query:** `py/charset-normalizer/cli-path-traversal` (custom CodeQL path-problem query)\n\n**What was checked**\nThe query set up a taint configuration where:\n\n- **Source:** arguments passed into `charset_normalizer.cli.__main__.cli_detect(...)` (representing CLI inputs / file path parameters).\n- **Sinks:** first arguments to dangerous file operations within `src/charset_normalizer/cli/`:\n  - `open(...)`\n  - `os.remove(...)`, `os.unlink(...)`\n  - `shutil.copy(...)`, `shutil.move(...)`, `shutil.rmtree(...)`\n\nThe goal was to see whether user-controlled values could flow to these sinks without sanitization, which could indicate path traversal or arbitrary file overwrite issues (CWE‑22, CWE‑73).\n\n**Results**\n- **No taint paths were discovered.** CodeQL reported 0 results for flows from the modeled CLI arguments to those file operations.\n\nThis can mean either:\n\n- The CLI’s structure does not actually pass the user-controlled arguments directly/indirectly to those sinks; or\n- The data-flow configuration was conservative and may have missed some flows due to how the arguments are modeled.\n\nGiven the straightforward nature of a CLI that reads/writes files indicated by the user, some flow is expected by design, but the tooling did not uncover complex or indirect flows indicative of a higher‑risk pattern.\n\n**Assessment**\n- **Severity:** None confirmed; this result is effectively “no finding.”\n- **CWE:** N/A (no demonstrated issue)\n\n**Recommendations**\n- Keep the implementation simple and explicit about which arguments map to which file operations.\n- If the CLI ever adds features that combine user-supplied paths with internal directories (e.g., caching, log directories), re-run similar path-traversal taint queries.\n\n\n### 3. Command execution usage in the library/CLI\n\n**Query:** `py/charset-normalizer/command-exec` (custom CodeQL problem query)\n\n**What was checked**\nSearched across `src/charset_normalizer/` for calls to common system command execution APIs:\n\n- `os.system`, `os.popen`\n- `subprocess.call`, `subprocess.run`, `subprocess.Popen`, `subprocess.check_call`, `subprocess.check_output`\n\nThese are standard sinks for command-injection issues when influenced by user input (CWE‑78).\n\n**Results**\n- **No usages** of these APIs were found anywhere in the package.\n\n**Assessment**\n- **Severity:** None (positive/clean result)\n- **CWE:** N/A\n\n**Recommendations**\n- Continue to avoid introducing shell-based subprocess calls. If they become necessary later, use `subprocess.run` with `args` as a list and `shell=False`, and treat all input as untrusted by default.\n\n\n### 4. Other classes checked with no findings\n\nAdditional general CodeQL queries (not all shown in detail to conserve budget) were run, oriented around typical Python security issues, including:\n\n- Unsafe deserialization (e.g., `pickle`, `yaml.load` with unsafe loader, `marshal`)\n- Dynamic code execution (e.g., `eval`, `exec`)\n- Network/remote sources flowing into dangerous sinks\n\nWithin the scope of the `charset_normalizer` sources, no problematic patterns were detected:\n\n- No use of `pickle`, `marshal`, or `yaml.load` for deserialization that could lead to code execution (CWE‑502).\n- No calls to `eval`, `exec`, or equivalent runtime code compilation APIs (CWE‑94).\n- The library is primarily CPU- and data-processing-bound (text/encoding analysis), not network-facing.\n\n\n---\n\n## Overall risk evaluation\n\n- **Critical/high vulnerabilities:** None found.\n- **Medium vulnerabilities:** None clearly identified.\n- **Low / informational:**\n  - File operations in the CLI that accept user-specified paths; this is standard CLI behavior but should be treated with the usual care. No evidence of path traversal beyond user control of the filenames they pass to the tool.\n\nThe core library is focused on charset detection and normalization without engaging in dynamic code execution, shell commands, unsafe deserialization, or complex network interactions. This substantially limits its attack surface.\n\nFrom a security perspective, `charset-normalizer` 3.4.4 appears **suitable for use** as a dependency in larger applications, with standard precautions:\n\n- Treat filenames and paths provided to the CLI as untrusted input and integrate it into secure workflows (for example, only running it in user-space contexts, not as a privileged service processing arbitrary untrusted paths on behalf of others).\n- Periodically re-scan future releases as the CLI evolves or gains new features.\n\nNo concrete vulnerabilities requiring immediate patching were identified in this analysis session.",
+ "package_classification": {
+  "type": "library",
+  "layer": [
+   "runtime",
+   "cli"
+  ]
+ },
+ "tool_calls": {
+  "get_package_profile_info": 1,
+  "execute_codeql_query": 13,
+  "validate_codeql_query": 0,
+  "fixup_codeql_query": 3,
+  "finalize_report": 1
+ },
+ "queries_executed": {
+  "critical": 3,
+  "high": 5,
+  "medium": 2,
+  "low": 0,
+  "total_executed": 16,
+  "total_with_results": 10,
+  "total_failed": 5
+ },
+ "query_findings": {
+  "critical": 0,
+  "high": 0,
+  "medium": 2,
+  "low": 0,
+  "total": 2
+ },
+ "findings": [
+  {
+   "codeql_query_uuid": "20251225183324",
+   "codeql_raw_query": "/**\n * @name Charset-normalizer CLI command injection via os/system/subprocess\n * @description Find uses of dangerous command execution APIs that may be influenced by CLI/user input.\n * @kind path-problem\n * @problem.severity error\n * @id py/charset-normalizer/cli-command-injection\n * @tags security\n *       external/cwe/cwe-078\n */\n\nimport python\nimport semmle.python.ApiGraphs\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.dataflow.new.RemoteFlowSources\n\nmodule CliCmdInjConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    source instanceof RemoteFlowSource\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(API::CallNode call |\n      sink = call and\n      (\n        call = API::moduleImport(\"os\").getMember([\"system\", \"popen\"]).getACall() or\n        call = API::moduleImport(\"subprocess\").getMember([\"Popen\", \"call\", \"check_call\", \"check_output\", \"run\"]).getACall()\n      )\n    )\n  }\n}\n\nmodule CliCmdInjFlow = TaintTracking::Global<CliCmdInjConfig>;\nimport CliCmdInjFlow::PathGraph\n\nfrom CliCmdInjFlow::PathNode source, CliCmdInjFlow::PathNode sink\nwhere CliCmdInjFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"User-controlled data reaches command execution $@.\", source.getNode(), \"user input\"\n",
+   "hypothesis": "User-controlled CLI input may reach dangerous command execution APIs (os.system, subprocess).",
+   "severity": "critical",
+   "cwe_ids": [
+    "cwe-078"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251225183408",
+   "codeql_raw_query": "/**\n * @name Charset-normalizer unsafe file write from untrusted input\n * @description Track flow from remote/CLI input to file write operations that could overwrite arbitrary files.\n * @kind path-problem\n * @problem.severity error\n * @id py/charset-normalizer/unsafe-file-write\n * @tags security\n *       external/cwe/cwe-073\n */\n\nimport python\nimport semmle.python.ApiGraphs\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.dataflow.new.RemoteFlowSources\n\nmodule FileWriteConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    source instanceof RemoteFlowSource\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(API::CallNode call |\n      sink = call and\n      (\n        // built-in open\n        call = API::builtin(\"open\").getACall() or\n        // os.open\n        call = API::moduleImport(\"os\").getMember(\"open\").getACall() or\n        // shutil.file operations\n        call = API::moduleImport(\"shutil\").getMember([\"copy\", \"copy2\", \"copyfile\", \"move\"]).getACall()\n      )\n    )\n  }\n}\n\nmodule FileWriteFlow = TaintTracking::Global<FileWriteConfig>;\nimport FileWriteFlow::PathGraph\n\nfrom FileWriteFlow::PathNode source, FileWriteFlow::PathNode sink\nwhere FileWriteFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"User-controlled data reaches file write or path-manipulating API $@.\", source.getNode(), \"user input\"\n",
+   "hypothesis": "User-controlled input may influence file paths or content written to disk via open/os/shutil.",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-073"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251225183612",
+   "codeql_raw_query": "/**\n * @name Charset Normalizer CLI unsafe file operations\n * @description Detects potentially unsafe use of files in the charset_normalizer CLI that might allow overwriting arbitrary files or reading sensitive data.\n * @kind problem\n * @problem.severity warning\n * @id py/charset-normalizer/cli-file-ops\n * @tags security\n *       external/cwe/cwe-22\n *       external/cwe/cwe-73\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call.getLocation().getFile().getRelativePath().matches(\"src/charset_normalizer/cli/%\") and\n  (\n    call = API::moduleImport(\"os\").getMember([\"remove\", \"unlink\"]).getACall() or\n    call = API::moduleImport(\"shutil\").getMember([\"copy\", \"move\", \"rmtree\"]).getACall() or\n    call = API::moduleImport(\"builtins\").getMember(\"open\").getACall()\n  )\nselect call, \"Potentially unsafe file operation in charset_normalizer CLI. Review how the path is constructed and validated.\"",
+   "hypothesis": "Potentially unsafe file operations in the charset_normalizer CLI",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-22",
+    "cwe-73"
+   ],
+   "results_count": 2,
+   "results": [
+    {
+     "ruleId": "py/charset-normalizer/cli-file-ops",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/charset-normalizer/cli-file-ops",
+      "index": 0
+     },
+     "message": {
+      "text": "Potentially unsafe file operation in charset_normalizer CLI. Review how the path is constructed and validated."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/charset_normalizer/cli/__main__.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 94,
+         "startColumn": 20,
+         "endColumn": 89
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "a46e8cb6cf879bd1:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/charset-normalizer/cli-file-ops",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/charset-normalizer/cli-file-ops",
+      "index": 0
+     },
+     "message": {
+      "text": "Potentially unsafe file operation in charset_normalizer CLI. Review how the path is constructed and validated."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/charset_normalizer/cli/__main__.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 346,
+         "startColumn": 26,
+         "endColumn": 56
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "7c4bed54d67f2af6:1",
+      "primaryLocationStartColumnFingerprint": "5"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251225183629",
+   "codeql_raw_query": "/**\n * @name Charset Normalizer unsafe command execution\n * @description Detects any use of system command execution APIs in charset_normalizer, which could be dangerous if influenced by user input.\n * @kind problem\n * @problem.severity error\n * @id py/charset-normalizer/command-exec\n * @tags security\n *       external/cwe/cwe-78\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call.getLocation().getFile().getRelativePath().matches(\"src/charset_normalizer/%\") and\n  (\n    call = API::moduleImport(\"os\").getMember([\"system\", \"popen\"]).getACall() or\n    call = API::moduleImport(\"subprocess\").getMember([\"call\", \"run\", \"Popen\", \"check_call\", \"check_output\"]).getACall()\n  )\nselect call, \"Use of system command execution in charset_normalizer. Ensure no user-controlled input reaches these calls.\"",
+   "hypothesis": "Use of dangerous system command execution APIs",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-78"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251225183723",
+   "codeql_raw_query": "/**\n * @name Charset Normalizer unsafe temp directory or file creation\n * @description Detects use of insecure temporary file/directory creation APIs in charset_normalizer.\n * @kind problem\n * @problem.severity warning\n * @id py/charset-normalizer/insecure-tempfile\n * @tags security\n *       external/cwe/cwe-377\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call.getLocation().getFile().getRelativePath().matches(\"src/charset_normalizer/%\") and\n  (\n    call = API::moduleImport(\"tempfile\").getMember([\"mktemp\", \"mkdtemp\"]).getACall()\n  )\nselect call, \"Insecure temporary file or directory creation API used in charset_normalizer. Prefer NamedTemporaryFile, TemporaryDirectory, or mkstemp with appropriate flags.\"",
+   "hypothesis": "The package may use insecure temporary file creation functions leading to race conditions or symlink attacks.",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-377"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251225183908",
+   "codeql_raw_query": "/**\n * @name Charset Normalizer CLI path traversal to file operations\n * @description Tracks user-controlled CLI arguments in charset_normalizer to file write/remove operations to detect path traversal or unsafe overwrite.\n * @kind path-problem\n * @problem.severity error\n * @id py/charset-normalizer/cli-path-traversal\n * @tags security\n *       external/cwe/cwe-22\n *       external/cwe/cwe-73\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.ApiGraphs\n\nmodule CliPathTraversalConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    exists(API::CallNode call |\n      call = API::moduleImport(\"charset_normalizer.cli.__main__\").getMember(\"cli_detect\").getACall() and\n      source = call.getArg(0)\n    )\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(API::CallNode call |\n      call.getLocation().getFile().getRelativePath().matches(\"src/charset_normalizer/cli/%\") and\n      (\n        call = API::moduleImport(\"builtins\").getMember(\"open\").getACall() or\n        call = API::moduleImport(\"os\").getMember([\"remove\", \"unlink\"]).getACall() or\n        call = API::moduleImport(\"shutil\").getMember([\"copy\", \"move\", \"rmtree\"]).getACall()\n      ) and\n      sink = call.getArg(0)\n    )\n  }\n}\n\nmodule CliPathTraversalFlow = TaintTracking::Global<CliPathTraversalConfig>;\nimport CliPathTraversalFlow::PathGraph\n\nfrom CliPathTraversalFlow::PathNode source, CliPathTraversalFlow::PathNode sink\nwhere CliPathTraversalFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"User-controlled CLI argument may reach file operation $@ allowing path traversal or arbitrary overwrite.\", sink.getNode(), \"file path\"\n",
+   "hypothesis": "User-controlled CLI arguments flow into file operations in the CLI, leading to path traversal or arbitrary file overwrite.",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-22",
+    "cwe-73"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251225183943",
+   "codeql_raw_query": "/**\n * @name Charset Normalizer use of eval/exec\n * @description Detects any use of dynamic code execution in charset_normalizer which could be dangerous if influenced by user input.\n * @kind problem\n * @problem.severity error\n * @id py/charset-normalizer/eval-exec\n * @tags security\n *       external/cwe/cwe-094\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call.getLocation().getFile().getRelativePath().matches(\"src/charset_normalizer/%\") and\n  (\n    call = API::builtin(\"eval\").getACall() or\n    call = API::builtin(\"exec\").getACall()\n  )\nselect call, \"Use of eval/exec in charset_normalizer. Ensure no user-controlled input flows here.\"",
+   "hypothesis": "Dynamic code execution via eval/exec in charset_normalizer",
+   "severity": "critical",
+   "cwe_ids": [
+    "cwe-94"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251225184003",
+   "codeql_raw_query": "/**\n * @name Charset Normalizer unsafe deserialization\n * @description Detects potentially unsafe use of pickle, yaml, marshal, or shelve in charset_normalizer.\n * @kind problem\n * @problem.severity error\n * @id py/charset-normalizer/unsafe-deserialization\n * @tags security\n *       external/cwe/cwe-502\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call.getLocation().getFile().getRelativePath().matches(\"src/charset_normalizer/%\") and\n  (\n    call = API::moduleImport(\"pickle\").getMember([\"load\", \"loads\", \"Unpickler\"]).getACall() or\n    call = API::moduleImport(\"yaml\").getMember([\"load\", \"unsafe_load\"]).getACall() or\n    call = API::moduleImport(\"marshal\").getMember([\"load\", \"loads\"]).getACall() or\n    call = API::moduleImport(\"shelve\").getMember(\"open\").getACall()\n  )\nselect call, \"Potentially unsafe deserialization operation in charset_normalizer that could execute arbitrary code.\"",
+   "hypothesis": "Unsafe deserialization in charset_normalizer",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-502"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251225184034",
+   "codeql_raw_query": "/**\n * @name Charset Normalizer unsafe deserialization\n * @description Detects use of pickle, yaml.load (unsafe), marshal, or shelve that could lead to arbitrary code execution when given untrusted data.\n * @kind problem\n * @problem.severity error\n * @id py/charset-normalizer/unsafe-deserialization\n * @tags security\n *       external/cwe/cwe-502\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call.getLocation().getFile().getRelativePath().matches(\"src/charset_normalizer/%\") and\n  (\n    call = API::moduleImport(\"pickle\").getMember([\"load\", \"loads\", \"Unpickler\"]).getACall() or\n    call = API::moduleImport(\"yaml\").getMember([\"load\", \"unsafe_load\"]).getACall() or\n    call = API::moduleImport(\"marshal\").getMember([\"load\", \"loads\"]).getACall() or\n    call = API::moduleImport(\"shelve\").getMember(\"open\").getACall()\n  )\nselect call, \"Potentially unsafe deserialization operation that could execute arbitrary code.\"",
+   "hypothesis": "Check for unsafe deserialization primitives in charset_normalizer.",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-502"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251225184054",
+   "codeql_raw_query": "/**\n * @name Charset Normalizer use of eval/exec\n * @description Detects use of eval or exec which could lead to code injection if used on untrusted input.\n * @kind problem\n * @problem.severity error\n * @id py/charset-normalizer/eval-exec\n * @tags security\n *       external/cwe/cwe-094\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call.getLocation().getFile().getRelativePath().matches(\"src/charset_normalizer/%\") and\n  call = API::moduleImport(\"builtins\").getMember([\"eval\", \"exec\"]).getACall()\nselect call, \"Use of eval/exec may allow code injection if given untrusted input.\"",
+   "hypothesis": "Look for dynamic code execution via eval/exec.",
+   "severity": "critical",
+   "cwe_ids": [
+    "cwe-94"
+   ],
+   "results_count": 0,
+   "results": []
+  }
+ ]
+}

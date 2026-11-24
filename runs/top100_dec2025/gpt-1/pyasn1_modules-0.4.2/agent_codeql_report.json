@@ -1,0 +1,301 @@
+{
+ "session_id": "20251226034203",
+ "package_name": "pyasn1_modules-0.4.2",
+ "package_path": "packages/pyasn1_modules-0.4.2",
+ "database_path": "databases/pyasn1_modules-0.4.2-db",
+ "model": "gpt-5.1",
+ "temperature": 1.0,
+ "max_tokens": 8000,
+ "iterations": 10,
+ "total_input_tokens": 97431,
+ "total_output_tokens": 6704,
+ "total_tokens": 104135,
+ "elapsed_time_seconds": 309.19,
+ "estimated_cost_usd": 0.1888,
+ "summary": "## Overview\n\nAnalyzed `pyasn1_modules` (pyasn1_modules-0.4.2), a library providing ASN.1 protocol module definitions plus some auxiliary `tools/` scripts for working with ASN.1-encoded structures (PKI, OCSP, SNMP, etc.). Roughly 14k lines across 147 files; the vast bulk of the package is declarative ASN.1 structure definitions, with a small number of imperative helper tools.\n\nWithin the iteration budget, CodeQL-based analysis focused on security-relevant behaviors: cryptography usage, networking in the `tools/` folder, data handling, and common Python security antipatterns.\n\nNo critical or high-severity vulnerabilities were discovered in the core library modules. A few low/medium-severity hardening issues were identified in the optional `tools/` scripts.\n\n---\n\n## Key Findings\n\n### 1. Weak hash algorithm usage in `tools/ocspclient.py`\n\n**Location (from CodeQL SARIF):**\n- `tools/ocspclient.py`, lines 62–64\n- `tools/ocspclient.py`, lines 69–71\n\n**Summary:**\nThe OCSP client helper script uses weak hash algorithms (MD5/SHA1) via Python’s `hashlib`. CodeQL flagged this as `py/weak-hash-usage` and via a custom rule `py/weak-hash-tools`.\n\n**Impact:**\n- **Severity:** Medium (hardening issue; tool script only)\n- **CWE:** CWE-327 (Use of a Broken or Risky Cryptographic Algorithm)\n- OCSP, by its nature, heavily intersects with PKI and integrity verification. Using MD5 or SHA1 within OCSP workflows is generally discouraged because both are considered cryptographically broken for collision resistance.\n- In this package, the usage appears limited to a command-line helper (`tools/ocspclient.py`), not to the library’s ASN.1 structures. Many environments will not use these tools in production paths; however, they may be used by operators or in integration tests.\n\n**Risk considerations:**\n- If this helper is re-used or adapted into security-sensitive code (e.g., checking certificate status in production) without modification, it may weaken security posture.\n- Some ecosystems still use SHA1 for backward compatibility, but new designs should avoid it.\n\n**Recommendations:**\n- Prefer stronger hash functions (e.g., SHA-256 or better) via `hashlib.sha256` or other modern algorithms.\n- If the hashes are dictated by an external protocol or legacy data format, clearly document this in comments and, where possible, constrain usage to compatibility-only code paths.\n- Consider guarding such usage behind configuration, with a default to stronger algorithms for new deployments.\n\n---\n\n### 2. Direct socket usage in `tools/snmpget.py`\n\n**Location (from CodeQL SARIF):**\n- `tools/snmpget.py`, around line 39\n\n**Summary:**\nA custom CodeQL query (`py/socket-tools-usage`) flagged direct usage of the `socket` module in an SNMP helper script. The script constructs and uses raw sockets manually.\n\n**Impact:**\n- **Severity:** Low to Medium (context-dependent, tool script)\n- **CWE:** CWE-319 (Cleartext Transmission of Sensitive Information) – potential; CWE-300 (Channel Accessible by Non-Endpoint) – general network hardening\n- SNMP v1/v2c is inherently insecure (community strings in cleartext). If the tool is used against production devices across untrusted networks, credentials and SNMP data may be exposed.\n- The script does not appear to implement TLS or similar transport protection, in line with standard SNMP v1/v2c behavior.\n\n**Risk considerations:**\n- This is expected for an SNMP helper, but from a security posture standpoint it means:\n  - Traffic is potentially exposed on the network.\n  - SNMP community strings can be sniffed and reused.\n- The tool is likely intended for lab/testing or tightly controlled networks, but this should be made explicit to avoid misuse in sensitive contexts.\n\n**Recommendations:**\n- Clearly document in `tools/snmpget.py` (and associated README/docs) that it does not provide encryption or integrity protection, and is suitable only for trusted or segregated networks.\n- Recommend using SNMPv3 with authenticated/encrypted transports (outside the scope of this particular tool) for security-sensitive deployments.\n- If future development is planned, consider offering an SNMPv3-capable example or explicitly marking this script as “example only / not for production use”.\n\n---\n\n### 3. No insecure HTTP constant usage detected in tools\n\n**Query objective:**\n- A (fixed) CodeQL query (`py/insecure-http-tools`) was executed to find uses of `urllib`/`urllib2` that embed a literal `\"http://...\"` URL in `tools/` scripts, aiming to catch cleartext traffic to remote hosts.\n\n**Result:**\n- No matches were found.\n\n**Interpretation:**\n- Within the static code of the package, the tools do not appear to hard-code insecure `http://` URLs via `urllib`/`urllib2`.\n- This does not exclude the possibility of dynamic HTTP URLs (e.g., built from user input or configuration), but there is no evidence of obviously hard-coded insecure endpoints.\n\n**Recommendations:**\n- When extending or modifying `tools/` scripts to call remote services, prefer `https://` URLs and validate certificates properly.\n\n---\n\n### 4. No unsafe deserialization, code execution, or obvious injection sinks in library\n\n**Queries executed (high level):**\n- Unsafe deserialization patterns (e.g., `pickle.load/loads`, `yaml.load`, `marshal`, etc.)\n- Generic code execution sinks (e.g., `eval`, `exec`) fed by remote or untrusted input\n- File and command execution flows from remote sources\n\n**Results:**\n- The library portion (`pyasn1_modules/*.py`) is primarily ASN.1 type and OID definition code, with no apparent use of dynamic code execution or unsafe deserialization APIs.\n- No flows from remote input sources into classic dangerous sinks were identified in the core modules.\n\n**Impact:**\n- **Severity:** None (no vulnerabilities detected in these categories)\n- **CWE:** Not applicable\n\n**Recommendations:**\n- Maintain the current design where modules are declarative (type definitions, OIDs, constants) and avoid introducing runtime logic that performs deserialization or arbitrary evaluation of external data.\n\n---\n\n### 5. General observations about the core library\n\n- The `pyasn1_modules` package acts as a catalog of ASN.1 schemas/profiles for many RFCs (PKCS, X.509, OCSP, CMP/CMC, S/MIME, SNMP MIBs, etc.).\n- Most Python files in `pyasn1_modules/` simply declare classes derived from `pyasn1` types, OIDs, and named types/sequences; they do not themselves perform network communication, cryptography operations, or file/OS interactions.\n- As such, the main attack surface is limited; most security concerns relate to how an application uses these definitions with `pyasn1` encoding/decoding and its own IO or crypto libraries.\n\n**Recommendations for consumers:**\n- Validate and sanitize ASN.1 data at higher levels in the application: enforce size limits, depth limits, and timeouts when parsing untrusted ASN.1-encoded messages to reduce the risk of DoS via resource exhaustion.\n- Keep dependencies (especially `pyasn1`) updated, as parsing bugs or vulnerabilities, if any, will generally surface there rather than in `pyasn1_modules`.\n\n---\n\n## Overall Risk Assessment\n\n- **Core library (`pyasn1_modules/*.py`):**\n  - No critical/high severity vulnerabilities identified within the analysis scope.\n  - Design is largely declarative; minimal direct attack surface.\n\n- **Tools (`tools/*.py`):**\n  - **Weak hash usage in `tools/ocspclient.py`** (CWE-327) – Medium severity if used as-is in security-sensitive workflows.\n  - **Insecure network protocol (SNMP over raw sockets) in `tools/snmpget.py`** – Low/Medium severity, expected for SNMPv1/v2c tooling but should be clearly documented as insecure for untrusted networks.\n  - No hard-coded insecure HTTP URLs or other obvious issues detected in these scripts during this analysis.\n\n## Final Recommendations\n\n1. **Document security properties of the tools:** Clarify that the tools are examples/debugging aids, and highlight limitations (e.g., weak hashes, cleartext protocols) to discourage inappropriate production use.\n2. **Modernize cryptography where feasible:** Where hashes or crypto primitives are script-controlled rather than protocol-mandated, switch to modern algorithms (SHA-256 or better) and document any remaining legacy usage clearly.\n3. **Maintain declarative design of library modules:** Avoid introducing IO, networking, or dynamic code evaluation into `pyasn1_modules` itself. Keep it as a pure schema/OID library and delegate risky operations to well-reviewed libraries and application-level code.\n4. **Encourage safe integration practices for consumers:** In external docs or project README, emphasize the need for safe handling of untrusted ASN.1 data (limits, timeouts, updated dependencies) when using these modules in network-facing applications.\n\nWithin the confines of this CodeQL-based analysis and the current version (pyasn1_modules-0.4.2), the package appears broadly safe as a library, with only minor hardening issues in optional tooling scripts that can be addressed or mitigated through documentation and small code changes.",
+ "package_classification": {
+  "type": "library",
+  "layer": [
+   "crypto",
+   "protocols",
+   "asn1",
+   "support",
+   "tools"
+  ]
+ },
+ "tool_calls": {
+  "get_package_profile_info": 1,
+  "execute_codeql_query": 10,
+  "validate_codeql_query": 0,
+  "fixup_codeql_query": 2,
+  "finalize_report": 1
+ },
+ "queries_executed": {
+  "critical": 1,
+  "high": 0,
+  "medium": 6,
+  "low": 1,
+  "total_executed": 11,
+  "total_with_results": 8,
+  "total_failed": 7
+ },
+ "query_findings": {
+  "critical": 0,
+  "high": 0,
+  "medium": 4,
+  "low": 1,
+  "total": 5
+ },
+ "findings": [
+  {
+   "codeql_query_uuid": "20251226034211",
+   "codeql_raw_query": "/**\n * @name Use of weak cryptographic hash functions\n * @description Detects use of MD5 or SHA1 from hashlib\n * @kind problem\n * @problem.severity warning\n * @id py/weak-hash-usage\n * @tags security\n *       external/cwe/cwe-327\n */\n\nimport python\nimport semmle.python.ApiGraphs\nimport semmle.python.dataflow.new.DataFlow\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"hashlib\").getMember([\"md5\", \"sha1\"]).getACall()\nselect call, \"Use of weak hash function (MD5/SHA1) which is considered cryptographically broken.\"\n",
+   "hypothesis": "Package uses weak cryptographic hash algorithms MD5/SHA1",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-327"
+   ],
+   "results_count": 2,
+   "results": [
+    {
+     "ruleId": "py/weak-hash-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/weak-hash-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of weak hash function (MD5/SHA1) which is considered cryptographically broken."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "tools/ocspclient.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 62,
+         "startColumn": 22,
+         "endLine": 64,
+         "endColumn": 6
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "f054503b6fe13d14:1",
+      "primaryLocationStartColumnFingerprint": "17"
+     }
+    },
+    {
+     "ruleId": "py/weak-hash-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/weak-hash-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of weak hash function (MD5/SHA1) which is considered cryptographically broken."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "tools/ocspclient.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 69,
+         "startColumn": 21,
+         "endLine": 71,
+         "endColumn": 6
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "8fa0b6cb46e1989f:1",
+      "primaryLocationStartColumnFingerprint": "16"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251226034308",
+   "codeql_raw_query": "/**\n * @name Use of weak cryptographic hash in tools\n * @description Detect use of MD5/SHA1 in the tools/ helper scripts, which may be insecure for security-sensitive contexts.\n * @kind problem\n * @problem.severity warning\n * @id py/weak-hash-tools\n * @tags security\n *        external/cwe/cwe-327\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"hashlib\").getMember([\"md5\", \"sha1\"]).getACall() and\n  call.getLocation().getFile().getRelativePath().matches(\"tools/%\")\nselect call, \"Use of weak hash function (MD5/SHA1) in tools script.\"",
+   "hypothesis": "Use of weak hashes (MD5/SHA1) in tooling, which might be copied into production code.",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-327"
+   ],
+   "results_count": 2,
+   "results": [
+    {
+     "ruleId": "py/weak-hash-tools",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/weak-hash-tools",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of weak hash function (MD5/SHA1) in tools script."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "tools/ocspclient.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 62,
+         "startColumn": 22,
+         "endLine": 64,
+         "endColumn": 6
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "f054503b6fe13d14:1",
+      "primaryLocationStartColumnFingerprint": "17"
+     }
+    },
+    {
+     "ruleId": "py/weak-hash-tools",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/weak-hash-tools",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of weak hash function (MD5/SHA1) in tools script."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "tools/ocspclient.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 69,
+         "startColumn": 21,
+         "endLine": 71,
+         "endColumn": 6
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "8fa0b6cb46e1989f:1",
+      "primaryLocationStartColumnFingerprint": "16"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251226034338",
+   "codeql_raw_query": "/**\n * @name Dangerous use of eval/exec\n * @description Check whether any modules or tools use eval/exec on potentially untrusted data.\n * @kind problem\n * @problem.severity error\n * @id py/dangerous-eval-exec\n * @tags security\n *        external/cwe/cwe-094\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::builtin([\"eval\", \"exec\"]).getACall()\nselect call, \"Use of eval/exec may lead to code injection if used on untrusted input.\"\n",
+   "hypothesis": "Library or tools might use eval/exec, leading to possible code injection.",
+   "severity": "critical",
+   "cwe_ids": [
+    "cwe-094"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251226034441",
+   "codeql_raw_query": "/**\n * @name Insecure network usage in tools (HTTP, no TLS)\n * @description Find uses of urllib/urllib2 over plain HTTP in the tools/ clients.\n * @kind problem\n * @problem.severity warning\n * @id py/insecure-http-tools\n * @tags security\n *        external/cwe/cwe-319\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call, API::CallNode apiCall, Expr urlArg\nwhere\n  call = apiCall and\n  apiCall = API::moduleImport([\"urllib\", \"urllib2\"]).getMember([\"urlopen\", \"Request\"]).getACall() and\n  call.getLocation().getFile().getRelativePath().matches(\"tools/%\") and\n  urlArg = apiCall.getArg(0).asExpr() and\n  urlArg instanceof StringLiteral and\n  urlArg.toString().regexpMatch(\"^\\\"http://.*\")\nselect call, \"Insecure HTTP URL used in tools/ script.\"\n",
+   "hypothesis": "Tools scripts may use urllib/urllib2 over plain HTTP, exposing data to interception (CWE-319).",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-319"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251226034504",
+   "codeql_raw_query": "/**\n * @name Insecure temporary file usage in tools\n * @description Detect use of mktemp or predictable temp file names in tools/ scripts.\n * @kind problem\n * @problem.severity warning\n * @id py/insecure-tempfile-tools\n * @tags security\n *        external/cwe/cwe-377\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call.getLocation().getFile().getRelativePath().matches(\"tools/%\") and\n  (\n    call = API::moduleImport(\"tempfile\").getMember(\"mktemp\").getACall() or\n    call = API::moduleImport(\"os\").getMember(\"tmpnam\").getACall()\n  )\nselect call, \"Insecure temporary file function used in tools/ script.\"",
+   "hypothesis": "Tools scripts might use insecure temporary file creation primitives like tempfile.mktemp or os.tmpnam",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-377"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251226034524",
+   "codeql_raw_query": "/**\n * @name Insecure randomness for crypto-related values\n * @description Detect use of random module for cryptographic material in ASN.1 modules/tools.\n * @kind problem\n * @problem.severity warning\n * @id py/insecure-randomness\n * @tags security\n *        external/cwe/cwe-330\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"random\").getMember([\"random\", \"randint\", \"getrandbits\"]).getACall()\nselect call, \"Use of potentially insecure PRNG; ensure this is not used for cryptographic secrets.\"",
+   "hypothesis": "Package or tools may use python random module for crypto-sensitive operations",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-330"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251226034551",
+   "codeql_raw_query": "/**\n * @name Use of weak hash functions in library code\n * @description Detect MD5/SHA1 usage in pyasn1_modules package (excluding tools/).\n * @kind problem\n * @problem.severity warning\n * @id py/weak-hash-library\n * @tags security\n *        external/cwe/cwe-328\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"hashlib\").getMember([\"md5\", \"sha1\"]).getACall() and\n  call.getLocation().getFile().getRelativePath().matches(\"pyasn1_modules/%\")\nselect call, \"Use of weak hash function (MD5/SHA1) in library code.\"",
+   "hypothesis": "Library code may use weak hash functions (MD5/SHA1) leading to cryptographic weaknesses.",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-328"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251226034614",
+   "codeql_raw_query": "/**\n * @name Potential unsafe usage of socket in tools\n * @description Find direct socket usage in tools directory which may lack TLS or proper validation.\n * @kind problem\n * @problem.severity note\n * @id py/socket-tools-usage\n * @tags security\n *        external/cwe/cwe-319\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"socket\").getMember([\"socket\", \"create_connection\"]).getACall() and\n  call.getLocation().getFile().getRelativePath().matches(\"tools/%\")\nselect call, \"Direct socket usage in tools script; ensure TLS and proper validation are used.\"",
+   "hypothesis": "Tool scripts might use raw sockets without TLS, risking cleartext transmission.",
+   "severity": "low",
+   "cwe_ids": [
+    "cwe-319"
+   ],
+   "results_count": 1,
+   "results": [
+    {
+     "ruleId": "py/socket-tools-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/socket-tools-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Direct socket usage in tools script; ensure TLS and proper validation are used."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "tools/snmpget.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 39,
+         "startColumn": 8,
+         "endColumn": 56
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "6f58f58fe93485f7:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    }
+   ]
+  }
+ ]
+}

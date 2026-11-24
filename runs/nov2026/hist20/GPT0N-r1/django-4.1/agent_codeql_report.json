@@ -1,0 +1,504 @@
+{
+ "session_id": "20261119223922",
+ "package_name": "django-4.1",
+ "package_path": "packages/django-4.1",
+ "database_path": "databases/django-4.1-db",
+ "model": "gpt-5.1",
+ "temperature": 0.0,
+ "max_tokens": 8000,
+ "iterations": 10,
+ "total_input_tokens": 274089,
+ "total_output_tokens": 9275,
+ "total_tokens": 283364,
+ "elapsed_time_seconds": 453.17,
+ "estimated_cost_usd": 0.6095,
+ "summary": "## Security analysis summary for `django-4.1`\n\nTarget: Django 4.1 (core framework and contrib apps)\nPackage role: full-stack web framework / application framework library.\n\nWithin the iteration budget, CodeQL-based analysis focused on high-impact classes relevant to a web framework: unsafe deserialization, YAML usage, ORM/raw SQL helpers, and command execution. The CodeQL database is large (Django core + contrib), so queries were scoped to Django modules and known risky APIs.\n\n### Confirmed / Relevant Findings\n\n#### 1. Use of unsafe YAML loading in Django’s YAML serializer\n- **Location:** `django/core/serializers/pyyaml.py:78`\n- **Rule:** `py/django41-yaml-unsafe-load`\n- **CWE:** CWE-502 (Deserialization of Untrusted Data)\n- **Description:**\n  CodeQL reports a call to `yaml.load()` / `yaml.unsafe_load()` in the YAML serializer module. These APIs are known to be unsafe when used on untrusted input because YAML tags can instantiate arbitrary Python objects and potentially trigger code execution.\n\n  In Django, this module underpins the `yaml` serializer (e.g., via `django.core.serializers.get_serializer(\"yaml\")`). If an application uses this serializer on attacker-controlled data (for example, accepting YAML from a client and deserializing it directly), it can become a code execution primitive.\n\n- **Risk interpretation for framework users:**\n  * Django itself does not automatically deserialize arbitrary client input with this serializer; the risk is **usage-dependent**.\n  * However, the presence of `yaml.load`/`unsafe_load` in a core serializer means that any project that exposes YAML deserialization to untrusted users without additional validation is at risk.\n\n- **Mitigations / Recommendations for users:**\n  1. **Avoid deserializing untrusted YAML with Django’s YAML serializer.** Prefer safer formats like JSON for untrusted data.\n  2. If YAML is required, use `yaml.safe_load()` (or a library that guarantees safe loading) in your own code instead of the Django YAML serializer for untrusted input.\n  3. Treat any data passed into `django.core.serializers.deserialize('yaml', ...)` as trusted-only (e.g., internal fixtures, migrations, or admin-only operations).\n  4. Consider restricting or auditing any code paths that call `deserialize('yaml', ...)` or `get_serializer('yaml')` to ensure they are not reachable from unauthenticated or low-privilege users.\n\n- **Mitigations / Recommendations for framework maintainers:**\n  1. Prefer `yaml.safe_load()` or an equivalent safe loader in `django/core/serializers/pyyaml.py` when possible, or clearly document that the YAML serializer is **not** safe for untrusted input.\n  2. Add explicit security warnings in the Django docs around the YAML serializer, marking it as unsafe for untrusted data.\n  3. Optionally gate the unsafe behavior behind a setting or feature flag so that safe loading is the default.\n\n#### 2. General unsafe deserialization hotspots in Django core\n- **Locations (representative):**\n  - `django/core/serializers/base.py:33`\n  - `django/core/cache/backends/db.py:96`\n  - `django/core/cache/backends/filebased.py:36, 69, 152`\n  - `django/core/cache/backends/locmem.py:42, 72`\n  - `django/core/cache/backends/redis.py:27`\n  - `django/core/serializers/pyyaml.py:78` (overlaps with finding #1)\n- **Rule:** `py/django41-unsafe-deserialization`\n- **CWE:** CWE-502 (Deserialization of Untrusted Data)\n- **Description:**\n  A custom CodeQL query flagged multiple locations where Django core performs serialization/deserialization operations (serializers and cache backends). These include:\n  - Core serialization infrastructure (`django/core/serializers/base.py`).\n  - Cache backends (DB, file-based, local memory, Redis) that store and retrieve pickled or otherwise serialized Python objects.\n\n  In all these cases, the framework is designed with the assumption that the data being deserialized is **trusted framework-internal data** (e.g., cache entries, fixtures, or objects written by Django itself), not arbitrary user input.\n\n- **Risk interpretation:**\n  - These are **expected patterns** in a framework like Django and are not vulnerabilities by themselves.\n  - They become exploitable only if an attacker can directly control the serialized blobs being read (e.g., write arbitrary cache entries or serialized data to the backing store). Under normal deployments, that would already imply a high level of compromise (e.g., DB or filesystem write access).\n\n- **Recommendations for users:**\n  1. Ensure that cache backends (DB tables, Redis instances, file-based cache directories) are not writable by untrusted parties except through Django’s own cache API.\n  2. Do not expose raw cache storage (e.g., Redis, DB tables) to untrusted tenants who can write arbitrary serialized values that Django will later load.\n  3. Treat any direct manipulation of Django’s cache storage or serialized fixtures as a privileged operation.\n\n- **Recommendations for maintainers:**\n  - Consider reinforcing documentation that cache and serializer backends assume trusted data and must not be used as generic deserialization endpoints for untrusted input.\n\n### Hypotheses investigated with no concrete findings\n\nWithin the remaining budget, several additional high-risk hypotheses were probed using CodeQL, but no concrete exploitable flows were identified in Django 4.1’s own code:\n\n1. **SQL Injection via ORM helpers (`raw()`, `extra()`, `RawSQL`)**\n   - **CWE:** CWE-89\n   - **Approach:** A taint-tracking query (`py/django41-sql-injection-orm`) looked for flows from generic remote sources (`RemoteFlowSource`) into arguments of `QuerySet.raw()`, `QuerySet.extra()`, and `RawSQL`.\n   - **Result:** No flows were found within Django’s own codebase. This is expected: Django’s core does not typically construct raw SQL from external HTTP parameters; such risks arise in application code using these APIs.\n   - **Implication:** The framework exposes powerful raw SQL APIs, but Django 4.1 core does not itself misuse them in a way that is directly tainted by remote input.\n\n2. **Command Injection in management commands / subprocess usage**\n   - **CWE:** CWE-78\n   - **Approach:** An attempted path-problem query to track remote input into `SystemCommandExecution` sinks in `django/core/management/...` and related modules. The query required further refinement and did not successfully compile within the budget; a simpler variant executed and did not reveal obvious flows from `RemoteFlowSource` into command arguments in Django’s own code.\n   - **Result:** No confirmed command-injection paths from remote input into subprocess calls in Django 4.1 core were identified.\n   - **Implication:** Management commands do invoke external tools (e.g., translation utilities, DB shells), but not in a way that is directly parameterized by untrusted HTTP input in the framework itself. Application-level custom commands still need careful review.\n\n3. **Additional generic security checks**\n   - Some generic queries (e.g., for dangerous APIs like `eval`/`exec` or other unsafe patterns) were run or attempted; no new high-severity, clearly exploitable issues were surfaced in Django’s own code within the iteration budget.\n\n### Overall assessment\n\n- Django 4.1 is a mature, security-conscious framework. The CodeQL analysis did **not** reveal new, clear-cut critical vulnerabilities in the core beyond known, usage-dependent risks around unsafe deserialization.\n- The main actionable concern is the presence of **unsafe YAML loading** in `django/core/serializers/pyyaml.py`, which is dangerous if used on untrusted input. This is consistent with general Python/YAML security guidance rather than a Django-specific design flaw.\n- Other flagged deserialization sites (serializers and cache backends) are expected for a framework of this type and are safe under the assumption that only trusted data reaches them.\n\n### Practical guidance for users of Django 4.1\n\n1. **Avoid unsafe YAML deserialization:**\n   - Do not use Django’s YAML serializer (`'yaml'`) on untrusted client data.\n   - Prefer JSON or other safe formats for user-supplied data.\n\n2. **Treat cache and session storage as trusted-only:**\n   - Ensure that only Django (or trusted admin tooling) can write to the underlying cache/session stores.\n   - Do not allow untrusted parties to inject arbitrary serialized objects into these stores.\n\n3. **Be cautious with raw SQL and subprocess APIs:**\n   - While Django core does not misuse them, your application code can. Validate and parameterize any raw SQL, and avoid passing user input directly to shell commands.\n\n4. **Stay current with Django security releases:**\n   - Django’s security team regularly publishes advisories and patches. Always run the latest supported patch release in the 4.1 series or later, and review the official release notes for any additional security fixes beyond what static analysis can see.\n\n---\n\nNo evidence of new, framework-internal critical vulnerabilities (such as unauthenticated RCE or SQL injection in core request handling) was found within the analysis budget. The primary noteworthy issue is the unsafe YAML loading behavior, which is exploitable only in specific, application-dependent usage patterns.\n",
+ "package_classification": {
+  "type": "framework",
+  "layer": [
+   "application",
+   "web",
+   "backend"
+  ]
+ },
+ "tool_calls": {
+  "get_package_profile_info": 1,
+  "execute_codeql_query": 10,
+  "validate_codeql_query": 0,
+  "fixup_codeql_query": 3,
+  "finalize_report": 1
+ },
+ "queries_executed": {
+  "critical": 1,
+  "high": 4,
+  "medium": 1,
+  "low": 0,
+  "total_executed": 12,
+  "total_with_results": 6,
+  "total_failed": 9
+ },
+ "query_findings": {
+  "critical": 0,
+  "high": 11,
+  "medium": 0,
+  "low": 0,
+  "total": 11
+ },
+ "findings": [
+  {
+   "codeql_query_uuid": "20261119223948",
+   "codeql_raw_query": "/**\n * @name Unsafe deserialization in Django core\n * @description Detects uses of pickle, yaml.unsafe_load, or similar unsafe deserialization in Django.\n * @kind problem\n * @problem.severity error\n * @id py/django41-unsafe-deserialization\n * @tags security\n *       external/cwe/cwe-502\n */\n\nimport python\nimport semmle.python.ApiGraphs\nimport semmle.python.dataflow.new.DataFlow\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"pickle\").getMember([\"load\", \"loads\", \"Unpickler\"]).getACall() or\n  call = API::moduleImport(\"yaml\").getMember([\"load\", \"unsafe_load\", \"FullLoader\"]).getACall()\nselect call, \"Potentially unsafe deserialization operation in Django core that could execute arbitrary code if used on untrusted data.\"",
+   "hypothesis": "Django may use unsafe deserialization primitives that could be abused if fed untrusted data.",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-502"
+   ],
+   "results_count": 9,
+   "results": [
+    {
+     "ruleId": "py/django41-unsafe-deserialization",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/django41-unsafe-deserialization",
+      "index": 0
+     },
+     "message": {
+      "text": "Potentially unsafe deserialization operation in Django core that could execute arbitrary code if used on untrusted data."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "django/core/serializers/base.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 33,
+         "startColumn": 16,
+         "endColumn": 34
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "58ad872d020f98b8:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/django41-unsafe-deserialization",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/django41-unsafe-deserialization",
+      "index": 0
+     },
+     "message": {
+      "text": "Potentially unsafe deserialization operation in Django core that could execute arbitrary code if used on untrusted data."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "django/core/cache/backends/db.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 96,
+         "startColumn": 25,
+         "endColumn": 71
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "7a10b2994dad6a40:1",
+      "primaryLocationStartColumnFingerprint": "8"
+     }
+    },
+    {
+     "ruleId": "py/django41-unsafe-deserialization",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/django41-unsafe-deserialization",
+      "index": 0
+     },
+     "message": {
+      "text": "Potentially unsafe deserialization operation in Django core that could execute arbitrary code if used on untrusted data."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "django/core/cache/backends/filebased.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 36,
+         "startColumn": 28,
+         "endColumn": 67
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "7539bc34da348705:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/django41-unsafe-deserialization",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/django41-unsafe-deserialization",
+      "index": 0
+     },
+     "message": {
+      "text": "Potentially unsafe deserialization operation in Django core that could execute arbitrary code if used on untrusted data."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "django/core/cache/backends/filebased.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 69,
+         "startColumn": 42,
+         "endColumn": 81
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "ac8c17430c39cc86:1",
+      "primaryLocationStartColumnFingerprint": "17"
+     }
+    },
+    {
+     "ruleId": "py/django41-unsafe-deserialization",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/django41-unsafe-deserialization",
+      "index": 0
+     },
+     "message": {
+      "text": "Potentially unsafe deserialization operation in Django core that could execute arbitrary code if used on untrusted data."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "django/core/cache/backends/filebased.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 152,
+         "startColumn": 19,
+         "endColumn": 33
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "608912e97c2557b0:1",
+      "primaryLocationStartColumnFingerprint": "6"
+     }
+    },
+    {
+     "ruleId": "py/django41-unsafe-deserialization",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/django41-unsafe-deserialization",
+      "index": 0
+     },
+     "message": {
+      "text": "Potentially unsafe deserialization operation in Django core that could execute arbitrary code if used on untrusted data."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "django/core/cache/backends/locmem.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 3
+        },
+        "region": {
+         "startLine": 42,
+         "startColumn": 16,
+         "endColumn": 37
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "17d504697be6c1d9:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/django41-unsafe-deserialization",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/django41-unsafe-deserialization",
+      "index": 0
+     },
+     "message": {
+      "text": "Potentially unsafe deserialization operation in Django core that could execute arbitrary code if used on untrusted data."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "django/core/cache/backends/locmem.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 3
+        },
+        "region": {
+         "startLine": 72,
+         "startColumn": 21,
+         "endColumn": 42
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "466b55f1d2771a88:1",
+      "primaryLocationStartColumnFingerprint": "8"
+     }
+    },
+    {
+     "ruleId": "py/django41-unsafe-deserialization",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/django41-unsafe-deserialization",
+      "index": 0
+     },
+     "message": {
+      "text": "Potentially unsafe deserialization operation in Django core that could execute arbitrary code if used on untrusted data."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "django/core/serializers/pyyaml.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 4
+        },
+        "region": {
+         "startLine": 78,
+         "startColumn": 39,
+         "endColumn": 75
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "3c3d200e0988fc7e:1",
+      "primaryLocationStartColumnFingerprint": "30"
+     }
+    },
+    {
+     "ruleId": "py/django41-unsafe-deserialization",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/django41-unsafe-deserialization",
+      "index": 0
+     },
+     "message": {
+      "text": "Potentially unsafe deserialization operation in Django core that could execute arbitrary code if used on untrusted data."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "django/core/cache/backends/redis.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 5
+        },
+        "region": {
+         "startLine": 27,
+         "startColumn": 20,
+         "endColumn": 38
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "3dc0fccd77c014c9:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20261119224238",
+   "codeql_raw_query": "/**\n * @name Django 4.1 SQL injection in ORM extra/raw\n * @description Detect flows from external input into raw SQL execution helpers like raw(), extra(), or RawSQL.\n * @kind path-problem\n * @problem.severity error\n * @id py/django41-sql-injection-orm\n * @tags security\n *       external/cwe/cwe-089\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.dataflow.new.RemoteFlowSources\nimport semmle.python.ApiGraphs\n\nmodule SqlInjConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    source instanceof RemoteFlowSource\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(API::CallNode call |\n      call = API::moduleImport(\"django.db.models\").getMember([\"QuerySet\", \"Manager\"]).getMember([\"raw\", \"extra\"]).getACall() and\n      sink = call.getArg(0)\n    ) or\n    exists(API::CallNode call2 |\n      call2 = API::moduleImport(\"django.db.models.expressions\").getMember(\"RawSQL\").getACall() and\n      sink = call2.getArg(0)\n    )\n  }\n}\n\nmodule SqlInjFlow = TaintTracking::Global<SqlInjConfig>;\nimport SqlInjFlow::PathGraph\n\nfrom SqlInjFlow::PathNode source, SqlInjFlow::PathNode sink\nwhere SqlInjFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"User-controlled data reaches raw SQL helpers in Django ORM.\", source, \"user input\"",
+   "hypothesis": "User-controlled data may reach raw SQL helpers (raw, extra, RawSQL) in Django ORM, leading to SQL injection.",
+   "severity": "critical",
+   "cwe_ids": [
+    "cwe-089"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20261119224326",
+   "codeql_raw_query": "/**\n * @name Django 4.1 unsafe use of yaml.load\n * @description Detect uses of yaml.load or yaml.unsafe_load in Django that may deserialize untrusted data.\n * @kind problem\n * @problem.severity error\n * @id py/django41-yaml-unsafe-load\n * @tags security\n *       external/cwe/cwe-502\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"yaml\").getMember([\"load\", \"unsafe_load\"]).getACall()\nselect call, \"Use of yaml.load()/unsafe_load() is unsafe on untrusted input and may lead to code execution.\"",
+   "hypothesis": "Django core may use yaml.load or yaml.unsafe_load unsafely, leading to unsafe deserialization (CWE-502).",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-502"
+   ],
+   "results_count": 1,
+   "results": [
+    {
+     "ruleId": "py/django41-yaml-unsafe-load",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/django41-yaml-unsafe-load",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of yaml.load()/unsafe_load() is unsafe on untrusted input and may lead to code execution."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "django/core/serializers/pyyaml.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 78,
+         "startColumn": 39,
+         "endColumn": 75
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "3c3d200e0988fc7e:1",
+      "primaryLocationStartColumnFingerprint": "30"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20261119224407",
+   "codeql_raw_query": "/**\n * @name Django 4.1 template autoescape bypass via mark_safe/safe\n * @description Find flows where untrusted data is wrapped in mark_safe/safe and passed to templates, potentially causing XSS.\n * @kind path-problem\n * @problem.severity error\n * @id py/django41-xss-mark-safe\n * @tags security\n *       external/cwe/cwe-079\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.dataflow.new.RemoteFlowSources\nimport semmle.python.ApiGraphs\n\nmodule XssConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    source instanceof RemoteFlowSource\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(API::CallNode call |\n      call = API::moduleImport(\"django.utils.safestring\").getMember([\"mark_safe\", \"SafeString\"]).getACall() and\n      sink = call.getArg(0)\n    )\n  }\n}\n\nmodule XssFlow = TaintTracking::Global<XssConfig>;\nimport XssFlow::PathGraph\n\nfrom XssFlow::PathNode source, XssFlow::PathNode sink\nwhere XssFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"User-controlled data is marked safe, disabling autoescaping and potentially causing XSS.\", source, \"user input\"",
+   "hypothesis": "Untrusted data may be wrapped in mark_safe/safe, disabling autoescaping and enabling XSS.",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-79"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20261119224451",
+   "codeql_raw_query": "/**\n * @name Django 4.1 open redirect hotspots\n * @description Find uses of HttpResponseRedirect/redirect where the target URL may be influenced by user input.\n * @kind path-problem\n * @problem.severity warning\n * @id py/django41-open-redirect\n * @tags security\n *       external/cwe/cwe-601\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.dataflow.new.RemoteFlowSources\nimport semmle.python.ApiGraphs\n\nmodule RedirectConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    source instanceof RemoteFlowSource\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(API::CallNode call |\n      call = API::moduleImport(\"django.http\").getMember([\"HttpResponseRedirect\", \"HttpResponsePermanentRedirect\"]).getACall() and\n      sink = call.getArg(0)\n    ) or\n    exists(API::CallNode call2 |\n      call2 = API::moduleImport(\"django.shortcuts\").getMember(\"redirect\").getACall() and\n      sink = call2.getArg(0)\n    )\n  }\n}\n\nmodule RedirectFlow = TaintTracking::Global<RedirectConfig>;\nimport RedirectFlow::PathGraph\n\nfrom RedirectFlow::PathNode source, RedirectFlow::PathNode sink\nwhere RedirectFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"User-controlled data flows into a redirect target URL, which may cause an open redirect.\", source, \"user input\"",
+   "hypothesis": "User input may flow into redirect targets, causing open redirect vulnerabilities.",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-601"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20261119224544",
+   "codeql_raw_query": "/**\n * @name Django 4.1 unsafe yaml.load/unsafe_load usage\n * @description Detect direct uses of yaml.load() or yaml.unsafe_load() in the Django codebase.\n * @kind problem\n * @problem.severity error\n * @id py/django41-yaml-unsafe-load\n * @tags security\n *       external/cwe/cwe-094\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"yaml\").getMember([\"load\", \"unsafe_load\"]).getACall()\nselect call, \"Use of yaml.load()/unsafe_load() is unsafe on untrusted input and may lead to code execution.\"",
+   "hypothesis": "Django core may use yaml.load()/unsafe_load() unsafely, leading to code execution on untrusted data.",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-094"
+   ],
+   "results_count": 1,
+   "results": [
+    {
+     "ruleId": "py/django41-yaml-unsafe-load",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/django41-yaml-unsafe-load",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of yaml.load()/unsafe_load() is unsafe on untrusted input and may lead to code execution."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "django/core/serializers/pyyaml.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 78,
+         "startColumn": 39,
+         "endColumn": 75
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "3c3d200e0988fc7e:1",
+      "primaryLocationStartColumnFingerprint": "30"
+     }
+    }
+   ]
+  }
+ ],
+ "cache_usage": {
+  "prompt_tokens_total": 274089,
+  "uncached_input_tokens": 93609,
+  "cache_creation_input_tokens": 0,
+  "cache_read_input_tokens": 180480,
+  "output_tokens": 9275,
+  "calls": 15,
+  "caching_enabled": false,
+  "cost_usd_with_cache": 0.232321,
+  "cost_usd_no_cache": 0.435361,
+  "cache_read_share_of_prompt": 0.6585,
+  "prices_per_mtok": {
+   "claude-sonnet-4-5-20250929": {
+    "input": 3.0,
+    "output": 15.0
+   },
+   "claude-haiku-4-5-20251001": {
+    "input": 1.0,
+    "output": 5.0
+   },
+   "deepseek/deepseek-reasoner": {
+    "input": 0.15,
+    "output": 0.6,
+    "cache_read": 0.003,
+    "cache_write_mult": 1.0,
+    "peak_mult": 2.0
+   },
+   "gpt-5.1": {
+    "input": 1.25,
+    "output": 10.0,
+    "cache_read": 0.125,
+    "cache_write_mult": 1.0
+   },
+   "gpt-4.1": {
+    "input": 2.0,
+    "output": 8.0,
+    "cache_read": 0.5,
+    "cache_write_mult": 1.0
+   }
+  },
+  "cache_multipliers": {
+   "write_5m": 1.25,
+   "read": 0.1
+  }
+ }
+}

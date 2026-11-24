@@ -1,0 +1,498 @@
+{
+ "session_id": "20251218231244",
+ "package_name": "pyasn1_modules-0.4.2",
+ "package_path": "packages/pyasn1_modules-0.4.2",
+ "database_path": "databases/pyasn1_modules-0.4.2-db",
+ "model": "gemini/gemini-3-pro-preview",
+ "temperature": 0.0,
+ "max_tokens": 8000,
+ "iterations": 20,
+ "total_input_tokens": 263034,
+ "total_output_tokens": 9184,
+ "total_tokens": 272218,
+ "elapsed_time_seconds": 322.92,
+ "estimated_cost_usd": 0.6363,
+ "summary": "Security analysis of `pyasn1_modules` revealed potential vulnerabilities in the provided utility scripts (`tools/`), while the core library modules appear to be mostly data definitions.\n\n**Key Findings:**\n\n1.  **Potential Server-Side Request Forgery (SSRF) (CWE-918)**:\n    -   **Location**: `tools/ocspclient.py:159`\n    -   **Description**: The `ocspclient.py` script accepts a URL as input (likely from command-line arguments) and uses it to initiate a network connection via `urllib`.\n    -   **Impact**: If this script is deployed as part of a service or automated pipeline where the input URL is controlled by an untrusted user, it could be used to perform SSRF attacks, accessing internal network resources. As a standalone CLI tool, this is likely intended behavior but represents a risk if misused.\n\n2.  **Use of Weak Cryptographic Hash (CWE-328)**:\n    -   **Location**: `tools/ocspclient.py:62`, `tools/ocspclient.py:69`\n    -   **Description**: The tool utilizes `hashlib.sha1`. SHA-1 is considered cryptographically broken and is not collision-resistant.\n    -   **Impact**: While SHA-1 might be used here for legacy protocol compatibility (OCSP), it is generally recommended to migrate to stronger hashing algorithms like SHA-256 where possible to prevent collision attacks.\n\n**Conclusion**:\nThe core `pyasn1_modules` library appears to be free of high-severity injection or deserialization flaws based on the executed queries. The identified issues are isolated to the `tools/` directory, which contains utility scripts. Users should be cautious when using these tools in production environments or exposing them to untrusted inputs.",
+ "package_classification": {
+  "layer": [
+   "Network",
+   "Support"
+  ],
+  "type": [
+   "Library"
+  ]
+ },
+ "tool_calls": {
+  "get_package_profile_info": 1,
+  "execute_codeql_query": 8,
+  "validate_codeql_query": 0,
+  "fixup_codeql_query": 0,
+  "finalize_report": 1
+ },
+ "queries_executed": {
+  "critical": 1,
+  "high": 5,
+  "medium": 1,
+  "low": 0,
+  "total_executed": 8,
+  "total_with_results": 7,
+  "total_failed": 1
+ },
+ "query_findings": {
+  "critical": 0,
+  "high": 3,
+  "medium": 2,
+  "low": 0,
+  "total": 5
+ },
+ "findings": [
+  {
+   "codeql_query_uuid": "20251218231301",
+   "codeql_raw_query": "/**\n * @name Command and Code Injection\n * @description Detects usage of potentially dangerous functions like os.system, subprocess, eval, and exec.\n * @kind problem\n * @problem.severity error\n * @id py/command-code-injection-check\n * @tags security\n *       external/cwe/cwe-078\n *       external/cwe/cwe-094\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  (\n    call = API::moduleImport(\"os\").getMember([\"system\", \"popen\"]).getACall() or\n    call = API::moduleImport(\"subprocess\").getMember([\"call\", \"check_call\", \"check_output\", \"run\", \"Popen\"]).getACall() or\n    call = API::builtin([\"eval\", \"exec\"]).getACall()\n  )\nselect call, \"Potential command or code injection sink.\"\n",
+   "hypothesis": "The package might use dangerous functions like os.system, subprocess, eval, or exec, which could lead to command or code injection if used with untrusted input.",
+   "severity": "high",
+   "cwe_ids": [
+    "CWE-78",
+    "CWE-94"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251218231325",
+   "codeql_raw_query": "/**\n * @name Unsafe deserialization\n * @description Deserializing untrusted data using pickle or other unsafe methods can lead to arbitrary code execution\n * @kind problem\n * @problem.severity error\n * @id py/unsafe-deserialization\n * @tags security\n *        external/cwe/cwe-502\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  (\n    call = API::moduleImport(\"pickle\").getMember([\"load\", \"loads\", \"Unpickler\"]).getACall() or\n    call = API::moduleImport(\"cPickle\").getMember([\"load\", \"loads\", \"Unpickler\"]).getACall() or\n    call = API::moduleImport(\"_pickle\").getMember([\"load\", \"loads\", \"Unpickler\"]).getACall() or\n    call = API::moduleImport(\"yaml\").getMember([\"load\", \"unsafe_load\"]).getACall() or\n    call = API::moduleImport(\"marshal\").getMember([\"load\", \"loads\"]).getACall() or\n    call = API::moduleImport(\"shelve\").getMember(\"open\").getACall() or\n    call = API::moduleImport(\"jsonpickle\").getMember([\"decode\", \"unpickler\"]).getACall()\n  )\nselect call, \"Potentially unsafe deserialization operation that could execute arbitrary code.\"\n",
+   "hypothesis": "The package might use unsafe deserialization libraries like pickle, yaml, or marshal, which can lead to arbitrary code execution when processing untrusted data.",
+   "severity": "critical",
+   "cwe_ids": [
+    "cwe-502"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251218231420",
+   "codeql_raw_query": "/**\n * @name Path traversal\n * @description Path traversal from command line arguments to open()\n * @kind path-problem\n * @problem.severity error\n * @id py/path-traversal\n * @tags security\n *       external/cwe/cwe-022\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.ApiGraphs\nimport semmle.python.Concepts\n\nmodule PathTraversalConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    source = API::moduleImport(\"sys\").getMember(\"argv\").getAValueReachableFromSource()\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(DataFlow::CallCfgNode call |\n      call = API::builtin(\"open\").getACall() and\n      sink = call.getArg(0)\n    )\n  }\n}\n\nmodule PathTraversalFlow = TaintTracking::Global<PathTraversalConfig>;\nimport PathTraversalFlow::PathGraph\n\nfrom PathTraversalFlow::PathNode source, PathTraversalFlow::PathNode sink\nwhere PathTraversalFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"Path traversal from $@.\", source.getNode(), \"command line argument\"\n",
+   "hypothesis": "Path traversal from command line arguments to open()",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-022"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251218231459",
+   "codeql_raw_query": "/**\n * @name Insecure network connection or SSRF\n * @description Checks for usage of urllib/urllib2 that might be vulnerable to SSRF or use insecure protocols (HTTP).\n * @kind problem\n * @problem.severity high\n * @id py/insecure-network-connection\n * @tags security\n *       external/cwe/cwe-918\n *       external/cwe/cwe-319\n *       external/cwe/cwe-295\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  (\n    call = API::moduleImport(\"urllib\").getMember(\"request\").getMember(\"urlopen\").getACall() or\n    call = API::moduleImport(\"urllib2\").getMember(\"urlopen\").getACall() or\n    call = API::moduleImport(\"requests\").getMember([\"get\", \"post\", \"put\", \"delete\", \"head\", \"patch\", \"request\"]).getACall()\n  )\nselect call, \"Potential network request found. Verify URL validation (SSRF) and protocol security (HTTP vs HTTPS).\"\n",
+   "hypothesis": "The package might be making network requests using urllib/urllib2 without proper validation of the URL (SSRF) or using insecure protocols (HTTP).",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-918",
+    "cwe-319",
+    "cwe-295"
+   ],
+   "results_count": 1,
+   "results": [
+    {
+     "ruleId": "py/insecure-network-connection",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/insecure-network-connection",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential network request found. Verify URL validation (SSRF) and protocol security (HTTP vs HTTPS)."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "tools/ocspclient.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 159,
+         "startColumn": 11,
+         "endColumn": 35
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "6a7d859b1da7965d:1",
+      "primaryLocationStartColumnFingerprint": "10"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251218231529",
+   "codeql_raw_query": "/**\n * @name User-controlled URL in urllib\n * @description Traces user input to urllib calls to identify SSRF or open redirect vulnerabilities.\n * @kind path-problem\n * @problem.severity error\n * @id py/ssrf-urllib\n * @tags security\n *       external/cwe/cwe-918\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.dataflow.new.RemoteFlowSources\nimport semmle.python.ApiGraphs\n\nmodule SsrfConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    source instanceof RemoteFlowSource or\n    source instanceof DataFlow::LocalSourceNode // Broaden to local sources to catch CLI args\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(DataFlow::CallCfgNode call |\n      call = API::moduleImport(\"urllib\").getMember(\"request\").getMember(\"urlopen\").getACall() or\n      call = API::moduleImport(\"urllib2\").getMember(\"urlopen\").getACall() or\n      call = API::moduleImport(\"urllib\").getMember(\"urlopen\").getACall()\n      |\n      sink = call.getArg(0)\n    )\n  }\n}\n\nmodule SsrfFlow = TaintTracking::Global<SsrfConfig>;\nimport SsrfFlow::PathGraph\n\nfrom SsrfFlow::PathNode source, SsrfFlow::PathNode sink\nwhere SsrfFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"Potential SSRF: URL from $@.\", source.getNode(), \"user input\"\n",
+   "hypothesis": "User-controlled input flows into urllib.urlopen, leading to SSRF.",
+   "severity": "high",
+   "cwe_ids": [
+    "CWE-918"
+   ],
+   "results_count": 1,
+   "results": [
+    {
+     "ruleId": "py/ssrf-urllib",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/ssrf-urllib",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential SSRF: URL from [user input](1)."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "tools/ocspclient.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 159,
+         "startColumn": 27,
+         "endColumn": 34
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "6a7d859b1da7965d:1",
+      "primaryLocationStartColumnFingerprint": "26"
+     },
+     "codeFlows": [
+      {
+       "threadFlows": [
+        {
+         "locations": [
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "tools/ocspclient.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 154,
+              "startColumn": 11,
+              "endLine": 158,
+              "endColumn": 2
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for Attribute()"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "tools/ocspclient.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 154,
+              "endColumn": 8
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for httpReq"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "tools/ocspclient.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 159,
+              "startColumn": 27,
+              "endColumn": 34
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for httpReq"
+            }
+           }
+          }
+         ]
+        }
+       ]
+      }
+     ],
+     "relatedLocations": [
+      {
+       "id": 1,
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "tools/ocspclient.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 154,
+         "startColumn": 11,
+         "endLine": 158,
+         "endColumn": 2
+        }
+       },
+       "message": {
+        "text": "user input"
+       }
+      },
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "tools/ocspclient.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 154,
+         "startColumn": 11,
+         "endLine": 158,
+         "endColumn": 2
+        }
+       }
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251218231614",
+   "codeql_raw_query": "/**\n * @name Potential SSRF in all tools\n * @description Detects potential Server-Side Request Forgery (SSRF) vulnerabilities in all files.\n * @kind path-problem\n * @problem.severity error\n * @id py/ssrf-all-tools\n * @tags security\n *       external/cwe/cwe-918\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.dataflow.new.RemoteFlowSources\nimport semmle.python.ApiGraphs\n\nmodule SSRFConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    source instanceof RemoteFlowSource or\n    source instanceof DataFlow::LocalSourceNode // Broaden to local sources to catch CLI args\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(DataFlow::CallCfgNode call |\n      call = API::moduleImport(\"urllib\").getMember(\"request\").getMember(\"urlopen\").getACall() or\n      call = API::moduleImport(\"urllib2\").getMember(\"urlopen\").getACall() or\n      call = API::moduleImport(\"requests\").getMember([\"get\", \"post\", \"put\", \"delete\", \"head\", \"patch\", \"request\"]).getACall()\n      |\n      sink = call.getArg(0)\n    )\n  }\n}\n\nmodule SSRFFlow = TaintTracking::Global<SSRFConfig>;\nimport SSRFFlow::PathGraph\n\nfrom SSRFFlow::PathNode source, SSRFFlow::PathNode sink\nwhere SSRFFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"Potential SSRF: URL from $@.\", source.getNode(), \"user input\"\n",
+   "hypothesis": "Check for SSRF in all files, broadening the scope.",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-918"
+   ],
+   "results_count": 1,
+   "results": [
+    {
+     "ruleId": "py/ssrf-all-tools",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/ssrf-all-tools",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential SSRF: URL from [user input](1)."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "tools/ocspclient.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 159,
+         "startColumn": 27,
+         "endColumn": 34
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "6a7d859b1da7965d:1",
+      "primaryLocationStartColumnFingerprint": "26"
+     },
+     "codeFlows": [
+      {
+       "threadFlows": [
+        {
+         "locations": [
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "tools/ocspclient.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 154,
+              "startColumn": 11,
+              "endLine": 158,
+              "endColumn": 2
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for Attribute()"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "tools/ocspclient.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 154,
+              "endColumn": 8
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for httpReq"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "tools/ocspclient.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 159,
+              "startColumn": 27,
+              "endColumn": 34
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for httpReq"
+            }
+           }
+          }
+         ]
+        }
+       ]
+      }
+     ],
+     "relatedLocations": [
+      {
+       "id": 1,
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "tools/ocspclient.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 154,
+         "startColumn": 11,
+         "endLine": 158,
+         "endColumn": 2
+        }
+       },
+       "message": {
+        "text": "user input"
+       }
+      },
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "tools/ocspclient.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 154,
+         "startColumn": 11,
+         "endLine": 158,
+         "endColumn": 2
+        }
+       }
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251218231700",
+   "codeql_raw_query": "/**\n * @name Use of weak cryptographic hashing\n * @description Using weak hashing algorithms like MD5 or SHA1 can lead to collision attacks.\n * @kind problem\n * @problem.severity warning\n * @id py/weak-crypto-hashing\n * @tags security\n *       external/cwe/cwe-327\n *       external/cwe/cwe-328\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  (\n    call = API::moduleImport(\"hashlib\").getMember([\"md5\", \"sha1\"]).getACall() or\n    call = API::moduleImport(\"Crypto\").getMember(\"Hash\").getMember([\"MD5\", \"SHA1\"]).getMember(\"new\").getACall() or\n    call = API::moduleImport(\"cryptography\").getMember(\"hazmat\").getMember(\"primitives\").getMember(\"hashes\").getMember([\"MD5\", \"SHA1\"]).getACall()\n  )\nselect call, \"Usage of weak cryptographic hashing algorithm.\"\n",
+   "hypothesis": "The package might be using weak hashing algorithms like MD5 or SHA1, which are vulnerable to collision attacks.",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-327",
+    "cwe-328"
+   ],
+   "results_count": 2,
+   "results": [
+    {
+     "ruleId": "py/weak-crypto-hashing",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/weak-crypto-hashing",
+      "index": 0
+     },
+     "message": {
+      "text": "Usage of weak cryptographic hashing algorithm."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "tools/ocspclient.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 62,
+         "startColumn": 22,
+         "endLine": 64,
+         "endColumn": 6
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "f054503b6fe13d14:1",
+      "primaryLocationStartColumnFingerprint": "17"
+     }
+    },
+    {
+     "ruleId": "py/weak-crypto-hashing",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/weak-crypto-hashing",
+      "index": 0
+     },
+     "message": {
+      "text": "Usage of weak cryptographic hashing algorithm."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "tools/ocspclient.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 69,
+         "startColumn": 21,
+         "endLine": 71,
+         "endColumn": 6
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "8fa0b6cb46e1989f:1",
+      "primaryLocationStartColumnFingerprint": "16"
+     }
+    }
+   ]
+  }
+ ]
+}

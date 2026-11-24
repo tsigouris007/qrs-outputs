@@ -1,0 +1,293 @@
+{
+ "session_id": "20251226030509",
+ "package_name": "propcache-0.4.1",
+ "package_path": "packages/propcache-0.4.1",
+ "database_path": "databases/propcache-0.4.1-db",
+ "model": "gpt-5.1",
+ "temperature": 1.0,
+ "max_tokens": 8000,
+ "iterations": 12,
+ "total_input_tokens": 65738,
+ "total_output_tokens": 6803,
+ "total_tokens": 72541,
+ "elapsed_time_seconds": 413.04,
+ "estimated_cost_usd": 0.1502,
+ "summary": "## Overview\nSecurity analysis was performed on the `propcache-0.4.1` package using CodeQL against the extracted source tree (`src/propcache` and `packaging/pep517_backend`). The package is primarily a small Cython-accelerated property-caching library, accompanied by a custom PEP 517 build backend implementation.\n\nTotal analyzed files: 12 (≈648 LOC).\nPrimary focus areas were:\n- Dangerous shell / filesystem operations and command execution\n- General injection or deserialization risks in the build backend\n- Obvious misuse of standard library security-sensitive APIs\n\nWithin the main library code (`src/propcache`), no direct security-relevant issues were detected. All identified findings are located in the PEP 517 backend helper code bundled under `packaging/pep517_backend`.\n\n---\n\n## Key Finding\n\n### 1. Potentially Dangerous Shell / Filesystem Operations in PEP 517 Backend\n\n**Location**  \n`packaging/pep517_backend/_backend.py`, approximately lines 228–233\n\nMultiple CodeQL queries independently flagged the same code region as a **dangerous shell or filesystem operation**, resulting in several related findings:\n- `py/propcache/command-execution`\n- `py/propcache/backend-dangerous-ops`\n- `py/propcache/backend-dangerous-ops-context`\n- `py/propcache/backend-dangerous-ops-manual`\n\nThese rules all report essentially the same issue: code in the build backend is invoking operations that, if they receive untrusted input, could lead to security problems such as arbitrary file writes/deletions or command execution.\n\n**Risk characterization**  \n- **Context**: The affected code is part of a PEP 517 build backend. That means it normally runs:\n  - in the context of a local build (`pip wheel`, `pip install`, `build`, etc.),\n  - on the machine of the developer or CI system that chooses to build the project.\n- **Input origin**: PEP 517 backend code typically consumes project configuration (e.g., `pyproject.toml`, environment variables, and file paths) which may be influenced by the local user or CI configuration. In standard use, it is *not* exposed directly to remote attackers.\n\nGiven this, the realistic threat model is:\n- **Local/CI compromise if the attacker can control the build environment or configuration** and the backend code uses that configuration unsafely for shell or file operations.\n- This is aligned with CWE categories such as:\n  - **CWE-78** (Improper Neutralization of Special Elements used in an OS Command)  \n  - **CWE-73/CWE-22** (External Control of File Name or Path / Path Traversal) depending on the exact operation.\n\nBecause CodeQL findings do not show direct dataflow from untrusted remote sources into this operation, and because the code runs in a build backend context, the severity is **medium** under typical assumptions but could be higher in highly automated or multi-tenant build environments.\n\n**Impact**\n- Under normal development usage: low to medium risk, as builds are explicitly invoked by trusted users and are expected to run arbitrary code from the dependency being installed.\n- Under strict supply-chain or sandboxed build scenarios: this pattern may be considered undesirable because it increases the attack surface available to any malicious or compromised project code.\n\n**Recommendations**\n1. **Review the code at lines ~228–233 in `packaging/pep517_backend/_backend.py` manually** to confirm the exact operation (e.g., `subprocess`/`os.system`, file deletion, or directory manipulation).\n2. If any user- or configuration-controllable data is passed into shell or file APIs:\n   - Prefer using `subprocess.run` with `shell=False` and argument lists rather than shell strings.\n   - Sanitize or validate file paths against a known safe root directory.\n   - Avoid interpolating untrusted strings into shell commands; pass them as separate arguments.\n3. Document that the backend expects to be used only in trusted build environments, and avoid exposing its functionality as a general-purpose CLI over untrusted inputs.\n\n---\n\n## Other Areas Checked\n\n- **Core library (`src/propcache`)**:  \n  - Files: `_helpers.py`, `_helpers_py.py`, `api.py`, `__init__.py`.  \n  - No dangerous deserialization, eval/exec usage, or direct command execution patterns were detected by the CodeQL queries executed.  \n  - The code is small and focused on property caching with Cython acceleration; risk surface is low and there is no evidence of network, filesystem, or subprocess interaction in the library itself.\n\n- **PEP 517 build backend support code** (`packaging/pep517_backend/*.py`):  \n  - Queries targeting unsafe deserialization, arbitrary code execution (e.g., via `eval`, `exec`), and overly broad taint flows did not show additional issues beyond the one shell/filesystem cluster described above.\n\n---\n\n## Overall Assessment\n\n- **Main library (`propcache` as used at runtime in applications):**  \n  - No concrete security vulnerabilities were identified by the executed CodeQL queries.  \n  - The library does not appear to expose or manipulate high-risk primitives (shell, filesystem, network) directly.\n\n- **Bundled PEP 517 build backend:**  \n  - Contains a shell or filesystem-related operation flagged as potentially dangerous, but in the normal Python packaging model, build backends are inherently trusted code executed on the builder’s machine.  \n  - The finding is noteworthy for supply-chain hardening and for environments that attempt to sandbox builds, but does **not** indicate a typical remote exploit vector in application runtime.\n\n**Conclusion**: For typical usage as a dependency in Python applications, `propcache-0.4.1` does not present clear, actionable security vulnerabilities based on the automated CodeQL analysis performed. The one notable issue is a potentially risky pattern in the build backend, whose practical impact is limited by the trust assumptions around running arbitrary code during package builds.\n",
+ "package_classification": {
+  "type": "library",
+  "layer": [
+   "backend",
+   "build",
+   "runtime"
+  ]
+ },
+ "tool_calls": {
+  "get_package_profile_info": 1,
+  "execute_codeql_query": 17,
+  "validate_codeql_query": 0,
+  "fixup_codeql_query": 0,
+  "finalize_report": 1
+ },
+ "queries_executed": {
+  "critical": 0,
+  "high": 4,
+  "medium": 5,
+  "low": 1,
+  "total_executed": 17,
+  "total_with_results": 10,
+  "total_failed": 7
+ },
+ "query_findings": {
+  "critical": 0,
+  "high": 2,
+  "medium": 2,
+  "low": 0,
+  "total": 4
+ },
+ "findings": [
+  {
+   "codeql_query_uuid": "20251226030518",
+   "codeql_raw_query": "/**\n * @name Dangerous use of eval/exec and similar dynamic execution\n * @description Find any use of eval, exec, compile, or __import__ which could enable code injection.\n * @kind problem\n * @problem.severity error\n * @id py/propcache/dynamic-execution\n * @tags security\n *       external/cwe/cwe-094\n */\n\nimport python\nimport semmle.python.ApiGraphs\nimport semmle.python.dataflow.new.DataFlow\n\nfrom DataFlow::CallCfgNode call, API::CallNode acall\nwhere\n  acall = API::builtin([\"eval\", \"exec\", \"compile\", \"__import__\"]).getACall() and\n  call = acall\nselect call, \"Use of dynamic code execution (eval/exec/compile/__import__) may lead to code injection if inputs are untrusted.\"",
+   "hypothesis": "The package or its PEP517 backend may use eval/exec/compile or dynamic __import__ unsafely.",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-094"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251226030532",
+   "codeql_raw_query": "/**\n * @name Subprocess and shell command execution\n * @description Detect use of os.system, subprocess, or shutil which might lead to command injection.\n * @kind problem\n * @problem.severity error\n * @id py/propcache/command-execution\n * @tags security\n *       external/cwe/cwe-078\n */\n\nimport python\nimport semmle.python.ApiGraphs\nimport semmle.python.dataflow.new.DataFlow\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"os\").getMember(\"system\").getACall() or\n  call = API::moduleImport(\"subprocess\").getMember([\"call\", \"run\", \"Popen\", \"check_call\", \"check_output\"]).getACall() or\n  call = API::moduleImport(\"shutil\").getMember([\"rmtree\", \"move\", \"copy\", \"copytree\"]).getACall()\nselect call, \"Shell or filesystem operations that, if fed with untrusted input, could be dangerous.\"",
+   "hypothesis": "The PEP517 backend may invoke shell commands or destructive filesystem utilities in an unsafe way.",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-078",
+    "cwe-073"
+   ],
+   "results_count": 1,
+   "results": [
+    {
+     "ruleId": "py/propcache/command-execution",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/propcache/command-execution",
+      "index": 0
+     },
+     "message": {
+      "text": "Shell or filesystem operations that, if fed with untrusted input, could be dangerous."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "packaging/pep517_backend/_backend.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 228,
+         "startColumn": 13,
+         "endLine": 233,
+         "endColumn": 14
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "293c76af465e297d:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251226030632",
+   "codeql_raw_query": "/**\n * @name Unsafe temporary directory usage\n * @description Detect use of tempfile.mkdtemp or mktemp in the pep517 backend which can be insecure if misused.\n * @kind problem\n * @problem.severity warning\n * @id py/propcache/insecure-tempdir\n * @tags security\n *       external/cwe/cwe-377\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call.getLocation().getFile().getRelativePath().regexpMatch(\"packaging/pep517_backend/_backend.py\") and\n  call = API::moduleImport(\"tempfile\").getMember([\"mkdtemp\", \"mktemp\"]).getACall()\nselect call, \"Use of potentially insecure temporary directory or file creation function.\"",
+   "hypothesis": "Check for insecure use of tempfile.mktemp/mkdtemp in the pep517 packaging backend.",
+   "severity": "low",
+   "cwe_ids": [
+    "cwe-377"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251226030700",
+   "codeql_raw_query": "/**\n * @name Dangerous shell and filesystem operations in packaging backend\n * @description Identify shell, copy, and removal operations in packaging/pep517_backend/_backend.py\n * @kind problem\n * @problem.severity warning\n * @id py/propcache/backend-dangerous-ops\n * @tags security\n *       external/cwe/cwe-078\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call.getLocation().getFile().getRelativePath() = \"packaging/pep517_backend/_backend.py\" and\n  (\n    call = API::moduleImport(\"shutil\").getMember([\"copy\", \"copy2\", \"copytree\", \"rmtree\", \"move\"]).getACall() or\n    call = API::moduleImport(\"os\").getMember([\"remove\", \"unlink\", \"rmdir\"]).getACall()\n  )\nselect call, \"Shell or filesystem operation that, if fed with untrusted input, could be dangerous.\"",
+   "hypothesis": "Identify potentially dangerous filesystem operations in the pep517 backend helper",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-078"
+   ],
+   "results_count": 1,
+   "results": [
+    {
+     "ruleId": "py/propcache/backend-dangerous-ops",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/propcache/backend-dangerous-ops",
+      "index": 0
+     },
+     "message": {
+      "text": "Shell or filesystem operation that, if fed with untrusted input, could be dangerous."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "packaging/pep517_backend/_backend.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 228,
+         "startColumn": 13,
+         "endLine": 233,
+         "endColumn": 14
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "293c76af465e297d:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251226030720",
+   "codeql_raw_query": "/**\n * @name Insecure temporary file usage\n * @description Find use of tempfile.mktemp and similar insecure temp file patterns\n * @kind problem\n * @problem.severity warning\n * @id py/propcache/insecure-tempfile\n * @tags security\n *       external/cwe/cwe-377\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"tempfile\").getMember([\"mktemp\"]).getACall()\nselect call, \"Insecure temporary file creation using tempfile.mktemp can lead to race conditions.\"",
+   "hypothesis": "Detect insecure temp file creation which could be used in the custom PEP517 backend",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-377"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251226030751",
+   "codeql_raw_query": "/**\n * @name Dangerous shell and filesystem operations in pep517 backend\n * @description Find OS command execution and filesystem-modifying calls in packaging/pep517_backend/_backend.py\n * @kind problem\n * @problem.severity warning\n * @id py/propcache/backend-dangerous-ops-context\n * @tags security\n *       external/cwe/cwe-078\n *       external/cwe/cwe-073\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call.getLocation().getFile().getRelativePath() = \"packaging/pep517_backend/_backend.py\" and\n  (\n    // subprocess and os command execution\n    call = API::moduleImport(\"subprocess\").getMember([\"run\", \"call\", \"check_call\", \"check_output\", \"Popen\"]).getACall() or\n    call = API::moduleImport(\"os\").getMember([\"system\", \"popen\", \"spawnv\", \"spawnve\", \"spawnvp\", \"spawnvpe\"]).getACall() or\n    // filesystem write/delete operations\n    call = API::moduleImport(\"shutil\").getMember([\"rmtree\", \"copy\", \"copy2\", \"copytree\", \"move\"]).getACall() or\n    call = API::moduleImport(\"os\").getMember([\"remove\", \"unlink\", \"rmdir\"]).getACall()\n  )\nselect call, \"Shell or filesystem operation that, if fed with untrusted input, could be dangerous.\"",
+   "hypothesis": "Identify concrete OS command execution and dangerous filesystem operations in the custom pep517 backend implementation.",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-078",
+    "cwe-073"
+   ],
+   "results_count": 1,
+   "results": [
+    {
+     "ruleId": "py/propcache/backend-dangerous-ops-context",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/propcache/backend-dangerous-ops-context",
+      "index": 0
+     },
+     "message": {
+      "text": "Shell or filesystem operation that, if fed with untrusted input, could be dangerous."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "packaging/pep517_backend/_backend.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 228,
+         "startColumn": 13,
+         "endLine": 233,
+         "endColumn": 14
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "293c76af465e297d:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251226030811",
+   "codeql_raw_query": "/**\n * @name Eval/exec usage in project\n * @description Find uses of eval()/exec() which can lead to code execution if passed untrusted input.\n * @kind problem\n * @problem.severity warning\n * @id py/propcache/eval-exec-usage\n * @tags security\n *       external/cwe/cwe-094\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::builtin([\"eval\", \"exec\"]).getACall()\nselect call, \"Use of eval/exec; ensure arguments are not derived from untrusted input.\"",
+   "hypothesis": "Search for direct eval/exec calls that may enable code injection.",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-094"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251226030855",
+   "codeql_raw_query": "/**\n * @name propcache backend dangerous subprocess usage\n * @description Find uses of subprocess, os.system, or shutil.rmtree in the packaging backend\n * @kind problem\n * @problem.severity warning\n * @id py/propcache/backend-dangerous-ops-list\n * @tags security\n *        external/cwe/cwe-078\n */\n\nimport python\nimport semmle.python.ApiGraphs\nimport semmle.python.dataflow.new.DataFlow\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call.getLocation().getFile().getRelativePath() = \"packaging/pep517_backend/_backend.py\" and\n  (\n    call = API::moduleImport(\"subprocess\").getMember([\"run\", \"check_call\", \"check_output\", \"Popen\"]).getACall() or\n    call = API::moduleImport(\"os\").getMember(\"system\").getACall() or\n    call = API::moduleImport(\"shutil\").getMember(\"rmtree\").getACall()\n  )\nselect call, \"Shell or filesystem operation that, if fed with untrusted input, could be dangerous.\"",
+   "hypothesis": "Identify concrete subprocess / shell / filesystem calls in backend for later dataflow tracing",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-078"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251226030937",
+   "codeql_raw_query": "/**\n * @name Dangerous shell/filesystem operations in pep517 backend\n * @description Find potentially dangerous uses of shutil, os, or subprocess in packaging backend.\n * @kind problem\n * @problem.severity warning\n * @id py/propcache/backend-dangerous-ops-manual\n * @tags security\n *       external/cwe/cwe-078\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call.getLocation().getFile().getRelativePath() = \"packaging/pep517_backend/_backend.py\" and\n  (\n    call = API::moduleImport(\"shutil\").getMember([\"copy\", \"copy2\", \"copytree\", \"rmtree\", \"move\"]).getACall() or\n    call = API::moduleImport(\"os\").getMember([\"remove\", \"unlink\", \"rmdir\", \"removedirs\", \"rename\"]).getACall()\n  )\nselect call, \"Shell or filesystem operation inside pep517 backend that, if fed with untrusted input, could be dangerous.\"",
+   "hypothesis": "There are dangerous shell or filesystem operations in the pep517 backend helper that might be influenced by untrusted project configuration.",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-078"
+   ],
+   "results_count": 1,
+   "results": [
+    {
+     "ruleId": "py/propcache/backend-dangerous-ops-manual",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/propcache/backend-dangerous-ops-manual",
+      "index": 0
+     },
+     "message": {
+      "text": "Shell or filesystem operation inside pep517 backend that, if fed with untrusted input, could be dangerous."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "packaging/pep517_backend/_backend.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 228,
+         "startColumn": 13,
+         "endLine": 233,
+         "endColumn": 14
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "293c76af465e297d:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251226031111",
+   "codeql_raw_query": "/**\n * @name Identify shell and filesystem operations in pep517 backend\n * @description Flags subprocess and dangerous filesystem operations that could be risky if given untrusted input.\n * @kind problem\n * @problem.severity warning\n * @id py/propcache/list-backend-dangerous-ops\n * @tags security\n *       external/cwe/cwe-078\n */\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call.getLocation().getFile().getRelativePath().regexpMatch(\"packaging/pep517_backend/_backend.py\") and\n  (\n    call = API::moduleImport(\"subprocess\").getMember([\"run\", \"Popen\", \"call\", \"check_call\", \"check_output\"]).getACall() or\n    call = API::moduleImport(\"os\").getMember([\"system\", \"popen\", \"remove\", \"rmdir\"]).getACall() or\n    call = API::moduleImport(\"shutil\").getMember([\"rmtree\", \"move\"]).getACall()\n  )\nselect call, \"Shell or filesystem operation that, if fed with untrusted input, could be dangerous.\"",
+   "hypothesis": "There may be shell command execution or destructive filesystem operations in the bundled pep517 backend that could be dangerous if they use untrusted input.",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-078"
+   ],
+   "results_count": 0,
+   "results": []
+  }
+ ]
+}

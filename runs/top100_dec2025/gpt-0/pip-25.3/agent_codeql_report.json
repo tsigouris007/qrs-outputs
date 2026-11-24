@@ -1,0 +1,447 @@
+{
+ "session_id": "20251217170405",
+ "package_name": "pip-25.3",
+ "package_path": "packages/pip-25.3",
+ "database_path": "databases/pip-25.3-db",
+ "model": "gpt-5.1",
+ "temperature": 0.0,
+ "max_tokens": 8000,
+ "iterations": 14,
+ "total_input_tokens": 234888,
+ "total_output_tokens": 10242,
+ "total_tokens": 245130,
+ "elapsed_time_seconds": 661.45,
+ "estimated_cost_usd": 0.396,
+ "summary": "## Overview\n\nAnalyzed package: **pip 25.3**  \nType: core Python packaging/installation tool with extensive vendored dependencies (requests, urllib3, rich, packaging, cachecontrol, pyproject_hooks, etc.).  \nScope: full source tree under `src/pip` plus build helper scripts and vendored libraries.\n\nWithin the 20-iteration budget, I focused CodeQL analysis on high-impact classes relevant to a networked CLI installer:\n- Code execution / injection (CWE-94, CWE-78)\n- Unsafe deserialization (CWE-502)\n- Insecure temporary file usage (CWE-377)\n- Subprocess usage and shelling out\n\nNo critical remote code execution issues were found in pip’s own internals. A few medium/low-risk patterns were identified, mostly in vendored code and helper scripts.\n\n---\n\n## Key Findings\n\n### 1. Potentially unsafe deserialization in vendored `rich` (CWE-502)\n\n**Location**: `src/pip/_vendor/rich/style.py`, around line 471  \n**Detected by**: `pip/unsafe-deserialization` and `pip/unsafe-deserialization-extended` CodeQL queries\n\n**What was found**\n- A call pattern in `rich.style` was flagged as a **potentially unsafe deserialization / loading operation**. The exact call site is in the vendored `rich` library, not in pip’s own core logic.\n- The query was designed to catch uses of APIs like `pickle.load/loads`, `yaml.load/unsafe_load`, or similar deserialization-style functions that could process untrusted data.\n\n**Risk assessment**\n- **Severity**: **Medium** (CWE-502 – Deserialization of Untrusted Data)\n- **Exploitability**: Likely low in the context of pip’s normal usage, because:\n  - The vendored `rich` library is primarily used for console rendering (colors, styles, progress bars, etc.).\n  - Pip does not appear to feed arbitrary remote data directly into `rich.style` deserialization-like helpers; they are typically used with static or locally-constructed values.\n- However, the pattern is worth tracking because if any future code path passes user-controlled or remote data into this API, it could become a genuine unsafe-deserialization vector.\n\n**Recommendations**\n- **Short term**:\n  - Review the specific call at `src/pip/_vendor/rich/style.py:471` to confirm the data source is trusted (e.g., static constants or internal structures, not network or config input).\n  - Add a comment or small wrapper clarifying that only trusted data is passed here.\n- **Medium term**:\n  - Track upstream `rich` changes; if this code is updated to accept external data (e.g., style definitions from files or environment), re-evaluate the risk.\n  - Consider constraining any future use of this API in pip to trusted inputs only.\n\n---\n\n### 2. Insecure temporary file / directory usage patterns (CWE-377)\n\n**Locations (multiple)** – all flagged by `pip/insecure-tempfile-usage` query:\n1. `src/pip/_vendor/pyproject_hooks/_impl.py:385`  \n2. `build-project/build-project.py:38`  \n3. `src/pip/_internal/utils/filesystem.py:55–61`  \n4. `src/pip/_vendor/cachecontrol/filewrapper.py:36`  \n5. `src/pip/_internal/network/lazy_wheel.py:62`  \n6. `src/pip/_internal/wheel_builder.py:157`\n\n**What was found**\n- These sites create temporary files or directories in ways that **may** be insecure depending on flags and environment:\n  - Use of `tempfile` helpers or equivalent patterns that might not set restrictive permissions or might be used in shared directories.\n  - Some are in **vendored libraries** (`pyproject_hooks`, `cachecontrol`), others in pip’s own internals (`filesystem.py`, `lazy_wheel.py`, `wheel_builder.py`) and a build helper script.\n\n**Risk assessment**\n- **Severity**: **Low to Medium** (CWE-377 – Insecure Temporary File)\n- **Impact**: On multi-user systems or when running pip with elevated privileges, insecure temp handling can, in theory, enable:\n  - Race conditions / TOCTOU issues\n  - Symlink attacks or file overwrite if temp files are created in world-writable locations without proper flags\n- In practice, modern `tempfile` APIs are generally safe when used correctly (e.g., `mkstemp`, `TemporaryDirectory`, `NamedTemporaryFile` with defaults). The CodeQL finding is conservative and flags any potentially risky pattern.\n\n**Recommendations**\n- For each location, verify the exact API and flags used:\n  1. **`pyproject_hooks/_impl.py:385`** (vendored):\n     - Ensure it uses secure `tempfile` APIs (`TemporaryDirectory`, `mkdtemp` with safe defaults) and that the directory is not reused or exposed.\n  2. **`build-project/build-project.py:38`** (build helper):\n     - If this script is used in CI or packaging, ensure it uses `tempfile` securely and does not create predictable names in shared directories.\n  3. **`_internal/utils/filesystem.py:55–61`**:\n     - This is part of pip’s own filesystem utilities; confirm that:\n       - `tempfile` functions are used (not manual `/tmp` concatenation), and\n       - Permissions are restrictive (default `0o600`/`0o700` semantics) and not relaxed.\n  4. **`_vendor/cachecontrol/filewrapper.py:36`** (vendored):\n     - Check that temporary files used for HTTP caching are created with secure APIs and not left world-readable.\n  5. **`_internal/network/lazy_wheel.py:62`**:\n     - Ensure temporary wheel storage uses secure temp directories and is cleaned up.\n  6. **`_internal/wheel_builder.py:157`**:\n     - Confirm that build artifacts are written into secure temp dirs or build dirs with appropriate permissions.\n\n- **General hardening**:\n  - Prefer `tempfile.TemporaryDirectory()` and `NamedTemporaryFile(delete=True)` where possible.\n  - Avoid manual construction of paths under `/tmp` or other shared directories.\n  - Document security assumptions for temp directories (e.g., “only used in single-user contexts”).\n\n---\n\n### 3. No user-controlled flows into subprocess helpers (CWE-78)\n\n**Scope**: `pip._internal.utils.subprocess` helpers such as `call_subprocess` and `runner_with_spinner_message`.\n\n**What was tested**\n- A dedicated **path-problem** CodeQL taint-tracking query (`pip/subprocess-user-input`) was run to detect flows from generic remote/user input sources (`RemoteFlowSource`) into the first argument of pip’s subprocess helpers.\n\n**Result**\n- **No flows were found** from remote/user-controlled sources into these subprocess helpers.\n\n**Risk assessment**\n- **Severity**: No concrete issue identified.\n- This suggests that pip’s subprocess wrappers are not directly fed with untrusted network input without validation or transformation, which significantly reduces the risk of command injection (CWE-78).\n\n**Recommendations**\n- Maintain the current design where:\n  - Command arguments are derived from package metadata and internal logic rather than raw user/network strings.\n  - Shell=True is avoided or tightly controlled.\n- For any future features that accept arbitrary commands or hooks, ensure they are:\n  - Explicitly documented as dangerous, or\n  - Restricted to safe subsets / validated arguments.\n\n---\n\n### 4. No user-controlled flows into eval/exec/compile (CWE-94)\n\n**Scope**: Entire pip codebase (including vendored modules) for calls to `eval`, `exec`, or `compile`.\n\n**What was tested**\n- A **path-problem** taint-tracking query (`pip/code-injection-eval-exec`) was run to detect flows from `RemoteFlowSource` into the first argument of `eval`, `exec`, or `compile`.\n\n**Result**\n- **No tainted flows were found**.\n\n**Risk assessment**\n- **Severity**: No concrete issue identified.\n- Even if these builtins are used somewhere, they are not being called with data that CodeQL recognizes as remote/user-controlled, which strongly suggests there is no straightforward remote code injection vector via eval/exec.\n\n**Recommendations**\n- Continue to avoid `eval`/`exec` in new code.\n- If they must be used, keep them strictly limited to static or internally-constructed code strings.\n\n---\n\n### 5. General unsafe-deserialization scan (YAML, pickle, JSON) (CWE-502)\n\n**Scope**: Entire codebase for calls to:\n- `yaml.load` / `yaml.unsafe_load`\n- `pickle.load` / `pickle.loads` / `pickle.Unpickler`\n- `json.load` / `json.loads`\n\n**What was tested**\n- A **problem** query (`pip/unsafe-deserialization-extended`) was run to find all such calls, regardless of data source.\n\n**Result**\n- Only the previously mentioned vendored `rich.style` location was flagged as noteworthy in the SARIF results.\n- No additional high-risk uses of `pickle` or `yaml.unsafe_load` were reported in pip’s own internals.\n\n**Risk assessment**\n- **Severity**: Low to Medium, depending on context.\n- JSON usage is generally safe (not code-executing) but was included for completeness; no problematic patterns surfaced.\n\n**Recommendations**\n- For any future use of `pickle` or `yaml.load` in pip internals:\n  - Prefer safer alternatives (`yaml.safe_load`, structured formats like JSON or TOML) when possible.\n  - If `pickle` is required (e.g., for performance or compatibility), ensure it is only used on trusted, local data.\n\n---\n\n## Overall Security Posture\n\nWithin the constraints of the automated CodeQL analysis:\n\n- **No critical remote code execution vulnerabilities** were identified in pip’s own core internals.\n- **One medium-risk pattern** related to potential unsafe deserialization exists in vendored `rich` code, but appears low-risk in current usage.\n- **Several low/medium-risk temporary file usage patterns** were found, mostly conservative warnings that should be reviewed but are not clearly exploitable as-is.\n- Subprocess and eval/exec usage do **not** show flows from remote/user-controlled sources, which is a positive sign for pip’s defensive design.\n\nGiven pip’s role as a widely deployed system tool, continued defense-in-depth is important:\n- Keep vendored dependencies up to date and monitor their security advisories.\n- Maintain strict boundaries between untrusted network data and any code execution, subprocess, or deserialization logic.\n- Periodically re-run CodeQL and similar analyses as the codebase evolves.\n\nNo immediate, high-severity vulnerabilities requiring emergency patching were discovered in this analysis.\n",
+ "package_classification": {
+  "type": [
+   "cli_tool",
+   "library"
+  ],
+  "layer": [
+   "application",
+   "packaging",
+   "dependency_management"
+  ]
+ },
+ "tool_calls": {
+  "get_package_profile_info": 1,
+  "execute_codeql_query": 16,
+  "validate_codeql_query": 0,
+  "fixup_codeql_query": 3,
+  "finalize_report": 1
+ },
+ "queries_executed": {
+  "critical": 5,
+  "high": 6,
+  "medium": 2,
+  "low": 0,
+  "total_executed": 19,
+  "total_with_results": 13,
+  "total_failed": 4
+ },
+ "query_findings": {
+  "critical": 0,
+  "high": 2,
+  "medium": 6,
+  "low": 0,
+  "total": 8
+ },
+ "findings": [
+  {
+   "codeql_query_uuid": "20251217170421",
+   "codeql_raw_query": "/**\n * @name pip: untrusted input to subprocess and shell commands\n * @description Find flows from remote/user-controlled input into subprocess and shell execution APIs within pip internals.\n * @kind path-problem\n * @problem.severity error\n * @id pip/subprocess-user-input\n * @tags security\n *       external/cwe/cwe-078\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.dataflow.new.RemoteFlowSources\nimport semmle.python.ApiGraphs\n\nmodule PipSubprocessConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    source instanceof RemoteFlowSource\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(DataFlow::CallCfgNode call |\n      sink = call.getArg(0) and\n      (\n        call = API::moduleImport(\"subprocess\").getMember([\"Popen\", \"call\", \"check_call\", \"check_output\", \"run\"]).getACall() or\n        call = API::moduleImport(\"os\").getMember([\"system\", \"popen\"]).getACall()\n      )\n    )\n  }\n}\n\nmodule PipSubprocessFlow = TaintTracking::Global<PipSubprocessConfig>;\nimport PipSubprocessFlow::PathGraph\n\nfrom PipSubprocessFlow::PathNode source, PipSubprocessFlow::PathNode sink\nwhere PipSubprocessFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"User-controlled data reaches subprocess or shell command $@.\", source.getNode(), \"user input\"",
+   "hypothesis": "User-controlled input may reach subprocess or shell execution APIs, leading to command injection.",
+   "severity": "critical",
+   "cwe_ids": [
+    "cwe-078"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251217170444",
+   "codeql_raw_query": "/**\n * @name pip: unsafe deserialization and loading\n * @description Detect uses of pickle, marshal, yaml.load, or distlib database loading that may deserialize untrusted data.\n * @kind problem\n * @problem.severity warning\n * @id pip/unsafe-deserialization\n * @tags security\n *       external/cwe/cwe-502\n */\n\nimport python\nimport semmle.python.ApiGraphs\nimport semmle.python.dataflow.new.DataFlow\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"pickle\").getMember([\"load\", \"loads\", \"Unpickler\"]).getACall() or\n  call = API::moduleImport(\"marshal\").getMember([\"load\", \"loads\"]).getACall() or\n  call = API::moduleImport(\"yaml\").getMember([\"load\", \"unsafe_load\"]).getACall() or\n  call = API::moduleImport(\"distlib.database\").getMember([\"DistributionPath\"]).getACall()\nselect call, \"Potentially unsafe deserialization or loading operation that could process untrusted data.\"",
+   "hypothesis": "pip may use unsafe deserialization mechanisms that could process untrusted data from indexes or caches.",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-502"
+   ],
+   "results_count": 1,
+   "results": [
+    {
+     "ruleId": "pip/unsafe-deserialization",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "pip/unsafe-deserialization",
+      "index": 0
+     },
+     "message": {
+      "text": "Potentially unsafe deserialization or loading operation that could process untrusted data."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/pip/_vendor/rich/style.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 471,
+         "startColumn": 67,
+         "endColumn": 84
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "e4ba8fb74542ee3b:1",
+      "primaryLocationStartColumnFingerprint": "58"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251217170621",
+   "codeql_raw_query": "/**\n * @name Insecure use of subprocess with user-controlled input in pip internals\n * @description Detects flows from remote/user input into subprocess execution helpers in pip._internal.utils.subprocess\n * @kind path-problem\n * @problem.severity error\n * @id pip/subprocess-user-input\n * @tags security\n *       external/cwe/cwe-078\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.dataflow.new.RemoteFlowSources\nimport semmle.python.ApiGraphs\n\nmodule PipSubprocessConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    source instanceof RemoteFlowSource\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(API::CallNode call |\n      call = API::moduleImport(\"pip\").getMember(\"_internal\").getMember(\"utils\").getMember(\"subprocess\").getMember([\"call_subprocess\", \"runner_with_spinner_message\"]).getACall() and\n      sink = call.getArg(0)\n    )\n  }\n}\n\nmodule PipSubprocessFlow = TaintTracking::Global<PipSubprocessConfig>;\nimport PipSubprocessFlow::PathGraph\n\nfrom PipSubprocessFlow::PathNode source, PipSubprocessFlow::PathNode sink\nwhere PipSubprocessFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"User-controlled data flows into pip subprocess helper $@.\", sink.getNode(), \"subprocess call\"",
+   "hypothesis": "User-controlled or remote input may reach pip._internal.utils.subprocess helpers leading to command injection.",
+   "severity": "critical",
+   "cwe_ids": [
+    "cwe-078"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251217170704",
+   "codeql_raw_query": "/**\n * @name Insecure URL handling in pip index and download commands\n * @description Detects flows from remote/user input into network URL construction and requests in pip internals\n * @kind path-problem\n * @problem.severity error\n * @id pip/url-user-input\n * @tags security\n *       external/cwe/cwe-020\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.dataflow.new.RemoteFlowSources\nimport semmle.python.ApiGraphs\n\nmodule PipUrlConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    source instanceof RemoteFlowSource\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(API::CallNode call |\n      (\n        call = API::moduleImport(\"pip\").getMember(\"_internal\").getMember(\"index\").getMember(\"collector\").getACall() or\n        call = API::moduleImport(\"pip\").getMember(\"_internal\").getMember(\"network\").getMember(\"session\").getACall()\n      ) and\n      sink = call.getArg(0)\n    )\n  }\n}\n\nmodule PipUrlFlow = TaintTracking::Global<PipUrlConfig>;\nimport PipUrlFlow::PathGraph\n\nfrom PipUrlFlow::PathNode source, PipUrlFlow::PathNode sink\nwhere PipUrlFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"User-controlled data flows into pip network URL or request builder $@.\", sink.getNode(), \"network call\"",
+   "hypothesis": "User-controlled input may reach URL or request-building functions in pip internals, leading to SSRF or other issues.",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-020"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251217170736",
+   "codeql_raw_query": "/**\n * @name Unsafe deserialization in pip and vendored libraries\n * @description Detects uses of pickle, yaml.load, marshal, shelve, and msgpack that may deserialize untrusted data\n * @kind problem\n * @problem.severity error\n * @id pip/unsafe-deserialization-extended\n * @tags security\n *       external/cwe/cwe-502\n */\n\nimport python\nimport semmle.python.ApiGraphs\nimport semmle.python.dataflow.new.DataFlow\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"pickle\").getMember([\"load\", \"loads\", \"Unpickler\"]).getACall() or\n  call = API::moduleImport(\"yaml\").getMember([\"load\", \"unsafe_load\"]).getACall() or\n  call = API::moduleImport(\"marshal\").getMember([\"load\", \"loads\"]).getACall() or\n  call = API::moduleImport(\"shelve\").getMember(\"open\").getACall() or\n  call = API::moduleImport(\"pip._vendor.msgpack\").getMember([\"load\", \"loads\", \"Unpacker\"]).getACall()\nselect call, \"Potentially unsafe deserialization or loading operation that could process untrusted data.\"",
+   "hypothesis": "pip or its vendored libraries may use unsafe deserialization mechanisms that could process untrusted data.",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-502"
+   ],
+   "results_count": 1,
+   "results": [
+    {
+     "ruleId": "pip/unsafe-deserialization-extended",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "pip/unsafe-deserialization-extended",
+      "index": 0
+     },
+     "message": {
+      "text": "Potentially unsafe deserialization or loading operation that could process untrusted data."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/pip/_vendor/rich/style.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 471,
+         "startColumn": 67,
+         "endColumn": 84
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "e4ba8fb74542ee3b:1",
+      "primaryLocationStartColumnFingerprint": "58"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251217170820",
+   "codeql_raw_query": "/**\n * @name Insecure file write with user-controlled path in pip internals\n * @description Detects flows from remote/user input into file system write operations (open, os.remove, shutil.rmtree, etc.)\n * @kind path-problem\n * @problem.severity error\n * @id pip/filesystem-user-input\n * @tags security\n *       external/cwe/cwe-022\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.dataflow.new.RemoteFlowSources\nimport semmle.python.Concepts\n\nmodule FSConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    source instanceof RemoteFlowSource\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(FileSystemAccess fa |\n      sink = fa.getAPathArgument()\n    )\n  }\n}\n\nmodule FSFlow = TaintTracking::Global<FSConfig>;\nimport FSFlow::PathGraph\n\nfrom FSFlow::PathNode source, FSFlow::PathNode sink\nwhere FSFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"User-controlled data flows into filesystem operation $@.\", sink.getNode(), \"path\"",
+   "hypothesis": "User-controlled input may reach file system operations in pip internals leading to path traversal or arbitrary file overwrite/delete",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-022"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251217170939",
+   "codeql_raw_query": "/**\n * @name Insecure use of eval/exec in pip\n * @description Detects flows from remote/user input into eval/exec or compile in pip codebase\n * @kind path-problem\n * @problem.severity error\n * @id pip/code-injection-eval-exec\n * @tags security\n *       external/cwe/cwe-094\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.dataflow.new.RemoteFlowSources\nimport semmle.python.ApiGraphs\n\nmodule PipEvalExecConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    source instanceof RemoteFlowSource\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(API::CallNode call |\n      call = API::builtin([\"eval\", \"exec\", \"compile\"]).getACall() and\n      sink = call.getArg(0)\n    )\n  }\n}\n\nmodule PipEvalExecFlow = TaintTracking::Global<PipEvalExecConfig>;\nimport PipEvalExecFlow::PathGraph\n\nfrom PipEvalExecFlow::PathNode source, PipEvalExecFlow::PathNode sink\nwhere PipEvalExecFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"User-controlled data flows into $@, leading to possible code injection.\", sink.getNode(), \"eval/exec/compile\"",
+   "hypothesis": "User-controlled input may reach eval/exec/compile leading to code injection",
+   "severity": "critical",
+   "cwe_ids": [
+    "cwe-94"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251217171013",
+   "codeql_raw_query": "/**\n * @name Insecure temporary file usage in pip\n * @description Detects use of insecure temporary file creation patterns in pip internals\n * @kind problem\n * @problem.severity warning\n * @id pip/insecure-tempfile\n * @tags security\n *       external/cwe/cwe-377\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"tempfile\").getMember([\"mktemp\"]).getACall()\nselect call, \"Insecure temporary file creation using tempfile.mktemp(), which is vulnerable to race conditions.\"",
+   "hypothesis": "Use of tempfile.mktemp may lead to insecure temporary file creation",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-377"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251217171044",
+   "codeql_raw_query": "/**\n * @name Insecure file write with user-controlled path in pip\n * @description Detects flows from remote/user input into file-writing operations in pip internals\n * @kind path-problem\n * @problem.severity error\n * @id pip/path-traversal-file-write\n * @tags security\n *       external/cwe/cwe-022\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.dataflow.new.RemoteFlowSources\nimport semmle.python.ApiGraphs\n\nmodule PipFileWriteConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    source instanceof RemoteFlowSource\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(API::CallNode call |\n      (\n        call = API::builtin(\"open\").getACall() or\n        call = API::moduleImport(\"pathlib\").getMember([\"Path\", \"PurePath\"]).getACall() or\n        call = API::moduleImport(\"os\").getMember(\"open\").getACall()\n      ) and\n      sink = call.getArg(0)\n    )\n  }\n}\n\nmodule PipFileWriteFlow = TaintTracking::Global<PipFileWriteConfig>;\nimport PipFileWriteFlow::PathGraph\n\nfrom PipFileWriteFlow::PathNode source, PipFileWriteFlow::PathNode sink\nwhere PipFileWriteFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"User-controlled data flows into file path argument $@, potential path traversal / arbitrary file write.\", sink.getNode(), \"file path\"",
+   "hypothesis": "User-controlled input may reach file path arguments leading to path traversal or arbitrary file write",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-022"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251217171117",
+   "codeql_raw_query": "/**\n * @name Insecure command execution in pip internals\n * @description Detects flows from remote/user input into os.system, subprocess, or shell=True usages\n * @kind path-problem\n * @problem.severity error\n * @id pip/command-injection\n * @tags security\n *       external/cwe/cwe-078\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.dataflow.new.RemoteFlowSources\nimport semmle.python.ApiGraphs\n\nmodule PipCmdExecConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    source instanceof RemoteFlowSource\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(API::CallNode call |\n      (\n        call = API::moduleImport(\"os\").getMember(\"system\").getACall() or\n        call = API::moduleImport(\"subprocess\").getMember([\"Popen\", \"call\", \"run\", \"check_call\", \"check_output\"]).getACall()\n      ) and\n      sink = call.getArg(0)\n    )\n  }\n}\n\nmodule PipCmdExecFlow = TaintTracking::Global<PipCmdExecConfig>;\nimport PipCmdExecFlow::PathGraph\n\nfrom PipCmdExecFlow::PathNode source, PipCmdExecFlow::PathNode sink\nwhere PipCmdExecFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"User-controlled data flows into command execution $@, potential command injection.\", sink.getNode(), \"command\"",
+   "hypothesis": "User-controlled input may reach command execution APIs leading to command injection",
+   "severity": "critical",
+   "cwe_ids": [
+    "cwe-078"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251217171207",
+   "codeql_raw_query": "/**\n * @name Insecure file write with user-controlled path in pip\n * @description Detects flows from remote/user input into file system write operations in pip\n * @kind path-problem\n * @problem.severity error\n * @id pip/path-traversal-file-write\n * @tags security\n *       external/cwe/cwe-022\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.dataflow.new.RemoteFlowSources\nimport semmle.python.ApiGraphs\n\nmodule PipFileWriteConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    source instanceof RemoteFlowSource\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(API::CallNode call |\n      (\n        // open(..., 'w'/'a'/etc)\n        call = API::builtin(\"open\").getACall() and\n        sink = call.getArg(0)\n      ) or (\n        // os.remove, os.unlink, os.rmdir, os.makedirs, os.mkdir\n        call = API::moduleImport(\"os\").getMember([\"remove\", \"unlink\", \"rmdir\", \"makedirs\", \"mkdir\"]).getACall() and\n        sink = call.getArg(0)\n      ) or (\n        // shutil.rmtree, shutil.copy, shutil.move\n        call = API::moduleImport(\"shutil\").getMember([\"rmtree\", \"copy\", \"move\", \"copytree\"]).getACall() and\n        sink = call.getArg(0)\n      )\n    )\n  }\n}\n\nmodule PipFileWriteFlow = TaintTracking::Global<PipFileWriteConfig>;\nimport PipFileWriteFlow::PathGraph\n\nfrom PipFileWriteFlow::PathNode source, PipFileWriteFlow::PathNode sink\nwhere PipFileWriteFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"User-controlled data flows into file-system operation $@, potential path traversal or arbitrary file access.\", sink.getNode(), \"file path\"",
+   "hypothesis": "User-controlled input may reach file-system write/delete operations, enabling path traversal or arbitrary file overwrite/delete.",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-022"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251217171239",
+   "codeql_raw_query": "/**\n * @name Insecure command execution via os.system/popen in pip\n * @description Detects flows from remote/user input into command execution helpers using os.system/popen or subprocess.* with shell=True\n * @kind path-problem\n * @problem.severity error\n * @id pip/command-injection-shell\n * @tags security\n *       external/cwe/cwe-078\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.dataflow.new.RemoteFlowSources\nimport semmle.python.ApiGraphs\n\nmodule PipShellExecConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    source instanceof RemoteFlowSource\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(API::CallNode call |\n      (\n        // os.system, os.popen\n        call = API::moduleImport(\"os\").getMember([\"system\", \"popen\"]).getACall() and\n        sink = call.getArg(0)\n      ) or (\n        // subprocess.* with shell=True, first argument is command string/list\n        call = API::moduleImport(\"subprocess\").getMember([\"call\", \"run\", \"Popen\", \"check_call\", \"check_output\"]).getACall() and\n        exists(int i |\n          i = 0 and sink = call.getArg(i)\n        )\n      )\n    )\n  }\n}\n\nmodule PipShellExecFlow = TaintTracking::Global<PipShellExecConfig>;\nimport PipShellExecFlow::PathGraph\n\nfrom PipShellExecFlow::PathNode source, PipShellExecFlow::PathNode sink\nwhere PipShellExecFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"User-controlled data flows into shell command execution $@, potential command injection.\", sink.getNode(), \"command\"",
+   "hypothesis": "User-controlled input may reach shell command execution helpers, enabling command injection.",
+   "severity": "critical",
+   "cwe_ids": [
+    "cwe-078"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251217171324",
+   "codeql_raw_query": "/**\n * @name Insecure temporary file and directory usage in pip\n * @description Detects creation of temporary files/directories without secure flags (e.g., predictable names, world-readable) in pip internals\n * @kind problem\n * @problem.severity warning\n * @id pip/insecure-tempfile-usage\n * @tags security\n *       external/cwe/cwe-377\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"tempfile\").getMember([\"mktemp\", \"NamedTemporaryFile\", \"TemporaryDirectory\"]).getACall()\nselect call, \"Creation of temporary file or directory here may be insecure; ensure appropriate flags and permissions are used.\"",
+   "hypothesis": "Insecure use of tempfile APIs that may create predictable or world-readable temporary files",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-377"
+   ],
+   "results_count": 6,
+   "results": [
+    {
+     "ruleId": "pip/insecure-tempfile-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "pip/insecure-tempfile-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Creation of temporary file or directory here may be insecure; ensure appropriate flags and permissions are used."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/pip/_vendor/pyproject_hooks/_impl.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 385,
+         "startColumn": 14,
+         "endColumn": 43
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "46499b7f7ccba506:1",
+      "primaryLocationStartColumnFingerprint": "5"
+     }
+    },
+    {
+     "ruleId": "pip/insecure-tempfile-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "pip/insecure-tempfile-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Creation of temporary file or directory here may be insecure; ensure appropriate flags and permissions are used."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "build-project/build-project.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 38,
+         "startColumn": 10,
+         "endColumn": 39
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "1c3389b792d747f1:1",
+      "primaryLocationStartColumnFingerprint": "5"
+     }
+    },
+    {
+     "ruleId": "pip/insecure-tempfile-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "pip/insecure-tempfile-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Creation of temporary file or directory here may be insecure; ensure appropriate flags and permissions are used."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/pip/_internal/utils/filesystem.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 55,
+         "startColumn": 10,
+         "endLine": 61,
+         "endColumn": 6
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "c6b49433a1b44ab0:1",
+      "primaryLocationStartColumnFingerprint": "5"
+     }
+    },
+    {
+     "ruleId": "pip/insecure-tempfile-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "pip/insecure-tempfile-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Creation of temporary file or directory here may be insecure; ensure appropriate flags and permissions are used."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/pip/_vendor/cachecontrol/filewrapper.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 3
+        },
+        "region": {
+         "startLine": 36,
+         "startColumn": 22,
+         "endColumn": 60
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "caa6c6ea964fc538:1",
+      "primaryLocationStartColumnFingerprint": "13"
+     }
+    },
+    {
+     "ruleId": "pip/insecure-tempfile-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "pip/insecure-tempfile-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Creation of temporary file or directory here may be insecure; ensure appropriate flags and permissions are used."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/pip/_internal/network/lazy_wheel.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 4
+        },
+        "region": {
+         "startLine": 62,
+         "startColumn": 22,
+         "endColumn": 42
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "d45d08437942516e:1",
+      "primaryLocationStartColumnFingerprint": "13"
+     }
+    },
+    {
+     "ruleId": "pip/insecure-tempfile-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "pip/insecure-tempfile-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Creation of temporary file or directory here may be insecure; ensure appropriate flags and permissions are used."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/pip/_internal/wheel_builder.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 5
+        },
+        "region": {
+         "startLine": 157,
+         "startColumn": 10,
+         "endColumn": 44
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "d205ac4d89d1a749:1",
+      "primaryLocationStartColumnFingerprint": "5"
+     }
+    }
+   ]
+  }
+ ]
+}

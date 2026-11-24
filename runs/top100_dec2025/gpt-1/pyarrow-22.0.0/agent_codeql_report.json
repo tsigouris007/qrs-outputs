@@ -1,0 +1,1583 @@
+{
+ "session_id": "20251226033017",
+ "package_name": "pyarrow-22.0.0",
+ "package_path": "packages/pyarrow-22.0.0",
+ "database_path": "databases/pyarrow-22.0.0-db",
+ "model": "gpt-5.1",
+ "temperature": 1.0,
+ "max_tokens": 8000,
+ "iterations": 12,
+ "total_input_tokens": 103521,
+ "total_output_tokens": 9504,
+ "total_tokens": 113025,
+ "elapsed_time_seconds": 429.51,
+ "estimated_cost_usd": 0.2244,
+ "summary": "## Overview\nSecurity analysis of **pyarrow 22.0.0** (Python bindings for Apache Arrow) was performed using CodeQL with a focus on critical and high‑impact issues first (code execution, unsafe subprocess use, injection, unsafe deserialization, and filesystem misuse). The package is a *library* used for data processing, Parquet/Feather I/O, datasets, and interoperability with pandas and other frameworks.\n\nNo clear critical remote code execution vulnerabilities were identified in the Python layer. However, several patterns of potentially dangerous behavior were found that deserve careful review by maintainers and by downstream users, especially in environments where untrusted inputs can influence configuration, file paths, or command arguments.\n\n---\n\n## Key Findings\n\n### 1. Subprocess usage in `pyarrow.__init__` (pkg-config helper)\n\n**Type:** Potential command injection / unsafe subprocess use  \n**CWE:** CWE-78 (OS Command Injection)  \n**Severity (for library code):** Medium (can be high if untrusted input reaches these functions)\n\n**Where (approximate from SARIF):** `pyarrow/__init__.py` around lines 314–330.\n\n**What CodeQL found**\n\n1. **Raw subprocess calls:**\n   - Query `pyarrow/subprocess-spawn` detected uses of `subprocess` APIs at:\n     - Line ~320–321 in `pyarrow/__init__.py`\n     - Line ~329–330 in `pyarrow/__init__.py`\n   - These locations correspond to helper logic that builds a command list and invokes a `subprocess` function (e.g., `subprocess.run` or similar) to call a **pkg-config-style executable**.\n\n2. **Tainted dataflow into subprocess:**\n   - Query `pyarrow/tainted-subprocess-call` (path-problem taint tracking from function parameters into subprocess calls) reported **two flows**:\n     - **Flow 1:** From a function parameter `pkgname` through a dict lookup and helper `_get_pkg_config_executable()` into the first argument of a subprocess invocation (list command) at ~line 320–321.\n     - **Flow 2:** From parameters `pkgname` and `cli_args` into a command list `cmd` that is passed to a subprocess call at ~line 329.\n   - The CodeQL traces show taint from parameter nodes named `pkgname` and `cli_args` into the command list elements used as the subprocess command.\n\n**Risk analysis**\n\n- The subprocess is invoked with a **list of arguments**, which usually mitigates shell injection when `shell=False` (the default for `subprocess.run`/`Popen` when given a list). That significantly reduces classic shell injection risk.\n- However, the **command executable name and arguments are partially derived from function parameters** (`pkgname`, `cli_args`). If these parameters receive untrusted or attacker-controlled values (e.g., from environment variables, configuration files, or higher-level APIs that accept arbitrary strings from users), this could:\n  - Attempt to execute arbitrary binaries if the \"executable\" portion is influenced.\n  - Pass attacker-controlled flags or arguments to the underlying tool.\n- In typical use, these helpers are likely intended for **internal packaging/installation or configuration** and not wired directly to untrusted web input. In such common scenarios, the risk is moderate.\n\n**Recommendations**\n\nFor maintainers:\n- **Constrain inputs**:\n  - Ensure any public APIs that eventually call these helpers validate `pkgname` against a fixed allowlist of known package names.\n  - For `cli_args`, either restrict it to specific known flags or sanitize strongly (e.g., disallow path separators, pipes, and shell metacharacters even though list-based subprocess is already safer).\n- **Confirm `shell=False`**:\n  - Verify that all subprocess calls in `pyarrow/__init__.py` use `shell=False` and pass arguments as a list.\n- **Document intended usage**:\n  - Document that the helpers are **not** meant to be called with untrusted user input to prevent dangerous patterns in downstream code.\n\nFor downstream users:\n- Never forward unvalidated user input (web request parameters, CLI arguments, etc.) directly into any `pyarrow` functions that can influence these subprocess helpers.\n- If extending or monkey-patching these helpers, preserve the `shell=False` behavior and avoid string-based `subprocess` calls.\n\n---\n\n### 2. Network usage via `requests` in `pyarrow.util`\n\n**Type:** Potential SSRF / unsafe network access pattern  \n**CWE:** CWE-918 (Server-Side Request Forgery)  \n**Severity:** Low–Medium (depends on exposure to untrusted URLs)\n\n**Where:** `pyarrow/util.py` around line 242.\n\n**What CodeQL found**\n\n- Query `pyarrow/network-usage` detected a call site using a network/HTTP API (likely `requests`), in `pyarrow/util.py` at ~line 242.\n- The exact call is not fully visible in SARIF, but is clearly a `requests` or similar HTTP client usage.\n\n**Risk analysis**\n\n- If the URL or parameters of this request are derived from **untrusted input** (for example, if pyarrow exposed an API allowing users to pass arbitrary URIs), this could allow SSRF or unintended outbound connections.\n- In many data-processing libraries, URLs may come from configuration or higher-level applications; risk is primarily dependent on how those applications pass values.\n\n**Recommendations**\n\nFor maintainers:\n- Check the function around util.py:242:\n  - Identify the function’s parameters and their intended trust model.\n  - Add validation for URL schemes (e.g., only allow `https` / `http`, block `file:`, `gopher:`, `ftp:`, `mailto:` etc., if applicable).\n- Consider providing **higher-level, safe wrappers** that only operate on pre-validated endpoints rather than arbitrary user-supplied URLs.\n\nFor downstream users:\n- Do not pass raw user input as URL or headers into pyarrow utilities that use `requests`.\n- Apply application-layer allowlisting (domains, protocols) before calling into pyarrow.\n\n---\n\n### 3. Tainted file-write paths in `pyarrow.util`\n\n**Type:** Potential unsafe file write / path traversal depending on caller  \n**CWE:** CWE-22 (Path Traversal), CWE-73 (External Control of File Name or Path)  \n**Severity:** Medium (if called with untrusted paths)\n\n**Where:** `pyarrow/util.py` around lines 233–243.\n\n**What CodeQL found**\n\n- Query `pyarrow/tainted-file-write` tracked **function parameters** into filesystem write operations:\n  - At ~line 236: parameter `out_path` is used as a path for a file write.\n  - At ~line 243: another (or same) parameter `out_path` is again used as a file write path.\n- CodeFlows show straightforward propagation:\n  - Parameter `out_path` (defined around lines 233 and 240) flows to the sink (file write path argument) at the lines above.\n\n**Risk analysis**\n\n- pyarrow is a library: it should reasonably allow callers to select output paths. This is expected behavior.\n- Risk emerges when **untrusted input is passed through without validation** by the application using pyarrow:\n  - Attackers might use `../` sequences or absolute paths to overwrite arbitrary files, if the application passes such paths to pyarrow utilities without restriction.\n  - Overwrites may affect application configuration, logs, or other sensitive files, depending on OS-level permissions.\n\n**Recommendations**\n\nFor maintainers:\n- In docstrings or API docs for these `util.py` functions, explicitly note that `out_path` should be a trusted, validated path.\n- Optionally, add an internal normalization step and consider warning if the path is outside an expected base directory, but this may be out of scope for a generic library.\n\nFor downstream users:\n- Treat any argument that ends up in these pyarrow `out_path` parameters as **sensitive**:\n  - Validate and normalize paths.\n  - If taking user input, restrict to a controlled directory and disallow path traversal components (`..`) and absolute paths.\n\n---\n\n### 4. Tainted paths into filesystem APIs in `pyarrow.parquet.core` and `pyarrow.feather`\n\n**Type:** Potential unsafe file system access / path traversal  \n**CWE:** CWE-22, CWE-73  \n**Severity:** Medium (depending on caller’s threat model)\n\n**Where:**\n- `pyarrow/parquet/core.py` around line 1931 and 1988.\n- `pyarrow/feather.py` around line 115 and 192.\n\n**What CodeQL found**\n\n1. **Parquet core – stringified write/read path**\n   - Query `pyarrow/tainted-path-to-filesystem` reported that function parameter `where` in `pyarrow/parquet/core.py` (around line 1931) flows into a filesystem sink around line 1988.\n   - The path flows through `pyarrow.util._stringify_path()` (in `util.py` around lines 138–143) then back to the Parquet core call where it is used for filesystem access.\n   - The SARIF trace shows:\n     - `where` parameter (line ~1931) → `_stringify_path()` call (line ~1988) → inside `_stringify_path`, parameter `path` (line ~138 in util.py) → attribute access (line ~143, AdditionalTaintStep) → returned string used as filesystem path.\n\n2. **Feather format – destination path**\n   - Same query showed that parameter `dest` in `pyarrow/feather.py` (around line 115) flows to a filesystem path sink at line 192.\n   - This is consistent with APIs that accept a target file path (or file-like object) for reading/writing Feather files.\n\n**Risk analysis**\n\n- These APIs intentionally accept paths (e.g., `parquet.write_table(table, where=...)`, `feather.write_feather(data, dest=...)`). It is normal for a library like pyarrow to do so.\n- The security risk is driven entirely by **how callers obtain and validate these path arguments**:\n  - If web applications or multi-tenant services pass user-supplied paths directly into `where`/`dest`, an attacker may gain directory traversal or overwrite arbitrary files (subject to OS permissions).\n- `_stringify_path()` does not appear to enforce any policy beyond converting various path-like objects to strings; it propagates taint as expected.\n\n**Recommendations**\n\nFor maintainers:\n- Keep `_stringify_path()` implementation simple and clearly documented as a **conversion helper**, not a security control.\n- Document path-related parameters (`where`, `dest`, etc.) as **trusted paths** in public API docs.\n\nFor downstream users:\n- When using `pyarrow.parquet` or `pyarrow.feather` with user-controllable file paths:\n  - Normalize and validate paths before passing them to pyarrow.\n  - Prefer mapping user identifiers to server-side paths (e.g., by using a lookup table) rather than accepting raw filesystem paths from users.\n\n---\n\n### 5. No evidence of unsafe deserialization in Python layer\n\n**Type:** Unsafe deserialization (pickle, yaml, marshal, shelve)  \n**CWE:** CWE-502  \n**Severity:** Not applicable (no occurrences found by query)\n\n**What CodeQL checked**\n\n- Query `pyarrow/unsafe-deserialization` looked for calls to `pickle`, `yaml.load/unsafe_load`, `marshal`, `shelve.open` within the pyarrow source tree.\n- **No results**: no direct use of these unsafe deserialization APIs in the Python portion inspected.\n\n**Note**\n\n- This does not assess the C++ backend or any binary serialization logic native to Arrow itself; it only covers Python usage of well-known unsafe deserializers.\n\n---\n\n## Overall Risk Assessment\n\n- The findings are broadly consistent with what you expect from a mature data-processing library: it performs filesystem operations, network requests, and some subprocess invocations.\n- There are **no strong indicators of an easily exploitable RCE** in the Python layer, given typical usage patterns.\n- However, **if untrusted input is allowed to influence**:\n  - file paths (`where`, `dest`, `out_path`),\n  - subprocess-related parameters (`pkgname`, `cli_args`), or\n  - network URLs used in `util.py`,\n  then an application could be exposed to path traversal, arbitrary file overwrite, SSRF, or command-execution-adjacent risks.\n\nFrom a library perspective these are **design trade-offs** rather than outright vulnerabilities, but they must be documented and understood by consumers.\n\n---\n\n## Recommendations Summary\n\nFor pyarrow maintainers:\n1. **Review subprocess helpers** in `pyarrow/__init__.py`:\n   - Confirm `shell=False` and list-argument usage everywhere.\n   - Validate or constrain `pkgname` and `cli_args` inputs if they are part of any public interfaces.\n   - Document that they are for trusted configuration and not user input.\n\n2. **Clarify trust boundaries for path parameters** across:\n   - `pyarrow/parquet/core.write_*` / `read_*` path arguments (`where`).\n   - `pyarrow.feather` path parameters (`dest`).\n   - `pyarrow.util` helpers that accept `out_path`.\n   Explicitly mark them as requiring caller-side validation.\n\n3. **Assess and document network utilities** in `pyarrow.util`:\n   - Ensure URLs & options are not influenced by untrusted input, or document constraints.\n   - Optionally add basic scheme/domain checks where appropriate.\n\n4. **Security documentation**:\n   - Add a short \"Security considerations\" section to pyarrow docs summarizing:\n     - Paths and URLs are treated as trusted inputs.\n     - subprocess helpers are not intended for arbitrary untrusted data.\n\nFor downstream users:\n- Do not forward raw user input directly into:\n  - Path parameters used by pyarrow filesystem APIs (`where`, `dest`, `out_path`).\n  - Any functions that can affect subprocess invocations.\n  - Network/URL parameters consumed by utilities in `pyarrow.util`.\n- Apply standard validation, normalization, and allowlisting before passing values into pyarrow.\n\n---\n\n## Classification\n\n- **Package name:** pyarrow  \n- **Role:** High-performance data processing and file format library (Arrow, Parquet, Feather, etc.)\n- **Primary risks:** Misuse-related (unvalidated paths/URLs/command arguments) rather than inherent design flaws or Python-level RCE.\n\nNo immediate, clearly exploitable vulnerabilities were confirmed, but several **potentially dangerous patterns** were highlighted where security depends critically on how applications using pyarrow manage and validate their inputs.",
+ "package_classification": {
+  "type": "library",
+  "layer": [
+   "data",
+   "persistence",
+   "serialization",
+   "filesystem",
+   "network-helper"
+  ]
+ },
+ "tool_calls": {
+  "get_package_profile_info": 1,
+  "execute_codeql_query": 12,
+  "validate_codeql_query": 0,
+  "fixup_codeql_query": 4,
+  "finalize_report": 1
+ },
+ "queries_executed": {
+  "critical": 1,
+  "high": 3,
+  "medium": 5,
+  "low": 0,
+  "total_executed": 15,
+  "total_with_results": 9,
+  "total_failed": 6
+ },
+ "query_findings": {
+  "critical": 0,
+  "high": 2,
+  "medium": 7,
+  "low": 0,
+  "total": 9
+ },
+ "findings": [
+  {
+   "codeql_query_uuid": "20251226033122",
+   "codeql_raw_query": "/**\n * @name Unsafe deserialization via pickle/yaml/marshal in pyarrow\n * @description Detects unsafe deserialization calls which may process untrusted data\n * @kind problem\n * @problem.severity error\n * @id pyarrow/unsafe-deserialization\n * @tags security\n *       external/cwe/cwe-502\n */\n\nimport python\nimport semmle.python.ApiGraphs\nimport semmle.python.dataflow.new.DataFlow\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport([\"pickle\", \"yaml\", \"marshal\", \"shelve\"]).getMember([\"load\", \"loads\", \"unsafe_load\", \"open\"]).getACall()\nselect call, \"Potentially unsafe deserialization operation inside pyarrow that could lead to code execution if fed untrusted data.\"",
+   "hypothesis": "pyarrow may use unsafe deserialization routines like pickle, yaml.load, or marshal on untrusted data",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-502"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251226033139",
+   "codeql_raw_query": "/**\n * @name Subprocess spawning in pyarrow\n * @description Find uses of subprocess APIs that may be impacted by user-controlled data\n * @kind problem\n * @problem.severity warning\n * @id pyarrow/subprocess-spawn\n * @tags security\n *       external/cwe/cwe-078\n */\n\nimport python\nimport semmle.python.ApiGraphs\nimport semmle.python.dataflow.new.DataFlow\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"subprocess\").getMember([\"run\", \"Popen\", \"call\", \"check_call\", \"check_output\"]).getACall()\nselect call, \"Use of subprocess API within pyarrow; review call sites for untrusted input usage.\"",
+   "hypothesis": "pyarrow may spawn subprocesses with arguments derived from user input",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-78"
+   ],
+   "results_count": 2,
+   "results": [
+    {
+     "ruleId": "pyarrow/subprocess-spawn",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "pyarrow/subprocess-spawn",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of subprocess API within pyarrow; review call sites for untrusted input usage."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pyarrow/__init__.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 320,
+         "startColumn": 16,
+         "endLine": 321,
+         "endColumn": 54
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "2bfddd257174bf2c:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "pyarrow/subprocess-spawn",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "pyarrow/subprocess-spawn",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of subprocess API within pyarrow; review call sites for untrusted input usage."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pyarrow/__init__.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 329,
+         "startColumn": 12,
+         "endLine": 330,
+         "endColumn": 52
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "b762c07e5cd446c4:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251226033321",
+   "codeql_raw_query": "/**\n * @name Taint to subprocess calls in pyarrow\n * @description Track data flow from function parameters to subprocess command arguments\n * @kind path-problem\n * @problem.severity warning\n * @id pyarrow/tainted-subprocess-call\n * @tags security\n *       external/cwe/cwe-078\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.ApiGraphs\n\nmodule SubprocessConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    source instanceof DataFlow::ParameterNode\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(DataFlow::CallCfgNode call |\n      call = API::moduleImport(\"subprocess\").getMember([\"run\", \"Popen\", \"call\", \"check_call\", \"check_output\"]).getACall() and\n      sink = call.getArg(0)\n    )\n  }\n}\n\nmodule SubprocessFlow = TaintTracking::Global<SubprocessConfig>;\nimport SubprocessFlow::PathGraph\n\nfrom SubprocessFlow::PathNode source, SubprocessFlow::PathNode sink\nwhere SubprocessFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"Tainted data from parameter flows into subprocess call $@.\", sink.getNode(), \"subprocess\"\n",
+   "hypothesis": "Function parameters may reach subprocess command arguments, allowing argument injection if parameters are attacker-controlled.",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-078"
+   ],
+   "results_count": 2,
+   "results": [
+    {
+     "ruleId": "pyarrow/tainted-subprocess-call",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "pyarrow/tainted-subprocess-call",
+      "index": 0
+     },
+     "message": {
+      "text": "Tainted data from parameter flows into subprocess call [subprocess](1).\nTainted data from parameter flows into subprocess call [subprocess](1).\nTainted data from parameter flows into subprocess call [subprocess](1)."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pyarrow/__init__.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 320,
+         "startColumn": 32,
+         "endLine": 321,
+         "endColumn": 53
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "2bfddd257174bf2c:1",
+      "primaryLocationStartColumnFingerprint": "23"
+     },
+     "codeFlows": [
+      {
+       "threadFlows": [
+        {
+         "locations": [
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "pyarrow/__init__.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 317,
+              "startColumn": 21,
+              "endColumn": 28
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for pkgname"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "pyarrow/__init__.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 320,
+              "startColumn": 32,
+              "endLine": 321,
+              "endColumn": 53
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for List"
+            }
+           }
+          }
+         ]
+        }
+       ]
+      },
+      {
+       "threadFlows": [
+        {
+         "locations": [
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "file:/",
+              "index": 1
+             }
+            },
+            "message": {
+             "text": "[summary param] self in dict.get"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "pyarrow/__init__.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 314,
+              "startColumn": 12,
+              "endColumn": 55
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for Attribute()"
+            }
+           },
+           "taxa": [
+            {
+             "id": "dict.get",
+             "properties": {
+              "CodeQL/DataflowRole": "step"
+             }
+            }
+           ]
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "pyarrow/__init__.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 320,
+              "startColumn": 33,
+              "endColumn": 61
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for _get_pkg_config_executable()"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "pyarrow/__init__.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 320,
+              "startColumn": 32,
+              "endLine": 321,
+              "endColumn": 53
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for List"
+            }
+           }
+          }
+         ]
+        }
+       ]
+      },
+      {
+       "threadFlows": [
+        {
+         "locations": [
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "file:/",
+              "index": 1
+             }
+            },
+            "message": {
+             "text": "[summary param] position 1 in dict.get"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "pyarrow/__init__.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 314,
+              "startColumn": 12,
+              "endColumn": 55
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for Attribute()"
+            }
+           },
+           "taxa": [
+            {
+             "id": "dict.get",
+             "properties": {
+              "CodeQL/DataflowRole": "step"
+             }
+            }
+           ]
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "pyarrow/__init__.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 320,
+              "startColumn": 33,
+              "endColumn": 61
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for _get_pkg_config_executable()"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "pyarrow/__init__.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 320,
+              "startColumn": 32,
+              "endLine": 321,
+              "endColumn": 53
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for List"
+            }
+           }
+          }
+         ]
+        }
+       ]
+      }
+     ],
+     "relatedLocations": [
+      {
+       "id": 1,
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pyarrow/__init__.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 320,
+         "startColumn": 32,
+         "endLine": 321,
+         "endColumn": 53
+        }
+       },
+       "message": {
+        "text": "subprocess"
+       }
+      },
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pyarrow/__init__.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 317,
+         "startColumn": 21,
+         "endColumn": 28
+        }
+       }
+      },
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "file:/",
+         "index": 1
+        }
+       }
+      }
+     ]
+    },
+    {
+     "ruleId": "pyarrow/tainted-subprocess-call",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "pyarrow/tainted-subprocess-call",
+      "index": 0
+     },
+     "message": {
+      "text": "Tainted data from parameter flows into subprocess call [subprocess](1).\nTainted data from parameter flows into subprocess call [subprocess](1).\nTainted data from parameter flows into subprocess call [subprocess](1).\nTainted data from parameter flows into subprocess call [subprocess](1)."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pyarrow/__init__.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 329,
+         "startColumn": 29,
+         "endColumn": 32
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "b762c07e5cd446c4:1",
+      "primaryLocationStartColumnFingerprint": "24"
+     },
+     "codeFlows": [
+      {
+       "threadFlows": [
+        {
+         "locations": [
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "pyarrow/__init__.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 326,
+              "startColumn": 31,
+              "endColumn": 38
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for pkgname"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "pyarrow/__init__.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 328,
+              "startColumn": 5,
+              "endColumn": 8
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for cmd"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "pyarrow/__init__.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 329,
+              "startColumn": 29,
+              "endColumn": 32
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for cmd"
+            }
+           }
+          }
+         ]
+        }
+       ]
+      },
+      {
+       "threadFlows": [
+        {
+         "locations": [
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "pyarrow/__init__.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 326,
+              "startColumn": 40,
+              "endColumn": 48
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for cli_args"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "pyarrow/__init__.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 328,
+              "startColumn": 5,
+              "endColumn": 8
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for cmd"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "pyarrow/__init__.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 329,
+              "startColumn": 29,
+              "endColumn": 32
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for cmd"
+            }
+           }
+          }
+         ]
+        }
+       ]
+      },
+      {
+       "threadFlows": [
+        {
+         "locations": [
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "file:/",
+              "index": 1
+             }
+            },
+            "message": {
+             "text": "[summary param] self in dict.get"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "pyarrow/__init__.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 314,
+              "startColumn": 12,
+              "endColumn": 55
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for Attribute()"
+            }
+           },
+           "taxa": [
+            {
+             "id": "dict.get",
+             "properties": {
+              "CodeQL/DataflowRole": "step"
+             }
+            }
+           ]
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "pyarrow/__init__.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 328,
+              "startColumn": 12,
+              "endColumn": 40
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for _get_pkg_config_executable()"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "pyarrow/__init__.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 328,
+              "startColumn": 5,
+              "endColumn": 8
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for cmd"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "pyarrow/__init__.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 329,
+              "startColumn": 29,
+              "endColumn": 32
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for cmd"
+            }
+           }
+          }
+         ]
+        }
+       ]
+      },
+      {
+       "threadFlows": [
+        {
+         "locations": [
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "file:/",
+              "index": 1
+             }
+            },
+            "message": {
+             "text": "[summary param] position 1 in dict.get"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "pyarrow/__init__.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 314,
+              "startColumn": 12,
+              "endColumn": 55
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for Attribute()"
+            }
+           },
+           "taxa": [
+            {
+             "id": "dict.get",
+             "properties": {
+              "CodeQL/DataflowRole": "step"
+             }
+            }
+           ]
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "pyarrow/__init__.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 328,
+              "startColumn": 12,
+              "endColumn": 40
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for _get_pkg_config_executable()"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "pyarrow/__init__.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 328,
+              "startColumn": 5,
+              "endColumn": 8
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for cmd"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "pyarrow/__init__.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 329,
+              "startColumn": 29,
+              "endColumn": 32
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for cmd"
+            }
+           }
+          }
+         ]
+        }
+       ]
+      }
+     ],
+     "relatedLocations": [
+      {
+       "id": 1,
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pyarrow/__init__.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 329,
+         "startColumn": 29,
+         "endColumn": 32
+        }
+       },
+       "message": {
+        "text": "subprocess"
+       }
+      },
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pyarrow/__init__.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 326,
+         "startColumn": 31,
+         "endColumn": 38
+        }
+       }
+      },
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pyarrow/__init__.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 326,
+         "startColumn": 40,
+         "endColumn": 48
+        }
+       }
+      },
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "file:/",
+         "index": 1
+        }
+       }
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251226033358",
+   "codeql_raw_query": "/**\n * @name pyarrow use of requests/network\n * @description Find network calls that may use untrusted URLs or headers\n * @kind problem\n * @problem.severity warning\n * @id pyarrow/network-usage\n * @tags security\n *       external/cwe/cwe-200\n */\n\nimport python\nimport semmle.python.ApiGraphs\nimport semmle.python.dataflow.new.DataFlow\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"requests\").getMember([\"get\", \"post\", \"put\", \"delete\", \"request\", \"Session\"]).getACall()\nselect call, \"Use of requests/network API inside pyarrow, review URL and parameters for user-controlled input.\"",
+   "hypothesis": "Identify any use of the requests HTTP client for potential SSRF/info-leak issues",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-200",
+    "cwe-918"
+   ],
+   "results_count": 1,
+   "results": [
+    {
+     "ruleId": "pyarrow/network-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "pyarrow/network-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of requests/network API inside pyarrow, review URL and parameters for user-controlled input."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pyarrow/util.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 242,
+         "startColumn": 10,
+         "endColumn": 27
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "a82deee5cdc221da:1",
+      "primaryLocationStartColumnFingerprint": "5"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251226033417",
+   "codeql_raw_query": "/**\n * @name pyarrow file-system writes\n * @description Detect functions that write to the filesystem where paths derive from parameters\n * @kind path-problem\n * @problem.severity warning\n * @id pyarrow/tainted-file-write\n * @tags security\n *       external/cwe/cwe-22\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.ApiGraphs\n\nmodule FileWriteConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) { source instanceof DataFlow::ParameterNode }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(DataFlow::CallCfgNode call |\n      (\n        call = API::moduleImport(\"os\").getMember([\"open\"]).getACall() or\n        call = API::moduleImport(\"builtins\").getMember(\"open\").getACall() or\n        call = API::moduleImport(\"pathlib.Path\").getMember([\"write_text\", \"write_bytes\", \"open\"]).getACall()\n      ) and\n      sink = call.getArg(0)\n    )\n  }\n}\n\nmodule FileWriteFlow = TaintTracking::Global<FileWriteConfig>;\nimport FileWriteFlow::PathGraph\n\nfrom FileWriteFlow::PathNode source, FileWriteFlow::PathNode sink\nwhere FileWriteFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"Function parameter flows into file write path $@.\", sink.getNode(), \"path\"",
+   "hypothesis": "Detect potential path traversal or arbitrary file write where path comes from caller",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-22",
+    "cwe-73"
+   ],
+   "results_count": 2,
+   "results": [
+    {
+     "ruleId": "pyarrow/tainted-file-write",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "pyarrow/tainted-file-write",
+      "index": 0
+     },
+     "message": {
+      "text": "Function parameter flows into file write path [path](1)."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pyarrow/util.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 236,
+         "startColumn": 19,
+         "endColumn": 27
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "3dcf8865a8c63e93:1",
+      "primaryLocationStartColumnFingerprint": "10"
+     },
+     "codeFlows": [
+      {
+       "threadFlows": [
+        {
+         "locations": [
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "pyarrow/util.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 233,
+              "startColumn": 27,
+              "endColumn": 35
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for out_path"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "pyarrow/util.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 236,
+              "startColumn": 19,
+              "endColumn": 27
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for out_path"
+            }
+           }
+          }
+         ]
+        }
+       ]
+      }
+     ],
+     "relatedLocations": [
+      {
+       "id": 1,
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pyarrow/util.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 236,
+         "startColumn": 19,
+         "endColumn": 27
+        }
+       },
+       "message": {
+        "text": "path"
+       }
+      },
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pyarrow/util.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 233,
+         "startColumn": 27,
+         "endColumn": 35
+        }
+       }
+      }
+     ]
+    },
+    {
+     "ruleId": "pyarrow/tainted-file-write",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "pyarrow/tainted-file-write",
+      "index": 0
+     },
+     "message": {
+      "text": "Function parameter flows into file write path [path](1)."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pyarrow/util.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 243,
+         "startColumn": 19,
+         "endColumn": 27
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "212800c0181dd84:1",
+      "primaryLocationStartColumnFingerprint": "10"
+     },
+     "codeFlows": [
+      {
+       "threadFlows": [
+        {
+         "locations": [
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "pyarrow/util.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 240,
+              "startColumn": 29,
+              "endColumn": 37
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for out_path"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "pyarrow/util.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 243,
+              "startColumn": 19,
+              "endColumn": 27
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for out_path"
+            }
+           }
+          }
+         ]
+        }
+       ]
+      }
+     ],
+     "relatedLocations": [
+      {
+       "id": 1,
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pyarrow/util.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 243,
+         "startColumn": 19,
+         "endColumn": 27
+        }
+       },
+       "message": {
+        "text": "path"
+       }
+      },
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pyarrow/util.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 240,
+         "startColumn": 29,
+         "endColumn": 37
+        }
+       }
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251226033501",
+   "codeql_raw_query": "/**\n * @name Dangerous eval/exec usage in pyarrow\n * @description Detects use of eval/exec which can lead to code execution if used with untrusted input\n * @kind problem\n * @problem.severity error\n * @id pyarrow/dangerous-eval-exec\n * @tags security\n *       external/cwe/cwe-094\n */\n\nimport python\nimport semmle.python.ApiGraphs\nimport semmle.python.dataflow.new.DataFlow\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::builtin([\"eval\", \"exec\"]).getACall()\nselect call, \"Use of eval/exec inside pyarrow; ensure arguments are not influenced by untrusted input.\"",
+   "hypothesis": "pyarrow may use eval/exec leading to code injection if arguments are tainted",
+   "severity": "critical",
+   "cwe_ids": [
+    "cwe-094"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251226033516",
+   "codeql_raw_query": "/**\n * @name Taint from external input to filesystem paths in pyarrow\n * @description Track flow from function parameters to filesystem path arguments\n * @kind path-problem\n * @problem.severity warning\n * @id pyarrow/tainted-path-to-filesystem\n * @tags security\n *       external/cwe/cwe-022\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.ApiGraphs\n\nmodule FsPathConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    source instanceof DataFlow::ParameterNode\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(DataFlow::CallCfgNode call |\n      (\n        call = API::moduleImport(\"os\").getMember([\"open\", \"remove\", \"unlink\"]).getACall() or\n        call = API::moduleImport(\"os.path\").getMember([\"join\", \"dirname\", \"basename\"]).getACall() or\n        call = API::moduleImport(\"pathlib\").getMember([\"Path\"]).getACall()\n      ) and\n      sink = call.getArg(0)\n    )\n  }\n}\n\nmodule FsPathFlow = TaintTracking::Global<FsPathConfig>;\nimport FsPathFlow::PathGraph\n\nfrom FsPathFlow::PathNode source, FsPathFlow::PathNode sink\nwhere FsPathFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"Function parameter flows into filesystem path $@.\", sink.getNode(), \"path\"",
+   "hypothesis": "Function parameters may reach filesystem APIs as paths, enabling path traversal or arbitrary file access",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-022"
+   ],
+   "results_count": 2,
+   "results": [
+    {
+     "ruleId": "pyarrow/tainted-path-to-filesystem",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "pyarrow/tainted-path-to-filesystem",
+      "index": 0
+     },
+     "message": {
+      "text": "Function parameter flows into filesystem path [path](1).\nFunction parameter flows into filesystem path [path](1)."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pyarrow/parquet/core.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 1988,
+         "startColumn": 27,
+         "endColumn": 49
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "eaab56ba5129c671:1",
+      "primaryLocationStartColumnFingerprint": "10"
+     },
+     "codeFlows": [
+      {
+       "threadFlows": [
+        {
+         "locations": [
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "pyarrow/parquet/core.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 1931,
+              "startColumn": 24,
+              "endColumn": 29
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for where"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "pyarrow/parquet/core.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 1988,
+              "startColumn": 43,
+              "endColumn": 48
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for where"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "pyarrow/util.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 1
+             },
+             "region": {
+              "startLine": 138,
+              "startColumn": 21,
+              "endColumn": 25
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for path"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "pyarrow/util.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 1
+             },
+             "region": {
+              "startLine": 143,
+              "startColumn": 16,
+              "endColumn": 40
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for Attribute()"
+            }
+           },
+           "taxa": [
+            {
+             "id": "AdditionalTaintStep",
+             "properties": {
+              "CodeQL/DataflowRole": "step"
+             }
+            }
+           ]
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "pyarrow/parquet/core.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 1988,
+              "startColumn": 27,
+              "endColumn": 49
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for _stringify_path()"
+            }
+           }
+          }
+         ]
+        }
+       ]
+      },
+      {
+       "threadFlows": [
+        {
+         "locations": [
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "pyarrow/util.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 1
+             },
+             "region": {
+              "startLine": 138,
+              "startColumn": 21,
+              "endColumn": 25
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for path"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "pyarrow/util.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 1
+             },
+             "region": {
+              "startLine": 143,
+              "startColumn": 16,
+              "endColumn": 40
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for Attribute()"
+            }
+           },
+           "taxa": [
+            {
+             "id": "AdditionalTaintStep",
+             "properties": {
+              "CodeQL/DataflowRole": "step"
+             }
+            }
+           ]
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "pyarrow/parquet/core.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 1988,
+              "startColumn": 27,
+              "endColumn": 49
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for _stringify_path()"
+            }
+           }
+          }
+         ]
+        }
+       ]
+      }
+     ],
+     "relatedLocations": [
+      {
+       "id": 1,
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pyarrow/parquet/core.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 1988,
+         "startColumn": 27,
+         "endColumn": 49
+        }
+       },
+       "message": {
+        "text": "path"
+       }
+      },
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pyarrow/parquet/core.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 1931,
+         "startColumn": 24,
+         "endColumn": 29
+        }
+       }
+      },
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pyarrow/util.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 138,
+         "startColumn": 21,
+         "endColumn": 25
+        }
+       }
+      }
+     ]
+    },
+    {
+     "ruleId": "pyarrow/tainted-path-to-filesystem",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "pyarrow/tainted-path-to-filesystem",
+      "index": 0
+     },
+     "message": {
+      "text": "Function parameter flows into filesystem path [path](1)."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pyarrow/feather.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 192,
+         "startColumn": 27,
+         "endColumn": 31
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "c15bd2057ab17fa:1",
+      "primaryLocationStartColumnFingerprint": "10"
+     },
+     "codeFlows": [
+      {
+       "threadFlows": [
+        {
+         "locations": [
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "pyarrow/feather.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 2
+             },
+             "region": {
+              "startLine": 115,
+              "startColumn": 23,
+              "endColumn": 27
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for dest"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "pyarrow/feather.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 2
+             },
+             "region": {
+              "startLine": 192,
+              "startColumn": 27,
+              "endColumn": 31
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for dest"
+            }
+           }
+          }
+         ]
+        }
+       ]
+      }
+     ],
+     "relatedLocations": [
+      {
+       "id": 1,
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pyarrow/feather.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 192,
+         "startColumn": 27,
+         "endColumn": 31
+        }
+       },
+       "message": {
+        "text": "path"
+       }
+      },
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pyarrow/feather.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 115,
+         "startColumn": 23,
+         "endColumn": 27
+        }
+       }
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251226033558",
+   "codeql_raw_query": "/**\n * @name Exec/eval usage in pyarrow\n * @description Detects use of eval/exec which can lead to code execution if passed untrusted input\n * @kind problem\n * @problem.severity error\n * @id pyarrow/exec-eval-usage\n * @tags security\n *       external/cwe/cwe-094\n */\n\nimport python\n\nfrom Exec exec\nselect exec, \"Use of eval/exec; ensure arguments are not derived from untrusted input.\"",
+   "hypothesis": "pyarrow may use eval/exec dynamically on data or schema definitions",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-094"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251226033613",
+   "codeql_raw_query": "/**\n * @name Unsafe yaml.load usage in pyarrow\n * @description Flags yaml.load/unsafe_load calls which may deserialize untrusted data\n * @kind problem\n * @problem.severity error\n * @id pyarrow/unsafe-yaml-load\n * @tags security\n *       external/cwe/cwe-502\n */\n\nimport python\nimport semmle.python.ApiGraphs\nimport semmle.python.dataflow.new.DataFlow\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"yaml\").getMember([\"load\", \"unsafe_load\"]).getACall()\nselect call, \"Potential unsafe yaml.load usage; prefer safe_load or ensure input is trusted.\"",
+   "hypothesis": "pyarrow may use yaml.load for configuration or schema reading",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-502"
+   ],
+   "results_count": 0,
+   "results": []
+  }
+ ]
+}

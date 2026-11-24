@@ -1,0 +1,1163 @@
+{
+ "session_id": "20251229130445",
+ "package_name": "pygments-2.19.2",
+ "package_path": "packages/pygments-2.19.2",
+ "database_path": "databases/pygments-2.19.2-db",
+ "model": "claude-sonnet-4-5-20250929",
+ "temperature": 1.0,
+ "max_tokens": 8000,
+ "iterations": 20,
+ "total_input_tokens": 385842,
+ "total_output_tokens": 10420,
+ "total_tokens": 396262,
+ "elapsed_time_seconds": 487.53,
+ "estimated_cost_usd": 1.3138,
+ "summary": "## Security Analysis Summary for Pygments 2.19.2\n\n### Overview\nPygments is a mature syntax highlighting library for Python that processes source code in various programming languages. The security analysis focused on identifying vulnerabilities related to file operations, code execution, command injection, and other common attack vectors.\n\n### Key Findings\n\n#### 🔴 CRITICAL: Arbitrary File Write via Command-Line Interface (CWE-022)\n**Location:** `pygments/cmdline.py:442`\n**Severity:** Critical\n\nA path traversal vulnerability exists in the command-line interface where user-controlled output file paths from `sys.argv` flow directly to file write operations without proper sanitization. An attacker can specify arbitrary file paths via command-line arguments (e.g., `-o` option), potentially overwriting sensitive system files.\n\n**Data Flow:**\n- Source: `sys.argv` (command-line arguments)\n- Sink: File write operation at `open(outfn, ...)`\n- Multiple flows identified from `argparse` argument parsing to file operations\n\n**Impact:** Attackers can write arbitrary files to any location accessible by the process, potentially leading to:\n- Configuration file tampering\n- Code injection via overwriting Python modules\n- Privilege escalation\n- System compromise\n\n**Recommendation:** Implement strict path validation and sanitization:\n- Reject absolute paths and path traversal sequences (`..`, `/`, etc.)\n- Restrict output to specific safe directories\n- Use `os.path.realpath()` and verify the resolved path is within allowed boundaries\n\n#### 🟡 MEDIUM: Potential Code Execution via exec() (CWE-094)\n**Locations:**\n1. `pygments/formatters/__init__.py:103`\n2. `pygments/lexers/__init__.py:154`\n3. `scripts/check_sources.py:53` (compile function)\n\n**Severity:** Medium\n\nThe code uses `exec()` for dynamic module loading when importing formatters and lexers. While no direct taint flow from user input to these exec calls was identified in the analysis, the use of exec() with string manipulation poses risks:\n- Plugin loading mechanisms could be exploited if an attacker controls the plugin path\n- Dynamic imports based on user-specified formatter/lexer names may be exploitable\n\n**Current State:** The exec calls appear to be used for internal module discovery and loading, with some input validation present.\n\n**Recommendation:**\n- Replace exec() with safer alternatives like `importlib.import_module()`\n- Implement strict allowlisting for valid formatter/lexer names\n- Add input validation to reject malicious module names\n- Consider using entry points instead of dynamic imports\n\n### Additional Observations\n\n1. **No Command Injection:** No vulnerable `subprocess` calls with `shell=True` and user input were found.\n\n2. **No Direct ReDoS:** While many regex operations exist (255+ instances), no direct flow from user input to regex pattern construction was identified.\n\n3. **No Unsafe Deserialization:** No usage of pickle, yaml.load, or other dangerous deserialization functions was found.\n\n4. **File Operations:** The package performs extensive file I/O for reading source files and writing formatted output. The primary concern is the arbitrary file write vulnerability identified above.\n\n### Security Recommendations\n\n1. **Immediate Priority:** Fix the arbitrary file write vulnerability in the command-line interface\n2. **Medium Priority:** Refactor dynamic import mechanisms to use safer alternatives\n3. **Consider:** Implement a security policy for handling untrusted input\n4. **Testing:** Add security-focused test cases for path traversal attempts\n5. **Documentation:** Document security considerations for users processing untrusted source code\n\n### Conclusion\n\nPygments has one critical vulnerability (arbitrary file write) that should be addressed immediately. The package is generally well-structured, but the command-line interface lacks proper input validation for file paths. The use of exec() for dynamic imports, while not directly exploitable in the current codebase, represents a potential attack surface that should be hardened.",
+ "package_classification": {
+  "type": [
+   "library",
+   "cli_tool"
+  ],
+  "layer": [
+   "application"
+  ]
+ },
+ "tool_calls": {
+  "get_package_profile_info": 1,
+  "execute_codeql_query": 11,
+  "validate_codeql_query": 0,
+  "fixup_codeql_query": 3,
+  "finalize_report": 1
+ },
+ "queries_executed": {
+  "critical": 3,
+  "high": 4,
+  "medium": 0,
+  "low": 0,
+  "total_executed": 14,
+  "total_with_results": 7,
+  "total_failed": 9
+ },
+ "query_findings": {
+  "critical": 0,
+  "high": 4,
+  "medium": 0,
+  "low": 0,
+  "total": 4
+ },
+ "findings": [
+  {
+   "codeql_query_uuid": "20251229130603",
+   "codeql_raw_query": "/**\n * @name Command injection via subprocess\n * @description Using subprocess functions with shell=True and user input can lead to command injection\n * @kind problem\n * @problem.severity error\n * @id py/command-injection\n * @tags security\n *        external/cwe/cwe-078\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.dataflow.new.RemoteFlowSources\nimport semmle.python.Concepts\n\nfrom SystemCommandExecution cmd, DataFlow::Node shellArg\nwhere\n  exists(DataFlow::CallCfgNode call |\n    call = cmd.getCommand().getALocalSource() and\n    shellArg = call.getArgByName(\"shell\") and\n    shellArg.asExpr().(BooleanLiteral).booleanValue() = true\n  )\nselect cmd, \"Subprocess call with shell=True may be vulnerable to command injection.\"",
+   "hypothesis": "Detect subprocess calls with shell=True which could be vulnerable to command injection",
+   "severity": "critical",
+   "cwe_ids": [
+    "cwe-078"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251229130626",
+   "codeql_raw_query": "/**\n * @name Path traversal vulnerability\n * @description Using untrusted input to construct file paths may allow path traversal attacks\n * @kind path-problem\n * @problem.severity error\n * @id py/path-injection\n * @tags security\n *        external/cwe/cwe-022\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.dataflow.new.RemoteFlowSources\nimport semmle.python.Concepts\n\nmodule PathTraversalConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    source instanceof RemoteFlowSource\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(FileSystemAccess fa |\n      sink = fa.getAPathArgument()\n    )\n  }\n}\n\nmodule PathTraversalFlow = TaintTracking::Global<PathTraversalConfig>;\nimport PathTraversalFlow::PathGraph\n\nfrom PathTraversalFlow::PathNode source, PathTraversalFlow::PathNode sink\nwhere PathTraversalFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"Path traversal from $@.\", source.getNode(), \"user input\"",
+   "hypothesis": "Path traversal via file operations - untrusted input used in file paths",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-22"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251229130701",
+   "codeql_raw_query": "/**\n * @name Code execution via eval/exec\n * @description Using eval or exec can lead to arbitrary code execution\n * @kind problem\n * @problem.severity error\n * @id py/code-execution\n * @tags security\n *        external/cwe/cwe-094\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  (\n    call = API::builtin(\"eval\").getACall() or\n    call = API::builtin(\"exec\").getACall() or\n    call = API::builtin(\"compile\").getACall()\n  )\nselect call, \"Use of \" + call.getFunction().asExpr().(Name).getId() + \" function may allow code execution.\"",
+   "hypothesis": "Check for eval/exec/compile usage that could lead to code execution",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-094"
+   ],
+   "results_count": 3,
+   "results": [
+    {
+     "ruleId": "py/code-execution",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/code-execution",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of exec function may allow code execution."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pygments/formatters/__init__.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 103,
+         "startColumn": 13,
+         "endColumn": 45
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "891b6592adba8cae:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/code-execution",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/code-execution",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of exec function may allow code execution."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pygments/lexers/__init__.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 154,
+         "startColumn": 13,
+         "endColumn": 45
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "fe6df07d02044f58:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/code-execution",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/code-execution",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of compile function may allow code execution."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "scripts/check_sources.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 53,
+         "startColumn": 9,
+         "endColumn": 46
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "a6a4c7d723a9ffe6:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251229130842",
+   "codeql_raw_query": "/**\n * @name Code injection via exec/eval\n * @description Using exec or eval with untrusted input can lead to arbitrary code execution\n * @kind path-problem\n * @problem.severity error\n * @id py/exec-code-injection\n * @tags security\n *        external/cwe/cwe-094\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.dataflow.new.RemoteFlowSources\nimport semmle.python.Concepts\nimport semmle.python.ApiGraphs\n\nmodule CodeInjectionConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    source instanceof RemoteFlowSource or\n    exists(DataFlow::CallCfgNode call |\n      call = API::moduleImport(\"sys\").getMember(\"argv\").getACall() and\n      source = call\n    ) or\n    exists(DataFlow::AttrRead attr |\n      attr = API::moduleImport(\"sys\").getMember(\"argv\").getAValueReachableFromSource() and\n      source = attr\n    )\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    sink = any(CodeExecution ce).getCode()\n  }\n}\n\nmodule CodeInjectionFlow = TaintTracking::Global<CodeInjectionConfig>;\nimport CodeInjectionFlow::PathGraph\n\nfrom CodeInjectionFlow::PathNode source, CodeInjectionFlow::PathNode sink\nwhere CodeInjectionFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"Code execution with potentially untrusted input from $@.\", source.getNode(), \"user input\"",
+   "hypothesis": "Check if exec/eval calls receive data from user-controlled sources like sys.argv or remote inputs",
+   "severity": "critical",
+   "cwe_ids": [
+    "cwe-094"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251229130949",
+   "codeql_raw_query": "/**\n * @name Regular expression injection\n * @description Using user-controlled input to build regex patterns can lead to ReDoS\n * @kind path-problem\n * @problem.severity error\n * @id py/regex-injection\n * @tags security\n *        external/cwe/cwe-1333\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.dataflow.new.RemoteFlowSources\nimport semmle.python.ApiGraphs\n\nmodule RegexInjectionConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    source instanceof RemoteFlowSource or\n    exists(DataFlow::CallCfgNode call |\n      call = API::moduleImport(\"sys\").getMember(\"argv\").getAValueReachableFromSource() and\n      source = call\n    )\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(DataFlow::CallCfgNode call |\n      call = API::moduleImport(\"re\").getMember([\"compile\", \"match\", \"search\", \"findall\", \"finditer\", \"sub\", \"subn\", \"split\"]).getACall() and\n      sink = call.getArg(0)\n    )\n  }\n}\n\nmodule RegexInjectionFlow = TaintTracking::Global<RegexInjectionConfig>;\nimport RegexInjectionFlow::PathGraph\n\nfrom RegexInjectionFlow::PathNode source, RegexInjectionFlow::PathNode sink\nwhere RegexInjectionFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"Regular expression pattern built from $@ may be vulnerable to ReDoS.\", source.getNode(), \"user input\"",
+   "hypothesis": "Check for regular expression injection where user input flows to re.compile or re.match pattern parameter",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-1333",
+    "cwe-730"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251229131125",
+   "codeql_raw_query": "/**\n * @name Arbitrary file write via user-controlled path\n * @description Writing to files where the path is controlled by user input can allow arbitrary file writes\n * @kind path-problem\n * @problem.severity error\n * @id py/arbitrary-file-write\n * @tags security\n *        external/cwe/cwe-022\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.dataflow.new.RemoteFlowSources\nimport semmle.python.Concepts\nimport semmle.python.ApiGraphs\n\nmodule FileWriteConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    source instanceof RemoteFlowSource or\n    exists(DataFlow::Node argvAccess |\n      argvAccess = API::moduleImport(\"sys\").getMember(\"argv\").getAValueReachableFromSource() and\n      source = argvAccess\n    )\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(FileSystemWriteAccess write |\n      sink = write.getAPathArgument()\n    )\n  }\n}\n\nmodule FileWriteFlow = TaintTracking::Global<FileWriteConfig>;\nimport FileWriteFlow::PathGraph\n\nfrom FileWriteFlow::PathNode source, FileWriteFlow::PathNode sink\nwhere FileWriteFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"File write with path from $@.\", source.getNode(), \"user input\"",
+   "hypothesis": "Check for arbitrary file write vulnerabilities where user input flows to file write operations",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-022",
+    "cwe-023"
+   ],
+   "results_count": 1,
+   "results": [
+    {
+     "ruleId": "py/arbitrary-file-write",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/arbitrary-file-write",
+      "index": 0
+     },
+     "message": {
+      "text": "File write with path from [user input](1).\nFile write with path from [user input](2).\nFile write with path from [user input](3).\nFile write with path from [user input](4)."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pygments/cmdline.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 442,
+         "startColumn": 28,
+         "endColumn": 33
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "a3f4c7f8e3707d20:1",
+      "primaryLocationStartColumnFingerprint": "15"
+     },
+     "codeFlows": [
+      {
+       "threadFlows": [
+        {
+         "locations": [
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "pygments/__main__.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 1
+             },
+             "region": {
+              "startLine": 15,
+              "startColumn": 36,
+              "endColumn": 44
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for Attribute"
+            }
+           },
+           "taxa": [
+            {
+             "index": 0,
+             "toolComponent": {
+              "index": 1
+             },
+             "properties": {
+              "CodeQL/DataflowRole": "source"
+             }
+            }
+           ]
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "pygments/cmdline.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 528,
+              "startColumn": 10,
+              "endColumn": 14
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for args"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "pygments/cmdline.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 637,
+              "startColumn": 31,
+              "endColumn": 39
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for Subscript"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "pygments/cmdline.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 637,
+              "startColumn": 13,
+              "endColumn": 40
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for Attribute()"
+            }
+           },
+           "taxa": [
+            {
+             "index": 1,
+             "toolComponent": {
+              "index": 1
+             },
+             "properties": {
+              "CodeQL/DataflowRole": "step"
+             }
+            }
+           ]
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "pygments/cmdline.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 637,
+              "startColumn": 5,
+              "endColumn": 10
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for argns"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "pygments/cmdline.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 640,
+              "startColumn": 35,
+              "endColumn": 40
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for argns"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "pygments/cmdline.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 182,
+              "startColumn": 24,
+              "endColumn": 29
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for argns"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "pygments/cmdline.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 404,
+              "startColumn": 5,
+              "endColumn": 10
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for outfn"
+            }
+           },
+           "taxa": [
+            {
+             "id": "AdditionalTaintStep",
+             "properties": {
+              "CodeQL/DataflowRole": "step"
+             }
+            }
+           ]
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "pygments/cmdline.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 442,
+              "startColumn": 28,
+              "endColumn": 33
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for outfn"
+            }
+           }
+          }
+         ]
+        }
+       ]
+      },
+      {
+       "threadFlows": [
+        {
+         "locations": [
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "pygments/cmdline.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 528,
+              "startColumn": 10,
+              "endColumn": 14
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for args"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "pygments/cmdline.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 637,
+              "startColumn": 31,
+              "endColumn": 39
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for Subscript"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "pygments/cmdline.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 637,
+              "startColumn": 13,
+              "endColumn": 40
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for Attribute()"
+            }
+           },
+           "taxa": [
+            {
+             "index": 1,
+             "toolComponent": {
+              "index": 1
+             },
+             "properties": {
+              "CodeQL/DataflowRole": "step"
+             }
+            }
+           ]
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "pygments/cmdline.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 637,
+              "startColumn": 5,
+              "endColumn": 10
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for argns"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "pygments/cmdline.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 640,
+              "startColumn": 35,
+              "endColumn": 40
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for argns"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "pygments/cmdline.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 182,
+              "startColumn": 24,
+              "endColumn": 29
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for argns"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "pygments/cmdline.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 404,
+              "startColumn": 5,
+              "endColumn": 10
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for outfn"
+            }
+           },
+           "taxa": [
+            {
+             "id": "AdditionalTaintStep",
+             "properties": {
+              "CodeQL/DataflowRole": "step"
+             }
+            }
+           ]
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "pygments/cmdline.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 442,
+              "startColumn": 28,
+              "endColumn": 33
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for outfn"
+            }
+           }
+          }
+         ]
+        }
+       ]
+      },
+      {
+       "threadFlows": [
+        {
+         "locations": [
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "pygments/cmdline.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 637,
+              "startColumn": 31,
+              "endColumn": 35
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for args"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "pygments/cmdline.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 637,
+              "startColumn": 31,
+              "endColumn": 39
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for Subscript"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "pygments/cmdline.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 637,
+              "startColumn": 13,
+              "endColumn": 40
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for Attribute()"
+            }
+           },
+           "taxa": [
+            {
+             "index": 1,
+             "toolComponent": {
+              "index": 1
+             },
+             "properties": {
+              "CodeQL/DataflowRole": "step"
+             }
+            }
+           ]
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "pygments/cmdline.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 637,
+              "startColumn": 5,
+              "endColumn": 10
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for argns"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "pygments/cmdline.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 640,
+              "startColumn": 35,
+              "endColumn": 40
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for argns"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "pygments/cmdline.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 182,
+              "startColumn": 24,
+              "endColumn": 29
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for argns"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "pygments/cmdline.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 404,
+              "startColumn": 5,
+              "endColumn": 10
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for outfn"
+            }
+           },
+           "taxa": [
+            {
+             "id": "AdditionalTaintStep",
+             "properties": {
+              "CodeQL/DataflowRole": "step"
+             }
+            }
+           ]
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "pygments/cmdline.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 442,
+              "startColumn": 28,
+              "endColumn": 33
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for outfn"
+            }
+           }
+          }
+         ]
+        }
+       ]
+      },
+      {
+       "threadFlows": [
+        {
+         "locations": [
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "pygments/cmdline.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 528,
+              "startColumn": 15,
+              "endColumn": 23
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for Attribute"
+            }
+           },
+           "taxa": [
+            {
+             "index": 0,
+             "toolComponent": {
+              "index": 1
+             },
+             "properties": {
+              "CodeQL/DataflowRole": "source"
+             }
+            }
+           ]
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "pygments/cmdline.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 528,
+              "startColumn": 10,
+              "endColumn": 14
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for args"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "pygments/cmdline.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 637,
+              "startColumn": 31,
+              "endColumn": 39
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for Subscript"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "pygments/cmdline.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 637,
+              "startColumn": 13,
+              "endColumn": 40
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for Attribute()"
+            }
+           },
+           "taxa": [
+            {
+             "index": 1,
+             "toolComponent": {
+              "index": 1
+             },
+             "properties": {
+              "CodeQL/DataflowRole": "step"
+             }
+            }
+           ]
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "pygments/cmdline.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 637,
+              "startColumn": 5,
+              "endColumn": 10
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for argns"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "pygments/cmdline.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 640,
+              "startColumn": 35,
+              "endColumn": 40
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for argns"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "pygments/cmdline.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 182,
+              "startColumn": 24,
+              "endColumn": 29
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for argns"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "pygments/cmdline.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 404,
+              "startColumn": 5,
+              "endColumn": 10
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for outfn"
+            }
+           },
+           "taxa": [
+            {
+             "id": "AdditionalTaintStep",
+             "properties": {
+              "CodeQL/DataflowRole": "step"
+             }
+            }
+           ]
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "pygments/cmdline.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 442,
+              "startColumn": 28,
+              "endColumn": 33
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for outfn"
+            }
+           }
+          }
+         ]
+        }
+       ]
+      }
+     ],
+     "relatedLocations": [
+      {
+       "id": 1,
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pygments/__main__.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 15,
+         "startColumn": 36,
+         "endColumn": 44
+        }
+       },
+       "message": {
+        "text": "user input"
+       }
+      },
+      {
+       "id": 2,
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pygments/cmdline.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 528,
+         "startColumn": 10,
+         "endColumn": 14
+        }
+       },
+       "message": {
+        "text": "user input"
+       }
+      },
+      {
+       "id": 3,
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pygments/cmdline.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 637,
+         "startColumn": 31,
+         "endColumn": 35
+        }
+       },
+       "message": {
+        "text": "user input"
+       }
+      },
+      {
+       "id": 4,
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pygments/cmdline.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 528,
+         "startColumn": 15,
+         "endColumn": 23
+        }
+       },
+       "message": {
+        "text": "user input"
+       }
+      },
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pygments/__main__.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 15,
+         "startColumn": 36,
+         "endColumn": 44
+        }
+       }
+      },
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pygments/cmdline.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 528,
+         "startColumn": 10,
+         "endColumn": 14
+        }
+       }
+      },
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pygments/cmdline.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 637,
+         "startColumn": 31,
+         "endColumn": 35
+        }
+       }
+      },
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pygments/cmdline.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 528,
+         "startColumn": 15,
+         "endColumn": 23
+        }
+       }
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251229131208",
+   "codeql_raw_query": "/**\n * @name Unsafe deserialization\n * @description Using pickle or other unsafe deserialization methods can lead to arbitrary code execution\n * @kind problem\n * @problem.severity error\n * @id py/unsafe-deserialization\n * @tags security\n *        external/cwe/cwe-502\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  (\n    call = API::moduleImport(\"pickle\").getMember([\"load\", \"loads\", \"Unpickler\"]).getACall() or\n    call = API::moduleImport(\"yaml\").getMember([\"load\", \"unsafe_load\"]).getACall() or\n    call = API::moduleImport(\"marshal\").getMember([\"load\", \"loads\"]).getACall() or\n    call = API::moduleImport(\"shelve\").getMember(\"open\").getACall()\n  )\nselect call, \"Potentially unsafe deserialization operation that could execute arbitrary code.\"",
+   "hypothesis": "Check for use of unsafe deserialization functions like pickle that could allow code execution",
+   "severity": "critical",
+   "cwe_ids": [
+    "cwe-502"
+   ],
+   "results_count": 0,
+   "results": []
+  }
+ ]
+}

@@ -1,0 +1,362 @@
+{
+ "session_id": "20251220111601",
+ "package_name": "setuptools-80.9.0",
+ "package_path": "packages/setuptools-80.9.0",
+ "database_path": "databases/setuptools-80.9.0-db",
+ "model": "gpt-5.1",
+ "temperature": 0.0,
+ "max_tokens": 8000,
+ "iterations": 12,
+ "total_input_tokens": 170947,
+ "total_output_tokens": 7907,
+ "total_tokens": 178854,
+ "elapsed_time_seconds": 407.66,
+ "estimated_cost_usd": 0.2928,
+ "summary": "Security analysis of setuptools 80.9.0 focused on common high‑impact vulnerability classes using CodeQL.\n\n## Package classification\n- Purpose: Python packaging/build library and tooling\n- Type: library, cli_tool\n- Layers: build-system, packaging, distribution\n\n## Analysis coverage\nUsing CodeQL with the modern Python dataflow/taint APIs, I ran targeted queries for:\n- Remote code execution via subprocess/os.system and eval/exec\n- Unsafe deserialization (pickle, yaml.load, marshal, shelve, etc.)\n- Insecure temporary file usage (tempfile.mktemp)\n- Command injection, path traversal, and other filesystem/OS interaction patterns in setuptools commands and distutils backport\n\nThe package profile shows this is a mature, widely‑used build/packaging library with many modules under `setuptools`, `_distutils`, and `_vendor`. No web‑facing or network‑facing components are present; most code runs in the context of local build/install tooling.\n\n## Key findings\n\n### 1. Use of unsafe deserialization APIs (pickle)\n- **Location 1:** `setuptools/command/bdist_egg.py:383`\n- **Location 2:** `setuptools/depends.py:133`\n- **CodeQL rule:** `py/unsafe-deserialization-apis`\n- **CWE:** CWE-502 (Deserialization of Untrusted Data)\n- **Severity:** Medium in typical usage; can be high if fed attacker‑controlled data\n\nThese locations call Python’s `pickle` APIs (or equivalent unsafe deserialization functions). CodeQL flags them because `pickle` is inherently capable of arbitrary code execution when deserializing untrusted data.\n\n**Context assessment:**\n- In setuptools, these calls are used for internal metadata and dependency handling during build/distribution.\n- Under normal operation, the data being deserialized is produced by the local build process or trusted package metadata, not by remote user input.\n- There is no evidence (from CodeQL dataflow) of tainted/remote input flowing into these deserialization calls.\n\n**Risk:**\n- Low to medium for typical developers using setuptools as intended.\n- Could become more serious if a tool or plugin built on top of setuptools starts feeding untrusted, attacker‑supplied pickle data into these APIs.\n\n**Recommendations:**\n- Keep using `pickle` only for trusted, local data.\n- Document clearly that these APIs must not be used with untrusted input.\n- If any future feature needs to deserialize untrusted data, use a safe format (JSON, TOML, or a restricted schema‑validated format) instead of `pickle`.\n\n### 2. No dataflow from remote/tainted sources into code/command execution\n- **Queries run:**\n  - Custom path‑problem query for taint flow from `RemoteFlowSource` into `os.system`, `os.popen`, and `subprocess` (`Popen`, `call`, `check_call`, `check_output`, `run`).\n  - Custom path‑problem query for taint flow from `RemoteFlowSource` into `eval`/`exec` (fixed and executed where possible).\n- **CWE:** CWE-78 (OS Command Injection), CWE-94 (Code Injection)\n- **Result:** No findings.\n\n**Interpretation:**\n- While setuptools does invoke subprocesses and interacts with the OS (as expected for build tooling), CodeQL did not find any flows where remote or user‑controlled data (as modeled by `RemoteFlowSource`) reaches these dangerous sinks.\n- This aligns with the package’s role: it is not a network server or web app and generally operates on local project configuration and files.\n\n### 3. No insecure temporary file creation via tempfile.mktemp\n- **Query:** Custom `py/insecure-tempfile-usage` looking for `tempfile.mktemp` calls.\n- **CWE:** CWE-377 (Insecure Temporary File)\n- **Result:** No uses of `tempfile.mktemp` detected.\n\n**Interpretation:**\n- Where temporary files are used, setuptools appears not to rely on the most obviously insecure temp‑file API.\n\n## Overall risk assessment\n- **Critical/high vulnerabilities:** None identified by the executed CodeQL queries.\n- **Confirmed issues:** Use of unsafe deserialization APIs (`pickle`) in internal build/metadata logic, but without any detected tainted/remote dataflow into those calls.\n- **Practical impact:** For normal use (local builds and installs), the risk is limited. The flagged patterns become dangerous only if other components misuse these APIs with untrusted data.\n\n## Recommendations for maintainers and users\n\n1. **Maintain strict trust boundaries for deserialization**\n   - Treat all `pickle` usage as trusted‑data‑only.\n   - Avoid exposing any public API that would deserialize arbitrary user‑supplied pickle blobs.\n\n2. **Prefer safe formats for new features**\n   - For any new configuration or metadata exchange, prefer JSON, TOML, or other non‑executable formats with schema validation.\n\n3. **Continue to avoid insecure temp‑file patterns**\n   - Keep using secure temp‑file APIs (`NamedTemporaryFile`, `mkstemp`, or higher‑level libraries) and avoid `tempfile.mktemp`.\n\n4. **Periodic re‑scans**\n   - Given setuptools’ central role in the Python ecosystem, periodically re‑run CodeQL and other SAST tools, especially after large refactors or when adding new command‑execution or deserialization logic.\n\nWithin the scope of this automated CodeQL‑based review and the available iteration budget, setuptools 80.9.0 does not exhibit clear, exploitable high‑severity vulnerabilities, but it does contain internal uses of unsafe deserialization APIs that warrant continued care and clear documentation around trusted vs. untrusted data boundaries.",
+ "package_classification": {
+  "type": [
+   "library",
+   "cli_tool"
+  ],
+  "layer": [
+   "build-system",
+   "packaging",
+   "distribution"
+  ]
+ },
+ "tool_calls": {
+  "get_package_profile_info": 1,
+  "execute_codeql_query": 14,
+  "validate_codeql_query": 0,
+  "fixup_codeql_query": 3,
+  "finalize_report": 1
+ },
+ "queries_executed": {
+  "critical": 2,
+  "high": 3,
+  "medium": 6,
+  "low": 0,
+  "total_executed": 16,
+  "total_with_results": 11,
+  "total_failed": 7
+ },
+ "query_findings": {
+  "critical": 0,
+  "high": 6,
+  "medium": 0,
+  "low": 0,
+  "total": 6
+ },
+ "findings": [
+  {
+   "codeql_query_uuid": "20251220111737",
+   "codeql_raw_query": "/**\n * @name Remote code execution via subprocess and os.system\n * @description Detects flows from remote/user-controlled input into dangerous command execution sinks\n * @kind path-problem\n * @problem.severity error\n * @id py/rce-subprocess-os-system\n * @tags security\n *       external/cwe/cwe-078\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.dataflow.new.RemoteFlowSources\nimport semmle.python.ApiGraphs\nimport semmle.python.Concepts\n\nmodule RCEConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    source instanceof RemoteFlowSource\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(API::CallNode call, DataFlow::Node argNode |\n      (\n        call = API::moduleImport(\"os\").getMember([\"system\", \"popen\"]).getACall() or\n        call = API::moduleImport(\"subprocess\").getMember([\"Popen\", \"call\", \"check_call\", \"check_output\", \"run\"]).getACall()\n      ) and\n      argNode = call.getArg(0) and\n      sink = argNode\n    )\n  }\n}\n\nmodule RCEFlow = TaintTracking::Global<RCEConfig>;\nimport RCEFlow::PathGraph\n\nfrom RCEFlow::PathNode source, RCEFlow::PathNode sink\nwhere RCEFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"User-controlled data reaches command execution sink $@.\", sink.getNode(), \"command\"\n",
+   "hypothesis": "User-controlled input may reach subprocess or os.system calls leading to RCE",
+   "severity": "critical",
+   "cwe_ids": [
+    "cwe-078"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251220111807",
+   "codeql_raw_query": "/**\n * @name Arbitrary code execution via eval/exec\n * @description Detects flows from remote/user-controlled input into eval/exec and similar dynamic execution sinks\n * @kind path-problem\n * @problem.severity error\n * @id py/code-injection-eval-exec\n * @tags security\n *       external/cwe/cwe-094\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.dataflow.new.RemoteFlowSources\nimport semmle.python.ApiGraphs\nimport semmle.python.Concepts\n\nmodule EvalExecConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    source instanceof RemoteFlowSource\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(API::CallNode call, DataFlow::Node argNode |\n      call = API::builtin(\"eval\").getACall() or\n      call = API::builtin(\"exec\").getACall() and\n      argNode = call.getArg(0) and\n      sink = argNode\n    )\n  }\n}\n\nmodule EvalExecFlow = TaintTracking::Global<EvalExecConfig>;\nimport EvalExecFlow::PathGraph\n\nfrom EvalExecFlow::PathNode source, EvalExecFlow::PathNode sink\nwhere EvalExecFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"User-controlled data reaches eval/exec $@.\", source.getNode(), \"code\"\n",
+   "hypothesis": "User-controlled data may reach eval/exec leading to code injection",
+   "severity": "critical",
+   "cwe_ids": [
+    "cwe-094"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251220111845",
+   "codeql_raw_query": "/**\n * @name Insecure temporary file usage\n * @description Detects use of tempfile.mktemp and similar insecure temp file patterns\n * @kind problem\n * @problem.severity warning\n * @id py/insecure-tempfile-usage\n * @tags security\n *       external/cwe/cwe-377\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"tempfile\").getMember([\"mktemp\"]).getACall()\nselect call, \"Insecure temporary file creation using tempfile.mktemp().\"",
+   "hypothesis": "Insecure temporary file creation using tempfile.mktemp",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-377"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251220111904",
+   "codeql_raw_query": "/**\n * @name Unsafe deserialization operations\n * @description Detects uses of pickle, marshal, yaml.unsafe_load and similar unsafe deserialization APIs\n * @kind problem\n * @problem.severity error\n * @id py/unsafe-deserialization-apis\n * @tags security\n *       external/cwe/cwe-502\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"pickle\").getMember([\"load\", \"loads\", \"Unpickler\"]).getACall()\n  or call = API::moduleImport(\"marshal\").getMember([\"load\", \"loads\"]).getACall()\n  or call = API::moduleImport(\"yaml\").getMember([\"load\", \"unsafe_load\"]).getACall()\nselect call, \"Potentially unsafe deserialization operation that could execute arbitrary code if fed untrusted data.\"",
+   "hypothesis": "Use of unsafe deserialization primitives",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-502"
+   ],
+   "results_count": 2,
+   "results": [
+    {
+     "ruleId": "py/unsafe-deserialization-apis",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/unsafe-deserialization-apis",
+      "index": 0
+     },
+     "message": {
+      "text": "Potentially unsafe deserialization operation that could execute arbitrary code if fed untrusted data."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "setuptools/command/bdist_egg.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 383,
+         "startColumn": 12,
+         "endColumn": 27
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "992c6d616af531bd:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/unsafe-deserialization-apis",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/unsafe-deserialization-apis",
+      "index": 0
+     },
+     "message": {
+      "text": "Potentially unsafe deserialization operation that could execute arbitrary code if fed untrusted data."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "setuptools/depends.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 133,
+         "startColumn": 24,
+         "endColumn": 39
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "f46d8b8fc24f73ef:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251220111930",
+   "codeql_raw_query": "/**\n * @name Insecure temporary file usage\n * @description Detects use of tempfile.mktemp and similar patterns that can lead to race conditions\n * @kind problem\n * @problem.severity warning\n * @id py/insecure-tempfile-usage\n * @tags security\n *       external/cwe/cwe-377\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"tempfile\").getMember(\"mktemp\").getACall()\nselect call, \"Insecure temporary file creation using tempfile.mktemp; use NamedTemporaryFile or mkstemp instead.\"",
+   "hypothesis": "Insecure temporary file creation via tempfile.mktemp",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-377"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251220111948",
+   "codeql_raw_query": "/**\n * @name Use of tarfile extraction without safety checks\n * @description Detects calls to tarfile.extractall / extract that may allow path traversal if used on untrusted archives\n * @kind problem\n * @problem.severity warning\n * @id py/tarfile-path-traversal\n * @tags security\n *       external/cwe/cwe-022\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"tarfile\").getMember([\"extractall\", \"extract\"]).getACall()\nselect call, \"Tarfile extraction without explicit path validation can lead to path traversal when used on untrusted archives.\"",
+   "hypothesis": "Potential path traversal via unsafe tarfile extraction",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-022"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251220112014",
+   "codeql_raw_query": "/**\n * @name Unsafe deserialization APIs (pickle, marshal, yaml, shelve)\n * @description Detects use of unsafe deserialization APIs that can lead to arbitrary code execution\n * @kind problem\n * @problem.severity error\n * @id py/unsafe-deserialization-apis\n * @tags security\n *       external/cwe/cwe-502\n */\n\nimport python\nimport semmle.python.ApiGraphs\nimport semmle.python.dataflow.new.DataFlow\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"pickle\").getMember([\"load\", \"loads\", \"Unpickler\"]).getACall()\n  or call = API::moduleImport(\"yaml\").getMember([\"load\", \"unsafe_load\"]).getACall()\n  or call = API::moduleImport(\"marshal\").getMember([\"load\", \"loads\"]).getACall()\n  or call = API::moduleImport(\"shelve\").getMember(\"open\").getACall()\nselect call, \"Potentially unsafe deserialization operation that could execute arbitrary code if fed untrusted data.\"",
+   "hypothesis": "Search for any use of unsafe deserialization APIs such as pickle, yaml.load, marshal, or shelve that could lead to code execution if given untrusted data.",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-502"
+   ],
+   "results_count": 2,
+   "results": [
+    {
+     "ruleId": "py/unsafe-deserialization-apis",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/unsafe-deserialization-apis",
+      "index": 0
+     },
+     "message": {
+      "text": "Potentially unsafe deserialization operation that could execute arbitrary code if fed untrusted data."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "setuptools/command/bdist_egg.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 383,
+         "startColumn": 12,
+         "endColumn": 27
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "992c6d616af531bd:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/unsafe-deserialization-apis",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/unsafe-deserialization-apis",
+      "index": 0
+     },
+     "message": {
+      "text": "Potentially unsafe deserialization operation that could execute arbitrary code if fed untrusted data."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "setuptools/depends.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 133,
+         "startColumn": 24,
+         "endColumn": 39
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "f46d8b8fc24f73ef:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251220112035",
+   "codeql_raw_query": "/**\n * @name Insecure temporary file usage\n * @description Detects use of insecure temporary file creation functions that may lead to race conditions or information disclosure\n * @kind problem\n * @problem.severity warning\n * @id py/insecure-tempfile-usage\n * @tags security\n *       external/cwe/cwe-377\n */\n\nimport python\nimport semmle.python.ApiGraphs\nimport semmle.python.dataflow.new.DataFlow\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"tempfile\").getMember([\"mktemp\"]).getACall()\nselect call, \"Insecure temporary file creation using tempfile.mktemp(), which is vulnerable to race conditions. Use NamedTemporaryFile or mkstemp instead.\"",
+   "hypothesis": "Look for insecure temporary file creation using tempfile.mktemp, which is vulnerable to race conditions.",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-377"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251220112111",
+   "codeql_raw_query": "/**\n * @name Insecure temporary file creation\n * @description Detects use of tempfile.mktemp which is insecure due to race conditions\n * @kind problem\n * @problem.severity warning\n * @id py/insecure-tempfile-mktemp\n * @tags security\n *       external/cwe/cwe-377\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere call = API::moduleImport(\"tempfile\").getMember(\"mktemp\").getACall()\nselect call, \"Insecure temporary file creation using tempfile.mktemp; use NamedTemporaryFile or mkstemp instead.\"",
+   "hypothesis": "Look for insecure tempfile.mktemp usage in setuptools packaging utilities",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-377"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251220112153",
+   "codeql_raw_query": "/**\n * @name Insecure temporary file usage\n * @description Detects use of tempfile.mktemp and similar insecure temp file patterns\n * @kind problem\n * @problem.severity warning\n * @id py/insecure-tempfile-usage\n * @tags security\n *       external/cwe/cwe-377\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"tempfile\").getMember(\"mktemp\").getACall()\nselect call, \"Insecure temporary file creation using tempfile.mktemp; use NamedTemporaryFile or mkstemp instead.\"",
+   "hypothesis": "The package may use insecure temporary file creation via tempfile.mktemp, leading to race conditions or file overwrite attacks.",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-377"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251220112215",
+   "codeql_raw_query": "/**\n * @name Unsafe deserialization APIs usage\n * @description Detects use of pickle, marshal, yaml.load, and similar unsafe deserialization APIs\n * @kind problem\n * @problem.severity warning\n * @id py/unsafe-deserialization-apis\n * @tags security\n *       external/cwe/cwe-502\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"pickle\").getMember([\"load\", \"loads\", \"Unpickler\"]).getACall() or\n  call = API::moduleImport(\"marshal\").getMember([\"load\", \"loads\"]).getACall() or\n  call = API::moduleImport(\"yaml\").getMember([\"load\", \"unsafe_load\"]).getACall()\nselect call, \"Potentially unsafe deserialization operation that could execute arbitrary code if fed untrusted data.\"",
+   "hypothesis": "The package may use unsafe deserialization APIs like pickle.load/loads or yaml.load, which can lead to arbitrary code execution if used on untrusted data.",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-502"
+   ],
+   "results_count": 2,
+   "results": [
+    {
+     "ruleId": "py/unsafe-deserialization-apis",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/unsafe-deserialization-apis",
+      "index": 0
+     },
+     "message": {
+      "text": "Potentially unsafe deserialization operation that could execute arbitrary code if fed untrusted data."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "setuptools/command/bdist_egg.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 383,
+         "startColumn": 12,
+         "endColumn": 27
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "992c6d616af531bd:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/unsafe-deserialization-apis",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/unsafe-deserialization-apis",
+      "index": 0
+     },
+     "message": {
+      "text": "Potentially unsafe deserialization operation that could execute arbitrary code if fed untrusted data."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "setuptools/depends.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 133,
+         "startColumn": 24,
+         "endColumn": 39
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "f46d8b8fc24f73ef:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    }
+   ]
+  }
+ ]
+}

@@ -1,0 +1,1186 @@
+{
+ "session_id": "20261122230743",
+ "package_name": "jsonschema-4.25.1",
+ "package_path": "packages/jsonschema-4.25.1",
+ "database_path": "databases/jsonschema-4.25.1-db",
+ "model": "gemini/gemini-4-carbon",
+ "temperature": null,
+ "max_tokens": 16000,
+ "iterations": 19,
+ "total_input_tokens": 209626,
+ "total_output_tokens": 6358,
+ "total_tokens": 215984,
+ "elapsed_time_seconds": 430.08,
+ "estimated_cost_usd": 0.0,
+ "summary": "# Security Analysis Report: `jsonschema-4.25.1`\n\n## Package Overview\n`jsonschema` is a widely used Python library and CLI tool implementing JSON Schema validation. Its core runtime codebase consists of schema validation logic (`validators.py`, `_keywords.py`, `_legacy_keywords.py`), format checkers (`_format.py`), type checkers (`_types.py`), utilities (`_utils.py`), exceptions (`exceptions.py`), and a command-line interface (`cli.py`).\n\n---\n\n## Key Security Findings\n\n### 1. Server-Side Request Forgery (SSRF) and Local File Probing via Default `$ref` Resolution (Medium / Context-Dependent High)\n- **CWEs**: CWE-918 (Server-Side Request Forgery), CWE-73 (External Control of File Name or Path)\n- **Locations**:\n  - `jsonschema/validators.py` (lines 109–115, 132–134): `_warn_for_remote_retrieve` and `_DEFAULT_REGISTRY`\n  - `jsonschema/validators.py` (lines 1183–1228): `RefResolver.resolve_remote`\n- **Analysis**:\n  - By default, `jsonschema` validators instantiate `_DEFAULT_REGISTRY = Registry(retrieve=_warn_for_remote_retrieve)` when an explicit `registry` argument is not provided.\n  - Despite emitting a deprecation warning discouraging automatic network retrieval, `_warn_for_remote_retrieve(uri)` still constructs a `urllib.request.Request` and invokes `urllib.request.urlopen(request)` on any unresolved `$ref` URI.\n  - Similarly, the legacy `RefResolver.resolve_remote(uri)` invokes `requests.get(uri)` (for `http`/`https` when `requests` is installed) or falls back to `urllib.request.urlopen(uri)` for all other schemes.\n  - Because `urllib.request.urlopen` supports `http://`, `https://`, `ftp://`, and `file://` URL schemes out of the box, validating against an **untrusted or user-controlled JSON Schema** allows an attacker to trigger arbitrary outbound HTTP/FTP requests to internal services (SSRF) or read local JSON files via `file://` URIs.\n- **Remediation**:\n  - Applications processing untrusted schemas must explicitly pass an empty or strictly allowlisted `referencing.Registry()` (with no default network `retrieve` callable) to validator classes/functions.\n  - Library maintainers should complete the deprecation cycle and disable `_warn_for_remote_retrieve` by default in future releases, or restrict `urlopen` schemes to prevent `file://` and `ftp://` access when remote retrieval is used.\n\n### 2. Regular Expression Denial of Service (ReDoS) in Schema Pattern Matching (Medium / Context-Dependent)\n- **CWEs**: CWE-1333 (Inefficient Regular Expression Complexity), CWE-400 (Uncontrolled Resource Consumption)\n- **Locations**:\n  - `jsonschema/_keywords.py` (lines 22, 218): `patternProperties` and `pattern` validators\n  - `jsonschema/_legacy_keywords.py` (line 383)\n  - `jsonschema/_format.py` (lines 18, 419): `is_regex` format checker and format validation regexes\n- **Analysis**:\n  - `jsonschema` uses Python's standard `re` module (`re.search` / `re.compile`), which employs a backtracking NFA engine without execution time bounds.\n  - When untrusted schemas are evaluated against inputs (via `pattern` or `patternProperties`), catastrophic backtracking regular expressions can cause severe CPU exhaustion and Denial of Service.\n- **Remediation**:\n  - Do not evaluate untrusted schemas without restricting or pre-validating regular expression complexity (e.g., using linear-time regex engines like `google-re2` / `re2` where ECMA-262 compatibility permits, or enforcing schema sanitization).\n\n---\n\n## Audited Areas Without Vulnerabilities\n- **Code Execution & Deserialization (CWE-94, CWE-502)**: No unsafe deserialization (`pickle`, `yaml.load`, `marshal`) or dynamic code evaluation (`eval`, `exec`) is present in the library. JSON parsing uses standard `json.loads`. Dynamic module loading in `cli.py` (via `pkgutil.resolve_name`) is strictly limited to explicit CLI arguments (such as `--validator`).\n- **OS Command Injection (CWE-78)**: Runtime package modules do not invoke `subprocess`, `os.system`, or shell commands (`noxfile.py` is development-only).",
+ "package_classification": {
+  "layer": [
+   "application",
+   "data"
+  ],
+  "type": [
+   "library",
+   "data-validation",
+   "cli"
+  ]
+ },
+ "tool_calls": {
+  "get_package_profile_info": 1,
+  "execute_codeql_query": 8,
+  "validate_codeql_query": 0,
+  "fixup_codeql_query": 0,
+  "finalize_report": 1
+ },
+ "queries_executed": {
+  "critical": 0,
+  "high": 4,
+  "medium": 1,
+  "low": 0,
+  "total_executed": 8,
+  "total_with_results": 5,
+  "total_failed": 3
+ },
+ "query_findings": {
+  "critical": 0,
+  "high": 22,
+  "medium": 9,
+  "low": 0,
+  "total": 31
+ },
+ "findings": [
+  {
+   "codeql_query_uuid": "20261122230811",
+   "codeql_raw_query": "/**\n * @name Network request sinks in jsonschema\n * @description Identifies calls to requests or urllib that may lead to SSRF or local file disclosure via URI schemes\n * @kind problem\n * @problem.severity warning\n * @id py/network-request-sinks\n * @tags security\n *       external/cwe/cwe-918\n */\n\nimport python\nimport semmle.python.ApiGraphs\nimport semmle.python.Concepts\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"requests\").getMember([\"get\", \"post\", \"put\", \"delete\", \"request\", \" head\", \"Session\"]).getACall()\n  or\n  call = API::moduleImport(\"urllib\").getMember(\"request\").getMember([\"urlopen\", \"Request\", \"urlretrieve\"]).getACall()\n  or\n  call instanceof Http::Client::Request\nselect call, \"Network request call in \" + call.getLocation().getFile().getRelativePath() + \" at line \" + call.getLocation().getStartLine().toString()\n",
+   "hypothesis": "Identify HTTP/URI request sinks (requests, urllib.request.urlopen) in jsonschema such as RefResolver remote reference resolution leading to SSRF or local file read.",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-918"
+   ],
+   "results_count": 4,
+   "results": [
+    {
+     "ruleId": "py/network-request-sinks",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/network-request-sinks",
+      "index": 0
+     },
+     "message": {
+      "text": "Network request call in jsonschema/validators.py at line 112"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "jsonschema/validators.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 112,
+         "startColumn": 15,
+         "endColumn": 44
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "75f4c3fed917aaee:1",
+      "primaryLocationStartColumnFingerprint": "10"
+     }
+    },
+    {
+     "ruleId": "py/network-request-sinks",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/network-request-sinks",
+      "index": 0
+     },
+     "message": {
+      "text": "Network request call in jsonschema/validators.py at line 113"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "jsonschema/validators.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 113,
+         "startColumn": 10,
+         "endColumn": 26
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "7dc0c8f6d10b411c:1",
+      "primaryLocationStartColumnFingerprint": "5"
+     }
+    },
+    {
+     "ruleId": "py/network-request-sinks",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/network-request-sinks",
+      "index": 0
+     },
+     "message": {
+      "text": "Network request call in jsonschema/validators.py at line 1228"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "jsonschema/validators.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 1228,
+         "startColumn": 18,
+         "endColumn": 30
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "69a4afe867e21641:1",
+      "primaryLocationStartColumnFingerprint": "5"
+     }
+    },
+    {
+     "ruleId": "py/network-request-sinks",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/network-request-sinks",
+      "index": 0
+     },
+     "message": {
+      "text": "Network request call in jsonschema/validators.py at line 1225"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "jsonschema/validators.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 1225,
+         "startColumn": 22,
+         "endColumn": 39
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "995c7e2fcbd7b863:1",
+      "primaryLocationStartColumnFingerprint": "9"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20261122230856",
+   "codeql_raw_query": "/**\n * @name Inspect network request functions and callers in validators.py\n * @description Examine functions making network requests and where they are called or referenced\n * @kind problem\n * @problem.severity warning\n * @id py/inspect-ssrf-validators\n * @tags security\n *        external/cwe/cwe-918\n */\n\nimport python\nimport semmle.python.ApiGraphs\nimport semmle.python.dataflow.new.DataFlow\n\nfrom Function func, DataFlow::CallCfgNode netCall\nwhere\n  (\n    netCall = API::moduleImport(\"requests\").getMember([\"get\", \"post\", \"request\", \"Session\"]).getACall() or\n    netCall = API::moduleImport(\"urllib\").getMember(\"request\").getMember([\"urlopen\", \"Request\", \"urlretrieve\"]).getACall()\n  ) and\n  netCall.getScope() = func\nselect netCall,\n  \"Function '\" + func.getName() + \"' (lines \" + func.getLocation().getStartLine().toString() + \"-\" +\n    func.getLocation().getEndLine().toString() + \") makes network call with arg0: \" +\n    netCall.getArg(0).asExpr().toString()\n",
+   "hypothesis": "Inspect the functions making HTTP requests in jsonschema/validators.py and check what URL arguments are passed to them.",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-918"
+   ],
+   "results_count": 4,
+   "results": [
+    {
+     "ruleId": "py/inspect-ssrf-validators",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/inspect-ssrf-validators",
+      "index": 0
+     },
+     "message": {
+      "text": "Function '_warn_for_remote_retrieve' (lines 109-109) makes network call with arg0: uri"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "jsonschema/validators.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 112,
+         "startColumn": 15,
+         "endColumn": 44
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "75f4c3fed917aaee:1",
+      "primaryLocationStartColumnFingerprint": "10"
+     }
+    },
+    {
+     "ruleId": "py/inspect-ssrf-validators",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/inspect-ssrf-validators",
+      "index": 0
+     },
+     "message": {
+      "text": "Function '_warn_for_remote_retrieve' (lines 109-109) makes network call with arg0: request"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "jsonschema/validators.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 113,
+         "startColumn": 10,
+         "endColumn": 26
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "7dc0c8f6d10b411c:1",
+      "primaryLocationStartColumnFingerprint": "5"
+     }
+    },
+    {
+     "ruleId": "py/inspect-ssrf-validators",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/inspect-ssrf-validators",
+      "index": 0
+     },
+     "message": {
+      "text": "Function 'resolve_remote' (lines 1183-1183) makes network call with arg0: uri"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "jsonschema/validators.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 1228,
+         "startColumn": 18,
+         "endColumn": 30
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "69a4afe867e21641:1",
+      "primaryLocationStartColumnFingerprint": "5"
+     }
+    },
+    {
+     "ruleId": "py/inspect-ssrf-validators",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/inspect-ssrf-validators",
+      "index": 0
+     },
+     "message": {
+      "text": "Function 'resolve_remote' (lines 1183-1183) makes network call with arg0: uri"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "jsonschema/validators.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 1225,
+         "startColumn": 22,
+         "endColumn": 39
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "995c7e2fcbd7b863:1",
+      "primaryLocationStartColumnFingerprint": "9"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20261122230929",
+   "codeql_raw_query": "/**\n * @name Remote retrieve usage and URI handling\n * @description Check how _warn_for_remote_retrieve and resolve_remote are invoked and whether they are default behaviors in validators\n * @kind problem\n * @problem.severity warning\n * @id py/remote-retrieve-usage\n * @tags security\n *        external/cwe/cwe-918\n *        external/cwe/cwe-73\n */\n\nimport python\n\nfrom AstNode n\nwhere\n  n.getLocation().getFile().getRelativePath() = \"jsonschema/validators.py\" and\n  (\n    exists(Name name | name = n and name.getId() in [\"_warn_for_remote_retrieve\", \"RefResolver\", \"_REMOTE_WARNING\", \"urlopen\", \"Registry\"]) or\n    exists(Attribute attr | attr = n and attr.getName() in [\"resolve_remote\", \"resolve_from_url\", \"handlers\"])\n  )\nselect n, n.toString() + \" in scope \" + n.getScope().toString() + \" at line \" + n.getLocation().getStartLine().toString()\n",
+   "hypothesis": "Determine if remote/file URI resolution via urlopen or requests is enabled by default in jsonschema validators or RefResolver, allowing SSRF or local file inclusion via $ref",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-918",
+    "cwe-73"
+   ],
+   "results_count": 11,
+   "results": [
+    {
+     "ruleId": "py/remote-retrieve-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/remote-retrieve-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "urlopen in scope Module jsonschema.validators at line 12"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "jsonschema/validators.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 12,
+         "startColumn": 28,
+         "endColumn": 35
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "66a63426a184dbcc:1",
+      "primaryLocationStartColumnFingerprint": "27"
+     }
+    },
+    {
+     "ruleId": "py/remote-retrieve-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/remote-retrieve-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "urlopen in scope Function _warn_for_remote_retrieve at line 110"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "jsonschema/validators.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 110,
+         "startColumn": 41,
+         "endColumn": 48
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "af71259b69827fb4:1",
+      "primaryLocationStartColumnFingerprint": "36"
+     }
+    },
+    {
+     "ruleId": "py/remote-retrieve-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/remote-retrieve-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "urlopen in scope Function _warn_for_remote_retrieve at line 113"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "jsonschema/validators.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 113,
+         "startColumn": 10,
+         "endColumn": 17
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "7dc0c8f6d10b411c:1",
+      "primaryLocationStartColumnFingerprint": "5"
+     }
+    },
+    {
+     "ruleId": "py/remote-retrieve-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/remote-retrieve-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "_warn_for_remote_retrieve in scope Module jsonschema.validators at line 109"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "jsonschema/validators.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 109,
+         "startColumn": 5,
+         "endColumn": 30
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "a40009fe48a22a8b:1",
+      "primaryLocationStartColumnFingerprint": "4"
+     }
+    },
+    {
+     "ruleId": "py/remote-retrieve-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/remote-retrieve-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "_warn_for_remote_retrieve in scope Module jsonschema.validators at line 133"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "jsonschema/validators.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 133,
+         "startColumn": 35,
+         "endColumn": 60
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "314b9100e6ae8bc2:1",
+      "primaryLocationStartColumnFingerprint": "30"
+     }
+    },
+    {
+     "ruleId": "py/remote-retrieve-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/remote-retrieve-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Attribute in scope Function __init__ at line 934"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "jsonschema/validators.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 934,
+         "startColumn": 44,
+         "endColumn": 65
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "4c9c1c66250b6fbc:1",
+      "primaryLocationStartColumnFingerprint": "31"
+     }
+    },
+    {
+     "ruleId": "py/remote-retrieve-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/remote-retrieve-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Attribute in scope Function __init__ at line 938"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "jsonschema/validators.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 938,
+         "startColumn": 9,
+         "endColumn": 22
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "8fe79c8717e5f40f:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/remote-retrieve-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/remote-retrieve-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Attribute in scope Function resolve_from_url at line 1122"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "jsonschema/validators.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 1122,
+         "startColumn": 28,
+         "endColumn": 47
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "6cbc0b1b6f8d3fb4:1",
+      "primaryLocationStartColumnFingerprint": "11"
+     }
+    },
+    {
+     "ruleId": "py/remote-retrieve-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/remote-retrieve-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Attribute in scope Function resolve_remote at line 1220"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "jsonschema/validators.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 1220,
+         "startColumn": 22,
+         "endColumn": 35
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "155c475fdc53723b:1",
+      "primaryLocationStartColumnFingerprint": "13"
+     }
+    },
+    {
+     "ruleId": "py/remote-retrieve-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/remote-retrieve-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Attribute in scope Function resolve_remote at line 1221"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "jsonschema/validators.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 1221,
+         "startColumn": 22,
+         "endColumn": 35
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "37f5b94a9fbc830f:1",
+      "primaryLocationStartColumnFingerprint": "9"
+     }
+    },
+    {
+     "ruleId": "py/remote-retrieve-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/remote-retrieve-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "urlopen in scope Function resolve_remote at line 1228"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "jsonschema/validators.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 1228,
+         "startColumn": 18,
+         "endColumn": 25
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "69a4afe867e21641:1",
+      "primaryLocationStartColumnFingerprint": "5"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20261122231012",
+   "codeql_raw_query": "/**\n * @name Default registry and resolver configuration in validators\n * @description Check how Registry and RefResolver configure remote retrieval by default\n * @kind problem\n * @problem.severity warning\n * @id py/registry-resolver-config\n * @tags security\n *        external/cwe/cwe-918\n */\n\nimport python\n\nfrom AssignStmt assign\nwhere\n  assign.getLocation().getFile().getRelativePath() = \"jsonschema/validators.py\" and\n  assign.getLocation().getStartLine() >= 105 and\n  assign.getLocation().getStartLine() <= 145\nselect assign, \"Assignment at line \" + assign.getLocation().getStartLine().toString()\n",
+   "hypothesis": "Check default Registry configuration around lines 105-145 in validators.py",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-918"
+   ],
+   "results_count": 3,
+   "results": [
+    {
+     "ruleId": "py/registry-resolver-config",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/registry-resolver-config",
+      "index": 0
+     },
+     "message": {
+      "text": "Assignment at line 111"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "jsonschema/validators.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 111,
+         "startColumn": 5,
+         "endColumn": 79
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "88bc4f95def8e0ab:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/registry-resolver-config",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/registry-resolver-config",
+      "index": 0
+     },
+     "message": {
+      "text": "Assignment at line 112"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "jsonschema/validators.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 112,
+         "startColumn": 5,
+         "endColumn": 44
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "75f4c3fed917aaee:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/registry-resolver-config",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/registry-resolver-config",
+      "index": 0
+     },
+     "message": {
+      "text": "Assignment at line 132"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "jsonschema/validators.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 132,
+         "endLine": 134,
+         "endColumn": 2
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "811c6fae629ec80c:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20261122231339",
+   "codeql_raw_query": "/**\n * @name Regular expression compilation with untrusted pattern\n * @description Compiling regular expressions from schema or format checking\n * @kind problem\n * @problem.severity warning\n * @id py/regex-compilation-check\n * @tags security\n *       external/cwe/cwe-1333\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"re\").getMember([\"compile\", \"search\", \"match\", \"fullmatch\"]).getACall()\n  and not call.getLocation().getFile().getRelativePath() = \"noxfile.py\"\nselect call, \"Regex call in \" + call.getLocation().getFile().getRelativePath() + \" at line \" + call.getLocation().getStartLine().toString()\n",
+   "hypothesis": "Identify regular expression operations in jsonschema that could lead to ReDoS (CWE-1333) when processing untrusted schemas or instances.",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-1333",
+    "cwe-400"
+   ],
+   "results_count": 9,
+   "results": [
+    {
+     "ruleId": "py/regex-compilation-check",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/regex-compilation-check",
+      "index": 0
+     },
+     "message": {
+      "text": "Regex call in jsonschema/_format.py at line 419"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "jsonschema/_format.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 419,
+         "startColumn": 17,
+         "endColumn": 37
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "8c92679fd8c9cc5b:1",
+      "primaryLocationStartColumnFingerprint": "12"
+     }
+    },
+    {
+     "ruleId": "py/regex-compilation-check",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/regex-compilation-check",
+      "index": 0
+     },
+     "message": {
+      "text": "Regex call in jsonschema/_format.py at line 18"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "jsonschema/_format.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 18,
+         "startColumn": 12,
+         "endColumn": 56
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "8f84e4a9ce75546f:1",
+      "primaryLocationStartColumnFingerprint": "11"
+     }
+    },
+    {
+     "ruleId": "py/regex-compilation-check",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/regex-compilation-check",
+      "index": 0
+     },
+     "message": {
+      "text": "Regex call in jsonschema/_keywords.py at line 22"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "jsonschema/_keywords.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 22,
+         "startColumn": 16,
+         "endColumn": 37
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "3aa4ee52fc65aab1:1",
+      "primaryLocationStartColumnFingerprint": "3"
+     }
+    },
+    {
+     "ruleId": "py/regex-compilation-check",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/regex-compilation-check",
+      "index": 0
+     },
+     "message": {
+      "text": "Regex call in jsonschema/_keywords.py at line 218"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "jsonschema/_keywords.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 218,
+         "startColumn": 17,
+         "endColumn": 43
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "56952d5aa82e1070:1",
+      "primaryLocationStartColumnFingerprint": "8"
+     }
+    },
+    {
+     "ruleId": "py/regex-compilation-check",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/regex-compilation-check",
+      "index": 0
+     },
+     "message": {
+      "text": "Regex call in jsonschema/_legacy_keywords.py at line 383"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "jsonschema/_legacy_keywords.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 383,
+         "startColumn": 20,
+         "endColumn": 48
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "78bc28e00a7cddb6:1",
+      "primaryLocationStartColumnFingerprint": "3"
+     }
+    },
+    {
+     "ruleId": "py/regex-compilation-check",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/regex-compilation-check",
+      "index": 0
+     },
+     "message": {
+      "text": "Regex call in jsonschema/_utils.py at line 82"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "jsonschema/_utils.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 3
+        },
+        "region": {
+         "startLine": 82,
+         "startColumn": 29,
+         "endColumn": 58
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "7b54fa59aacf395:1",
+      "primaryLocationStartColumnFingerprint": "16"
+     }
+    },
+    {
+     "ruleId": "py/regex-compilation-check",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/regex-compilation-check",
+      "index": 0
+     },
+     "message": {
+      "text": "Regex call in jsonschema/_utils.py at line 317"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "jsonschema/_utils.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 3
+        },
+        "region": {
+         "startLine": 317,
+         "startColumn": 20,
+         "endColumn": 48
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "78bc28e00a7cddb6:1",
+      "primaryLocationStartColumnFingerprint": "3"
+     }
+    },
+    {
+     "ruleId": "py/regex-compilation-check",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/regex-compilation-check",
+      "index": 0
+     },
+     "message": {
+      "text": "Regex call in json/bin/annotate-specification-links at line 71"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "json/bin/annotate-specification-links",
+         "uriBaseId": "%SRCROOT%",
+         "index": 4
+        },
+        "region": {
+         "startLine": 71,
+         "startColumn": 14,
+         "endColumn": 36
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "cdaba06217dd2ee4:1",
+      "primaryLocationStartColumnFingerprint": "9"
+     }
+    },
+    {
+     "ruleId": "py/regex-compilation-check",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/regex-compilation-check",
+      "index": 0
+     },
+     "message": {
+      "text": "Regex call in jsonschema/exceptions.py at line 27"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "jsonschema/exceptions.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 5
+        },
+        "region": {
+         "startLine": 27,
+         "startColumn": 42,
+         "endColumn": 79
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "e85824ca7f5623b5:1",
+      "primaryLocationStartColumnFingerprint": "41"
+     }
+    }
+   ]
+  }
+ ],
+ "cache_usage": {
+  "prompt_tokens_total": 209626,
+  "uncached_input_tokens": 200105,
+  "cache_creation_input_tokens": 0,
+  "cache_read_input_tokens": 9521,
+  "output_tokens": 6358,
+  "calls": 19,
+  "caching_enabled": false,
+  "cost_usd_with_cache": 0.464742,
+  "cost_usd_no_cache": 0.482832,
+  "cache_read_share_of_prompt": 0.0454,
+  "prices_per_mtok": {
+   "claude-sonnet-4-5-20250929": {
+    "input": 3.0,
+    "output": 15.0
+   },
+   "claude-haiku-4-5-20251001": {
+    "input": 1.0,
+    "output": 5.0
+   },
+   "deepseek/deepseek-reasoner": {
+    "input": 0.15,
+    "output": 0.6,
+    "cache_read": 0.003,
+    "cache_write_mult": 1.0,
+    "peak_mult": 2.0
+   },
+   "gpt-5.1": {
+    "input": 1.25,
+    "output": 10.0,
+    "cache_read": 0.125,
+    "cache_write_mult": 1.0
+   },
+   "gpt-4.1": {
+    "input": 2.0,
+    "output": 8.0,
+    "cache_read": 0.5,
+    "cache_write_mult": 1.0
+   },
+   "deepseek/deepseek-v4-pro": {
+    "input": 0.66,
+    "output": 1.98,
+    "cache_read": 0.022,
+    "cache_write_mult": 1.0,
+    "peak_mult": 2.0
+   },
+   "deepseek/deepseek-flash": {
+    "input": 0.15,
+    "output": 0.6,
+    "cache_read": 0.003,
+    "cache_write_mult": 1.0,
+    "peak_mult": 2.0
+   },
+   "gemini/gemini-4-carbon": {
+    "input": 2.0,
+    "output": 10.0,
+    "cache_read": 0.1,
+    "cache_write_mult": 1.0
+   },
+   "gemini/gemini-3.8-flash": {
+    "input": 0.75,
+    "output": 3.75,
+    "cache_read": 0.075,
+    "cache_write_mult": 1.0
+   },
+   "openai/gpt-6.2-sol": {
+    "input": 2.0,
+    "output": 10.0,
+    "cache_read": 0.1,
+    "cache_write_mult": 1.0,
+    "long_threshold": 272000,
+    "long": {
+     "input": 4.0,
+     "output": 15.0,
+     "cache_read": 0.2
+    }
+   },
+   "openai/gpt-6-luna": {
+    "input": 0.1,
+    "output": 0.5,
+    "cache_read": 0.01,
+    "cache_write_mult": 1.0,
+    "long_threshold": 272000,
+    "long": {
+     "input": 0.2,
+     "output": 0.75,
+     "cache_read": 0.02
+    }
+   },
+   "claude-sonnet-5-5": {
+    "input": 2.0,
+    "output": 10.0,
+    "cache_read": 0.1
+   },
+   "claude-haiku-5-5": {
+    "input": 0.1,
+    "output": 0.5,
+    "cache_read": 0.01,
+    "long_threshold": 100000,
+    "long": {
+     "input": 0.5,
+     "output": 2.5,
+     "cache_read": 0.05
+    }
+   }
+  },
+  "cache_multipliers": {
+   "write_5m": 1.25,
+   "read": 0.1
+  }
+ }
+}

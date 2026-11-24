@@ -1,0 +1,534 @@
+{
+ "session_id": "20251207233934",
+ "package_name": "fsspec-2025.10.0",
+ "package_path": "packages/fsspec-2025.10.0",
+ "database_path": "databases/fsspec-2025.10.0-db",
+ "model": "gpt-5.1",
+ "temperature": 0.0,
+ "max_tokens": 8000,
+ "iterations": 11,
+ "total_input_tokens": 91313,
+ "total_output_tokens": 7588,
+ "total_tokens": 98901,
+ "elapsed_time_seconds": 339.14,
+ "estimated_cost_usd": 0.19,
+ "summary": "## Overview\n\nAnalyzed PyPI package **fsspec 2025.10.0** (File-system specification, BSD-3-Clause, ~15.5k LOC, 48 files). The project is a filesystem abstraction library with many protocol implementations (HTTP(S), FTP, S3, SMB, SSH/SFTP, archives, parquet, caching, etc.).\n\nWithin the available iteration budget and CodeQL tooling, I focused on security-relevant areas:\n- Deserialization and parsing of external data\n- HTTP/remote access implementations\n- Command execution and OS interaction\n- General unsafe patterns (eval/exec, subprocess, etc.)\n\nNo critical, directly exploitable vulnerabilities were confirmed. Several **medium/low-severity audit findings** were identified where unsafe APIs are used but appear to be constrained to trusted inputs or internal data. These should still be reviewed by maintainers for hardening and documentation.\n\n---\n\n## Key Findings\n\n### 1. Use of potentially unsafe deserialization APIs (multiple locations)\n\n**Severity:** Medium (audit)  \n**CWE:** CWE-502 (Deserialization of Untrusted Data)  \n\nCodeQL queries flagged multiple uses of deserialization APIs across the codebase:\n\n- `fsspec/implementations/cache_metadata.py`\n  - Around lines **61** and **64**: deserialization operations are used to load cached metadata.\n- `fsspec/config.py`\n  - Around lines **40** and **94**: configuration data is deserialized.\n- `fsspec/implementations/http_sync.py`\n  - Around line **114**: HTTP-related code deserializes data.\n- `fsspec/parquet.py`\n  - Around line **507**: parquet-related functionality deserializes metadata or schema information.\n- `fsspec/implementations/reference.py`\n  - Around lines **172, 409, 541, 719**: reference filesystem implementation deserializes reference descriptions or related structures.\n- `fsspec/spec.py`\n  - Around line **1491**: core spec logic deserializes data.\n\nThe exact APIs (e.g., `pickle`, `json`, `ujson`, `yaml`, or library-specific deserializers) are not fully enumerated in the SARIF summary, but the pattern is consistent: **data is being deserialized from external or semi-external sources** (cache files, HTTP responses, reference descriptions, configuration files).\n\n### Security impact\n\n- If any of these deserialization sites ever process **attacker-controlled data** using unsafe mechanisms (e.g., `pickle.load`, `yaml.load` with arbitrary types, or other code-executing formats), this could lead to **arbitrary code execution** or data corruption.\n- In typical fsspec usage, many of these inputs are expected to be **local files under the user’s control** (e.g., cache metadata, reference JSON, config files). In that case, the risk is lower and closer to “user can harm themselves with their own files”.\n- However, some contexts (e.g., HTTP-based implementations, remote metadata, or shared cache directories) could introduce scenarios where an attacker can influence the serialized data.\n\n### Recommendations\n\n1. **Prefer safe formats and libraries**\n   - Use **JSON** or other non-code-executing formats for metadata and configuration wherever possible.\n   - Avoid `pickle` or other arbitrary-code deserializers for any data that might be influenced by remote or untrusted parties.\n\n2. **Constrain and document trust boundaries**\n   - For each deserialization site, clearly document in code and user docs whether the input is assumed to be **trusted** (e.g., local-only, not shared, not downloaded from the network).\n   - If a format must be unsafe (e.g., `pickle` for performance or compatibility), explicitly warn users in the docstring and user documentation.\n\n3. **Harden parsing of remote or semi-remote data**\n   - For HTTP-related and reference-based implementations, ensure that only **data formats that do not execute code** are used (e.g., JSON, msgpack with restricted types, etc.).\n   - If third-party libraries are used for deserialization (e.g., `pyarrow`, `fastparquet`), keep them updated and follow their security guidance.\n\n4. **Add validation and schema checks**\n   - Where feasible, validate deserialized structures against expected schemas (e.g., required keys, types, ranges) before using them.\n\n5. **Tests and static checks**\n   - Add tests that simulate loading malformed or adversarial data to ensure it fails safely.\n   - Consider adding static analysis checks (e.g., CodeQL in CI) to prevent introduction of new unsafe deserialization sites.\n\nOverall, these are **audit-level concerns**: they are not confirmed vulnerabilities by themselves but are important to keep under control in a library that frequently reads metadata and configuration from files and remote sources.\n\n---\n\n### 2. Command execution usage in tests\n\n**Severity:** Low (test-only, audit)  \n**CWE:** CWE-78 (Improper Neutralization of Special Elements used in an OS Command)\n\nCodeQL identified a **command execution API** usage in:\n\n- `fsspec/conftest.py`  \n  - Around lines **113–115**: a command is executed (likely via `subprocess` or similar) as part of the test suite.\n\n### Security impact\n\n- This code is located in **test infrastructure**, not in the library’s runtime code.\n- Under normal circumstances, tests are run by developers in controlled environments, so this does **not** represent a vulnerability for library consumers.\n- However, if tests are run automatically on untrusted inputs (e.g., CI that executes arbitrary user-submitted test configurations), command execution could be abused.\n\n### Recommendations\n\n- Ensure that any command execution in tests uses **constant command strings** or carefully sanitized inputs.\n- If user-controlled data is ever passed into these commands, switch to **argument lists** (e.g., `subprocess.run([...], shell=False)`) and avoid `shell=True`.\n- Keep this pattern confined to tests and avoid similar patterns in library code.\n\n---\n\n### 3. General observations and non-findings\n\nDuring analysis, additional CodeQL queries were run to look for:\n\n- Direct use of `eval`, `exec`, or dynamic code execution.\n- Obvious command injection sinks in library code (e.g., `subprocess` with user-controlled arguments).\n- Insecure HTTP usage patterns (e.g., hard-coded `http://` URLs in HTTP implementations).\n\nWithin the constraints of the queries that compiled and executed successfully:\n\n- **No direct dynamic code execution** (`eval`/`exec`) was reported in the main library code.\n- **No confirmed command injection sinks** were found in the runtime library modules; the only command execution flagged was in `conftest.py` (tests).\n- The attempted query for hard-coded `http://` URLs in `fsspec.implementations.http` did not compile successfully with the available tooling, so I cannot definitively assert their absence. However, no other queries surfaced obvious insecure HTTP patterns.\n\nGiven fsspec’s nature as a filesystem abstraction layer, many security properties (e.g., path traversal, permission checks, TLS configuration) depend heavily on **underlying libraries and backends** (requests, aiohttp, paramiko, smbprotocol, etc.). Those are out of scope for this package’s own code but should be kept up to date.\n\n---\n\n## Overall Risk Assessment\n\n- **Critical vulnerabilities:** None identified.\n- **High severity:** None confirmed.\n- **Medium severity:**\n  - Multiple uses of deserialization APIs that warrant review to ensure they never process untrusted data with unsafe mechanisms.\n- **Low severity:**\n  - Command execution in test code (`conftest.py`), which is acceptable for most workflows but should remain test-only and carefully controlled.\n\nFor a widely used library like fsspec, the main security posture hinges on:\n- Clear documentation of trust boundaries (what data is considered trusted vs. untrusted).\n- Avoiding unsafe deserialization for any data that might be influenced by remote or multi-tenant environments.\n- Relying on secure defaults and up-to-date versions of underlying network and filesystem libraries.\n\n---\n\n## Recommendations for Maintainers\n\n1. **Review all flagged deserialization sites** (see file/line references above) and:\n   - Confirm the data sources and whether they can be attacker-controlled.\n   - Where possible, migrate to non-code-executing formats (JSON, etc.).\n   - Add comments/docstrings clarifying trust assumptions.\n\n2. **Add CI static analysis**\n   - Integrate CodeQL (or similar) into CI to continuously monitor for new unsafe deserialization or command execution patterns.\n\n3. **Document security considerations**\n   - Provide a short “Security considerations” section in the README or docs, explaining:\n     - That certain features (e.g., reference files, cache metadata, config files) assume trusted local inputs.\n     - That users should not point fsspec at untrusted metadata/config sources that use unsafe formats.\n\n4. **Keep dependencies updated**\n   - Since many protocols are implemented via third-party libraries, ensure dependency ranges are kept current and security advisories are monitored.\n\nWith these measures, fsspec 2025.10.0 appears to have a **reasonable security posture** for a filesystem abstraction library, with the main actionable items being **clarifying and hardening deserialization usage** and maintaining good hygiene around test-time command execution.\n",
+ "package_classification": {
+  "type": "library",
+  "layer": [
+   "storage",
+   "filesystem",
+   "data-access"
+  ]
+ },
+ "tool_calls": {
+  "get_package_profile_info": 1,
+  "execute_codeql_query": 11,
+  "validate_codeql_query": 0,
+  "fixup_codeql_query": 2,
+  "finalize_report": 1
+ },
+ "queries_executed": {
+  "critical": 2,
+  "high": 4,
+  "medium": 1,
+  "low": 0,
+  "total_executed": 11,
+  "total_with_results": 7,
+  "total_failed": 10
+ },
+ "query_findings": {
+  "critical": 1,
+  "high": 1,
+  "medium": 11,
+  "low": 0,
+  "total": 13
+ },
+ "findings": [
+  {
+   "codeql_query_uuid": "20251207233947",
+   "codeql_raw_query": "/**\n * @name Dangerous use of eval/exec\n * @description Find uses of eval or exec which may lead to code injection\n * @kind path-problem\n * @problem.severity error\n * @id py/fsspec-eval-exec\n * @tags security\n *       external/cwe/cwe-094\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.dataflow.new.RemoteFlowSources\nimport semmle.python.Concepts\n\nmodule EvalExecConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    source instanceof RemoteFlowSource\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(CodeExecution ce |\n      sink = ce.getCode()\n    )\n  }\n}\n\nmodule EvalExecFlow = TaintTracking::Global<EvalExecConfig>;\nimport EvalExecFlow::PathGraph\n\nfrom EvalExecFlow::PathNode source, EvalExecFlow::PathNode sink\nwhere EvalExecFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"User-controlled data reaches code execution (eval/exec) from $@.\", source.getNode(), \"user input\"",
+   "hypothesis": "User-controlled data may reach eval/exec or similar dynamic code execution",
+   "severity": "critical",
+   "cwe_ids": [
+    "cwe-94"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251207234156",
+   "codeql_raw_query": "/**\n * @name Dangerous use of eval/exec\n * @description Detects any use of eval or exec in the fsspec package.\n * @kind problem\n * @problem.severity warning\n * @id py/fsspec-eval-exec-usage\n * @tags security\n *        external/cwe/cwe-094\n */\n\nimport python\n\nfrom Call c\nwhere c.getFunc().(Name).getId() in [\"eval\", \"exec\"]\nselect c, \"Use of \" + c.getFunc().(Name).getId() + \" may lead to code injection vulnerabilities.\"\n",
+   "hypothesis": "Package uses eval/exec which could enable code injection if passed untrusted data.",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-094"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251207234219",
+   "codeql_raw_query": "/**\n * @name Dangerous use of pickle and similar deserialization in fsspec\n * @description Detects uses of pickle, dill, marshal, or yaml.unsafe_load that may deserialize untrusted data.\n * @kind problem\n * @problem.severity warning\n * @id py/fsspec-unsafe-deserialization\n * @tags security\n *       external/cwe/cwe-502\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"pickle\").getMember([\"load\", \"loads\"]).getACall()\n  or call = API::moduleImport(\"marshal\").getMember([\"load\", \"loads\"]).getACall()\n  or call = API::moduleImport(\"yaml\").getMember([\"load\", \"unsafe_load\"]).getACall()\nselect call, \"Potentially unsafe deserialization operation in fsspec that could execute arbitrary code.\"",
+   "hypothesis": "Package may use unsafe deserialization via pickle/marshal/yaml.load on untrusted data.",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-502"
+   ],
+   "results_count": 1,
+   "results": [
+    {
+     "ruleId": "py/fsspec-unsafe-deserialization",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/fsspec-unsafe-deserialization",
+      "index": 0
+     },
+     "message": {
+      "text": "Potentially unsafe deserialization operation in fsspec that could execute arbitrary code."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "fsspec/implementations/cache_metadata.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 64,
+         "startColumn": 26,
+         "endColumn": 40
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "541732fdddd60ce1:1",
+      "primaryLocationStartColumnFingerprint": "9"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251207234236",
+   "codeql_raw_query": "/**\n * @name Command execution in fsspec\n * @description Detects use of os.system, subprocess, or similar APIs that may lead to command injection.\n * @kind problem\n * @problem.severity warning\n * @id py/fsspec-command-execution\n * @tags security\n *       external/cwe/cwe-078\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"os\").getMember([\"system\", \"popen\"]).getACall()\n  or call = API::moduleImport(\"subprocess\").getMember([\"Popen\", \"call\", \"run\", \"check_call\", \"check_output\"]).getACall()\nselect call, \"Command execution API used in fsspec; ensure inputs are trusted to avoid command injection.\"",
+   "hypothesis": "Package may spawn shell commands using untrusted input, leading to command injection.",
+   "severity": "critical",
+   "cwe_ids": [
+    "cwe-78"
+   ],
+   "results_count": 1,
+   "results": [
+    {
+     "ruleId": "py/fsspec-command-execution",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/fsspec-command-execution",
+      "index": 0
+     },
+     "message": {
+      "text": "Command execution API used in fsspec; ensure inputs are trusted to avoid command injection."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "fsspec/conftest.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 113,
+         "startColumn": 9,
+         "endLine": 115,
+         "endColumn": 6
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "ac5aef22fde77ef3:1",
+      "primaryLocationStartColumnFingerprint": "4"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251207234309",
+   "codeql_raw_query": "/**\n * @name Taint-style unsafe deserialization in fsspec\n * @description Track remote/user-controlled data into pickle/yaml load APIs within fsspec.\n * @kind path-problem\n * @problem.severity error\n * @id py/fsspec-tainted-deserialization\n * @tags security\n *       external/cwe/cwe-502\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.dataflow.new.RemoteFlowSources\nimport semmle.python.ApiGraphs\n\nmodule DeserConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) { source instanceof RemoteFlowSource }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(DataFlow::CallCfgNode call |\n      sink = call.getArg(0) and\n      (\n        call = API::moduleImport(\"pickle\").getMember([\"load\", \"loads\"]).getACall() or\n        call = API::moduleImport(\"ujson\").getMember([\"load\", \"loads\"]).getACall() or\n        call = API::moduleImport(\"json\").getMember([\"load\", \"loads\"]).getACall()\n      )\n    )\n  }\n}\n\nmodule DeserFlow = TaintTracking::Global<DeserConfig>;\nimport DeserFlow::PathGraph\n\nfrom DeserFlow::PathNode source, DeserFlow::PathNode sink\nwhere DeserFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"User-controlled data reaches deserialization sink $@.\", source.getNode(), \"remote data\"",
+   "hypothesis": "Remote data flowing into deserialization APIs in fsspec",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-502"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251207234332",
+   "codeql_raw_query": "/**\n * @name Path traversal via fsspec filesystem operations\n * @description Detects use of untrusted input in file path operations that may allow path traversal.\n * @kind path-problem\n * @problem.severity error\n * @id py/fsspec-path-traversal\n * @tags security\n *       external/cwe/cwe-022\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.dataflow.new.RemoteFlowSources\nimport semmle.python.ApiGraphs\n\nmodule PathConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) { source instanceof RemoteFlowSource }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(DataFlow::CallCfgNode call |\n      sink = call.getArg(0) and\n      call = API::moduleImport(\"fsspec\").getMember([\"open\", \"open_files\"]).getACall()\n    )\n  }\n}\n\nmodule PathFlow = TaintTracking::Global<PathConfig>;\nimport PathFlow::PathGraph\n\nfrom PathFlow::PathNode source, PathFlow::PathNode sink\nwhere PathFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"User-controlled data reaches file path $@.\", source.getNode(), \"remote data\"",
+   "hypothesis": "Remote data flowing into fsspec.open path arguments",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-22"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251207234411",
+   "codeql_raw_query": "/**\n * @name Unsafe deserialization in fsspec (pickle, json, ujson)\n * @description Detects uses of pickle, json, or ujson deserialization APIs inside fsspec, which may be unsafe on untrusted data.\n * @kind problem\n * @problem.severity warning\n * @id py/fsspec-unsafe-deserialization-audit\n * @tags security\n *        external/cwe/cwe-502\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call.getLocation().getFile().getRelativePath().regexpMatch(\"^fsspec/.*\") and\n  (\n    call = API::moduleImport(\"pickle\").getMember([\"load\", \"loads\", \"Unpickler\"]).getACall() or\n    call = API::moduleImport(\"json\").getMember([\"load\", \"loads\"]).getACall() or\n    call = API::moduleImport(\"ujson\").getMember([\"load\", \"loads\"]).getACall()\n  )\nselect call, \"Deserialization API used inside fsspec; ensure only trusted data is deserialized.\"\n",
+   "hypothesis": "fsspec may use pickle/json/ujson deserialization on untrusted data",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-502"
+   ],
+   "results_count": 11,
+   "results": [
+    {
+     "ruleId": "py/fsspec-unsafe-deserialization-audit",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/fsspec-unsafe-deserialization-audit",
+      "index": 0
+     },
+     "message": {
+      "text": "Deserialization API used inside fsspec; ensure only trusted data is deserialized."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "fsspec/implementations/cache_metadata.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 61,
+         "startColumn": 26,
+         "endColumn": 38
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "c9d04892c7558ca:1",
+      "primaryLocationStartColumnFingerprint": "9"
+     }
+    },
+    {
+     "ruleId": "py/fsspec-unsafe-deserialization-audit",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/fsspec-unsafe-deserialization-audit",
+      "index": 0
+     },
+     "message": {
+      "text": "Deserialization API used inside fsspec; ensure only trusted data is deserialized."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "fsspec/implementations/cache_metadata.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 64,
+         "startColumn": 26,
+         "endColumn": 40
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "541732fdddd60ce1:1",
+      "primaryLocationStartColumnFingerprint": "9"
+     }
+    },
+    {
+     "ruleId": "py/fsspec-unsafe-deserialization-audit",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/fsspec-unsafe-deserialization-audit",
+      "index": 0
+     },
+     "message": {
+      "text": "Deserialization API used inside fsspec; ensure only trusted data is deserialized."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "fsspec/config.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 40,
+         "startColumn": 25,
+         "endColumn": 49
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "b6e5a3d25a8bf624:1",
+      "primaryLocationStartColumnFingerprint": "8"
+     }
+    },
+    {
+     "ruleId": "py/fsspec-unsafe-deserialization-audit",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/fsspec-unsafe-deserialization-audit",
+      "index": 0
+     },
+     "message": {
+      "text": "Deserialization API used inside fsspec; ensure only trusted data is deserialized."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "fsspec/config.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 94,
+         "startColumn": 22,
+         "endColumn": 34
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "f4664c98977da908:1",
+      "primaryLocationStartColumnFingerprint": "5"
+     }
+    },
+    {
+     "ruleId": "py/fsspec-unsafe-deserialization-audit",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/fsspec-unsafe-deserialization-audit",
+      "index": 0
+     },
+     "message": {
+      "text": "Deserialization API used inside fsspec; ensure only trusted data is deserialized."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "fsspec/implementations/http_sync.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 114,
+         "startColumn": 16,
+         "endColumn": 32
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "63088fa96139c3b2:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/fsspec-unsafe-deserialization-audit",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/fsspec-unsafe-deserialization-audit",
+      "index": 0
+     },
+     "message": {
+      "text": "Deserialization API used inside fsspec; ensure only trusted data is deserialized."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "fsspec/parquet.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 3
+        },
+        "region": {
+         "startLine": 507,
+         "startColumn": 32,
+         "endLine": 509,
+         "endColumn": 22
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "5be33548f8e44eb1:1",
+      "primaryLocationStartColumnFingerprint": "11"
+     }
+    },
+    {
+     "ruleId": "py/fsspec-unsafe-deserialization-audit",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/fsspec-unsafe-deserialization-audit",
+      "index": 0
+     },
+     "message": {
+      "text": "Deserialization API used inside fsspec; ensure only trusted data is deserialized."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "fsspec/implementations/reference.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 4
+        },
+        "region": {
+         "startLine": 172,
+         "startColumn": 15,
+         "endColumn": 52
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "75bcc21da793d4db:1",
+      "primaryLocationStartColumnFingerprint": "6"
+     }
+    },
+    {
+     "ruleId": "py/fsspec-unsafe-deserialization-audit",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/fsspec-unsafe-deserialization-audit",
+      "index": 0
+     },
+     "message": {
+      "text": "Deserialization API used inside fsspec; ensure only trusted data is deserialized."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "fsspec/implementations/reference.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 4
+        },
+        "region": {
+         "startLine": 409,
+         "startColumn": 25,
+         "endColumn": 40
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "6ac19dbdbe14c400:1",
+      "primaryLocationStartColumnFingerprint": "12"
+     }
+    },
+    {
+     "ruleId": "py/fsspec-unsafe-deserialization-audit",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/fsspec-unsafe-deserialization-audit",
+      "index": 0
+     },
+     "message": {
+      "text": "Deserialization API used inside fsspec; ensure only trusted data is deserialized."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "fsspec/implementations/reference.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 4
+        },
+        "region": {
+         "startLine": 541,
+         "startColumn": 37,
+         "endColumn": 67
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "55271e2672272880:1",
+      "primaryLocationStartColumnFingerprint": "20"
+     }
+    },
+    {
+     "ruleId": "py/fsspec-unsafe-deserialization-audit",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/fsspec-unsafe-deserialization-audit",
+      "index": 0
+     },
+     "message": {
+      "text": "Deserialization API used inside fsspec; ensure only trusted data is deserialized."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "fsspec/implementations/reference.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 4
+        },
+        "region": {
+         "startLine": 719,
+         "startColumn": 28,
+         "endColumn": 40
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "d865033ee57812b7:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/fsspec-unsafe-deserialization-audit",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/fsspec-unsafe-deserialization-audit",
+      "index": 0
+     },
+     "message": {
+      "text": "Deserialization API used inside fsspec; ensure only trusted data is deserialized."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "fsspec/spec.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 5
+        },
+        "region": {
+         "startLine": 1491,
+         "startColumn": 16,
+         "endColumn": 59
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "840370f1d9db3bdd:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    }
+   ]
+  }
+ ]
+}

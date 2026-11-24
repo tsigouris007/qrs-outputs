@@ -1,0 +1,3091 @@
+{
+ "session_id": "20261119202603",
+ "package_name": "pyyaml-5.3",
+ "package_path": "packages/pyyaml-5.3",
+ "database_path": "databases/pyyaml-5.3-db",
+ "model": "deepseek/deepseek-reasoner",
+ "temperature": 0.0,
+ "max_tokens": 8000,
+ "iterations": 19,
+ "total_input_tokens": 211689,
+ "total_output_tokens": 33470,
+ "total_tokens": 245159,
+ "elapsed_time_seconds": 491.03,
+ "estimated_cost_usd": 0.0733,
+ "summary": "## Security Analysis: PyYAML 5.3\n\n### Summary\nPyYAML 5.3 is the YAML parser/emitter library (`yaml` package, shipped as both `lib/yaml` for Python 2 and `lib3/yaml` for Python 3). The analysis confirms the well-known **unsafe deserialization / arbitrary code execution** weakness class — the package intentionally implements the PyYAML \"python object\" tag family, and in version 5.3 the *default and \"full\"* loaders still expose those tags. This is the root cause of **CVE-2020-1747**, fixed later in 5.3.1/5.4.\n\n### Key Findings\n\n**1. Dynamic object-construction sinks reachable from YAML content (critical) — CWE-502 / CWE-94 / CWE-470**\n- `lib/yaml/constructor.py:514,529` and `lib3/yaml/constructor.py:507,522,704,707` — `find_python_module` / `find_python_name` call `__import__(...)` on names parsed directly out of the YAML document (`node.value.split('.')`), so a document controls which module gets imported.\n- `make_python_instance` performs a **dynamic call through the YAML-controlled name** (`lib3/yaml/constructor.py:575` = `cls(*args, **kwds)`, `lib3/yaml/constructor.py:591` = `cls.__new__(cls, *args, **kwds)`; `lib/yaml/constructor.py:572,588`). This lets an attacker name any importable callable/class (e.g. `os.system`, `subprocess.check_output`, `eval`) and supply arguments from the YAML body → arbitrary command execution.\n\n**2. Object-construction tags registered and enabled**\n`FullConstructor.register_python_*` functions register: `python/none`, `python/bool`, `python/str`, `python/unicode`, `python/bytes`, `python/int`, `python/long`, `python/float`, `python/complex`, `python/list`, `python/tuple`, `python/dict` (lib3 638–696, lib 654–696) **plus the dangerous object tags** `python/name:`, `python/module:`, `python/object:`, `python/object/new:`, `python/object/apply:` (lib3 687–715, lib 699–727) with corresponding `construct_python_*` handlers (`construct_python_object`, `construct_python_object_apply`, `construct_python_object_new`, `set_python_instance_state`, lib3 547–635, lib 554–651).\n\n**3. Default loader is not safe (CVE-2020-1747)**\n`lib/yaml/__init__.py` and `lib3/yaml/__init__.py` bind `load`/`full_load`/`load_all` (lines 110, 125, 142, 152, 407/411) to **FullLoader**, which inherits the `FullConstructor` python-tag handling. Consequently `yaml.load(untrusted_data)`, `yaml.full_load(...)`, and `yaml.load_all(...)` in 5.3 can execute arbitrary code from a hostile YAML document — no `unsafe_load`/`UnsafeLoader` (lines 182, 192) needed by the caller. `yaml.safe_load`/`SafeLoader`/`SafeConstructor` is the only safe path (it does not include the python object tags).\n\n**4. Representer/emitter side (lower severity)**\n`lib/yaml/representer.py` (345–439) and `lib3/yaml/representer.py` (290–361) serialize objects using the same `python/object`, `python/object/new:`, `python/object/apply:`, `python/name:`, `python/module:` tags (including a formatted `tag:yaml.org,2002:python/object/apply:%s.%s`). Combined with the permissive FullLoader default, this makes round-tripping untrusted YAML dangerous and enables gadget-style payloads.\n\n### Impact\nAny application calling `yaml.load()`, `yaml.full_load()`, or `yaml.load_all()` on attacker-influenced input runs with the chance of full remote code execution in the process context. PyYAML 5.3 predates the 5.3.1/5.4 hardening (restriction of python tags to `UnsafeLoader` and warnings on bare `load()`).\n\n### Recommendation\nUpgrade to PyYAML >= 5.4 and always use `yaml.safe_load()` / `SafeLoader` for untrusted documents; never pass untrusted input to `load`, `full_load`, `unsafe_load`, `load_all`, or `FullLoader`/`UnsafeLoader`.",
+ "package_classification": {
+  "type": [
+   "library"
+  ],
+  "layer": [
+   "data",
+   "application"
+  ]
+ },
+ "tool_calls": {
+  "get_package_profile_info": 1,
+  "execute_codeql_query": 25,
+  "validate_codeql_query": 0,
+  "fixup_codeql_query": 1,
+  "finalize_report": 1
+ },
+ "queries_executed": {
+  "critical": 4,
+  "high": 5,
+  "medium": 0,
+  "low": 0,
+  "total_executed": 25,
+  "total_with_results": 9,
+  "total_failed": 19
+ },
+ "query_findings": {
+  "critical": 50,
+  "high": 43,
+  "medium": 0,
+  "low": 0,
+  "total": 93
+ },
+ "findings": [
+  {
+   "codeql_query_uuid": "20261119202626",
+   "codeql_raw_query": "/**\n * @name Dangerous function calls in PyYAML\n * @description Identifies calls to code execution, command execution and deserialization sinks\n * @kind problem\n * @problem.severity warning\n * @id py/pyyaml-dangerous-calls\n * @tags security\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call, string kind\nwhere\n  (\n    call = API::builtin(\"eval\").getACall() and kind = \"eval\"\n    or\n    call = API::builtin(\"exec\").getACall() and kind = \"exec\"\n    or\n    call = API::builtin(\"compile\").getACall() and kind = \"compile\"\n    or\n    call = API::moduleImport(\"os\").getMember([\"system\", \"popen\", \"execv\", \"execve\", \"spawnl\", \"spawnv\"]).getACall() and kind = \"os command\"\n    or\n    call = API::moduleImport(\"subprocess\").getMember([\"call\", \"run\", \"Popen\", \"check_output\", \"check_call\"]).getACall() and kind = \"subprocess\"\n    or\n    call = API::moduleImport(\"pickle\").getMember([\"load\", \"loads\"]).getACall() and kind = \"pickle load\"\n    or\n    call = API::moduleImport(\"marshal\").getMember([\"load\", \"loads\"]).getACall() and kind = \"marshal load\"\n  )\nselect call, \"Dangerous sink (\" + kind + \") reachable in PyYAML\"\n",
+   "hypothesis": "PyYAML contains code-execution / deserialization sinks (eval, exec, pickle, os.system) that may be reachable from untrusted YAML input",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-502",
+    "cwe-94",
+    "cwe-78"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20261119202646",
+   "codeql_raw_query": "/**\n * @name Dangerous calls in PyYAML\n * @description Finds eval/exec/pickle/os.system style calls inside the package\n * @kind problem\n * @problem.severity warning\n * @id py/pyyaml-dangerous-calls\n * @tags security\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call, string what\nwhere\n  (\n    call = API::builtin([\"eval\", \"exec\", \"compile\"]).getACall() and what = \"eval/exec/compile\"\n    or\n    call = API::moduleImport(\"os\").getMember([\"system\", \"popen\"]).getACall() and what = \"os shell\"\n    or\n    call = API::moduleImport(\"subprocess\").getMember([\"call\", \"run\", \"Popen\", \"check_output\", \"check_call\"]).getACall() and what = \"subprocess\"\n    or\n    call = API::moduleImport(\"pickle\").getMember([\"load\", \"loads\", \"Unpickler\"]).getACall() and what = \"pickle\"\n    or\n    call = API::moduleImport(\"marshal\").getMember([\"load\", \"loads\"]).getACall() and what = \"marshal\"\n    or\n    call = API::builtin(\"__import__\").getACall() and what = \"import\"\n  )\nselect call, \"Dangerous call: \" + what",
+   "hypothesis": "Library contains dangerous evaluation/deserialization sinks (CWE-94, CWE-502)",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-94",
+    "cwe-502"
+   ],
+   "results_count": 4,
+   "results": [
+    {
+     "ruleId": "py/pyyaml-dangerous-calls",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pyyaml-dangerous-calls",
+      "index": 0
+     },
+     "message": {
+      "text": "Dangerous call: import"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "lib3/yaml/constructor.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 513,
+         "startColumn": 17,
+         "endColumn": 33
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "272a175984837d25:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/pyyaml-dangerous-calls",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pyyaml-dangerous-calls",
+      "index": 0
+     },
+     "message": {
+      "text": "Dangerous call: import"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "lib3/yaml/constructor.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 533,
+         "startColumn": 17,
+         "endColumn": 40
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "4872e4c281270e82:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/pyyaml-dangerous-calls",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pyyaml-dangerous-calls",
+      "index": 0
+     },
+     "message": {
+      "text": "Dangerous call: import"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "lib/yaml/constructor.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 520,
+         "startColumn": 17,
+         "endColumn": 33
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "a9d7e6c2a0c8ffb5:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/pyyaml-dangerous-calls",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pyyaml-dangerous-calls",
+      "index": 0
+     },
+     "message": {
+      "text": "Dangerous call: import"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "lib/yaml/constructor.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 540,
+         "startColumn": 17,
+         "endColumn": 40
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "5e8aab8724d7cf7a:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20261119202738",
+   "codeql_raw_query": "/**\n * @name python/* tag registrations on constructors\n * @kind problem\n * @problem.severity warning\n * @id py/pyyaml-python-tags\n * @tags security external/cwe/cwe-502\n */\nimport python\n\nfrom Call c, Str tag, Expr recv\nwhere\n  c.getFunc().(Attribute).getName() = \"add_constructor\"\n  and c.getArg(0) = tag\n  and tag.getText().matches(\"%2:python/%\")\n  and recv = c.getFunc().(Attribute).getObject()\nselect c, recv.toString() + \" registers \" + tag.getText()",
+   "hypothesis": "FullConstructor/SafeConstructor register dangerous python/* tags (object/apply, object/new, name) enabling arbitrary callable invocation from YAML input.",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-502"
+   ],
+   "results_count": 23,
+   "results": [
+    {
+     "ruleId": "py/pyyaml-python-tags",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pyyaml-python-tags",
+      "index": 0
+     },
+     "message": {
+      "text": "FullConstructor registers tag:yaml.org,2002:python/none"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "lib3/yaml/constructor.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 638,
+         "endLine": 640,
+         "endColumn": 41
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "7fa28a7f9dcda201:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/pyyaml-python-tags",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pyyaml-python-tags",
+      "index": 0
+     },
+     "message": {
+      "text": "FullConstructor registers tag:yaml.org,2002:python/bool"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "lib3/yaml/constructor.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 642,
+         "endLine": 644,
+         "endColumn": 41
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "6c49ba62c39e530a:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/pyyaml-python-tags",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pyyaml-python-tags",
+      "index": 0
+     },
+     "message": {
+      "text": "FullConstructor registers tag:yaml.org,2002:python/str"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "lib3/yaml/constructor.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 646,
+         "endLine": 648,
+         "endColumn": 42
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "1bb975a6ec2b3361:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/pyyaml-python-tags",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pyyaml-python-tags",
+      "index": 0
+     },
+     "message": {
+      "text": "FullConstructor registers tag:yaml.org,2002:python/unicode"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "lib3/yaml/constructor.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 650,
+         "endLine": 652,
+         "endColumn": 46
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "f5b654d718582783:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/pyyaml-python-tags",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pyyaml-python-tags",
+      "index": 0
+     },
+     "message": {
+      "text": "FullConstructor registers tag:yaml.org,2002:python/bytes"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "lib3/yaml/constructor.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 654,
+         "endLine": 656,
+         "endColumn": 44
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "751a3a7468112f84:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/pyyaml-python-tags",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pyyaml-python-tags",
+      "index": 0
+     },
+     "message": {
+      "text": "FullConstructor registers tag:yaml.org,2002:python/int"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "lib3/yaml/constructor.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 658,
+         "endLine": 660,
+         "endColumn": 40
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "788015aa0a44cf11:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/pyyaml-python-tags",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pyyaml-python-tags",
+      "index": 0
+     },
+     "message": {
+      "text": "FullConstructor registers tag:yaml.org,2002:python/long"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "lib3/yaml/constructor.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 662,
+         "endLine": 664,
+         "endColumn": 43
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "228a3dd3ea6bdfd:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/pyyaml-python-tags",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pyyaml-python-tags",
+      "index": 0
+     },
+     "message": {
+      "text": "FullConstructor registers tag:yaml.org,2002:python/float"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "lib3/yaml/constructor.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 666,
+         "endLine": 668,
+         "endColumn": 42
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "e1c195d85808e6da:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/pyyaml-python-tags",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pyyaml-python-tags",
+      "index": 0
+     },
+     "message": {
+      "text": "FullConstructor registers tag:yaml.org,2002:python/complex"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "lib3/yaml/constructor.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 670,
+         "endLine": 672,
+         "endColumn": 46
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "609a7e9e56545ad8:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/pyyaml-python-tags",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pyyaml-python-tags",
+      "index": 0
+     },
+     "message": {
+      "text": "FullConstructor registers tag:yaml.org,2002:python/list"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "lib3/yaml/constructor.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 674,
+         "endLine": 676,
+         "endColumn": 40
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "c1e3709c5328d0cb:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/pyyaml-python-tags",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pyyaml-python-tags",
+      "index": 0
+     },
+     "message": {
+      "text": "FullConstructor registers tag:yaml.org,2002:python/tuple"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "lib3/yaml/constructor.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 678,
+         "endLine": 680,
+         "endColumn": 44
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "e1e3c17a61687723:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/pyyaml-python-tags",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pyyaml-python-tags",
+      "index": 0
+     },
+     "message": {
+      "text": "FullConstructor registers tag:yaml.org,2002:python/dict"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "lib3/yaml/constructor.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 682,
+         "endLine": 684,
+         "endColumn": 40
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "52ab8dc8cae87888:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/pyyaml-python-tags",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pyyaml-python-tags",
+      "index": 0
+     },
+     "message": {
+      "text": "FullConstructor registers tag:yaml.org,2002:python/none"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "lib/yaml/constructor.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 654,
+         "endLine": 656,
+         "endColumn": 41
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "98aa7b75c2552afa:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/pyyaml-python-tags",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pyyaml-python-tags",
+      "index": 0
+     },
+     "message": {
+      "text": "FullConstructor registers tag:yaml.org,2002:python/bool"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "lib/yaml/constructor.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 658,
+         "endLine": 660,
+         "endColumn": 41
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "2970bb0646d06e08:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/pyyaml-python-tags",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pyyaml-python-tags",
+      "index": 0
+     },
+     "message": {
+      "text": "FullConstructor registers tag:yaml.org,2002:python/str"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "lib/yaml/constructor.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 662,
+         "endLine": 664,
+         "endColumn": 42
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "5e9d438b9404ab72:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/pyyaml-python-tags",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pyyaml-python-tags",
+      "index": 0
+     },
+     "message": {
+      "text": "FullConstructor registers tag:yaml.org,2002:python/unicode"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "lib/yaml/constructor.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 666,
+         "endLine": 668,
+         "endColumn": 46
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "648180edbeb9c6cd:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/pyyaml-python-tags",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pyyaml-python-tags",
+      "index": 0
+     },
+     "message": {
+      "text": "FullConstructor registers tag:yaml.org,2002:python/int"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "lib/yaml/constructor.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 670,
+         "endLine": 672,
+         "endColumn": 40
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "6ef5a8bc184a8d11:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/pyyaml-python-tags",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pyyaml-python-tags",
+      "index": 0
+     },
+     "message": {
+      "text": "FullConstructor registers tag:yaml.org,2002:python/long"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "lib/yaml/constructor.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 674,
+         "endLine": 676,
+         "endColumn": 43
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "18bbf1c465d0a846:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/pyyaml-python-tags",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pyyaml-python-tags",
+      "index": 0
+     },
+     "message": {
+      "text": "FullConstructor registers tag:yaml.org,2002:python/float"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "lib/yaml/constructor.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 678,
+         "endLine": 680,
+         "endColumn": 42
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "4f35b31e3611949f:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/pyyaml-python-tags",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pyyaml-python-tags",
+      "index": 0
+     },
+     "message": {
+      "text": "FullConstructor registers tag:yaml.org,2002:python/complex"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "lib/yaml/constructor.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 682,
+         "endLine": 684,
+         "endColumn": 46
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "a5aa43c99dce6e3e:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/pyyaml-python-tags",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pyyaml-python-tags",
+      "index": 0
+     },
+     "message": {
+      "text": "FullConstructor registers tag:yaml.org,2002:python/list"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "lib/yaml/constructor.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 686,
+         "endLine": 688,
+         "endColumn": 40
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "554473d7665e8d1b:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/pyyaml-python-tags",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pyyaml-python-tags",
+      "index": 0
+     },
+     "message": {
+      "text": "FullConstructor registers tag:yaml.org,2002:python/tuple"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "lib/yaml/constructor.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 690,
+         "endLine": 692,
+         "endColumn": 44
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "484b61452f6730bd:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/pyyaml-python-tags",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pyyaml-python-tags",
+      "index": 0
+     },
+     "message": {
+      "text": "FullConstructor registers tag:yaml.org,2002:python/dict"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "lib/yaml/constructor.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 694,
+         "endLine": 696,
+         "endColumn": 40
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "82b1a50ff3fbf281:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20261119202804",
+   "codeql_raw_query": "/**\n * @name yaml.load default loader\n * @description Shows which Loader class load() uses by default\n * @kind problem\n * @problem.severity warning\n * @id py/pyyaml-default-loader\n */\n\nimport python\n\nfrom Function load, Name loaderName, Call defaultCall\nwhere\n  load.getName() = \"load\" and\n  load.getScope().(Module).getName() = \"yaml\" and\n  exists(Assign a |\n    a.getScope() = load and\n    a.getATarget().(Name).getId() = \"Loader\" and\n    loaderName = a.getValue()\n  )\nselect load, \"yaml.load default Loader = \" + loaderName.getId()",
+   "hypothesis": "yaml.load() uses FullLoader by default in 5.3 which still permits arbitrary object construction",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-502"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20261119202940",
+   "codeql_raw_query": "/**\n * @name pyyaml default loader selection\n * @description Finds uses of FullLoader / UnsafeLoader in the top-level API\n * @kind problem\n * @problem.severity warning\n * @id py/pyyaml-default-loader\n * @tags security\n *        external/cwe/cwe-502\n */\n\nimport python\n\nfrom Name n\nwhere\n  n.getId() in [\"FullLoader\", \"UnsafeLoader\", \"FullConstructor\", \"Constructor\"]\n  and n.getLocation().getFile().getBaseName() = \"__init__.py\"\nselect n, n.getId() + \" used in top-level API\"",
+   "hypothesis": "yaml.load() defaults to FullLoader which still permits python/object/* construction, so untrusted YAML can trigger arbitrary code execution (CVE-2017-18342 / CVE-2020-1747 class).",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-502"
+   ],
+   "results_count": 16,
+   "results": [
+    {
+     "ruleId": "py/pyyaml-default-loader",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pyyaml-default-loader",
+      "index": 0
+     },
+     "message": {
+      "text": "FullLoader used in top-level API"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "lib3/yaml/__init__.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 110,
+         "startColumn": 18,
+         "endColumn": 28
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "38303e6af5851adc:1",
+      "primaryLocationStartColumnFingerprint": "9"
+     }
+    },
+    {
+     "ruleId": "py/pyyaml-default-loader",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pyyaml-default-loader",
+      "index": 0
+     },
+     "message": {
+      "text": "FullLoader used in top-level API"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "lib3/yaml/__init__.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 125,
+         "startColumn": 18,
+         "endColumn": 28
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "2ed0e2a917d7154f:1",
+      "primaryLocationStartColumnFingerprint": "9"
+     }
+    },
+    {
+     "ruleId": "py/pyyaml-default-loader",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pyyaml-default-loader",
+      "index": 0
+     },
+     "message": {
+      "text": "FullLoader used in top-level API"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "lib3/yaml/__init__.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 142,
+         "startColumn": 25,
+         "endColumn": 35
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "5404486c436e9911:1",
+      "primaryLocationStartColumnFingerprint": "20"
+     }
+    },
+    {
+     "ruleId": "py/pyyaml-default-loader",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pyyaml-default-loader",
+      "index": 0
+     },
+     "message": {
+      "text": "FullLoader used in top-level API"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "lib3/yaml/__init__.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 152,
+         "startColumn": 29,
+         "endColumn": 39
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "5192649ce9baeac4:1",
+      "primaryLocationStartColumnFingerprint": "24"
+     }
+    },
+    {
+     "ruleId": "py/pyyaml-default-loader",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pyyaml-default-loader",
+      "index": 0
+     },
+     "message": {
+      "text": "UnsafeLoader used in top-level API"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "lib3/yaml/__init__.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 182,
+         "startColumn": 25,
+         "endColumn": 37
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "6aab77110e8a34ad:1",
+      "primaryLocationStartColumnFingerprint": "20"
+     }
+    },
+    {
+     "ruleId": "py/pyyaml-default-loader",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pyyaml-default-loader",
+      "index": 0
+     },
+     "message": {
+      "text": "UnsafeLoader used in top-level API"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "lib3/yaml/__init__.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 192,
+         "startColumn": 29,
+         "endColumn": 41
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "b96959161dd69a3a:1",
+      "primaryLocationStartColumnFingerprint": "24"
+     }
+    },
+    {
+     "ruleId": "py/pyyaml-default-loader",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pyyaml-default-loader",
+      "index": 0
+     },
+     "message": {
+      "text": "FullLoader used in top-level API"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "lib3/yaml/__init__.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 407,
+         "startColumn": 28,
+         "endColumn": 38
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "cc4caed96a9286e5:1",
+      "primaryLocationStartColumnFingerprint": "23"
+     }
+    },
+    {
+     "ruleId": "py/pyyaml-default-loader",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pyyaml-default-loader",
+      "index": 0
+     },
+     "message": {
+      "text": "UnsafeLoader used in top-level API"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "lib3/yaml/__init__.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 407,
+         "startColumn": 40,
+         "endColumn": 52
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "cc4caed96a9286e5:1",
+      "primaryLocationStartColumnFingerprint": "35"
+     }
+    },
+    {
+     "ruleId": "py/pyyaml-default-loader",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pyyaml-default-loader",
+      "index": 0
+     },
+     "message": {
+      "text": "FullLoader used in top-level API"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "lib/yaml/__init__.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 110,
+         "startColumn": 18,
+         "endColumn": 28
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "38303e6af5851adc:1",
+      "primaryLocationStartColumnFingerprint": "9"
+     }
+    },
+    {
+     "ruleId": "py/pyyaml-default-loader",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pyyaml-default-loader",
+      "index": 0
+     },
+     "message": {
+      "text": "FullLoader used in top-level API"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "lib/yaml/__init__.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 125,
+         "startColumn": 18,
+         "endColumn": 28
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "2ed0e2a917d7154f:1",
+      "primaryLocationStartColumnFingerprint": "9"
+     }
+    },
+    {
+     "ruleId": "py/pyyaml-default-loader",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pyyaml-default-loader",
+      "index": 0
+     },
+     "message": {
+      "text": "FullLoader used in top-level API"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "lib/yaml/__init__.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 142,
+         "startColumn": 25,
+         "endColumn": 35
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "5404486c436e9911:1",
+      "primaryLocationStartColumnFingerprint": "20"
+     }
+    },
+    {
+     "ruleId": "py/pyyaml-default-loader",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pyyaml-default-loader",
+      "index": 0
+     },
+     "message": {
+      "text": "FullLoader used in top-level API"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "lib/yaml/__init__.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 152,
+         "startColumn": 29,
+         "endColumn": 39
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "5192649ce9baeac4:1",
+      "primaryLocationStartColumnFingerprint": "24"
+     }
+    },
+    {
+     "ruleId": "py/pyyaml-default-loader",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pyyaml-default-loader",
+      "index": 0
+     },
+     "message": {
+      "text": "UnsafeLoader used in top-level API"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "lib/yaml/__init__.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 182,
+         "startColumn": 25,
+         "endColumn": 37
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "6aab77110e8a34ad:1",
+      "primaryLocationStartColumnFingerprint": "20"
+     }
+    },
+    {
+     "ruleId": "py/pyyaml-default-loader",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pyyaml-default-loader",
+      "index": 0
+     },
+     "message": {
+      "text": "UnsafeLoader used in top-level API"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "lib/yaml/__init__.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 192,
+         "startColumn": 29,
+         "endColumn": 41
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "b96959161dd69a3a:1",
+      "primaryLocationStartColumnFingerprint": "24"
+     }
+    },
+    {
+     "ruleId": "py/pyyaml-default-loader",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pyyaml-default-loader",
+      "index": 0
+     },
+     "message": {
+      "text": "FullLoader used in top-level API"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "lib/yaml/__init__.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 411,
+         "startColumn": 28,
+         "endColumn": 38
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "cc4caed96a9286e5:1",
+      "primaryLocationStartColumnFingerprint": "23"
+     }
+    },
+    {
+     "ruleId": "py/pyyaml-default-loader",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pyyaml-default-loader",
+      "index": 0
+     },
+     "message": {
+      "text": "UnsafeLoader used in top-level API"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "lib/yaml/__init__.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 411,
+         "startColumn": 40,
+         "endColumn": 52
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "cc4caed96a9286e5:1",
+      "primaryLocationStartColumnFingerprint": "35"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20261119203013",
+   "codeql_raw_query": "/**\n * @name PyYAML construct_python_object_apply callable invocation\n * @description construct_python_object_apply resolves user supplied names and invokes them, enabling code execution\n * @kind problem\n * @problem.severity error\n * @id py/pyyaml-object-apply-impl\n * @tags security\n *        external/cwe/cwe-502\n */\n\nimport python\n\nfrom Function f, Call c\nwhere\n  f.getName() = \"construct_python_object_apply\" and\n  c.getScope() = f and\n  c.getFunc().(Name).getId() in [\"make_python_instance\", \"find_python_name\", \"set_python_instance_state\", \"get_state_keys_blacklist\", \"__import__\"]\nselect c, \"Call to \" + c.getFunc().(Name).getId() + \" inside construct_python_object_apply\"",
+   "hypothesis": "construct_python_object_apply in 5.3 permits arbitrary callable resolution (CVE-2020-14343).",
+   "severity": "critical",
+   "cwe_ids": [
+    "cwe-502"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20261119203046",
+   "codeql_raw_query": "/**\n * @name Dangerous YAML python object tags registered\n * @description Registration of python/object/new, python/object/apply, python/name tags allows arbitrary object instantiation\n * @kind problem\n * @problem.severity error\n * @id py/pyyaml-object-tags\n * @tags security\n *        external/cwe/cwe-502\n */\nimport python\n\nfrom StrConst s\nwhere\n  s.getText().matches(\"%python/object%\") or\n  s.getText().matches(\"%python/name%\") or\n  s.getText().matches(\"%python/module%\")\nselect s, \"Unsafe YAML tag literal: \" + s.getText()",
+   "hypothesis": "Library registers python/object/apply and python/object/new tags which permit arbitrary code execution during deserialization",
+   "severity": "critical",
+   "cwe_ids": [
+    "cwe-502",
+    "cwe-94"
+   ],
+   "results_count": 24,
+   "results": [
+    {
+     "ruleId": "py/pyyaml-object-tags",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pyyaml-object-tags",
+      "index": 0
+     },
+     "message": {
+      "text": "Unsafe YAML tag literal: tag:yaml.org,2002:python/name:"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "lib3/yaml/constructor.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 687,
+         "startColumn": 5,
+         "endColumn": 37
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "235189857a3b4384:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/pyyaml-object-tags",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pyyaml-object-tags",
+      "index": 0
+     },
+     "message": {
+      "text": "Unsafe YAML tag literal: tag:yaml.org,2002:python/module:"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "lib3/yaml/constructor.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 691,
+         "startColumn": 5,
+         "endColumn": 39
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "bb1311feb4994276:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/pyyaml-object-tags",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pyyaml-object-tags",
+      "index": 0
+     },
+     "message": {
+      "text": "Unsafe YAML tag literal: tag:yaml.org,2002:python/object:"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "lib3/yaml/constructor.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 695,
+         "startColumn": 5,
+         "endColumn": 39
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "1ac4e4e2f3902ab4:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/pyyaml-object-tags",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pyyaml-object-tags",
+      "index": 0
+     },
+     "message": {
+      "text": "Unsafe YAML tag literal: tag:yaml.org,2002:python/object/new:"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "lib3/yaml/constructor.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 699,
+         "startColumn": 5,
+         "endColumn": 43
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "a6bd390b8ec9f581:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/pyyaml-object-tags",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pyyaml-object-tags",
+      "index": 0
+     },
+     "message": {
+      "text": "Unsafe YAML tag literal: tag:yaml.org,2002:python/object/apply:"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "lib3/yaml/constructor.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 715,
+         "startColumn": 5,
+         "endColumn": 45
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "a48ffa326722d365:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/pyyaml-object-tags",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pyyaml-object-tags",
+      "index": 0
+     },
+     "message": {
+      "text": "Unsafe YAML tag literal: tag:yaml.org,2002:python/name:"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "lib/yaml/constructor.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 699,
+         "startColumn": 5,
+         "endColumn": 38
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "37e43d67c09b1f82:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/pyyaml-object-tags",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pyyaml-object-tags",
+      "index": 0
+     },
+     "message": {
+      "text": "Unsafe YAML tag literal: tag:yaml.org,2002:python/module:"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "lib/yaml/constructor.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 703,
+         "startColumn": 5,
+         "endColumn": 40
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "2e27bda261518e2e:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/pyyaml-object-tags",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pyyaml-object-tags",
+      "index": 0
+     },
+     "message": {
+      "text": "Unsafe YAML tag literal: tag:yaml.org,2002:python/object:"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "lib/yaml/constructor.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 707,
+         "startColumn": 5,
+         "endColumn": 40
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "bb1eb57f09130a14:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/pyyaml-object-tags",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pyyaml-object-tags",
+      "index": 0
+     },
+     "message": {
+      "text": "Unsafe YAML tag literal: tag:yaml.org,2002:python/object/new:"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "lib/yaml/constructor.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 711,
+         "startColumn": 5,
+         "endColumn": 44
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "79b6b7c552757758:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/pyyaml-object-tags",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pyyaml-object-tags",
+      "index": 0
+     },
+     "message": {
+      "text": "Unsafe YAML tag literal: tag:yaml.org,2002:python/object/apply:"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "lib/yaml/constructor.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 727,
+         "startColumn": 5,
+         "endColumn": 46
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "9c3fdf95f085b4b1:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/pyyaml-object-tags",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pyyaml-object-tags",
+      "index": 0
+     },
+     "message": {
+      "text": "Unsafe YAML tag literal: tag:yaml.org,2002:python/name:"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "lib3/yaml/representer.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 290,
+         "startColumn": 38,
+         "endColumn": 70
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "b77ac8dfcf390faf:1",
+      "primaryLocationStartColumnFingerprint": "29"
+     }
+    },
+    {
+     "ruleId": "py/pyyaml-object-tags",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pyyaml-object-tags",
+      "index": 0
+     },
+     "message": {
+      "text": "Unsafe YAML tag literal: tag:yaml.org,2002:python/module:"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "lib3/yaml/representer.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 294,
+         "startColumn": 17,
+         "endColumn": 51
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "12d7f2eeef7b0d73:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/pyyaml-object-tags",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pyyaml-object-tags",
+      "index": 0
+     },
+     "message": {
+      "text": "Unsafe YAML tag literal: tag:yaml.org,2002:python/object/new:"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "lib3/yaml/representer.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 334,
+         "startColumn": 19,
+         "endColumn": 57
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "aff5f475dc8856df:1",
+      "primaryLocationStartColumnFingerprint": "6"
+     }
+    },
+    {
+     "ruleId": "py/pyyaml-object-tags",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pyyaml-object-tags",
+      "index": 0
+     },
+     "message": {
+      "text": "Unsafe YAML tag literal: tag:yaml.org,2002:python/object/apply:"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "lib3/yaml/representer.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 337,
+         "startColumn": 19,
+         "endColumn": 59
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "7bea18b34dd5b7ee:1",
+      "primaryLocationStartColumnFingerprint": "6"
+     }
+    },
+    {
+     "ruleId": "py/pyyaml-object-tags",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pyyaml-object-tags",
+      "index": 0
+     },
+     "message": {
+      "text": "Unsafe YAML tag literal: tag:yaml.org,2002:python/object:"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "lib3/yaml/representer.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 343,
+         "startColumn": 21,
+         "endColumn": 55
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "90d77fda8ed7de54:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/pyyaml-object-tags",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pyyaml-object-tags",
+      "index": 0
+     },
+     "message": {
+      "text": "Unsafe YAML tag literal: tag:yaml.org,2002:python/object/apply:%s.%s"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "lib3/yaml/representer.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 361,
+         "startColumn": 15,
+         "endColumn": 60
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "4d8c244ffde524e7:1",
+      "primaryLocationStartColumnFingerprint": "6"
+     }
+    },
+    {
+     "ruleId": "py/pyyaml-object-tags",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pyyaml-object-tags",
+      "index": 0
+     },
+     "message": {
+      "text": "Unsafe YAML tag literal: tag:yaml.org,2002:python/name:"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "lib/yaml/representer.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 3
+        },
+        "region": {
+         "startLine": 345,
+         "startColumn": 38,
+         "endColumn": 71
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "686a5f7511ec13c4:1",
+      "primaryLocationStartColumnFingerprint": "29"
+     }
+    },
+    {
+     "ruleId": "py/pyyaml-object-tags",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pyyaml-object-tags",
+      "index": 0
+     },
+     "message": {
+      "text": "Unsafe YAML tag literal: tag:yaml.org,2002:python/module:"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "lib/yaml/representer.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 3
+        },
+        "region": {
+         "startLine": 349,
+         "startColumn": 17,
+         "endColumn": 52
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "ce0d99794c70b290:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/pyyaml-object-tags",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pyyaml-object-tags",
+      "index": 0
+     },
+     "message": {
+      "text": "Unsafe YAML tag literal: tag:yaml.org,2002:python/object:"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "lib/yaml/representer.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 3
+        },
+        "region": {
+         "startLine": 381,
+         "startColumn": 21,
+         "endColumn": 56
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "2d2a3e71187f101e:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/pyyaml-object-tags",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pyyaml-object-tags",
+      "index": 0
+     },
+     "message": {
+      "text": "Unsafe YAML tag literal: tag:yaml.org,2002:python/object/new:"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "lib/yaml/representer.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 3
+        },
+        "region": {
+         "startLine": 384,
+         "startColumn": 21,
+         "endColumn": 60
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "71f396bfd7b28c1b:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/pyyaml-object-tags",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pyyaml-object-tags",
+      "index": 0
+     },
+     "message": {
+      "text": "Unsafe YAML tag literal: tag:yaml.org,2002:python/object/new:"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "lib/yaml/representer.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 3
+        },
+        "region": {
+         "startLine": 390,
+         "startColumn": 17,
+         "endColumn": 56
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "3ccbb1af0bb956d0:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/pyyaml-object-tags",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pyyaml-object-tags",
+      "index": 0
+     },
+     "message": {
+      "text": "Unsafe YAML tag literal: tag:yaml.org,2002:python/object/new:"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "lib/yaml/representer.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 3
+        },
+        "region": {
+         "startLine": 430,
+         "startColumn": 19,
+         "endColumn": 58
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "83766c44d64ce924:1",
+      "primaryLocationStartColumnFingerprint": "6"
+     }
+    },
+    {
+     "ruleId": "py/pyyaml-object-tags",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pyyaml-object-tags",
+      "index": 0
+     },
+     "message": {
+      "text": "Unsafe YAML tag literal: tag:yaml.org,2002:python/object/apply:"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "lib/yaml/representer.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 3
+        },
+        "region": {
+         "startLine": 433,
+         "startColumn": 19,
+         "endColumn": 60
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "3208671eb6f770d2:1",
+      "primaryLocationStartColumnFingerprint": "6"
+     }
+    },
+    {
+     "ruleId": "py/pyyaml-object-tags",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pyyaml-object-tags",
+      "index": 0
+     },
+     "message": {
+      "text": "Unsafe YAML tag literal: tag:yaml.org,2002:python/object:"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "lib/yaml/representer.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 3
+        },
+        "region": {
+         "startLine": 439,
+         "startColumn": 21,
+         "endColumn": 56
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "9bb76d9390bb0804:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20261119203326",
+   "codeql_raw_query": "/**\n * @name PyYAML unsafe object construction helpers\n * @description Lists the helper functions used to resolve and instantiate arbitrary Python objects from YAML tags (CVE-2020-1747 mechanism).\n * @kind problem\n * @problem.severity warning\n * @id py/pyyaml-object-construct-helpers\n */\n\nimport python\n\nfrom Function f\nwhere\n  f.getName() in [\n    \"find_python_name\", \"find_python_module\", \"make_python_instance\",\n    \"set_python_instance_state\", \"construct_python_object\", \"construct_python_object_new\",\n    \"construct_python_object_apply\", \"construct_python_name\", \"construct_python_module\"\n  ]\nselect f, \"PyYAML object-construction helper: \" + f.getName()\n",
+   "hypothesis": "PyYAML contains helpers that resolve arbitrary dotted names into Python objects and invoke them (find_python_name/make_python_instance), the mechanism behind CVE-2020-1747 when FullLoader is used on untrusted YAML.",
+   "severity": "critical",
+   "cwe_ids": [
+    "cwe-502",
+    "cwe-470"
+   ],
+   "results_count": 24,
+   "results": [
+    {
+     "ruleId": "py/pyyaml-object-construct-helpers",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pyyaml-object-construct-helpers",
+      "index": 0
+     },
+     "message": {
+      "text": "PyYAML object-construction helper: find_python_module"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "lib3/yaml/constructor.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 507,
+         "startColumn": 5,
+         "endColumn": 60
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "5cbf3def451433b4:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/pyyaml-object-construct-helpers",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pyyaml-object-construct-helpers",
+      "index": 0
+     },
+     "message": {
+      "text": "PyYAML object-construction helper: find_python_name"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "lib3/yaml/constructor.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 522,
+         "startColumn": 5,
+         "endColumn": 58
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "20f7f0417f744e9e:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/pyyaml-object-construct-helpers",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pyyaml-object-construct-helpers",
+      "index": 0
+     },
+     "message": {
+      "text": "PyYAML object-construction helper: construct_python_name"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "lib3/yaml/constructor.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 547,
+         "startColumn": 5,
+         "endColumn": 51
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "a47e71071509d81d:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/pyyaml-object-construct-helpers",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pyyaml-object-construct-helpers",
+      "index": 0
+     },
+     "message": {
+      "text": "PyYAML object-construction helper: construct_python_module"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "lib3/yaml/constructor.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 554,
+         "startColumn": 5,
+         "endColumn": 53
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "da6e1d48aefdbc2e:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/pyyaml-object-construct-helpers",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pyyaml-object-construct-helpers",
+      "index": 0
+     },
+     "message": {
+      "text": "PyYAML object-construction helper: make_python_instance"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "lib3/yaml/constructor.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 561,
+         "startColumn": 5,
+         "endLine": 562,
+         "endColumn": 63
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "d06c7215d2098520:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/pyyaml-object-construct-helpers",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pyyaml-object-construct-helpers",
+      "index": 0
+     },
+     "message": {
+      "text": "PyYAML object-construction helper: set_python_instance_state"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "lib3/yaml/constructor.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 577,
+         "startColumn": 5,
+         "endColumn": 58
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "85c0e1176c34ded9:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/pyyaml-object-construct-helpers",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pyyaml-object-construct-helpers",
+      "index": 0
+     },
+     "message": {
+      "text": "PyYAML object-construction helper: construct_python_object"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "lib3/yaml/constructor.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 591,
+         "startColumn": 5,
+         "endColumn": 53
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "2644af1177430712:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/pyyaml-object-construct-helpers",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pyyaml-object-construct-helpers",
+      "index": 0
+     },
+     "message": {
+      "text": "PyYAML object-construction helper: construct_python_object_apply"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "lib3/yaml/constructor.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 600,
+         "startColumn": 5,
+         "endColumn": 73
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "46006964fd7704b5:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/pyyaml-object-construct-helpers",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pyyaml-object-construct-helpers",
+      "index": 0
+     },
+     "message": {
+      "text": "PyYAML object-construction helper: construct_python_object_new"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "lib3/yaml/constructor.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 635,
+         "startColumn": 5,
+         "endColumn": 57
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "9a2a1edfffef26cd:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/pyyaml-object-construct-helpers",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pyyaml-object-construct-helpers",
+      "index": 0
+     },
+     "message": {
+      "text": "PyYAML object-construction helper: find_python_module"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "lib3/yaml/constructor.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 704,
+         "startColumn": 5,
+         "endColumn": 46
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "570c59b6d891e272:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/pyyaml-object-construct-helpers",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pyyaml-object-construct-helpers",
+      "index": 0
+     },
+     "message": {
+      "text": "PyYAML object-construction helper: find_python_name"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "lib3/yaml/constructor.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 707,
+         "startColumn": 5,
+         "endColumn": 44
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "6226c38caa9089aa:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/pyyaml-object-construct-helpers",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pyyaml-object-construct-helpers",
+      "index": 0
+     },
+     "message": {
+      "text": "PyYAML object-construction helper: make_python_instance"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "lib3/yaml/constructor.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 710,
+         "startColumn": 5,
+         "endColumn": 86
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "96ebbfdc5eedf793:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/pyyaml-object-construct-helpers",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pyyaml-object-construct-helpers",
+      "index": 0
+     },
+     "message": {
+      "text": "PyYAML object-construction helper: find_python_module"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "lib/yaml/constructor.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 514,
+         "startColumn": 5,
+         "endColumn": 60
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "5cbf3def451433b4:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/pyyaml-object-construct-helpers",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pyyaml-object-construct-helpers",
+      "index": 0
+     },
+     "message": {
+      "text": "PyYAML object-construction helper: find_python_name"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "lib/yaml/constructor.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 529,
+         "startColumn": 5,
+         "endColumn": 58
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "20f7f0417f744e9e:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/pyyaml-object-construct-helpers",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pyyaml-object-construct-helpers",
+      "index": 0
+     },
+     "message": {
+      "text": "PyYAML object-construction helper: construct_python_name"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "lib/yaml/constructor.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 554,
+         "startColumn": 5,
+         "endColumn": 51
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "a47e71071509d81d:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/pyyaml-object-construct-helpers",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pyyaml-object-construct-helpers",
+      "index": 0
+     },
+     "message": {
+      "text": "PyYAML object-construction helper: construct_python_module"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "lib/yaml/constructor.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 562,
+         "startColumn": 5,
+         "endColumn": 53
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "da6e1d48aefdbc2e:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/pyyaml-object-construct-helpers",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pyyaml-object-construct-helpers",
+      "index": 0
+     },
+     "message": {
+      "text": "PyYAML object-construction helper: make_python_instance"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "lib/yaml/constructor.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 572,
+         "startColumn": 5,
+         "endLine": 573,
+         "endColumn": 63
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "d06c7215d2098520:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/pyyaml-object-construct-helpers",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pyyaml-object-construct-helpers",
+      "index": 0
+     },
+     "message": {
+      "text": "PyYAML object-construction helper: set_python_instance_state"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "lib/yaml/constructor.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 593,
+         "startColumn": 5,
+         "endColumn": 58
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "85c0e1176c34ded9:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/pyyaml-object-construct-helpers",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pyyaml-object-construct-helpers",
+      "index": 0
+     },
+     "message": {
+      "text": "PyYAML object-construction helper: construct_python_object"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "lib/yaml/constructor.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 607,
+         "startColumn": 5,
+         "endColumn": 53
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "2644af1177430712:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/pyyaml-object-construct-helpers",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pyyaml-object-construct-helpers",
+      "index": 0
+     },
+     "message": {
+      "text": "PyYAML object-construction helper: construct_python_object_apply"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "lib/yaml/constructor.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 616,
+         "startColumn": 5,
+         "endColumn": 73
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "46006964fd7704b5:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/pyyaml-object-construct-helpers",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pyyaml-object-construct-helpers",
+      "index": 0
+     },
+     "message": {
+      "text": "PyYAML object-construction helper: construct_python_object_new"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "lib/yaml/constructor.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 651,
+         "startColumn": 5,
+         "endColumn": 57
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "9a2a1edfffef26cd:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/pyyaml-object-construct-helpers",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pyyaml-object-construct-helpers",
+      "index": 0
+     },
+     "message": {
+      "text": "PyYAML object-construction helper: find_python_module"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "lib/yaml/constructor.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 716,
+         "startColumn": 5,
+         "endColumn": 46
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "570c59b6d891e272:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/pyyaml-object-construct-helpers",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pyyaml-object-construct-helpers",
+      "index": 0
+     },
+     "message": {
+      "text": "PyYAML object-construction helper: find_python_name"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "lib/yaml/constructor.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 719,
+         "startColumn": 5,
+         "endColumn": 44
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "6226c38caa9089aa:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/pyyaml-object-construct-helpers",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pyyaml-object-construct-helpers",
+      "index": 0
+     },
+     "message": {
+      "text": "PyYAML object-construction helper: make_python_instance"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "lib/yaml/constructor.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 722,
+         "startColumn": 5,
+         "endColumn": 86
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "96ebbfdc5eedf793:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20261119203350",
+   "codeql_raw_query": "/**\n * @name PyYAML dynamic instantiation / attribute access sink\n * @description Confirms calls that instantiate a class resolved from YAML-controlled data\n *              (the code-execution sink behind CVE-2020-1747 in FullLoader / UnsafeLoader).\n * @kind problem\n * @problem.severity error\n * @id py/pyyaml-dynamic-instantiation\n * @tags security\n *        external/cwe/cwe-094\n */\n\nimport python\n\nfrom Call c, Name n\nwhere\n  c.getFunc() = n and\n  n.getId() in [\"cls\", \"suffix\", \"instance\", \"obj\"]\nselect c, \"Dynamic call through YAML-controlled name '\" + n.getId() + \"' (CVE-2020-1747 code execution sink)\"\n",
+   "hypothesis": "PyYAML's make_python_instance / find_python_name / find_python_module resolve attacker-supplied dotted names and then invoke/instantiate them, giving code execution reachable from YAML tags.",
+   "severity": "critical",
+   "cwe_ids": [
+    "cwe-094",
+    "cwe-502"
+   ],
+   "results_count": 2,
+   "results": [
+    {
+     "ruleId": "py/pyyaml-dynamic-instantiation",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pyyaml-dynamic-instantiation",
+      "index": 0
+     },
+     "message": {
+      "text": "Dynamic call through YAML-controlled name 'cls' (CVE-2020-1747 code execution sink)"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "lib3/yaml/constructor.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 575,
+         "startColumn": 20,
+         "endColumn": 38
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "b8e71b5f96f95c38:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/pyyaml-dynamic-instantiation",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pyyaml-dynamic-instantiation",
+      "index": 0
+     },
+     "message": {
+      "text": "Dynamic call through YAML-controlled name 'cls' (CVE-2020-1747 code execution sink)"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "lib/yaml/constructor.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 591,
+         "startColumn": 20,
+         "endColumn": 38
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "b8e71b5f96f95c38:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    }
+   ]
+  }
+ ],
+ "cache_usage": {
+  "prompt_tokens_total": 211689,
+  "uncached_input_tokens": 18793,
+  "cache_creation_input_tokens": 0,
+  "cache_read_input_tokens": 192896,
+  "output_tokens": 33470,
+  "calls": 22,
+  "caching_enabled": false,
+  "cost_usd_with_cache": 0.02348,
+  "cost_usd_no_cache": 0.051835,
+  "cache_read_share_of_prompt": 0.9112,
+  "prices_per_mtok": {
+   "claude-sonnet-4-5-20250929": {
+    "input": 3.0,
+    "output": 15.0
+   },
+   "claude-haiku-4-5-20251001": {
+    "input": 1.0,
+    "output": 5.0
+   },
+   "deepseek/deepseek-reasoner": {
+    "input": 0.15,
+    "output": 0.6,
+    "cache_read": 0.003,
+    "cache_write_mult": 1.0,
+    "peak_mult": 2.0
+   },
+   "gpt-5.1": {
+    "input": 1.25,
+    "output": 10.0,
+    "cache_read": 0.125,
+    "cache_write_mult": 1.0
+   },
+   "gpt-4.1": {
+    "input": 2.0,
+    "output": 8.0,
+    "cache_read": 0.5,
+    "cache_write_mult": 1.0
+   }
+  },
+  "cache_multipliers": {
+   "write_5m": 1.25,
+   "read": 0.1
+  }
+ }
+}

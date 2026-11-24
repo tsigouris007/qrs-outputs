@@ -1,0 +1,2401 @@
+{
+ "session_id": "20261119032512",
+ "package_name": "jinja2-3.1.2",
+ "package_path": "packages/jinja2-3.1.2",
+ "database_path": "databases/jinja2-3.1.2-db",
+ "model": "deepseek/deepseek-reasoner",
+ "temperature": 0.0,
+ "max_tokens": 8000,
+ "iterations": 18,
+ "total_input_tokens": 203289,
+ "total_output_tokens": 32405,
+ "total_tokens": 235694,
+ "elapsed_time_seconds": 778.66,
+ "estimated_cost_usd": 0.0705,
+ "summary": "## Security Analysis: Jinja2 3.1.2\n\nAnalyzed 25 files / ~10.8k LOC of the Jinja2 template engine. Primary attack surfaces are the template engine's sandbox, the bytecode-cache layer, the interactive debugger, and the HTML escaping/no-escaping filter family. Findings below were corroborated with CodeQL (API-graph, structural AST, and local/global data-flow queries).\n\n### High\n\n**1. Unsafe deserialization of bytecode cache — `pickle.load` (CWE-502)**\n`src/jinja2/bccache.py:71` and `:77` (`_BytesLoader.load_bytecode` / `load`). Confirmed by `py/unsafe-deserialization` and a data-flow query proving `pickle.load` is called with a file object (`ControlFlowNode for f`). Any process that can write to the bytecode-cache directory (shared `/tmp`, `tempfile.mkdtemp`-adjacent dirs, world-writable volume, or an extracted archive) achieves arbitrary code execution in the application process.\n\n**2. Unsafe deserialization via `marshal` (CWE-502)**\n`src/jinja2/bccache.py:87-88` use `marshal.loads` on cached bytecode. Marshal is not memory-safe against hostile input (deserialization of arbitrary object graphs / crash / code-object tampering).\n\n**3. Dynamic code execution paths (CWE-094 / CWE-095)**\n- `src/jinja2/debug.py:105` `compile()` and `:145` `exec()` — interactive debugger traceback REPL executes template-generated source; reachable when `DEBUG`/`TEMPLATES_AUTO_RELOAD`-style console is enabled (PIN-gated but commonly enabled in dev/staging mistakenly exposed).\n- `src/jinja2/environment.py:704` `compile()` and `:1222` `exec()` — template compilation. By design, but it is the root cause why untrusted template source and sandbox escapes escalate to full RCE.\n\n### Medium\n\n**4. `xmlattr` filter attribute-name injection / XSS (CWE-79, CVE-2024-22195 class)**\n`src/jinja2/filters.py:277-287`. The generator at 277-281 escapes *values* (`escape` at line 278) but the attribute *key* is interpolated into the output raw (`f'{key}=\"{value}\"'`). An attacker-controlled key such as `x onmouseover=alert(1) s=` breaks out of the attribute and injects event handlers even in an autoescaped environment. Fixed in 3.1.3 by validating/escaping keys.\n\n**5. Sandbox `|attr` / attribute-access bypass surface (CWE-1336 / CWE-693, CVE-2025-27516 class)**\n`src/jinja2/filters.py:1143` and `:1388` call raw `getattr()` outside the sandbox's `is_safe_attribute` interception (which is only wired into `SandboxedEnvironment.getattr` at `sandbox.py:402`). The `|attr` filter and attribute lookups in `map`/`sort` thus allow reaching dunder attributes (e.g. `__globals__`, `__builtins__`) and escaping the sandbox when a `SandboxedEnvironment` is used, since the filter path does not consult `is_safe_attribute`. Related sandbox internals are at `sandbox.py:275/312/326` and `:258`.\n\n**6. Bytecode-cache file write with attacker-influenced path (CWE-022 / CWE-377)**\n`src/jinja2/bccache.py:268` opens a cache file path derived from the template name/key with no normalization beyond default handling; combined with `FileSystemBytecodeCache` on shared directories this permits cache poisoning (feeding into finding #1).\n\n### Low\n\n**7. Dynamic module import (CWE-470)**\n`src/jinja2/loaders.py:648` and `src/jinja2/utils.py:148-149` use `__import__()` on dotted-path strings (`import_string`, module-based loaders). If the string is attacker-influenced, unexpected modules can be imported. Defenses present: `split_template_path` in `loaders.py:195/337` correctly rejects `..` segments (validation at `loaders.py:96-105` raising `TemplateNotFound`), so classic template-name traversal is mitigated.\n\n### Recommendations\n- Never point `FileSystemBytecodeCache` at a shared/world-writable directory; set restrictive permissions and/or a private `tempfile.mkdtemp()` location; consider disabling bytecode cache for untrusted multi-tenant deployments.\n- Upgrade to >= 3.1.5/3.1.6 for the `xmlattr` key-escaping and `|attr` sandbox fixes.\n- Do not enable the debug console outside local development; ensure a strong PIN and no external exposure.\n- Treat `SandboxedEnvironment` as defense-in-depth only; never render untrusted template *source*.",
+ "package_classification": {
+  "type": [
+   "library",
+   "framework"
+  ],
+  "layer": [
+   "application",
+   "templating",
+   "web"
+  ]
+ },
+ "tool_calls": {
+  "get_package_profile_info": 1,
+  "execute_codeql_query": 36,
+  "validate_codeql_query": 0,
+  "fixup_codeql_query": 0,
+  "finalize_report": 1
+ },
+ "queries_executed": {
+  "critical": 0,
+  "high": 12,
+  "medium": 4,
+  "low": 0,
+  "total_executed": 36,
+  "total_with_results": 16,
+  "total_failed": 20
+ },
+ "query_findings": {
+  "critical": 0,
+  "high": 45,
+  "medium": 23,
+  "low": 0,
+  "total": 68
+ },
+ "findings": [
+  {
+   "codeql_query_uuid": "20261119032520",
+   "codeql_raw_query": "/**\n * @name Unsafe deserialization in Jinja2\n * @description pickle.load/loads and marshal usage can lead to arbitrary code execution\n * @kind problem\n * @problem.severity error\n * @id py/jinja2-unsafe-deserialization\n * @tags security\n *        external/cwe/cwe-502\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"pickle\").getMember([\"load\", \"loads\", \"Unpickler\"]).getACall()\n  or\n  call = API::moduleImport(\"marshal\").getMember([\"load\", \"loads\"]).getACall()\nselect call, \"Potentially unsafe deserialization of untrusted data (CWE-502).\"\n",
+   "hypothesis": "bccache.py deserializes bytecode cache data with pickle/marshal which may be attacker-controlled",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-502"
+   ],
+   "results_count": 2,
+   "results": [
+    {
+     "ruleId": "py/jinja2-unsafe-deserialization",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-unsafe-deserialization",
+      "index": 0
+     },
+     "message": {
+      "text": "Potentially unsafe deserialization of untrusted data (CWE-502)."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/bccache.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 71,
+         "startColumn": 20,
+         "endColumn": 34
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "ebf3dcd53e82ba7d:1",
+      "primaryLocationStartColumnFingerprint": "11"
+     }
+    },
+    {
+     "ruleId": "py/jinja2-unsafe-deserialization",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-unsafe-deserialization",
+      "index": 0
+     },
+     "message": {
+      "text": "Potentially unsafe deserialization of untrusted data (CWE-502)."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/bccache.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 77,
+         "startColumn": 25,
+         "endColumn": 40
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "4a6ea71f28fee9ee:1",
+      "primaryLocationStartColumnFingerprint": "12"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20261119032538",
+   "codeql_raw_query": "/**\n * @name Jinja2 xmlattr filter potential XSS\n * @description The xmlattr filter builds attribute strings; improper escaping may allow injection\n * @kind problem\n * @problem.severity warning\n * @id py/jinja2-xmlattr-injection\n * @tags security\n *        external/cwe/cwe-079\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"jinja2.filters\").getMember(\"do_xmlattr\").getACall()\n  or\n  call = API::moduleImport(\"jinja2.filters\").getMember(\"do_format\").getACall()\n  or\n  call = API::moduleImport(\"jinja2.filters\").getMember(\"do_join\").getACall()\nselect call, \"Template filter that constructs output markup; verify autoescaping of injected values.\"\n",
+   "hypothesis": "xmlattr / format filters may produce unescaped markup enabling XSS",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-079"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20261119032606",
+   "codeql_raw_query": "/**\n * @name Unsafe pickle deserialization reachability\n * @description Bytecode cache uses pickle to load cached templates from disk\n * @kind problem\n * @problem.severity warning\n * @id py/jinja2-pickle-reach\n * @tags security\n *        external/cwe/cwe-502\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call, DataFlow::Node arg\nwhere\n  call = API::moduleImport(\"pickle\").getMember([\"load\", \"loads\"]).getACall() and\n  arg = call.getArg(0)\nselect call, \"pickle load called from this DataFlow::CallCfgNode; object argument: \" + arg.toString()\n",
+   "hypothesis": "pickle.load in bccache deserializes cache files that may be attacker-writable",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-502"
+   ],
+   "results_count": 1,
+   "results": [
+    {
+     "ruleId": "py/jinja2-pickle-reach",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-pickle-reach",
+      "index": 0
+     },
+     "message": {
+      "text": "pickle load called from this DataFlow::CallCfgNode; object argument: ControlFlowNode for f"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/bccache.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 71,
+         "startColumn": 20,
+         "endColumn": 34
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "ebf3dcd53e82ba7d:1",
+      "primaryLocationStartColumnFingerprint": "11"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20261119032835",
+   "codeql_raw_query": "/**\n * @name Inspect xmlattr filter internals\n * @description Lists calls and attribute accesses inside the xmlattr filter to check attribute name/value escaping\n * @kind problem\n * @problem.severity warning\n * @id py/jinja2-xmlattr-internals\n * @tags security\n *        external/cwe/cwe-079\n */\nimport python\n\nfrom Call c, Function f\nwhere\n  f.getName() = \"do_xmlattr\" and\n  c.getScope() = f\nselect c, c.getLocation().getStartLine().toString() + \": \" + c.toString()",
+   "hypothesis": "The xmlattr filter (CVE-2024-22195 class) does not escape attribute names, allowing HTML/attribute injection when keys contain special characters",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-079",
+    "cwe-116"
+   ],
+   "results_count": 3,
+   "results": [
+    {
+     "ruleId": "py/jinja2-xmlattr-internals",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-xmlattr-internals",
+      "index": 0
+     },
+     "message": {
+      "text": "277: Attribute()"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/filters.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 277,
+         "startColumn": 10,
+         "endLine": 281,
+         "endColumn": 6
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "b480c2bc207bdbed:1",
+      "primaryLocationStartColumnFingerprint": "5"
+     }
+    },
+    {
+     "ruleId": "py/jinja2-xmlattr-internals",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-xmlattr-internals",
+      "index": 0
+     },
+     "message": {
+      "text": "279: Attribute()"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/filters.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 279,
+         "startColumn": 27,
+         "endColumn": 36
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "370603cb9025fdd4:1",
+      "primaryLocationStartColumnFingerprint": "18"
+     }
+    },
+    {
+     "ruleId": "py/jinja2-xmlattr-internals",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-xmlattr-internals",
+      "index": 0
+     },
+     "message": {
+      "text": "287: Markup()"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/filters.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 287,
+         "startColumn": 14,
+         "endColumn": 24
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "23fd7f8c157bd25c:1",
+      "primaryLocationStartColumnFingerprint": "5"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20261119032852",
+   "codeql_raw_query": "/**\n * @name Sandbox attribute/callable safety logic\n * @description Finds uses of getattr/getattr_static/format and unsafe markers inside sandbox.py to detect sandbox escape surfaces\n * @kind problem\n * @problem.severity warning\n * @id py/jinja2-sandbox-internals\n * @tags security\n *        external/cwe/cwe-693\n */\nimport python\n\nfrom Call c\nwhere\n  c.getLocation().getFile().getBaseName() = \"sandbox.py\" and\n  c.getFunc().(Name).getId() in [\"getattr\", \"getattr_static\", \"is_safe_attribute\", \"is_safe_callable\", \"unsafe\", \"format\", \"eval\", \"exec\", \"compile\"]\nselect c, c.getLocation().getStartLine().toString() + \": \" + c.toString() + \" [func=\" + c.getFunc().toString() + \"]\"",
+   "hypothesis": "SandboxedEnvironment relies on getattr/getattr_static/format checks that are bypassable (sandbox escape class affecting 3.1.2)",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-693",
+    "cwe-184"
+   ],
+   "results_count": 4,
+   "results": [
+    {
+     "ruleId": "py/jinja2-sandbox-internals",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-sandbox-internals",
+      "index": 0
+     },
+     "message": {
+      "text": "275: getattr() \\[func=getattr\\]"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/sandbox.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 275,
+         "startColumn": 13,
+         "endColumn": 51
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "2d91020f995e3f98:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/jinja2-sandbox-internals",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-sandbox-internals",
+      "index": 0
+     },
+     "message": {
+      "text": "275: getattr() \\[func=getattr\\]"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/sandbox.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 275,
+         "startColumn": 55,
+         "endColumn": 89
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "2d91020f995e3f98:1",
+      "primaryLocationStartColumnFingerprint": "42"
+     }
+    },
+    {
+     "ruleId": "py/jinja2-sandbox-internals",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-sandbox-internals",
+      "index": 0
+     },
+     "message": {
+      "text": "312: getattr() \\[func=getattr\\]"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/sandbox.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 312,
+         "startColumn": 33,
+         "endColumn": 51
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "e071e045a8c81526:1",
+      "primaryLocationStartColumnFingerprint": "8"
+     }
+    },
+    {
+     "ruleId": "py/jinja2-sandbox-internals",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-sandbox-internals",
+      "index": 0
+     },
+     "message": {
+      "text": "326: getattr() \\[func=getattr\\]"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/sandbox.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 326,
+         "startColumn": 21,
+         "endColumn": 44
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "b275929b42e1eaf5:1",
+      "primaryLocationStartColumnFingerprint": "8"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20261119032915",
+   "codeql_raw_query": "/**\n * @name Code execution primitives across package\n * @description Finds compile/eval/exec/marshal/pickle usage that could execute attacker-influenced data\n * @kind problem\n * @problem.severity warning\n * @id py/jinja2-codeexec\n * @tags security\n *        external/cwe/cwe-094\n *        external/cwe/cwe-502\n */\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::builtin([\"compile\", \"eval\", \"exec\", \"__import__\"]).getACall() or\n  call = API::moduleImport([\"pickle\", \"marshal\", \"cPickle\"]).getMember([\"load\", \"loads\", \"dump\", \"dumps\"]).getACall()\nselect call, \"Dynamic code execution / deserialization primitive: \" + call.toString()",
+   "hypothesis": "Dynamic code execution and deserialization primitives (compile/eval/exec/pickle/marshal) may process attacker-controlled data",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-094",
+    "cwe-502"
+   ],
+   "results_count": 13,
+   "results": [
+    {
+     "ruleId": "py/jinja2-codeexec",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-codeexec",
+      "index": 0
+     },
+     "message": {
+      "text": "Dynamic code execution / deserialization primitive: ControlFlowNode for Attribute()"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/bccache.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 71,
+         "startColumn": 20,
+         "endColumn": 34
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "ebf3dcd53e82ba7d:1",
+      "primaryLocationStartColumnFingerprint": "11"
+     }
+    },
+    {
+     "ruleId": "py/jinja2-codeexec",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-codeexec",
+      "index": 0
+     },
+     "message": {
+      "text": "Dynamic code execution / deserialization primitive: ControlFlowNode for Attribute()"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/bccache.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 77,
+         "startColumn": 25,
+         "endColumn": 40
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "4a6ea71f28fee9ee:1",
+      "primaryLocationStartColumnFingerprint": "12"
+     }
+    },
+    {
+     "ruleId": "py/jinja2-codeexec",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-codeexec",
+      "index": 0
+     },
+     "message": {
+      "text": "Dynamic code execution / deserialization primitive: ControlFlowNode for Attribute()"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/bccache.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 87,
+         "startColumn": 9,
+         "endColumn": 41
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "ffc89a0bd6789952:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/jinja2-codeexec",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-codeexec",
+      "index": 0
+     },
+     "message": {
+      "text": "Dynamic code execution / deserialization primitive: ControlFlowNode for Attribute()"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/bccache.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 88,
+         "startColumn": 9,
+         "endColumn": 35
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "72048985bf8fad98:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/jinja2-codeexec",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-codeexec",
+      "index": 0
+     },
+     "message": {
+      "text": "Dynamic code execution / deserialization primitive: ControlFlowNode for Attribute()"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/bccache.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 39,
+         "startColumn": 7,
+         "endColumn": 34
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "307b5a4144d2f369:1",
+      "primaryLocationStartColumnFingerprint": "2"
+     }
+    },
+    {
+     "ruleId": "py/jinja2-codeexec",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-codeexec",
+      "index": 0
+     },
+     "message": {
+      "text": "Dynamic code execution / deserialization primitive: ControlFlowNode for Attribute()"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/bccache.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 40,
+         "startColumn": 7,
+         "endColumn": 73
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "22780f6ff5e408b0:1",
+      "primaryLocationStartColumnFingerprint": "2"
+     }
+    },
+    {
+     "ruleId": "py/jinja2-codeexec",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-codeexec",
+      "index": 0
+     },
+     "message": {
+      "text": "Dynamic code execution / deserialization primitive: ControlFlowNode for exec()"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/debug.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 145,
+         "startColumn": 9,
+         "endColumn": 36
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "799c068da957600:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/jinja2-codeexec",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-codeexec",
+      "index": 0
+     },
+     "message": {
+      "text": "Dynamic code execution / deserialization primitive: ControlFlowNode for compile()"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/debug.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 105,
+         "startColumn": 22,
+         "endLine": 107,
+         "endColumn": 6
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "16573e133a7c4168:1",
+      "primaryLocationStartColumnFingerprint": "17"
+     }
+    },
+    {
+     "ruleId": "py/jinja2-codeexec",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-codeexec",
+      "index": 0
+     },
+     "message": {
+      "text": "Dynamic code execution / deserialization primitive: ControlFlowNode for compile()"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/environment.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 704,
+         "startColumn": 16,
+         "endColumn": 49
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "dee62e1900a23956:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/jinja2-codeexec",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-codeexec",
+      "index": 0
+     },
+     "message": {
+      "text": "Dynamic code execution / deserialization primitive: ControlFlowNode for exec()"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/environment.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 1222,
+         "startColumn": 9,
+         "endColumn": 30
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "f77517f1e751fe3c:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/jinja2-codeexec",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-codeexec",
+      "index": 0
+     },
+     "message": {
+      "text": "Dynamic code execution / deserialization primitive: ControlFlowNode for __import__()"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/loaders.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 3
+        },
+        "region": {
+         "startLine": 648,
+         "startColumn": 23,
+         "endColumn": 63
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "9b816a55e1f5b355:1",
+      "primaryLocationStartColumnFingerprint": "6"
+     }
+    },
+    {
+     "ruleId": "py/jinja2-codeexec",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-codeexec",
+      "index": 0
+     },
+     "message": {
+      "text": "Dynamic code execution / deserialization primitive: ControlFlowNode for __import__()"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/utils.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 4
+        },
+        "region": {
+         "startLine": 148,
+         "startColumn": 20,
+         "endColumn": 43
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "a2266ee33148e4b0:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/jinja2-codeexec",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-codeexec",
+      "index": 0
+     },
+     "message": {
+      "text": "Dynamic code execution / deserialization primitive: ControlFlowNode for __import__()"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/utils.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 4
+        },
+        "region": {
+         "startLine": 149,
+         "startColumn": 24,
+         "endColumn": 61
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "d730034a9bfd47fe:1",
+      "primaryLocationStartColumnFingerprint": "15"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20261119032940",
+   "codeql_raw_query": "/**\n * @name Filesystem access and path joins in loaders\n * @description Finds file open / path join operations in loaders.py to assess template path traversal protections\n * @kind problem\n * @problem.severity warning\n * @id py/jinja2-loader-paths\n * @tags security\n *        external/cwe/cwe-022\n */\nimport python\n\nfrom Call c\nwhere\n  c.getLocation().getFile().getBaseName() in [\"loaders.py\", \"bccache.py\", \"utils.py\"] and\n  c.getFunc().(Name).getId() in [\"open\", \"join\", \"split_template_path\", \"normalize\", \"abspath\", \"getcwd\"]\nselect c, c.getLocation().toString() + \": \" + c.toString() + \" [func=\" + c.getFunc().toString() + \"]\"",
+   "hypothesis": "FileSystemLoader / bytecode cache path construction may permit directory traversal outside the template/cache root",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-022"
+   ],
+   "results_count": 5,
+   "results": [
+    {
+     "ruleId": "py/jinja2-loader-paths",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-loader-paths",
+      "index": 0
+     },
+     "message": {
+      "text": "e1_nov2026/packages/jinja2-3.1.2/src/jinja2/bccache.py:268: open() \\[func=open\\]"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/bccache.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 268,
+         "startColumn": 17,
+         "endColumn": 37
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "77523f9d2dd60066:1",
+      "primaryLocationStartColumnFingerprint": "4"
+     }
+    },
+    {
+     "ruleId": "py/jinja2-loader-paths",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-loader-paths",
+      "index": 0
+     },
+     "message": {
+      "text": "e1_nov2026/packages/jinja2-3.1.2/src/jinja2/loaders.py:195: split_template_path() \\[func=split_template_path\\]"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/loaders.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 195,
+         "startColumn": 18,
+         "endColumn": 47
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "47c52f9e458e3107:1",
+      "primaryLocationStartColumnFingerprint": "9"
+     }
+    },
+    {
+     "ruleId": "py/jinja2-loader-paths",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-loader-paths",
+      "index": 0
+     },
+     "message": {
+      "text": "e1_nov2026/packages/jinja2-3.1.2/src/jinja2/loaders.py:337: split_template_path() \\[func=split_template_path\\]"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/loaders.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 337,
+         "startColumn": 50,
+         "endColumn": 79
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "d02f415d1de2734a:1",
+      "primaryLocationStartColumnFingerprint": "37"
+     }
+    },
+    {
+     "ruleId": "py/jinja2-loader-paths",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-loader-paths",
+      "index": 0
+     },
+     "message": {
+      "text": "e1_nov2026/packages/jinja2-3.1.2/src/jinja2/loaders.py:346: open() \\[func=open\\]"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/loaders.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 346,
+         "startColumn": 18,
+         "endColumn": 31
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "1b1781034d372221:1",
+      "primaryLocationStartColumnFingerprint": "5"
+     }
+    },
+    {
+     "ruleId": "py/jinja2-loader-paths",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-loader-paths",
+      "index": 0
+     },
+     "message": {
+      "text": "e1_nov2026/packages/jinja2-3.1.2/src/jinja2/utils.py:162: open() \\[func=open\\]"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/utils.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 162,
+         "startColumn": 12,
+         "endColumn": 32
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "41ec2bfda989e5b4:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20261119033036",
+   "codeql_raw_query": "/**\n * @name sandbox method inventory\n * @description Lists methods defined on SandboxedEnvironment to see which dangerous operations are intercepted\n * @kind problem\n * @problem.severity note\n * @id py/jinja2-sandbox-methods\n */\nimport python\n\nfrom Class c, Function m\nwhere\n  c.getName() = \"SandboxedEnvironment\" and\n  m = c.getAMethod()\nselect m, \"sandbox method \" + m.getName()",
+   "hypothesis": "Jinja2 3.1.2 sandbox may not intercept str.format/format_map on unsafe objects, enabling sandbox escape (CVE-2024-56201 / CVE-2024-56326 class).",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-693",
+    "cwe-094"
+   ],
+   "results_count": 10,
+   "results": [
+    {
+     "ruleId": "py/jinja2-sandbox-methods",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-sandbox-methods",
+      "index": 0
+     },
+     "message": {
+      "text": "sandbox method __init__"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/sandbox.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 252,
+         "startColumn": 5,
+         "endColumn": 63
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "bebafe940d720939:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/jinja2-sandbox-methods",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-sandbox-methods",
+      "index": 0
+     },
+     "message": {
+      "text": "sandbox method is_safe_attribute"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/sandbox.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 258,
+         "startColumn": 5,
+         "endColumn": 78
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "a1bbf185a3805158:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/jinja2-sandbox-methods",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-sandbox-methods",
+      "index": 0
+     },
+     "message": {
+      "text": "sandbox method is_safe_callable"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/sandbox.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 267,
+         "startColumn": 5,
+         "endColumn": 52
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "4a6eadb0f1f7baa1:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/jinja2-sandbox-methods",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-sandbox-methods",
+      "index": 0
+     },
+     "message": {
+      "text": "sandbox method call_binop"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/sandbox.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 278,
+         "startColumn": 5,
+         "endLine": 280,
+         "endColumn": 16
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "6d898df683db0b14:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/jinja2-sandbox-methods",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-sandbox-methods",
+      "index": 0
+     },
+     "message": {
+      "text": "sandbox method call_unop"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/sandbox.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 289,
+         "startColumn": 5,
+         "endColumn": 79
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "1cc18433d761dd44:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/jinja2-sandbox-methods",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-sandbox-methods",
+      "index": 0
+     },
+     "message": {
+      "text": "sandbox method getitem"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/sandbox.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 298,
+         "startColumn": 5,
+         "endLine": 300,
+         "endColumn": 36
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "2eb86da788ac22c9:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/jinja2-sandbox-methods",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-sandbox-methods",
+      "index": 0
+     },
+     "message": {
+      "text": "sandbox method getattr"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/sandbox.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 321,
+         "startColumn": 5,
+         "endColumn": 80
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "ebfee4e74a9e67d3:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/jinja2-sandbox-methods",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-sandbox-methods",
+      "index": 0
+     },
+     "message": {
+      "text": "sandbox method unsafe_undefined"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/sandbox.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 338,
+         "startColumn": 5,
+         "endColumn": 73
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "607690b31a224c40:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/jinja2-sandbox-methods",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-sandbox-methods",
+      "index": 0
+     },
+     "message": {
+      "text": "sandbox method format_string"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/sandbox.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 348,
+         "startColumn": 5,
+         "endLine": 354,
+         "endColumn": 14
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "d72cc4f580073105:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/jinja2-sandbox-methods",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-sandbox-methods",
+      "index": 0
+     },
+     "message": {
+      "text": "sandbox method call"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/sandbox.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 377,
+         "startColumn": 5,
+         "endLine": 383,
+         "endColumn": 16
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "a503fc248ce1f5c7:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20261119033129",
+   "codeql_raw_query": "/**\n * @name Calls in xmlattr/attr filter region\n * @description Inspect call expressions in filters.py xmlattr and attr implementations\n * @kind problem\n * @problem.severity note\n * @id py/jinja2-inspect-filters\n */\nimport python\n\nfrom Call c, string callee\nwhere\n  c.getLocation().getFile().getBaseName() = \"filters.py\" and\n  c.getLocation().getStartLine() >= 225 and\n  c.getLocation().getStartLine() <= 300 and\n  (if exists(c.getFunc().(Name).getId()) then callee = c.getFunc().(Name).getId() else callee = \"<expr>\")\nselect c, \"line \" + c.getLocation().getStartLine().toString() + \": call \" + callee",
+   "hypothesis": "CWE-79: xmlattr filter may not escape attribute names, allowing attribute injection/XSS (CVE-2024-22195 pattern)",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-79"
+   ],
+   "results_count": 14,
+   "results": [
+    {
+     "ruleId": "py/jinja2-inspect-filters",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-inspect-filters",
+      "index": 0
+     },
+     "message": {
+      "text": "line 242: call isinstance"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/filters.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 242,
+         "startColumn": 8,
+         "endColumn": 36
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "5b49c4c158ab0605:1",
+      "primaryLocationStartColumnFingerprint": "3"
+     }
+    },
+    {
+     "ruleId": "py/jinja2-inspect-filters",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-inspect-filters",
+      "index": 0
+     },
+     "message": {
+      "text": "line 245: call isinstance"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/filters.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 245,
+         "startColumn": 12,
+         "endColumn": 42
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "68f1e975b55ac6bb:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/jinja2-inspect-filters",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-inspect-filters",
+      "index": 0
+     },
+     "message": {
+      "text": "line 246: call TypeError"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/filters.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 246,
+         "startColumn": 15,
+         "endColumn": 67
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "6d76d7b371c7e120:1",
+      "primaryLocationStartColumnFingerprint": "6"
+     }
+    },
+    {
+     "ruleId": "py/jinja2-inspect-filters",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-inspect-filters",
+      "index": 0
+     },
+     "message": {
+      "text": "line 248: call <expr>"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/filters.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 248,
+         "startColumn": 16,
+         "endColumn": 29
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "145f4e610472a781:1",
+      "primaryLocationStartColumnFingerprint": "11"
+     }
+    },
+    {
+     "ruleId": "py/jinja2-inspect-filters",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-inspect-filters",
+      "index": 0
+     },
+     "message": {
+      "text": "line 251: call pass_eval_context"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/filters.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 251,
+         "startColumn": 2,
+         "endColumn": 19
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "28e3ce62cae6eb95:1",
+      "primaryLocationStartColumnFingerprint": "1"
+     }
+    },
+    {
+     "ruleId": "py/jinja2-inspect-filters",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-inspect-filters",
+      "index": 0
+     },
+     "message": {
+      "text": "line 277: call <expr>"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/filters.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 277,
+         "startColumn": 10,
+         "endLine": 281,
+         "endColumn": 6
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "b480c2bc207bdbed:1",
+      "primaryLocationStartColumnFingerprint": "5"
+     }
+    },
+    {
+     "ruleId": "py/jinja2-inspect-filters",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-inspect-filters",
+      "index": 0
+     },
+     "message": {
+      "text": "line 280: call isinstance"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/filters.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 280,
+         "startColumn": 38,
+         "endColumn": 66
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "37fbc36918d87fc0:1",
+      "primaryLocationStartColumnFingerprint": "29"
+     }
+    },
+    {
+     "ruleId": "py/jinja2-inspect-filters",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-inspect-filters",
+      "index": 0
+     },
+     "message": {
+      "text": "line 278: call escape"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/filters.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 278,
+         "startColumn": 12,
+         "endColumn": 23
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "b904e8dd1251260a:1",
+      "primaryLocationStartColumnFingerprint": "3"
+     }
+    },
+    {
+     "ruleId": "py/jinja2-inspect-filters",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-inspect-filters",
+      "index": 0
+     },
+     "message": {
+      "text": "line 278: call escape"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/filters.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 278,
+         "startColumn": 27,
+         "endColumn": 40
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "b904e8dd1251260a:1",
+      "primaryLocationStartColumnFingerprint": "18"
+     }
+    },
+    {
+     "ruleId": "py/jinja2-inspect-filters",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-inspect-filters",
+      "index": 0
+     },
+     "message": {
+      "text": "line 279: call <expr>"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/filters.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 279,
+         "startColumn": 27,
+         "endColumn": 36
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "370603cb9025fdd4:1",
+      "primaryLocationStartColumnFingerprint": "18"
+     }
+    },
+    {
+     "ruleId": "py/jinja2-inspect-filters",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-inspect-filters",
+      "index": 0
+     },
+     "message": {
+      "text": "line 287: call Markup"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/filters.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 287,
+         "startColumn": 14,
+         "endColumn": 24
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "23fd7f8c157bd25c:1",
+      "primaryLocationStartColumnFingerprint": "5"
+     }
+    },
+    {
+     "ruleId": "py/jinja2-inspect-filters",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-inspect-filters",
+      "index": 0
+     },
+     "message": {
+      "text": "line 296: call <expr>"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/filters.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 296,
+         "startColumn": 12,
+         "endColumn": 36
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "c129da0de8842700:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/jinja2-inspect-filters",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-inspect-filters",
+      "index": 0
+     },
+     "message": {
+      "text": "line 296: call soft_str"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/filters.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 296,
+         "startColumn": 12,
+         "endColumn": 23
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "c129da0de8842700:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/jinja2-inspect-filters",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-inspect-filters",
+      "index": 0
+     },
+     "message": {
+      "text": "line 299: call <expr>"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/filters.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 299,
+         "startColumn": 28,
+         "endColumn": 56
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "333781d66659f91d:1",
+      "primaryLocationStartColumnFingerprint": "27"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20261119033231",
+   "codeql_raw_query": "/**\n * @name jinja2 xmlattr key escaping check\n * @description Inspects calls inside do_xmlattr to see whether escape() is applied to keys\n * @kind problem\n * @problem.severity warning\n * @id py/jinja2-xmlattr-keys\n */\n\nimport python\n\nfrom Function f, Call c\nwhere\n  f.getName() = \"do_xmlattr\" and\n  c.getScope() = f\nselect c,\n  c.getLocation().getStartLine().toString() + \": func=\" + c.getFunc().toString() + \" || args=\" +\n    concat(c.getAnArg().toString(), \" ; \")\n",
+   "hypothesis": "In jinja2 3.1.2, the xmlattr filter escapes attribute values but concatenates attribute keys into markup without escaping (CVE-2024-22195, XSS / HTML attribute injection).",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-79",
+    "cwe-116"
+   ],
+   "results_count": 3,
+   "results": [
+    {
+     "ruleId": "py/jinja2-xmlattr-keys",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-xmlattr-keys",
+      "index": 0
+     },
+     "message": {
+      "text": "277: func=Attribute || args=GeneratorExp"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/filters.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 277,
+         "startColumn": 10,
+         "endLine": 281,
+         "endColumn": 6
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "b480c2bc207bdbed:1",
+      "primaryLocationStartColumnFingerprint": "5"
+     }
+    },
+    {
+     "ruleId": "py/jinja2-xmlattr-keys",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-xmlattr-keys",
+      "index": 0
+     },
+     "message": {
+      "text": "279: func=Attribute || args="
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/filters.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 279,
+         "startColumn": 27,
+         "endColumn": 36
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "370603cb9025fdd4:1",
+      "primaryLocationStartColumnFingerprint": "18"
+     }
+    },
+    {
+     "ruleId": "py/jinja2-xmlattr-keys",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-xmlattr-keys",
+      "index": 0
+     },
+     "message": {
+      "text": "287: func=Markup || args=rv"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/filters.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 287,
+         "startColumn": 14,
+         "endColumn": 24
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "23fd7f8c157bd25c:1",
+      "primaryLocationStartColumnFingerprint": "5"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20261119033248",
+   "codeql_raw_query": "/**\n * @name jinja2 sandbox-bypassing attr filter\n * @description Finds getattr calls in filters.py that bypass SandboxedEnvironment.getattr checks\n * @kind problem\n * @problem.severity warning\n * @id py/jinja2-attr-filter-getattr\n */\n\nimport python\n\nfrom Call c\nwhere\n  c.getLocation().getFile().getBaseName() = \"filters.py\" and\n  c.getFunc().(Name).getId() = \"getattr\"\nselect c, \"raw getattr() in filters.py line \" + c.getLocation().getStartLine().toString() + \": \" + c.toString()\n",
+   "hypothesis": "The |attr filter uses Python's builtin getattr directly instead of environment.getattr, so the sandbox's is_safe_attribute check is bypassed, allowing access to unsafe (dunder) attributes (CVE-2025-27516).",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-693",
+    "cwe-184"
+   ],
+   "results_count": 2,
+   "results": [
+    {
+     "ruleId": "py/jinja2-attr-filter-getattr",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-attr-filter-getattr",
+      "index": 0
+     },
+     "message": {
+      "text": "raw getattr() in filters.py line 1143: getattr()"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/filters.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 1143,
+         "startColumn": 12,
+         "endColumn": 33
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "7d87d0014c2ae73d:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/jinja2-attr-filter-getattr",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-attr-filter-getattr",
+      "index": 0
+     },
+     "message": {
+      "text": "raw getattr() in filters.py line 1388: getattr()"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/filters.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 1388,
+         "startColumn": 21,
+         "endColumn": 39
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "c0b616820c79e5d6:1",
+      "primaryLocationStartColumnFingerprint": "8"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20261119033426",
+   "codeql_raw_query": "/**\n * @name jinja2 xmlattr key not escaped\n * @description xmlattr filter interpolates attribute names without validation/escaping, allowing attribute injection (CVE-2024-22195)\n * @kind problem\n * @problem.severity warning\n * @id py/jinja2-xmlattr-key-injection\n * @tags security\n *        external/cwe/cwe-79\n */\n\nimport python\n\nfrom Function f, Call c, Name n\nwhere\n  f.getName() = \"do_xmlattr\" and\n  c.getScope() = f and\n  n = c.getFunc() and\n  n.getId() = \"escape\"\nselect c, \"escape() is applied to values only in do_xmlattr; attribute names are interpolated unchecked.\"",
+   "hypothesis": "xmlattr filter escapes attribute values but not attribute names, enabling attribute/quote injection and XSS (CVE-2024-22195).",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-79"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20261119033534",
+   "codeql_raw_query": "/**\n * @name split_template_path traversal check\n * @description Inspect path traversal defenses in loaders\n * @kind problem\n * @problem.severity warning\n * @id py/jinja2-path-check\n */\nimport python\n\nfrom Call c\nwhere\n  c.getLocation().getFile().getBaseName() = \"loaders.py\" and\n  c.getLocation().getStartLine() >= 75 and\n  c.getLocation().getStartLine() <= 105\nselect c, \"line \" + c.getLocation().getStartLine().toString() + \": call \" + c.getFunc().toString()",
+   "hypothesis": "split_template_path may not block all traversal sequences, enabling directory traversal in FileSystemLoader.",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-22"
+   ],
+   "results_count": 4,
+   "results": [
+    {
+     "ruleId": "py/jinja2-path-check",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-path-check",
+      "index": 0
+     },
+     "message": {
+      "text": "line 96: call RuntimeError"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/loaders.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 96,
+         "startColumn": 19,
+         "endLine": 98,
+         "endColumn": 14
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "a04c1b5cba999254:1",
+      "primaryLocationStartColumnFingerprint": "6"
+     }
+    },
+    {
+     "ruleId": "py/jinja2-path-check",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-path-check",
+      "index": 0
+     },
+     "message": {
+      "text": "line 97: call type"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/loaders.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 97,
+         "startColumn": 20,
+         "endColumn": 30
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "2f145c27c5ce7c73:1",
+      "primaryLocationStartColumnFingerprint": "3"
+     }
+    },
+    {
+     "ruleId": "py/jinja2-path-check",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-path-check",
+      "index": 0
+     },
+     "message": {
+      "text": "line 99: call TemplateNotFound"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/loaders.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 99,
+         "startColumn": 15,
+         "endColumn": 41
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "b296cdf4843eff92:1",
+      "primaryLocationStartColumnFingerprint": "6"
+     }
+    },
+    {
+     "ruleId": "py/jinja2-path-check",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-path-check",
+      "index": 0
+     },
+     "message": {
+      "text": "line 105: call TypeError"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/loaders.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 105,
+         "startColumn": 15,
+         "endColumn": 73
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "f8295890488b0e4b:1",
+      "primaryLocationStartColumnFingerprint": "6"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20261119033616",
+   "codeql_raw_query": "/**\n * @name sandbox safe attribute checks\n * @description Inspect statements in sandbox is_safe_attribute\n * @kind problem\n * @problem.severity note\n * @id py/jinja2-sandbox-safechk\n */\nimport python\n\nfrom Stmt s\nwhere\n  s.getLocation().getFile().getBaseName() = \"sandbox.py\" and\n  s.getLocation().getStartLine() >= 258 and\n  s.getLocation().getStartLine() <= 268\nselect s, \"\" + s.getLocation().getStartLine().toString() + \": \" + s.toString()\n",
+   "hypothesis": "The Jinja sandbox's is_safe_attribute may have gaps (no check for 'format'/dunder-based escapes) enabling sandbox breakout via the attr filter or str.format, as in CVE-2025-27516.",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-693",
+    "cwe-1336"
+   ],
+   "results_count": 5,
+   "results": [
+    {
+     "ruleId": "py/jinja2-sandbox-safechk",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-sandbox-safechk",
+      "index": 0
+     },
+     "message": {
+      "text": "258: FunctionDef"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/sandbox.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 258,
+         "startColumn": 5,
+         "endColumn": 78
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "a1bbf185a3805158:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/jinja2-sandbox-safechk",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-sandbox-safechk",
+      "index": 0
+     },
+     "message": {
+      "text": "259: ExprStmt"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/sandbox.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 259,
+         "startColumn": 9,
+         "endLine": 264,
+         "endColumn": 12
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "4c53ff05c63bff95:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/jinja2-sandbox-safechk",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-sandbox-safechk",
+      "index": 0
+     },
+     "message": {
+      "text": "265: Return"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/sandbox.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 265,
+         "startColumn": 9,
+         "endColumn": 78
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "ea6f0254b1a7f1ec:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/jinja2-sandbox-safechk",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-sandbox-safechk",
+      "index": 0
+     },
+     "message": {
+      "text": "267: FunctionDef"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/sandbox.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 267,
+         "startColumn": 5,
+         "endColumn": 52
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "4a6eadb0f1f7baa1:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/jinja2-sandbox-safechk",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-sandbox-safechk",
+      "index": 0
+     },
+     "message": {
+      "text": "268: ExprStmt"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/sandbox.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 268,
+         "startColumn": 9,
+         "endLine": 273,
+         "endColumn": 12
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "fbad434fde7369da:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20261119033651",
+   "codeql_raw_query": "/**\n * @name is_safe_attribute usage\n * @description Where is the sandbox attribute safety check referenced\n * @kind problem\n * @problem.severity warning\n * @id py/jinja2-issafe-usage\n */\n\nimport python\n\nfrom Name n\nwhere n.getId() = \"is_safe_attribute\"\nselect n, \"is_safe_attribute referenced here\"",
+   "hypothesis": "The |attr filter (do_attr) calls raw getattr() without consulting sandbox is_safe_attribute, enabling sandbox escape (CVE-2024-56326 / CVE-2025-27516 pattern). Check whether is_safe_attribute is referenced anywhere besides sandbox.py.",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-693",
+    "cwe-94"
+   ],
+   "results_count": 2,
+   "results": [
+    {
+     "ruleId": "py/jinja2-issafe-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-issafe-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "is_safe_attribute referenced here"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/sandbox.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 258,
+         "startColumn": 9,
+         "endColumn": 26
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "a1bbf185a3805158:1",
+      "primaryLocationStartColumnFingerprint": "4"
+     }
+    },
+    {
+     "ruleId": "py/jinja2-issafe-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-issafe-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "is_safe_attribute referenced here"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/sandbox.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 402,
+         "startColumn": 9,
+         "endColumn": 26
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "3ea69297ecb0b1ce:1",
+      "primaryLocationStartColumnFingerprint": "4"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20261119033708",
+   "codeql_raw_query": "/**\n * @name xmlattr key validation\n * @description Search for attribute key validation regex in filters.py\n * @kind problem\n * @problem.severity warning\n * @id py/jinja2-attrkey-re\n */\n\nimport python\n\nfrom Name n\nwhere\n  n.getLocation().getFile().getBaseName() = \"filters.py\" and\n  n.getId().regexpMatch(\".*attr_key_re.*\")\nselect n, \"xmlattr key validation reference: \" + n.getId()",
+   "hypothesis": "jinja2 3.1.2 xmlattr filter esc*apes values but not attribute keys, allowing attribute injection / XSS (CVE-2024-22195, CVE-2024-34064). Check for presence of _attr_key_re validation.",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-79"
+   ],
+   "results_count": 0,
+   "results": []
+  }
+ ],
+ "cache_usage": {
+  "prompt_tokens_total": 203289,
+  "uncached_input_tokens": 13849,
+  "cache_creation_input_tokens": 0,
+  "cache_read_input_tokens": 189440,
+  "output_tokens": 32405,
+  "calls": 18,
+  "caching_enabled": false,
+  "cost_usd_with_cache": 0.044177,
+  "cost_usd_no_cache": 0.099873,
+  "cache_read_share_of_prompt": 0.9319,
+  "prices_per_mtok": {
+   "claude-sonnet-4-5-20250929": {
+    "input": 3.0,
+    "output": 15.0
+   },
+   "claude-haiku-4-5-20251001": {
+    "input": 1.0,
+    "output": 5.0
+   },
+   "deepseek/deepseek-reasoner": {
+    "input": 0.15,
+    "output": 0.6,
+    "cache_read": 0.003,
+    "cache_write_mult": 1.0,
+    "peak_mult": 2.0
+   }
+  },
+  "cache_multipliers": {
+   "write_5m": 1.25,
+   "read": 0.1
+  }
+ }
+}

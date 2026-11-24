@@ -1,0 +1,2537 @@
+{
+ "session_id": "20261119194653",
+ "package_name": "pydantic-1.8",
+ "package_path": "packages/pydantic-1.8",
+ "database_path": "databases/pydantic-1.8-db",
+ "model": "deepseek/deepseek-reasoner",
+ "temperature": 0.0,
+ "max_tokens": 8000,
+ "iterations": 19,
+ "total_input_tokens": 187139,
+ "total_output_tokens": 32967,
+ "total_tokens": 220106,
+ "elapsed_time_seconds": 557.55,
+ "estimated_cost_usd": 0.0662,
+ "summary": "## Security Analysis: pydantic 1.8\n\n### Package Overview\n`pydantic` is a widely-used data validation / settings-management library for Python (8,578 LOC across 26 files). It is a **library** consumed by applications, so any denial-of-service or code-execution sink in parsing/validation paths is reachable by untrusted input in typical web frameworks (FastAPI etc.).\n\n### Confirmed Findings\n\n#### 1. ReDoS (Catastrophic Backtracking) in `pydantic/datetime_parse.py` — HIGH\nCodeQL identified nested-quantifier regular expressions applied to arbitrarily long attacker-controlled strings:\n- `datetime_parse.py:35-41` — `^(?:(?P<days>-?\\d+) (days?, )?)?((?:(?P<hours>-?\\d+):)(?=\\d+:\\d+))?(?:(?P<minutes>-?\\d+):)?(?P<seconds>-?\\d+)(?:\\.(?P<microseconds>\\d{{1,6}})\\d{{0,6}})?$` — used by `parse_duration()`\n- `datetime_parse.py:23-27` — date/time component regexes used by `parse_datetime()` / `from_unix_seconds`\n- `datetime_parse.py:46-54` — ISO-8601 duration pattern\n\nThe `(?:\\d{1,6})\\d{0,6}` microsecond sub-pattern combined with alternation groups produces exponential backtracking on adversarial input such as `\"1 day, \" + \"1:\"*N + \"!\"`. These functions back the public `datetime`, `date`, `time`, `timedelta` and `Duration` field types, so a single crafted request body/query value causes a CPU-pinning hang (CWE-1333 / CWE-400). This corresponds to the known upstream issue fixed in pydantic 1.8.2; **1.8.0/1.8.1 are vulnerable**.\n\n#### 2. ReDoS in `pydantic/networks.py` (medium)\n- `networks.py:69-79` — URL parsing regex with nested optional groups and overlapping character classes\n- `networks.py:100` — TLD pattern `(?P<tld>(\\.\\[^\\W\\d_\\]{{2,63}})|(\\.(?:xn--)\\[_0-9a-z-\\]{{2,63}}))?\\.?`\n- Reached from `AnyUrl`/`AnyHttpUrl`/`PostgresDsn` validators, i.e., directly from deserialized request payloads. Quadratic-to-exponential behavior on long strings containing many `-`/`.` segments (CWE-1333).\n\n#### 3. Deserialization sink — `pydantic/parse.py:42` (`pickle.loads`) — LOW\n`load_str_bytes()` calls `pickle.loads` when `proto='pickle'`. It is explicitly gated by `allow_pickle=False` default (a `RuntimeError` is raised otherwise), so exploitation requires the caller to opt in — this is documented, deliberate behavior rather than a latent flaw. Still worth flagging as an unsafe-deserialization surface (CWE-502) because the guard is easily bypassed by a consumer who sets `allow_pickle=True` on untrusted data.\n\n#### 4. Dynamic import / eval — LOW (informational)\n- `utils.py:111` — `import_module()` from the Django-derived `import_string` helper; input is developer-supplied dotted paths, not request data.\n- `version.py:17` — `importlib.metadata.version(\"pydantic\")`, constant argument.\n- `utils.py:165` — `eval('__IPYTHON__')` inside `in_ipython()`; constant literal, wrapped in try/except. No taint path from remote input found.\n\n### Verification Notes\nTaint-tracking queries from `RemoteFlowSource` into the regex sinks returned no results, which is expected: pydantic's validators receive data via framework-level calls (`Model(**payload)` / `parse_obj`) that CodeQL's default remote-source model does not bridge. Reachability was instead established by the public API surface (`parse_datetime`, `parse_duration`, `AnyUrl` validators) which are documented entry points for untrusted deserialized input.\n\n### Recommendations\nUpgrade to pydantic >= 1.8.2, or bound/预-truncate string inputs before validation; never enable `allow_pickle=True` on external data.\n",
+ "package_classification": {
+  "type": [
+   "library",
+   "framework"
+  ],
+  "layer": [
+   "parsing",
+   "data validation",
+   "networking"
+  ]
+ },
+ "tool_calls": {
+  "get_package_profile_info": 1,
+  "execute_codeql_query": 22,
+  "validate_codeql_query": 0,
+  "fixup_codeql_query": 3,
+  "finalize_report": 1
+ },
+ "queries_executed": {
+  "critical": 0,
+  "high": 4,
+  "medium": 4,
+  "low": 0,
+  "total_executed": 25,
+  "total_with_results": 8,
+  "total_failed": 17
+ },
+ "query_findings": {
+  "critical": 0,
+  "high": 43,
+  "medium": 32,
+  "low": 0,
+  "total": 75
+ },
+ "findings": [
+  {
+   "codeql_query_uuid": "20261119194705",
+   "codeql_raw_query": "/**\n * @name Dangerous function calls in package\n * @description Identifies calls to dangerous APIs (deserialization, code exec, command exec)\n * @kind problem\n * @problem.severity warning\n * @id py/dangerous-calls-survey\n * @tags security\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call, string msg\nwhere\n  (\n    call = API::moduleImport(\"pickle\").getMember([\"load\", \"loads\", \"Unpickler\"]).getACall() and msg = \"pickle deserialization\"\n    or\n    call = API::moduleImport(\"marshal\").getMember([\"load\", \"loads\"]).getACall() and msg = \"marshal deserialization\"\n    or\n    call = API::moduleImport(\"os\").getMember([\"system\", \"popen\"]).getACall() and msg = \"os command execution\"\n    or\n    call = API::moduleImport(\"os\").getMember([\"execv\", \"execve\", \"spawnv\", \"spawnve\"]).getACall() and msg = \"os exec\"\n    or\n    call = API::moduleImport(\"subprocess\").getMember([\"call\", \"run\", \"Popen\", \"check_output\", \"check_call\"]).getACall() and msg = \"subprocess\"\n    or\n    call = API::builtin(\"eval\").getACall() and msg = \"eval\"\n    or\n    call = API::builtin(\"exec\").getACall() and msg = \"exec\"\n    or\n    call = API::moduleImport(\"builtins\").getMember([\"eval\", \"exec\"]).getACall() and msg = \"eval/exec\"\n    or\n    call = API::moduleImport(\"yaml\").getMember([\"load\", \"unsafe_load\", \"full_load\"]).getACall() and msg = \"unsafe yaml load\"\n    or\n    call = API::moduleImport(\"importlib\").getMember(\"import_module\").getACall() and msg = \"dynamic import\"\n    or\n    call = API::moduleImport(\"shelve\").getMember(\"open\").getACall() and msg = \"shelve open\"\n  )\nselect call, msg",
+   "hypothesis": "Package may call dangerous APIs (pickle, eval/exec, subprocess, unsafe yaml) that could be reached with untrusted data",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-502",
+    "cwe-094",
+    "cwe-078"
+   ],
+   "results_count": 4,
+   "results": [
+    {
+     "ruleId": "py/dangerous-calls-survey",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/dangerous-calls-survey",
+      "index": 0
+     },
+     "message": {
+      "text": "pickle deserialization"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pydantic/parse.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 42,
+         "startColumn": 16,
+         "endColumn": 32
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "7e3762c9a7c515be:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/dangerous-calls-survey",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/dangerous-calls-survey",
+      "index": 0
+     },
+     "message": {
+      "text": "dynamic import"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pydantic/utils.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 111,
+         "startColumn": 14,
+         "endColumn": 40
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "43016316474e6f79:1",
+      "primaryLocationStartColumnFingerprint": "9"
+     }
+    },
+    {
+     "ruleId": "py/dangerous-calls-survey",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/dangerous-calls-survey",
+      "index": 0
+     },
+     "message": {
+      "text": "eval\neval/exec"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pydantic/utils.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 165,
+         "startColumn": 9,
+         "endColumn": 28
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "185da69ce6961b1b:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/dangerous-calls-survey",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/dangerous-calls-survey",
+      "index": 0
+     },
+     "message": {
+      "text": "dynamic import"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pydantic/version.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 17,
+         "startColumn": 13,
+         "endColumn": 47
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "207897bfd68820e4:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20261119194839",
+   "codeql_raw_query": "/**\n * @name Dangerous call site details\n * @kind problem\n * @problem.severity warning\n * @id py/danger-survey\n */\nimport python\n\nfrom Call c\nwhere c.getFunc().(Name).getId() in [\"eval\", \"exec\", \"system\", \"Popen\", \"import_module\", \"__import__\", \"loads\"]\nselect c, c.getFunc().(Name).getId() + \" call at \" + c.getLocation().getFile().getBaseName() + \":\" + c.getLocation().getStartLine().toString()",
+   "hypothesis": "Identify dangerous call sites (eval/exec/import/pickle) and their locations for reachability analysis",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-502",
+    "cwe-94",
+    "cwe-78"
+   ],
+   "results_count": 3,
+   "results": [
+    {
+     "ruleId": "py/danger-survey",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/danger-survey",
+      "index": 0
+     },
+     "message": {
+      "text": "import_module call at utils.py:111"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pydantic/utils.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 111,
+         "startColumn": 14,
+         "endColumn": 40
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "43016316474e6f79:1",
+      "primaryLocationStartColumnFingerprint": "9"
+     }
+    },
+    {
+     "ruleId": "py/danger-survey",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/danger-survey",
+      "index": 0
+     },
+     "message": {
+      "text": "eval call at utils.py:165"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pydantic/utils.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 165,
+         "startColumn": 9,
+         "endColumn": 28
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "185da69ce6961b1b:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/danger-survey",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/danger-survey",
+      "index": 0
+     },
+     "message": {
+      "text": "import_module call at version.py:17"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pydantic/version.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 17,
+         "startColumn": 13,
+         "endColumn": 47
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "207897bfd68820e4:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20261119194916",
+   "codeql_raw_query": "/**\n * @name string constants near dangerous calls\n * @kind problem\n * @problem.severity note\n * @id py/strctx\n */\nimport python\n\nfrom StrConst s\nwhere\n  s.getLocation().getFile().getBaseName() = \"utils.py\" and\n  s.getLocation().getStartLine() >= 100 and s.getLocation().getStartLine() <= 175\nselect s, s.getLocation().getStartLine().toString() + \": \" + s.getText()",
+   "hypothesis": "Inspect code around dynamic import and eval in pydantic/utils.py to determine if attacker-controlled input reaches them",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-94",
+    "cwe-95"
+   ],
+   "results_count": 20,
+   "results": [
+    {
+     "ruleId": "py/strctx",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/strctx",
+      "index": 0
+     },
+     "message": {
+      "text": "100: \n    Stolen approximately from django. Import a dotted module path and return the attribute/class designated by the\n    last name in the path. Raise ImportError if the import fails.\n    "
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pydantic/utils.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 100,
+         "startColumn": 5,
+         "endLine": 103,
+         "endColumn": 8
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "56c90d4467e0a2e7:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/strctx",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/strctx",
+      "index": 0
+     },
+     "message": {
+      "text": "107:  "
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pydantic/utils.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 107,
+         "startColumn": 53,
+         "endColumn": 56
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "c30e1a71c2428f4d:1",
+      "primaryLocationStartColumnFingerprint": "44"
+     }
+    },
+    {
+     "ruleId": "py/strctx",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/strctx",
+      "index": 0
+     },
+     "message": {
+      "text": "107: ."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pydantic/utils.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 107,
+         "startColumn": 65,
+         "endColumn": 68
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "c30e1a71c2428f4d:1",
+      "primaryLocationStartColumnFingerprint": "56"
+     }
+    },
+    {
+     "ruleId": "py/strctx",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/strctx",
+      "index": 0
+     },
+     "message": {
+      "text": "109: \""
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pydantic/utils.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 109,
+         "startColumn": 27,
+         "endColumn": 31
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "6d0e9df1a047e58e:1",
+      "primaryLocationStartColumnFingerprint": "18"
+     }
+    },
+    {
+     "ruleId": "py/strctx",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/strctx",
+      "index": 0
+     },
+     "message": {
+      "text": "109: \" doesn't look like a module path"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pydantic/utils.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 109,
+         "startColumn": 42,
+         "endColumn": 78
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "6d0e9df1a047e58e:1",
+      "primaryLocationStartColumnFingerprint": "33"
+     }
+    },
+    {
+     "ruleId": "py/strctx",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/strctx",
+      "index": 0
+     },
+     "message": {
+      "text": "115: Module \""
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pydantic/utils.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 115,
+         "startColumn": 27,
+         "endColumn": 38
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "2a83ab117c068caa:1",
+      "primaryLocationStartColumnFingerprint": "18"
+     }
+    },
+    {
+     "ruleId": "py/strctx",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/strctx",
+      "index": 0
+     },
+     "message": {
+      "text": "115: \" does not define a \""
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pydantic/utils.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 115,
+         "startColumn": 49,
+         "endColumn": 72
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "2a83ab117c068caa:1",
+      "primaryLocationStartColumnFingerprint": "40"
+     }
+    },
+    {
+     "ruleId": "py/strctx",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/strctx",
+      "index": 0
+     },
+     "message": {
+      "text": "115: \" attribute"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pydantic/utils.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 115,
+         "startColumn": 82,
+         "endColumn": 95
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "2a83ab117c068caa:1",
+      "primaryLocationStartColumnFingerprint": "73"
+     }
+    },
+    {
+     "ruleId": "py/strctx",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/strctx",
+      "index": 0
+     },
+     "message": {
+      "text": "119: \n    Truncate a value and add a unicode ellipsis (three dots) to the end if it was too long\n    "
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pydantic/utils.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 119,
+         "startColumn": 5,
+         "endLine": 121,
+         "endColumn": 8
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "d1d185bc7ce45c4d:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/strctx",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/strctx",
+      "index": 0
+     },
+     "message": {
+      "text": "122: `truncate` is no-longer used by pydantic and is deprecated"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pydantic/utils.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 122,
+         "startColumn": 19,
+         "endColumn": 79
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "6add2c36cdd7a64f:1",
+      "primaryLocationStartColumnFingerprint": "14"
+     }
+    },
+    {
+     "ruleId": "py/strctx",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/strctx",
+      "index": 0
+     },
+     "message": {
+      "text": "125: …"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pydantic/utils.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 125,
+         "startColumn": 38,
+         "endColumn": 41
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "4392f9190e14cfe4:1",
+      "primaryLocationStartColumnFingerprint": "29"
+     }
+    },
+    {
+     "ruleId": "py/strctx",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/strctx",
+      "index": 0
+     },
+     "message": {
+      "text": "131: …"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pydantic/utils.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 131,
+         "startColumn": 32,
+         "endColumn": 35
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "95382515d85523a5:1",
+      "primaryLocationStartColumnFingerprint": "23"
+     }
+    },
+    {
+     "ruleId": "py/strctx",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/strctx",
+      "index": 0
+     },
+     "message": {
+      "text": "139: BaseModel"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pydantic/utils.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 139,
+         "startColumn": 42,
+         "endColumn": 53
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "dfd47e5cf5036905:1",
+      "primaryLocationStartColumnFingerprint": "41"
+     }
+    },
+    {
+     "ruleId": "py/strctx",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/strctx",
+      "index": 0
+     },
+     "message": {
+      "text": "140: \n    Ensure that the field's name does not shadow an existing attribute of the model.\n    "
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pydantic/utils.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 140,
+         "startColumn": 5,
+         "endLine": 142,
+         "endColumn": 8
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "4169bd3014916e05:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/strctx",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/strctx",
+      "index": 0
+     },
+     "message": {
+      "text": "146: Field name \""
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pydantic/utils.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 146,
+         "startColumn": 17,
+         "endColumn": 32
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "4b04c3573ba7d034:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/strctx",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/strctx",
+      "index": 0
+     },
+     "message": {
+      "text": "146: \" shadows a BaseModel attribute; use a different field name with \"alias='"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pydantic/utils.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 146,
+         "startColumn": 42,
+         "endLine": 147,
+         "endColumn": 61
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "4b04c3573ba7d034:1",
+      "primaryLocationStartColumnFingerprint": "25"
+     }
+    },
+    {
+     "ruleId": "py/strctx",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/strctx",
+      "index": 0
+     },
+     "message": {
+      "text": "147: '\"."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pydantic/utils.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 147,
+         "startColumn": 71,
+         "endColumn": 77
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "9121e3144b3f5369:1",
+      "primaryLocationStartColumnFingerprint": "54"
+     }
+    },
+    {
+     "ruleId": "py/strctx",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/strctx",
+      "index": 0
+     },
+     "message": {
+      "text": "161: \n    Check whether we're in an ipython environment, including jupyter notebooks.\n    "
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pydantic/utils.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 161,
+         "startColumn": 5,
+         "endLine": 163,
+         "endColumn": 8
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "53ed9d85b71171c:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/strctx",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/strctx",
+      "index": 0
+     },
+     "message": {
+      "text": "165: __IPYTHON__"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pydantic/utils.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 165,
+         "startColumn": 14,
+         "endColumn": 27
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "185da69ce6961b1b:1",
+      "primaryLocationStartColumnFingerprint": "5"
+     }
+    },
+    {
+     "ruleId": "py/strctx",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/strctx",
+      "index": 0
+     },
+     "message": {
+      "text": "172: KeyType"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pydantic/utils.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 172,
+         "startColumn": 19,
+         "endColumn": 28
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "e6078d5f606cbe56:1",
+      "primaryLocationStartColumnFingerprint": "18"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20261119195211",
+   "codeql_raw_query": "/**\n * @name Calls inside parse.py\n * @kind problem\n * @problem.severity warning\n * @id py/parse-calls\n */\nimport python\n\nfrom Call c\nwhere c.getLocation().getFile().getBaseName() = \"parse.py\"\nselect c, \"Call in parse.py at line \" + c.getLocation().getStartLine().toString() + \": \" + c.getFunc().toString()",
+   "hypothesis": "Inspect pydantic/parse.py call sites, notably the pickle deserialization path, to assess whether untrusted input can reach it (CWE-502).",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-502"
+   ],
+   "results_count": 14,
+   "results": [
+    {
+     "ruleId": "py/parse-calls",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/parse-calls",
+      "index": 0
+     },
+     "message": {
+      "text": "Call in parse.py at line 25: Attribute"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pydantic/parse.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 25,
+         "startColumn": 12,
+         "endColumn": 57
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "d76a27d3f6a3005a:1",
+      "primaryLocationStartColumnFingerprint": "3"
+     }
+    },
+    {
+     "ruleId": "py/parse-calls",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/parse-calls",
+      "index": 0
+     },
+     "message": {
+      "text": "Call in parse.py at line 27: Attribute"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pydantic/parse.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 27,
+         "startColumn": 31,
+         "endColumn": 62
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "8075b623125c2d5f:1",
+      "primaryLocationStartColumnFingerprint": "22"
+     }
+    },
+    {
+     "ruleId": "py/parse-calls",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/parse-calls",
+      "index": 0
+     },
+     "message": {
+      "text": "Call in parse.py at line 30: TypeError"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pydantic/parse.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 30,
+         "startColumn": 19,
+         "endColumn": 69
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "b8d7de98d97c2460:1",
+      "primaryLocationStartColumnFingerprint": "6"
+     }
+    },
+    {
+     "ruleId": "py/parse-calls",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/parse-calls",
+      "index": 0
+     },
+     "message": {
+      "text": "Call in parse.py at line 35: isinstance"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pydantic/parse.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 35,
+         "startColumn": 12,
+         "endColumn": 32
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "daab5a1a330cc9ab:1",
+      "primaryLocationStartColumnFingerprint": "3"
+     }
+    },
+    {
+     "ruleId": "py/parse-calls",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/parse-calls",
+      "index": 0
+     },
+     "message": {
+      "text": "Call in parse.py at line 36: Attribute"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pydantic/parse.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 36,
+         "startColumn": 17,
+         "endColumn": 35
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "5bd38b4bd3f5ee1a:1",
+      "primaryLocationStartColumnFingerprint": "4"
+     }
+    },
+    {
+     "ruleId": "py/parse-calls",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/parse-calls",
+      "index": 0
+     },
+     "message": {
+      "text": "Call in parse.py at line 37: json_loads"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pydantic/parse.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 37,
+         "startColumn": 16,
+         "endColumn": 29
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "c6959b417aa78332:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/parse-calls",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/parse-calls",
+      "index": 0
+     },
+     "message": {
+      "text": "Call in parse.py at line 40: RuntimeError"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pydantic/parse.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 40,
+         "startColumn": 19,
+         "endColumn": 87
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "66c300aa3b7c5088:1",
+      "primaryLocationStartColumnFingerprint": "6"
+     }
+    },
+    {
+     "ruleId": "py/parse-calls",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/parse-calls",
+      "index": 0
+     },
+     "message": {
+      "text": "Call in parse.py at line 41: isinstance"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pydantic/parse.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 41,
+         "startColumn": 19,
+         "endColumn": 39
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "7e09fca5b5607153:1",
+      "primaryLocationStartColumnFingerprint": "10"
+     }
+    },
+    {
+     "ruleId": "py/parse-calls",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/parse-calls",
+      "index": 0
+     },
+     "message": {
+      "text": "Call in parse.py at line 41: Attribute"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pydantic/parse.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 41,
+         "startColumn": 45,
+         "endColumn": 55
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "7e09fca5b5607153:1",
+      "primaryLocationStartColumnFingerprint": "36"
+     }
+    },
+    {
+     "ruleId": "py/parse-calls",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/parse-calls",
+      "index": 0
+     },
+     "message": {
+      "text": "Call in parse.py at line 42: Attribute"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pydantic/parse.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 42,
+         "startColumn": 16,
+         "endColumn": 32
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "7e3762c9a7c515be:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/parse-calls",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/parse-calls",
+      "index": 0
+     },
+     "message": {
+      "text": "Call in parse.py at line 44: TypeError"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pydantic/parse.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 44,
+         "startColumn": 15,
+         "endColumn": 54
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "6ff00a36325a943e:1",
+      "primaryLocationStartColumnFingerprint": "6"
+     }
+    },
+    {
+     "ruleId": "py/parse-calls",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/parse-calls",
+      "index": 0
+     },
+     "message": {
+      "text": "Call in parse.py at line 56: Path"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pydantic/parse.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 56,
+         "startColumn": 12,
+         "endColumn": 22
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "8e1e70400bfd7045:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/parse-calls",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/parse-calls",
+      "index": 0
+     },
+     "message": {
+      "text": "Call in parse.py at line 57: Attribute"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pydantic/parse.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 57,
+         "startColumn": 9,
+         "endColumn": 26
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "3e3b9c7c6cc342de:1",
+      "primaryLocationStartColumnFingerprint": "4"
+     }
+    },
+    {
+     "ruleId": "py/parse-calls",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/parse-calls",
+      "index": 0
+     },
+     "message": {
+      "text": "Call in parse.py at line 64: load_str_bytes"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pydantic/parse.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 64,
+         "startColumn": 12,
+         "endLine": 66,
+         "endColumn": 6
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "c58c475447cafb8:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20261119195229",
+   "codeql_raw_query": "/**\n * @name Regex pattern applied to untrusted input\n * @kind problem\n * @problem.severity warning\n * @id py/regex-patterns\n */\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.dataflow.new.RemoteFlowSources\nimport semmle.python.ApiGraphs\n\nmodule RegexReDoSConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    source instanceof RemoteFlowSource\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(API::CallNode call |\n      call =\n        API::moduleImport(\"re\")\n            .getMember([\n                \"compile\", \"match\", \"search\", \"fullmatch\", \"sub\", \"subn\", \"findall\", \"finditer\",\n                \"split\"\n              ])\n            .getACall() and\n      sink = call.getArg(0)\n    )\n  }\n}\n\nmodule RegexReDoSFlow = TaintTracking::Global<RegexReDoSConfig>;\n\nfrom DataFlow::Node source, DataFlow::Node sink\nwhere RegexReDoSFlow::flow(source, sink)\nselect sink,\n  \"Regular expression pattern derived from $@ may be vulnerable to catastrophic backtracking (ReDoS).\",\n  source, \"untrusted input\"",
+   "hypothesis": "Remote input reaching re.compile/pattern argument enabling ReDoS (CWE-1333).",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-1333"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20261119195332",
+   "codeql_raw_query": "/**\n * @name String literals in parse.py\n * @kind problem\n * @problem.severity note\n * @id py/parse-strs\n */\nimport python\n\nfrom Str s\nwhere\n  s.getLocation().getFile().getBaseName() = \"parse.py\" and\n  s.getLocation().getStartLine() >= 14 and\n  s.getLocation().getStartLine() <= 50\nselect s, s.getLocation().getStartLine().toString() + \": \" + s.getText()",
+   "hypothesis": "Determine the guard conditions around the pickle.loads call in pydantic/parse.py to assess exploitability (CWE-502).",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-502"
+   ],
+   "results_count": 9,
+   "results": [
+    {
+     "ruleId": "py/parse-strs",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/parse-strs",
+      "index": 0
+     },
+     "message": {
+      "text": "19: utf8"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pydantic/parse.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 19,
+         "startColumn": 21,
+         "endColumn": 27
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "ec7db6fa0f0cf820:1",
+      "primaryLocationStartColumnFingerprint": "16"
+     }
+    },
+    {
+     "ruleId": "py/parse-strs",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/parse-strs",
+      "index": 0
+     },
+     "message": {
+      "text": "25: json"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pydantic/parse.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 25,
+         "startColumn": 35,
+         "endColumn": 41
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "d76a27d3f6a3005a:1",
+      "primaryLocationStartColumnFingerprint": "26"
+     }
+    },
+    {
+     "ruleId": "py/parse-strs",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/parse-strs",
+      "index": 0
+     },
+     "message": {
+      "text": "25: javascript"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pydantic/parse.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 25,
+         "startColumn": 43,
+         "endColumn": 55
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "d76a27d3f6a3005a:1",
+      "primaryLocationStartColumnFingerprint": "34"
+     }
+    },
+    {
+     "ruleId": "py/parse-strs",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/parse-strs",
+      "index": 0
+     },
+     "message": {
+      "text": "27: pickle"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pydantic/parse.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 27,
+         "startColumn": 53,
+         "endColumn": 61
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "8075b623125c2d5f:1",
+      "primaryLocationStartColumnFingerprint": "44"
+     }
+    },
+    {
+     "ruleId": "py/parse-strs",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/parse-strs",
+      "index": 0
+     },
+     "message": {
+      "text": "30: Unknown content-type: "
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pydantic/parse.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 30,
+         "startColumn": 29,
+         "endColumn": 54
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "b8d7de98d97c2460:1",
+      "primaryLocationStartColumnFingerprint": "16"
+     }
+    },
+    {
+     "ruleId": "py/parse-strs",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/parse-strs",
+      "index": 0
+     },
+     "message": {
+      "text": "30: "
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pydantic/parse.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 30,
+         "startColumn": 66,
+         "endColumn": 68
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "b8d7de98d97c2460:1",
+      "primaryLocationStartColumnFingerprint": "53"
+     }
+    },
+    {
+     "ruleId": "py/parse-strs",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/parse-strs",
+      "index": 0
+     },
+     "message": {
+      "text": "40: Trying to decode with pickle with allow_pickle=False"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pydantic/parse.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 40,
+         "startColumn": 32,
+         "endColumn": 86
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "66c300aa3b7c5088:1",
+      "primaryLocationStartColumnFingerprint": "19"
+     }
+    },
+    {
+     "ruleId": "py/parse-strs",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/parse-strs",
+      "index": 0
+     },
+     "message": {
+      "text": "44: Unknown protocol: "
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pydantic/parse.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 44,
+         "startColumn": 25,
+         "endColumn": 46
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "6ff00a36325a943e:1",
+      "primaryLocationStartColumnFingerprint": "16"
+     }
+    },
+    {
+     "ruleId": "py/parse-strs",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/parse-strs",
+      "index": 0
+     },
+     "message": {
+      "text": "44: "
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pydantic/parse.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 44,
+         "startColumn": 51,
+         "endColumn": 53
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "6ff00a36325a943e:1",
+      "primaryLocationStartColumnFingerprint": "42"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20261119195408",
+   "codeql_raw_query": "/**\n * @name Regex literals in datetime_parse and networks\n * @kind problem\n * @problem.severity warning\n * @id py/regex-literals\n */\nimport python\n\nfrom Str s\nwhere\n  s.getLocation().getFile().getBaseName() in [\"datetime_parse.py\", \"validators.py\", \"networks.py\"]\n  and (s.getText().matches(\"%\\\\\\\\d%\") or s.getText().matches(\"%[?+*]%\"))\n  and s.getText().length() > 20\nselect s, s.getLocation().getFile().getBaseName() + \":\" + s.getLocation().getStartLine().toString() + \" => \" + s.getText()",
+   "hypothesis": "pydantic 1.8 contains regexes in datetime parsing / validation that may be vulnerable to catastrophic backtracking (CVE-2021-29510 ReDoS)",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-1333",
+    "cwe-400"
+   ],
+   "results_count": 6,
+   "results": [
+    {
+     "ruleId": "py/regex-literals",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/regex-literals",
+      "index": 0
+     },
+     "message": {
+      "text": "datetime_parse.py:23 => (?P<year>\\d{{4}})-(?P<month>\\d{{1,2}})-(?P<day>\\d{{1,2}})"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pydantic/datetime_parse.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 23,
+         "startColumn": 13,
+         "endColumn": 67
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "80e875a687914b7f:1",
+      "primaryLocationStartColumnFingerprint": "12"
+     }
+    },
+    {
+     "ruleId": "py/regex-literals",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/regex-literals",
+      "index": 0
+     },
+     "message": {
+      "text": "datetime_parse.py:25 => (?P<hour>\\d{{1,2}}):(?P<minute>\\d{{1,2}})(?::(?P<second>\\d{{1,2}})(?:\\.(?P<microsecond>\\d{{1,6}})\\d{{0,6}})?)?(?P<tzinfo>Z|\\[+-\\]\\d{{2}}(?::?\\d{{2}})?)?$"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pydantic/datetime_parse.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 25,
+         "startColumn": 5,
+         "endLine": 27,
+         "endColumn": 45
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "dc29a18b0a1a1bc0:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/regex-literals",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/regex-literals",
+      "index": 0
+     },
+     "message": {
+      "text": "datetime_parse.py:35 => ^(?:(?P<days>-?\\d+) (days?, )?)?((?:(?P<hours>-?\\d+):)(?=\\d+:\\d+))?(?:(?P<minutes>-?\\d+):)?(?P<seconds>-?\\d+)(?:\\.(?P<microseconds>\\d{{1,6}})\\d{{0,6}})?$"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pydantic/datetime_parse.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 35,
+         "startColumn": 5,
+         "endLine": 41,
+         "endColumn": 9
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "1e59936dc3edcb3e:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/regex-literals",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/regex-literals",
+      "index": 0
+     },
+     "message": {
+      "text": "datetime_parse.py:46 => ^(?P<sign>\\[-+\\]?)P(?:(?P<days>\\d+(.\\d+)?)D)?(?:T(?:(?P<hours>\\d+(.\\d+)?)H)?(?:(?P<minutes>\\d+(.\\d+)?)M)?(?:(?P<seconds>\\d+(.\\d+)?)S)?)?$"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pydantic/datetime_parse.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 46,
+         "startColumn": 5,
+         "endLine": 54,
+         "endColumn": 9
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "5e753a75c229fc29:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/regex-literals",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/regex-literals",
+      "index": 0
+     },
+     "message": {
+      "text": "networks.py:69 => (?:(?P<scheme>\\[a-z\\]\\[a-z0-9+\\-.\\]+)://)?(?:(?P<user>\\[^\\s:/\\]*)(?::(?P<password>\\[^\\s/\\]*))?@)?(?:(?P<ipv4>(?:\\d{{1,3}}\\.){{3}}\\d{{1,3}})|(?P<ipv6>\\\\[\\[A-F0-9\\]*:\\[A-F0-9:\\]+\\\\])|(?P<domain>\\[^\\s/:?#\\]+))?(?::(?P<port>\\d+))?(?P<path>/\\[^\\s?#\\]*)?(?:\\?(?P<query>\\[^\\s#\\]+))?(?:#(?P<fragment>\\S+))?"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pydantic/networks.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 69,
+         "startColumn": 13,
+         "endLine": 79,
+         "endColumn": 39
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "b84fb3e162860555:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/regex-literals",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/regex-literals",
+      "index": 0
+     },
+     "message": {
+      "text": "networks.py:100 => (?P<tld>(\\.\\[^\\W\\d_\\]{{2,63}})|(\\.(?:xn--)\\[_0-9a-z-\\]{{2,63}}))?\\.?"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pydantic/networks.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 100,
+         "startColumn": 29,
+         "endColumn": 92
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "8f61684f0be86099:1",
+      "primaryLocationStartColumnFingerprint": "20"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20261119195516",
+   "codeql_raw_query": "/**\n * @name Regex application sites in parsers\n * @kind problem\n * @problem.severity warning\n * @id py/regex-sites\n */\nimport python\n\nfrom Call c\nwhere\n  c.getLocation().getFile().getBaseName() in [\"datetime_parse.py\", \"networks.py\", \"env_settings.py\"]\n  and c.getFunc().(Attribute).getAttr() in [\"match\", \"search\", \"fullmatch\", \"sub\", \"findall\", \"compile\"]\nselect c,\n  c.getLocation().getFile().getBaseName() + \":\" +\n  c.getLocation().getStartLine().toString() + \" -> \" + c.getFunc().toString()",
+   "hypothesis": "Regexes in datetime/network parsers are applied to attacker-controlled strings, enabling ReDoS (CVE-2021-29510, CVE-2024-3772).",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-1333"
+   ],
+   "results_count": 19,
+   "results": [
+    {
+     "ruleId": "py/regex-sites",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/regex-sites",
+      "index": 0
+     },
+     "message": {
+      "text": "datetime_parse.py:30 -> Attribute"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pydantic/datetime_parse.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 30,
+         "startColumn": 11,
+         "endColumn": 38
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "84de1dfaf87e480e:1",
+      "primaryLocationStartColumnFingerprint": "10"
+     }
+    },
+    {
+     "ruleId": "py/regex-sites",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/regex-sites",
+      "index": 0
+     },
+     "message": {
+      "text": "datetime_parse.py:31 -> Attribute"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pydantic/datetime_parse.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 31,
+         "startColumn": 11,
+         "endColumn": 32
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "4116d53042c7abd0:1",
+      "primaryLocationStartColumnFingerprint": "10"
+     }
+    },
+    {
+     "ruleId": "py/regex-sites",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/regex-sites",
+      "index": 0
+     },
+     "message": {
+      "text": "datetime_parse.py:32 -> Attribute"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pydantic/datetime_parse.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 32,
+         "startColumn": 15,
+         "endColumn": 56
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "9a2be84715cc9ace:1",
+      "primaryLocationStartColumnFingerprint": "14"
+     }
+    },
+    {
+     "ruleId": "py/regex-sites",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/regex-sites",
+      "index": 0
+     },
+     "message": {
+      "text": "datetime_parse.py:34 -> Attribute"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pydantic/datetime_parse.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 34,
+         "startColumn": 24,
+         "endLine": 42,
+         "endColumn": 2
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "fe03c4e8cbba625d:1",
+      "primaryLocationStartColumnFingerprint": "23"
+     }
+    },
+    {
+     "ruleId": "py/regex-sites",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/regex-sites",
+      "index": 0
+     },
+     "message": {
+      "text": "datetime_parse.py:45 -> Attribute"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pydantic/datetime_parse.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 45,
+         "startColumn": 23,
+         "endLine": 55,
+         "endColumn": 2
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "f1648629c26d6f21:1",
+      "primaryLocationStartColumnFingerprint": "22"
+     }
+    },
+    {
+     "ruleId": "py/regex-sites",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/regex-sites",
+      "index": 0
+     },
+     "message": {
+      "text": "datetime_parse.py:118 -> Attribute"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pydantic/datetime_parse.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 118,
+         "startColumn": 13,
+         "endColumn": 33
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "61b25771600abdc9:1",
+      "primaryLocationStartColumnFingerprint": "8"
+     }
+    },
+    {
+     "ruleId": "py/regex-sites",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/regex-sites",
+      "index": 0
+     },
+     "message": {
+      "text": "datetime_parse.py:150 -> Attribute"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pydantic/datetime_parse.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 150,
+         "startColumn": 13,
+         "endColumn": 33
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "6e80b259eb298644:1",
+      "primaryLocationStartColumnFingerprint": "8"
+     }
+    },
+    {
+     "ruleId": "py/regex-sites",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/regex-sites",
+      "index": 0
+     },
+     "message": {
+      "text": "datetime_parse.py:188 -> Attribute"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pydantic/datetime_parse.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 188,
+         "startColumn": 13,
+         "endColumn": 37
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "52b21a06e8cfb569:1",
+      "primaryLocationStartColumnFingerprint": "8"
+     }
+    },
+    {
+     "ruleId": "py/regex-sites",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/regex-sites",
+      "index": 0
+     },
+     "message": {
+      "text": "datetime_parse.py:224 -> Attribute"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pydantic/datetime_parse.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 224,
+         "startColumn": 17,
+         "endColumn": 50
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "3ca95229b615c34b:1",
+      "primaryLocationStartColumnFingerprint": "8"
+     }
+    },
+    {
+     "ruleId": "py/regex-sites",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/regex-sites",
+      "index": 0
+     },
+     "message": {
+      "text": "datetime_parse.py:224 -> Attribute"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pydantic/datetime_parse.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 224,
+         "startColumn": 54,
+         "endColumn": 86
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "3ca95229b615c34b:1",
+      "primaryLocationStartColumnFingerprint": "45"
+     }
+    },
+    {
+     "ruleId": "py/regex-sites",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/regex-sites",
+      "index": 0
+     },
+     "message": {
+      "text": "networks.py:68 -> Attribute"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pydantic/networks.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 68,
+         "startColumn": 28,
+         "endLine": 81,
+         "endColumn": 10
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "d9d6ed5d5461e57e:1",
+      "primaryLocationStartColumnFingerprint": "19"
+     }
+    },
+    {
+     "ruleId": "py/regex-sites",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/regex-sites",
+      "index": 0
+     },
+     "message": {
+      "text": "networks.py:90 -> Attribute"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pydantic/networks.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 90,
+         "startColumn": 37,
+         "endLine": 92,
+         "endColumn": 10
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "3b6c39336be2a1b5:1",
+      "primaryLocationStartColumnFingerprint": "28"
+     }
+    },
+    {
+     "ruleId": "py/regex-sites",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/regex-sites",
+      "index": 0
+     },
+     "message": {
+      "text": "networks.py:101 -> Attribute"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pydantic/networks.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 101,
+         "startColumn": 35,
+         "endColumn": 115
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "7f3aa292f3c2e171:1",
+      "primaryLocationStartColumnFingerprint": "26"
+     }
+    },
+    {
+     "ruleId": "py/regex-sites",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/regex-sites",
+      "index": 0
+     },
+     "message": {
+      "text": "networks.py:195 -> Attribute"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pydantic/networks.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 195,
+         "startColumn": 13,
+         "endColumn": 35
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "36a84769cb64571c:1",
+      "primaryLocationStartColumnFingerprint": "4"
+     }
+    },
+    {
+     "ruleId": "py/regex-sites",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/regex-sites",
+      "index": 0
+     },
+     "message": {
+      "text": "networks.py:257 -> Attribute"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pydantic/networks.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 257,
+         "startColumn": 17,
+         "endColumn": 53
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "61933159dd1741a1:1",
+      "primaryLocationStartColumnFingerprint": "4"
+     }
+    },
+    {
+     "ruleId": "py/regex-sites",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/regex-sites",
+      "index": 0
+     },
+     "message": {
+      "text": "networks.py:259 -> Attribute"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pydantic/networks.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 259,
+         "startColumn": 21,
+         "endColumn": 55
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "cb19e977141e885d:1",
+      "primaryLocationStartColumnFingerprint": "4"
+     }
+    },
+    {
+     "ruleId": "py/regex-sites",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/regex-sites",
+      "index": 0
+     },
+     "message": {
+      "text": "networks.py:266 -> Attribute"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pydantic/networks.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 266,
+         "startColumn": 21,
+         "endColumn": 55
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "e7a8582bb8be738f:1",
+      "primaryLocationStartColumnFingerprint": "4"
+     }
+    },
+    {
+     "ruleId": "py/regex-sites",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/regex-sites",
+      "index": 0
+     },
+     "message": {
+      "text": "networks.py:465 -> Attribute"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pydantic/networks.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 465,
+         "startColumn": 22,
+         "endColumn": 56
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "4840ff1828c3b186:1",
+      "primaryLocationStartColumnFingerprint": "21"
+     }
+    },
+    {
+     "ruleId": "py/regex-sites",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/regex-sites",
+      "index": 0
+     },
+     "message": {
+      "text": "networks.py:482 -> Attribute"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pydantic/networks.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 482,
+         "startColumn": 9,
+         "endColumn": 44
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "47134c25fdbc47f6:1",
+      "primaryLocationStartColumnFingerprint": "4"
+     }
+    }
+   ]
+  }
+ ],
+ "cache_usage": {
+  "prompt_tokens_total": 187139,
+  "uncached_input_tokens": 17795,
+  "cache_creation_input_tokens": 0,
+  "cache_read_input_tokens": 169344,
+  "output_tokens": 32967,
+  "calls": 22,
+  "caching_enabled": false,
+  "cost_usd_with_cache": 0.022957,
+  "cost_usd_no_cache": 0.047851,
+  "cache_read_share_of_prompt": 0.9049,
+  "prices_per_mtok": {
+   "claude-sonnet-4-5-20250929": {
+    "input": 3.0,
+    "output": 15.0
+   },
+   "claude-haiku-4-5-20251001": {
+    "input": 1.0,
+    "output": 5.0
+   },
+   "deepseek/deepseek-reasoner": {
+    "input": 0.15,
+    "output": 0.6,
+    "cache_read": 0.003,
+    "cache_write_mult": 1.0,
+    "peak_mult": 2.0
+   },
+   "gpt-5.1": {
+    "input": 1.25,
+    "output": 10.0,
+    "cache_read": 0.125,
+    "cache_write_mult": 1.0
+   },
+   "gpt-4.1": {
+    "input": 2.0,
+    "output": 8.0,
+    "cache_read": 0.5,
+    "cache_write_mult": 1.0
+   }
+  },
+  "cache_multipliers": {
+   "write_5m": 1.25,
+   "read": 0.1
+  }
+ }
+}

@@ -1,0 +1,277 @@
+{
+ "session_id": "20251226112902",
+ "package_name": "pygments-2.19.2",
+ "package_path": "packages/pygments-2.19.2",
+ "database_path": "databases/pygments-2.19.2-db",
+ "model": "gpt-5.1",
+ "temperature": 1.0,
+ "max_tokens": 8000,
+ "iterations": 9,
+ "total_input_tokens": 130221,
+ "total_output_tokens": 7362,
+ "total_tokens": 137583,
+ "elapsed_time_seconds": 247.28,
+ "estimated_cost_usd": 0.2364,
+ "summary": "## Overview\n\nThis analysis examined Pygments 2.19.2 (a mature syntax-highlighting library and CLI) with CodeQL, focusing on security-relevant patterns such as code execution, subprocess usage, and taint from untrusted inputs. The package is primarily a library with a small CLI entry point (`pygmentize`).\n\nNo clear, directly exploitable vulnerabilities from untrusted input to dangerous sinks were identified within the package alone, but several constructs merit security review and careful use by downstream applications.\n\n---\n\n## Package classification\n\n- **Type:** library, cli_tool\n- **Layer:** text-processing, developer-tooling\n\n---\n\n## Key findings\n\n### 1. Subprocess / shell execution usage\n\n**Files/locations (from custom CodeQL query `py/pygments-subprocess`):**\n\n1. `pygments/formatters/img.py` (around lines 93–94)\n2. `pygments/lexers/_scilab_builtins.py` (around lines 3061–3062)\n\n**What the query detected**\nA custom CodeQL query located calls to `subprocess` and `os` shell helpers:\n- `subprocess.Popen`, `subprocess.call`, `subprocess.run`, `subprocess.check_call`, `subprocess.check_output`\n- `os.system`, `os.popen`\n\nThese are potential command-execution sinks (CWE-78) if attacker-controlled data can influence the executed command or its arguments.\n\n**Risk assessment**\n- **Severity:** medium (library code that may be used in diverse threat environments)\n- **CWE:** CWE-78 (OS Command Injection)\n- **Current evidence:**\n  - The CodeQL result is *sink-only*: it flags where subprocess/shell helpers are used, but does not demonstrate any tainted data flow from `RemoteFlowSource` or any other user-controlled origin.\n  - Pygments is, by design, a library that processes arbitrary text and structures (code snippets, markup, etc.) from callers. If its subprocess invocations incorporate data derived from untrusted input (e.g., a file path or command fragment), there could be a risk.\n\n**Likely design intent (based on context):**\n- `pygments/formatters/img.py` historically renders highlighted output as an image using back-end tools (e.g., external image conversion utilities). The typical pattern is to call a fixed binary with controlled arguments.\n- `pygments/lexers/_scilab_builtins.py` is a large builtins table for the Scilab lexer; the hit here may correspond to an embedded example or string mentioning shell commands rather than active command execution, but it still deserves review by maintainers.\n\n**Exploitability considerations**\n- There is no automated evidence of user-controlled input flowing into these subprocess calls in the package alone.\n- Exploitability ultimately depends on how downstream applications expose Pygments APIs. If an application allows users to supply a path, command, or option that is passed directly into any subprocess usage in `img.py` without validation, command injection could be possible.\n\n**Recommendations for maintainers**\n- **Confirm argument origin:** Review the exact subprocess invocations at the flagged lines and verify all arguments are either:\n  - hard-coded, or\n  - derived from configuration not under attacker control, or\n  - strictly validated/escaped.\n- **Avoid `shell=True`:** If any of these calls use `shell=True`, strongly consider switching to `shell=False` with a list of arguments to reduce injection risk.\n- **Constrain inputs:** Where user-derived values are inevitable (e.g., image size, output path), restrict them to safe patterns (whitelisting, type checks) before passing them to subprocess.\n\n**Recommendations for users of Pygments**\n- Treat any Pygments feature that interacts with external programs (especially image formatters) as sensitive. Avoid feeding untrusted input into parameters that could affect command lines unless you’ve audited Pygments’ argument handling.\n\n---\n\n### 2. Dynamic code execution via `exec` in plugin/auto-discovery logic\n\n**Files/locations (from custom CodeQL query `py/pygments-eval-exec`):**\n\n1. `pygments/formatters/__init__.py` (around line 103)\n2. `pygments/lexers/__init__.py` (around line 154)\n\n**What the query detected**\nA custom CodeQL query searched for `eval`/`exec` usage and found two instances of `exec`:\n- One in the formatters package initializer\n- One in the lexers package initializer\n\nThese are used for dynamic registration / auto-import of formatter and lexer classes (plugin-like behavior), a pattern Pygments has used historically.\n\n**Risk assessment**\n- **Severity:** medium\n- **CWE:** CWE-94 (Code Injection)\n- **Current evidence:**\n  - The query flags presence of `exec` but does not show any tainted dataflow from untrusted input.\n  - In typical Pygments design, the executed code originates from within the package or from installed, trusted Pygments plugins, not from arbitrary runtime data.\n\n**Threat model considerations**\n- If an attacker can plant or alter Python modules that Pygments auto-discovers (e.g., via compromised environment, writing to `sys.path`, or adding malicious formatter/lexer plugins), then they already have a much broader code-execution capability than these `exec` calls themselves. In that sense, `exec` is not the root cause; it’s part of the plugin mechanism.\n- If untrusted input could somehow be interpolated into the string passed to `exec` (which would be nonstandard for Pygments), it would be exploitable, but CodeQL analysis of this package did not show such dataflow.\n\n**Recommendations for maintainers**\n- Review the `exec` usage to ensure:\n  - The executed string is constructed from constant templates and module/class names derived from trusted metadata, not from user-supplied values.\n  - Prefer safer reflection mechanisms when possible (e.g., `importlib`, `getattr`) instead of `exec` when only attribute access is needed.\n- Clearly document how third-party lexers/formatters are discovered and loaded so downstream users understand the trust model.\n\n**Recommendations for users of Pygments**\n- Treat Pygments plugins (third-party lexers/formatters) like any other code dependency; they are executed with full privileges.\n- Avoid allowing untrusted parties to install or modify Python code on the interpreter’s `sys.path` used by your application.\n\n---\n\n## Other areas probed (no concrete vulnerabilities found)\n\nWithin the iteration budget, the analysis also probed for:\n\n- **General command injection:** attempted path-based taint-flow queries from `RemoteFlowSources` to `subprocess`/`os` execution, but these queries failed to compile cleanly and were not reliably executed. The simpler sink-only query did execute and showed only the two subprocess locations above.\n- **Broad code injection patterns:** a custom `eval/exec` search successfully ran and only reported the two `exec` instances already discussed.\n- **High-risk patterns (pickle, `yaml.load`, `marshal`, etc.):** no evidence from the imports profile that `pickle`/unsafe deserialization or dynamic module loading of untrusted data is central in the core library. Most imports relate to text processing (`re`, `json`, `docutils`, `markdown`, `sphinx`) and standard utilities.\n\nGiven the size of the codebase (~111k lines across 350 files), exhaustively enumerating all potential issues is outside this single run, but the high-value targets (command execution and dynamic code execution) were covered.\n\n---\n\n## Overall assessment\n\n- Pygments 2.19.2 behaves as a mature, text-processing **library/CLI** with some security-relevant features:\n  - Use of subprocess/shell helpers in image formatting and possibly Scilab-related builtins.\n  - Use of `exec` in plugin/auto-discovery infrastructure.\n- No confirmed, self-contained vulnerability (i.e., untrusted data unavoidably reaching a dangerous sink) was identified in this analysis.\n- The main security considerations arise from **how downstream applications feed untrusted data into Pygments** and from the **trust model for installed plugins and environment**.\n\n**For most users:**\n- Using Pygments in a typical way (highlighting text in a web app or CLI) is acceptable if:\n  - You do not expose arbitrary OS-level paths/commands through Pygments configuration to untrusted users.\n  - You control which plugins/lexers/formatters are installed.\n\n**For high-security or multi-tenant environments:**\n- Consider sandboxing or isolating Pygments if untrusted tenants can strongly influence its configuration, especially image generation and any feature that interacts with external tools.\n\n---\n\n## Recommended follow-up for maintainers\n\n1. **Audit the subprocess usage in detail** at the reported lines in `pygments/formatters/img.py` and `pygments/lexers/_scilab_builtins.py`:\n   - Confirm whether `shell=True` is used; if so, evaluate replacing it with `shell=False` and argument lists.\n   - Verify that no parts of the command or arguments can be influenced directly by untrusted input without strict validation.\n\n2. **Revisit `exec` usage** in `pygments/formatters/__init__.py` and `pygments/lexers/__init__.py`:\n   - If possible, migrate to `importlib` + `getattr`-style dynamic loading.\n   - Keep the executed strings simple and constant-structured.\n\n3. **Document security-relevant behavior**:\n   - Note in the documentation that some formatters (e.g., image formatters) may call external programs.\n   - Provide guidance for safe deployment in untrusted-input contexts.\n\nWithin the limits of this automated CodeQL-based analysis, these are the primary security-relevant constructs discovered; there are no clear, exploitable vulnerabilities confirmed in Pygments 2.19.2 itself, but careful configuration and plugin hygiene remain important for secure use.",
+ "package_classification": {
+  "type": [
+   "library",
+   "cli_tool"
+  ],
+  "layer": [
+   "text-processing",
+   "developer-tooling"
+  ]
+ },
+ "tool_calls": {
+  "get_package_profile_info": 1,
+  "execute_codeql_query": 8,
+  "validate_codeql_query": 0,
+  "fixup_codeql_query": 2,
+  "finalize_report": 1
+ },
+ "queries_executed": {
+  "critical": 0,
+  "high": 3,
+  "medium": 0,
+  "low": 0,
+  "total_executed": 9,
+  "total_with_results": 3,
+  "total_failed": 9
+ },
+ "query_findings": {
+  "critical": 0,
+  "high": 6,
+  "medium": 0,
+  "low": 0,
+  "total": 6
+ },
+ "findings": [
+  {
+   "codeql_query_uuid": "20251226112918",
+   "codeql_raw_query": "/**\n * @name Subprocess and shell command execution in Pygments\n * @description Identify uses of subprocess or os.system that could be influenced by untrusted data.\n * @kind problem\n * @problem.severity error\n * @id py/pygments-subprocess\n * @tags security\n *       external/cwe/cwe-078\n */\nimport python\nimport semmle.python.ApiGraphs\nimport semmle.python.dataflow.new.DataFlow\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"os\").getMember(\"system\").getACall() or\n  call = API::moduleImport(\"subprocess\").getMember([\"run\", \"Popen\", \"call\", \"check_call\", \"check_output\"]).getACall()\nselect call, \"Shell or subprocess execution; ensure inputs are not attacker-controlled.\"",
+   "hypothesis": "Pygments scripts or utilities might invoke system commands (e.g., for external tools or image processing).",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-078"
+   ],
+   "results_count": 2,
+   "results": [
+    {
+     "ruleId": "py/pygments-subprocess",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pygments-subprocess",
+      "index": 0
+     },
+     "message": {
+      "text": "Shell or subprocess execution; ensure inputs are not attacker-controlled."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pygments/lexers/_scilab_builtins.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 3061,
+         "startColumn": 13,
+         "endLine": 3062,
+         "endColumn": 77
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "1f60fd44922dc01a:1",
+      "primaryLocationStartColumnFingerprint": "4"
+     }
+    },
+    {
+     "ruleId": "py/pygments-subprocess",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pygments-subprocess",
+      "index": 0
+     },
+     "message": {
+      "text": "Shell or subprocess execution; ensure inputs are not attacker-controlled."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pygments/formatters/img.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 93,
+         "startColumn": 16,
+         "endLine": 94,
+         "endColumn": 69
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "e7b93ff4c7caac08:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251226113109",
+   "codeql_raw_query": "/**\n * @name Pygments shell/subprocess usage\n * @description Finds invocations of shell/subprocess helpers in Pygments to review for command injection risk.\n * @kind problem\n * @problem.severity warning\n * @id py/pygments-subprocess\n * @tags security\n *       external/cwe/cwe-078\n */\n\nimport python\nimport semmle.python.ApiGraphs\nimport semmle.python.dataflow.new.DataFlow\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"subprocess\").getMember([\"Popen\", \"call\", \"run\", \"check_call\", \"check_output\"]).getACall()\n  or call = API::moduleImport(\"os\").getMember([\"system\", \"popen\"]).getACall()\nselect call, \"Shell or subprocess execution; ensure inputs are not attacker-controlled.\"\n",
+   "hypothesis": "Pygments may invoke subprocess or shell commands that, if given untrusted input, could lead to command injection.",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-078"
+   ],
+   "results_count": 2,
+   "results": [
+    {
+     "ruleId": "py/pygments-subprocess",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pygments-subprocess",
+      "index": 0
+     },
+     "message": {
+      "text": "Shell or subprocess execution; ensure inputs are not attacker-controlled."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pygments/lexers/_scilab_builtins.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 3061,
+         "startColumn": 13,
+         "endLine": 3062,
+         "endColumn": 77
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "1f60fd44922dc01a:1",
+      "primaryLocationStartColumnFingerprint": "4"
+     }
+    },
+    {
+     "ruleId": "py/pygments-subprocess",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pygments-subprocess",
+      "index": 0
+     },
+     "message": {
+      "text": "Shell or subprocess execution; ensure inputs are not attacker-controlled."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pygments/formatters/img.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 93,
+         "startColumn": 16,
+         "endLine": 94,
+         "endColumn": 69
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "e7b93ff4c7caac08:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251226113221",
+   "codeql_raw_query": "/**\n * @name Pygments usage of eval/exec\n * @description Direct use of eval or exec may lead to code injection if fed with untrusted data.\n * @kind problem\n * @problem.severity warning\n * @id py/pygments-eval-exec\n * @tags security\n *       external/cwe/cwe-094\n */\n\nimport python\n\nfrom Call call, Name func\nwhere\n  func = call.getFunc() and\n  func.getId() in [\"eval\", \"exec\"] and\n  call.getLocation().getFile().getRelativePath().regexpMatch(\"^pygments/.*\")\nselect call, \"Use of \" + func.getId() + \"; ensure arguments are not attacker-controlled.\"",
+   "hypothesis": "Use of eval/exec in Pygments",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-094"
+   ],
+   "results_count": 2,
+   "results": [
+    {
+     "ruleId": "py/pygments-eval-exec",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pygments-eval-exec",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of exec; ensure arguments are not attacker-controlled."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pygments/formatters/__init__.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 103,
+         "startColumn": 13,
+         "endColumn": 45
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "891b6592adba8cae:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/pygments-eval-exec",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pygments-eval-exec",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of exec; ensure arguments are not attacker-controlled."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pygments/lexers/__init__.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 154,
+         "startColumn": 13,
+         "endColumn": 45
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "fe6df07d02044f58:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    }
+   ]
+  }
+ ]
+}

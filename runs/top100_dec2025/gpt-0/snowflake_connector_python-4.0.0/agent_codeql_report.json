@@ -1,0 +1,277 @@
+{
+ "session_id": "20251220114117",
+ "package_name": "snowflake_connector_python-4.0.0",
+ "package_path": "packages/snowflake_connector_python-4.0.0",
+ "database_path": "databases/snowflake_connector_python-4.0.0-db",
+ "model": "gpt-5.1",
+ "temperature": 0.0,
+ "max_tokens": 8000,
+ "iterations": 12,
+ "total_input_tokens": 116683,
+ "total_output_tokens": 7855,
+ "total_tokens": 124538,
+ "elapsed_time_seconds": 484.98,
+ "estimated_cost_usd": 0.2244,
+ "summary": "## Overview\n\nPackage analyzed: **snowflake_connector_python-4.0.0**  \nType: Python Snowflake database connector (client library, with CLI-style tools)  \nScope: 147 source files, ~37k LOC, including core connector logic, authentication flows, network/OCSP handling, file transfer, and vendored `urllib3`/`requests`.\n\nAnalysis used multiple CodeQL queries focused on high‑impact classes: unsafe deserialization, subprocess usage, SSL/TLS configuration, and general remote‑input sinks. Below are the key security‑relevant findings.\n\n---\n\n## Key Findings\n\n### 1. Use of `pickle` for local cache persistence\n\n**Location**  \n- `src/snowflake/connector/cache.py:545`  \n  (flagged by two independent queries: `py/unsafe-deserialization-custom` and `py/snowflake-cache-pickle`)\n\n**What the code does**  \nThe connector uses Python’s `pickle` module to serialize and deserialize cached data (likely connection/session metadata or similar) to disk.\n\n**Risk**  \n- `pickle` deserialization is **code‑execution capable**: if an attacker can modify the cache file or otherwise influence the bytes being unpickled, they can execute arbitrary Python code in the context of the application using this connector.  \n- This is a classic **unsafe deserialization** pattern.\n\n**Threat model considerations**  \n- In typical deployments, the cache file is local to the user and not directly exposed to remote attackers. The primary risk is when:\n  - The cache directory is on a shared or world‑writable filesystem, or\n  - Another local user or process (malware, compromised account) can tamper with the cache file, or\n  - The application copies or syncs cache files from untrusted locations.\n- Because this is a client library, the connector cannot fully control the environment; some users may run it in multi‑tenant or containerized setups where local file integrity is weaker.\n\n**CWE / Severity**  \n- CWE‑502: Deserialization of Untrusted Data  \n- Severity: **Medium** in the default threat model (local‑only attacker), but can become **High** if cache files are stored in locations writable by less‑trusted principals.\n\n**Recommendations**  \nFor library maintainers:\n- Prefer a non‑code‑executing serialization format for caches, such as JSON, msgpack, or a custom schema using `dataclasses` + `json`.  \n- If `pickle` must be retained for backward compatibility:\n  - Constrain the types being deserialized (e.g., custom restricted unpickler that rejects arbitrary globals and only allows a small, known set of safe classes).\n  - Store cache files in a directory with strict permissions (e.g., `0700` on POSIX) and document this requirement clearly.\n  - Consider versioning cache formats and providing a migration path away from pickle.\n\nFor users of the library:\n- Treat the cache directory as sensitive; do not place it on shared or world‑writable volumes.  \n- Do not copy cache files between machines or from untrusted sources.  \n- If you operate in a high‑security environment, consider disabling or clearing the cache between runs if the library exposes such an option.\n\n---\n\n### 2. Subprocess usage in `gzip_decoder`\n\n**Location**  \n- `src/snowflake/connector/gzip_decoder.py:57`\n\n**What the code does**  \nA CodeQL query (`py/snowflake-subprocess-usage`) identified a subprocess invocation in `gzip_decoder.py`. While the exact arguments were not fully expanded in the SARIF snippet, the pattern is a call to `subprocess` (e.g., `subprocess.Popen`/`run`/`check_call`/`check_output`).\n\n**Risk**  \n- Subprocess calls can lead to **command injection** if any part of the command or its arguments is derived from untrusted input and either:\n  - `shell=True` is used, or\n  - Arguments are concatenated into a single string that the shell interprets.\n- Even with `shell=False`, passing unvalidated paths or options influenced by remote data can be dangerous in some environments.\n\n**Threat model considerations**  \n- In a database connector, typical inputs (SQL queries, connection parameters, file paths for stages) may be influenced by remote users or higher‑level application logic.  \n- If the subprocess command or its arguments are derived from such inputs, there is a potential for remote‑to‑local impact.\n\n**CWE / Severity**  \n- CWE‑78: Improper Neutralization of Special Elements used in an OS Command (OS Command Injection)  \n- Severity: **Low–Medium (needs manual review)**. The automated analysis only confirms that a subprocess is used; it does not prove that user‑controlled data reaches it.\n\n**Recommendations**  \nFor maintainers:\n- Review `src/snowflake/connector/gzip_decoder.py` around line 57:\n  - Ensure `shell=False` is used for all subprocess calls.  \n  - Ensure all arguments are passed as a list, not as a shell‑parsed string.  \n  - Confirm that any file paths or options passed to the subprocess are not directly derived from remote or user‑supplied data without validation.\n- If the subprocess is only used for local helper tooling (e.g., invoking a system `gzip`), consider:\n  - Replacing it with a pure‑Python implementation (`gzip` module) where feasible, or\n  - Strictly constraining inputs to known‑safe values (e.g., fixed command, fixed flags, validated file paths).\n\nFor users:\n- Avoid passing untrusted or user‑supplied paths/options into APIs that might indirectly influence this subprocess call, until the implementation is confirmed safe.\n\n---\n\n## Other Areas Analyzed (No Concrete Issues Found)\n\nThe following areas were examined with targeted CodeQL queries but did not yield concrete, actionable findings in this version of the package:\n\n1. **Subprocess with remote input (data‑flow based)**  \n   - A taint‑tracking query from `RemoteFlowSource` to `subprocess` calls (`Popen`, `run`, etc.) found **no flows**, suggesting that subprocess invocations are not directly fed with remote/user input in the analyzed code paths.\n\n2. **General unsafe deserialization (pickle/yaml/marshal)**  \n   - The only flagged use was the `pickle`‑based cache in `cache.py` described above.  \n   - No uses of `yaml.load(…, Loader=…)` or `marshal.load/loads` were detected.\n\n3. **Insecure SSL/TLS configuration**  \n   - A query for calls to `ssl._create_unverified_context` and `ssl.create_default_context` with `CERT_NONE` did **not** find matches.  \n   - This suggests the connector does not trivially disable certificate verification via these APIs in the scanned code.\n\n4. **Other high‑risk sinks (code execution, SQL injection, etc.)**  \n   - Within the constraints of the iteration budget, no direct patterns of `eval`/`exec` with remote input or raw SQL string concatenation in the connector itself were identified by the executed queries.\n\n---\n\n## Overall Assessment\n\n- The **most concrete security concern** is the use of `pickle` for caching in `cache.py`. While common in Python libraries, it is inherently risky and should be treated as such, especially in multi‑tenant or less‑trusted environments.\n- The **subprocess usage** in `gzip_decoder.py` warrants a **manual code review** to confirm that no user‑controlled data can influence the command or its arguments and that `shell=True` is not used.\n- No evidence was found of the connector deliberately disabling SSL verification or using other obviously dangerous patterns like `eval`/`exec` on remote data.\n\nWith the above caveats and assuming standard deployment practices (local, protected cache directory; no untrusted manipulation of cache files; careful use of the library APIs), the package does not exhibit clear remote‑exploitable vulnerabilities in the areas examined. However, hardening the cache mechanism and double‑checking subprocess usage would improve its security posture.\n",
+ "package_classification": {
+  "type": "library",
+  "layer": [
+   "data-access",
+   "database-client",
+   "networking"
+  ]
+ },
+ "tool_calls": {
+  "get_package_profile_info": 1,
+  "execute_codeql_query": 15,
+  "validate_codeql_query": 0,
+  "fixup_codeql_query": 3,
+  "finalize_report": 1
+ },
+ "queries_executed": {
+  "critical": 4,
+  "high": 4,
+  "medium": 4,
+  "low": 0,
+  "total_executed": 18,
+  "total_with_results": 12,
+  "total_failed": 4
+ },
+ "query_findings": {
+  "critical": 0,
+  "high": 2,
+  "medium": 1,
+  "low": 0,
+  "total": 3
+ },
+ "findings": [
+  {
+   "codeql_query_uuid": "20251220114124",
+   "codeql_raw_query": "/**\n * @name SQL injection via cursor.execute and similar APIs\n * @description Detects untrusted data flowing into Snowflake cursor.execute/execute_async and connection.execute_string\n * @kind path-problem\n * @problem.severity error\n * @id py/snowflake-sqli\n * @tags security\n *       external/cwe/cwe-089\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.dataflow.new.RemoteFlowSources\nimport semmle.python.ApiGraphs\n\nmodule SnowflakeSQLConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    source instanceof RemoteFlowSource\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(API::CallNode call |\n      // cursor.execute / execute_async\n      call = API::moduleImport(\"snowflake.connector.cursor\").getMember([\"execute\", \"execute_async\"]).getACall() or\n      // connection.execute_string\n      call = API::moduleImport(\"snowflake.connector.connection\").getMember(\"execute_string\").getACall()\n      |\n      sink = call.getArg(0)\n    )\n  }\n}\n\nmodule SnowflakeSQLFlow = TaintTracking::Global<SnowflakeSQLConfig>;\nimport SnowflakeSQLFlow::PathGraph\n\nfrom SnowflakeSQLFlow::PathNode source, SnowflakeSQLFlow::PathNode sink\nwhere SnowflakeSQLFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"User-controlled data flows into Snowflake SQL execution $@.\", source.getNode(), \"user input\"",
+   "hypothesis": "Untrusted remote input may reach Snowflake SQL execution APIs leading to SQL injection.",
+   "severity": "critical",
+   "cwe_ids": [
+    "cwe-089"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251220114146",
+   "codeql_raw_query": "/**\n * @name Insecure use of subprocess in Snowflake connector tools\n * @description Finds uses of subprocess module that may execute shell commands with untrusted input\n * @kind path-problem\n * @problem.severity error\n * @id py/snowflake-subprocess-taint\n * @tags security\n *       external/cwe/cwe-078\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.dataflow.new.RemoteFlowSources\nimport semmle.python.ApiGraphs\n\nmodule SubprocessConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    source instanceof RemoteFlowSource\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(API::CallNode call |\n      call = API::moduleImport(\"subprocess\").getMember([\"Popen\", \"call\", \"check_call\", \"check_output\", \"run\"]).getACall() |\n      sink = call.getArg(0)\n    )\n  }\n}\n\nmodule SubprocessFlow = TaintTracking::Global<SubprocessConfig>;\nimport SubprocessFlow::PathGraph\n\nfrom SubprocessFlow::PathNode source, SubprocessFlow::PathNode sink\nwhere SubprocessFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"User-controlled data flows into subprocess execution $@.\", source.getNode(), \"user input\"",
+   "hypothesis": "Untrusted input may reach subprocess.* calls in Snowflake connector tools, leading to command injection.",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-078"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251220114401",
+   "codeql_raw_query": "/**\n * @name Insecure use of subprocess with user-controlled input\n * @description Detects flows from remote/user input into subprocess execution functions.\n * @kind path-problem\n * @problem.severity error\n * @id py/subprocess-user-input\n * @tags security\n *       external/cwe/cwe-078\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.dataflow.new.RemoteFlowSources\nimport semmle.python.Concepts\nimport semmle.python.ApiGraphs\n\nmodule SubprocessConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    source instanceof RemoteFlowSource\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(API::CallNode call |\n      call = API::moduleImport(\"subprocess\").getMember([\"Popen\", \"call\", \"check_call\", \"check_output\", \"run\"]).getACall() and\n      sink = call.getArg(0)\n    )\n  }\n}\n\nmodule SubprocessFlow = TaintTracking::Global<SubprocessConfig>;\nimport SubprocessFlow::PathGraph\n\nfrom SubprocessFlow::PathNode source, SubprocessFlow::PathNode sink\nwhere SubprocessFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"User-controlled data flows into subprocess call $@.\", source, \"subprocess call\"",
+   "hypothesis": "User-controlled input may reach subprocess execution APIs leading to command injection.",
+   "severity": "critical",
+   "cwe_ids": [
+    "cwe-078"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251220114434",
+   "codeql_raw_query": "/**\n * @name Unsafe deserialization via pickle, yaml, or marshal\n * @description Detects uses of unsafe deserialization APIs which may process untrusted data.\n * @kind problem\n * @problem.severity error\n * @id py/unsafe-deserialization-custom\n * @tags security\n *       external/cwe/cwe-502\n */\n\nimport python\nimport semmle.python.ApiGraphs\nimport semmle.python.dataflow.new.DataFlow\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"pickle\").getMember([\"load\", \"loads\", \"Unpickler\"]).getACall()\n  or call = API::moduleImport(\"yaml\").getMember([\"load\", \"unsafe_load\"]).getACall()\n  or call = API::moduleImport(\"marshal\").getMember([\"load\", \"loads\"]).getACall()\nselect call, \"Potentially unsafe deserialization operation that could execute arbitrary code.\"",
+   "hypothesis": "Package may use unsafe deserialization APIs that could process untrusted data.",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-502"
+   ],
+   "results_count": 1,
+   "results": [
+    {
+     "ruleId": "py/unsafe-deserialization-custom",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/unsafe-deserialization-custom",
+      "index": 0
+     },
+     "message": {
+      "text": "Potentially unsafe deserialization operation that could execute arbitrary code."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/snowflake/connector/cache.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 545,
+         "startColumn": 16,
+         "endColumn": 35
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "e9b5e08abd6af0f0:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251220114500",
+   "codeql_raw_query": "/**\n * @name Insecure use of yaml.load\n * @description Detects use of yaml.load which is unsafe with untrusted input.\n * @kind problem\n * @problem.severity warning\n * @id py/yaml-load-usage\n * @tags security\n *       external/cwe/cwe-502\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere call = API::moduleImport(\"yaml\").getMember(\"load\").getACall()\nselect call, \"Use of yaml.load may be unsafe when parsing untrusted input; prefer safe_load or load with SafeLoader.\"",
+   "hypothesis": "Package may use yaml.load unsafely for cache or config handling",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-502"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251220114556",
+   "codeql_raw_query": "/**\n * @name Insecure SSL/TLS configuration\n * @description Detects disabling certificate verification or hostname checking in SSL contexts.\n * @kind problem\n * @problem.severity error\n * @id py/insecure-ssl-config\n * @tags security\n *       external/cwe/cwe-295\n */\n\nimport python\nimport semmle.python.ApiGraphs\nimport semmle.python.dataflow.new.DataFlow\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"ssl\").getMember(\"_create_unverified_context\").getACall()\n  or\n  (\n    call = API::moduleImport(\"ssl\").getMember(\"create_default_context\").getACall() and\n    exists(DataFlow::ExprNode arg |\n      arg = call.getArg(0) and\n      arg.asExpr().toString() = \"ssl.CERT_NONE\"\n    )\n  )\nselect call, \"Potentially insecure SSL/TLS configuration that disables certificate verification.\"",
+   "hypothesis": "The package may disable SSL certificate verification or hostname checking, weakening TLS security.",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-295"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251220114621",
+   "codeql_raw_query": "/**\n * @name Use of system command execution with user-controlled input\n * @description Detects flows from remote/user input into os.system and similar command execution APIs.\n * @kind path-problem\n * @problem.severity error\n * @id py/command-injection-os-system\n * @tags security\n *       external/cwe/cwe-078\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.dataflow.new.RemoteFlowSources\nimport semmle.python.Concepts\nimport semmle.python.ApiGraphs\n\nmodule OsSystemConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    source instanceof RemoteFlowSource\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(API::CallNode call |\n      call = API::moduleImport(\"os\").getMember([\"system\", \"popen\"]).getACall() and\n      sink = call.getArg(0)\n    )\n  }\n}\n\nmodule OsSystemFlow = TaintTracking::Global<OsSystemConfig>;\nimport OsSystemFlow::PathGraph\n\nfrom OsSystemFlow::PathNode source, OsSystemFlow::PathNode sink\nwhere OsSystemFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"User-controlled data flows into system command execution $@.\", source, \"command\"",
+   "hypothesis": "User-controlled data may reach os.system/popen leading to command injection",
+   "severity": "critical",
+   "cwe_ids": [
+    "cwe-78"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251220114651",
+   "codeql_raw_query": "/**\n * @name Insecure temporary file creation\n * @description Detects use of tempfile.mktemp which is insecure due to race conditions.\n * @kind problem\n * @problem.severity warning\n * @id py/insecure-tempfile-mktemp\n * @tags security\n *       external/cwe/cwe-377\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere call = API::moduleImport(\"tempfile\").getMember(\"mktemp\").getACall()\nselect call, \"Insecure use of tempfile.mktemp; use NamedTemporaryFile or mkstemp instead.\"",
+   "hypothesis": "Package may use insecure tempfile.mktemp leading to predictable temp files",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-377"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251220114715",
+   "codeql_raw_query": "/**\n * @name Use of system command execution with user-controlled input\n * @description Detects flows from remote/user input into os.system or subprocess-like wrappers.\n * @kind path-problem\n * @problem.severity error\n * @id py/os-system-user-input\n * @tags security\n *       external/cwe/cwe-078\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.dataflow.new.RemoteFlowSources\nimport semmle.python.Concepts\nimport semmle.python.ApiGraphs\n\nmodule OsSystemConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    source instanceof RemoteFlowSource\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(API::CallNode call |\n      call = API::moduleImport(\"os\").getMember(\"system\").getACall() and\n      sink = call.getArg(0)\n    )\n  }\n}\n\nmodule OsSystemFlow = TaintTracking::Global<OsSystemConfig>;\nimport OsSystemFlow::PathGraph\n\nfrom OsSystemFlow::PathNode source, OsSystemFlow::PathNode sink\nwhere OsSystemFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"User-controlled data flows into os.system call $@.\", source, \"os.system call\"",
+   "hypothesis": "User-controlled input may reach os.system leading to command injection",
+   "severity": "critical",
+   "cwe_ids": [
+    "cwe-078"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251220114749",
+   "codeql_raw_query": "/**\n * @name Insecure temporary file creation\n * @description Detects use of tempfile.mktemp which is insecure due to race conditions.\n * @kind problem\n * @problem.severity warning\n * @id py/insecure-tempfile-mktemp\n * @tags security\n *       external/cwe/cwe-377\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere call = API::moduleImport(\"tempfile\").getMember(\"mktemp\").getACall()\nselect call, \"Insecure temporary file creation using tempfile.mktemp; use NamedTemporaryFile or mkstemp instead.\"",
+   "hypothesis": "Use of tempfile.mktemp can lead to insecure temporary file usage",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-377"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251220114813",
+   "codeql_raw_query": "/**\n * @name Unsafe use of pickle in cache module\n * @description Flags uses of pickle.load/loads in src/snowflake/connector/cache.py\n * @kind problem\n * @problem.severity warning\n * @id py/snowflake-cache-pickle\n * @tags security\n *       external/cwe/cwe-502\n */\n\nimport python\nimport semmle.python.ApiGraphs\nimport semmle.python.dataflow.new.DataFlow\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call.getLocation().getFile().getRelativePath() = \"src/snowflake/connector/cache.py\" and\n  call = API::moduleImport(\"pickle\").getMember([\"load\", \"loads\", \"Unpickler\"]).getACall()\nselect call, \"Use of pickle for caching may be unsafe if fed untrusted data. Ensure only trusted data is deserialized.\"",
+   "hypothesis": "pickle deserialization in cache.py may be unsafe",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-502"
+   ],
+   "results_count": 1,
+   "results": [
+    {
+     "ruleId": "py/snowflake-cache-pickle",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/snowflake-cache-pickle",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of pickle for caching may be unsafe if fed untrusted data. Ensure only trusted data is deserialized."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/snowflake/connector/cache.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 545,
+         "startColumn": 16,
+         "endColumn": 35
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "e9b5e08abd6af0f0:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251220114836",
+   "codeql_raw_query": "/**\n * @name Potential command execution via subprocess\n * @description Detects any use of subprocess module in the package.\n * @kind problem\n * @problem.severity note\n * @id py/snowflake-subprocess-usage\n * @tags security\n *       external/cwe/cwe-078\n */\n\nimport python\nimport semmle.python.ApiGraphs\nimport semmle.python.dataflow.new.DataFlow\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"subprocess\").getMember([\"Popen\", \"call\", \"check_call\", \"check_output\", \"run\"]).getACall()\nselect call, \"Subprocess invocation; review arguments to ensure they are not user-controlled or shell=True.\"",
+   "hypothesis": "identify all subprocess usage for manual review",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-078"
+   ],
+   "results_count": 1,
+   "results": [
+    {
+     "ruleId": "py/snowflake-subprocess-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/snowflake-subprocess-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Subprocess invocation; review arguments to ensure they are not user-controlled or shell=True."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/snowflake/connector/gzip_decoder.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 57,
+         "startColumn": 9,
+         "endColumn": 82
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "eaa7756f3199a025:1",
+      "primaryLocationStartColumnFingerprint": "4"
+     }
+    }
+   ]
+  }
+ ]
+}

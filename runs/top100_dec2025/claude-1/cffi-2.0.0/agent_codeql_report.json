@@ -1,0 +1,1660 @@
+{
+ "session_id": "20251229040416",
+ "package_name": "cffi-2.0.0",
+ "package_path": "packages/cffi-2.0.0",
+ "database_path": "databases/cffi-2.0.0-db",
+ "model": "claude-sonnet-4-5-20250929",
+ "temperature": 1.0,
+ "max_tokens": 8000,
+ "iterations": 19,
+ "total_input_tokens": 269939,
+ "total_output_tokens": 8045,
+ "total_tokens": 277984,
+ "elapsed_time_seconds": 402.06,
+ "estimated_cost_usd": 0.9305,
+ "summary": "# Security Analysis Report: cffi-2.0.0\n\n## Package Overview\nCFFI (C Foreign Function Interface) is a library for calling C code from Python. The package contains ~6,876 lines of code across 20 files and provides functionality for compiling and loading C extensions dynamically.\n\n## Key Findings\n\n### Critical Vulnerabilities\n\n#### 1. Code Injection via compile()/exec() (CWE-94)\n**Severity: Critical**\n- **Location**: `src/cffi/setuptools_ext.py` (lines 25-26)\n- **Description**: The package reads Python source code from files and executes it using `compile()` and `exec()`. Taint tracking analysis confirmed that file contents flow directly into code execution sinks without proper sanitization.\n- **Impact**: If an attacker can control the contents of files read by this module, they can achieve arbitrary code execution.\n- **Affected Files**: \n  - `src/cffi/setuptools_ext.py` (2 flows found)\n  - `testing/cffi1/test_dlopen_unicode_literals.py` (2 flows found - testing code)\n\n#### 2. Subprocess Shell Injection Risk (CWE-078)\n**Severity: High**\n- **Locations**: \n  - `setup.py` (line 126)\n  - Multiple test files\n- **Description**: Found 4 instances of subprocess calls with `shell=True`, which can enable command injection if user-controlled data flows into the command arguments.\n- **Impact**: Potential for command injection if untrusted input reaches these calls.\n\n#### 3. Multiple eval()/exec()/compile() Usage (CWE-94)\n**Severity: High**\n- **Description**: Found 15 instances of eval(), exec(), or compile() usage across the codebase:\n  - `src/cffi/api.py` - compile() usage\n  - `src/cffi/recompiler.py` - eval() usage\n  - `src/cffi/setuptools_ext.py` - compile() and exec() usage\n  - Multiple instances in test files\n- **Impact**: These functions execute arbitrary code and are inherently dangerous if any user-controlled input reaches them.\n\n### Medium Severity Issues\n\n#### 4. Insecure Temporary File Operations (CWE-377)\n**Severity: Medium**\n- **Description**: Found 7 instances of potentially insecure temporary file operations using `tempfile.mktemp()` or similar deprecated functions.\n- **Locations**: Primarily in test files (`backend_tests.py`, `test_new_ffi_1.py`, `test_verify.py`, `test_verify1.py`, `test_zdist.py`)\n- **Impact**: Race condition vulnerabilities that could allow local attackers to intercept or modify temporary files.\n\n## Summary Statistics\n- **Total Queries Executed**: 13\n- **Critical Findings**: 4 (code injection paths)\n- **High Severity Findings**: 15+ (eval/exec usage) + 4 (subprocess shell=True)\n- **Medium Severity Findings**: 7 (insecure temp files)\n\n## Recommendations\n1. **Immediate**: Review and sanitize all file inputs before passing to compile()/exec() in `setuptools_ext.py`\n2. **High Priority**: Eliminate or properly sanitize all subprocess calls using `shell=True`\n3. **Medium Priority**: Replace deprecated `tempfile.mktemp()` with secure alternatives like `tempfile.NamedTemporaryFile(delete=False)`\n4. **General**: Implement input validation and sanitization for all external data sources before code execution\n\n## Risk Assessment\nThis package handles dynamic code compilation and execution, which is inherently risky. While many of the findings are in test code, the critical findings in production code (`setuptools_ext.py`) represent real security risks if the package processes untrusted input files.",
+ "package_classification": {
+  "type": [
+   "library"
+  ],
+  "layer": [
+   "interface",
+   "runtime"
+  ]
+ },
+ "tool_calls": {
+  "get_package_profile_info": 1,
+  "execute_codeql_query": 11,
+  "validate_codeql_query": 0,
+  "fixup_codeql_query": 2,
+  "finalize_report": 1
+ },
+ "queries_executed": {
+  "critical": 0,
+  "high": 7,
+  "medium": 1,
+  "low": 0,
+  "total_executed": 13,
+  "total_with_results": 8,
+  "total_failed": 4
+ },
+ "query_findings": {
+  "critical": 0,
+  "high": 23,
+  "medium": 7,
+  "low": 0,
+  "total": 30
+ },
+ "findings": [
+  {
+   "codeql_query_uuid": "20251229040524",
+   "codeql_raw_query": "/**\n * @name Command injection in subprocess calls\n * @description Using subprocess with user-controlled input can lead to command injection\n * @kind path-problem\n * @problem.severity error\n * @id py/command-injection\n * @tags security\n *        external/cwe/cwe-078\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.dataflow.new.RemoteFlowSources\nimport semmle.python.Concepts\nimport semmle.python.ApiGraphs\n\nmodule CommandInjectionConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    source instanceof RemoteFlowSource or\n    exists(DataFlow::CallCfgNode call |\n      call = API::moduleImport(\"os\").getMember(\"environ\").getAValueReachableFromSource() and\n      source = call\n    )\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(SystemCommandExecution cmd |\n      sink = cmd.getCommand()\n    )\n  }\n}\n\nmodule CommandInjectionFlow = TaintTracking::Global<CommandInjectionConfig>;\nimport CommandInjectionFlow::PathGraph\n\nfrom CommandInjectionFlow::PathNode source, CommandInjectionFlow::PathNode sink\nwhere CommandInjectionFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"Possible command injection from $@.\", source.getNode(), \"user input\"",
+   "hypothesis": "Command injection through subprocess calls with environment variables or user input",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-078"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251229040558",
+   "codeql_raw_query": "/**\n * @name Subprocess calls with shell=True or string commands\n * @description Using subprocess with shell=True or string commands can be dangerous\n * @kind problem\n * @problem.severity warning\n * @id py/subprocess-shell-true\n * @tags security\n *        external/cwe/cwe-078\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  (\n    call = API::moduleImport(\"subprocess\").getMember([\"call\", \"run\", \"Popen\", \"check_call\", \"check_output\"]).getACall() and\n    exists(DataFlow::Node arg |\n      arg = call.getArgByName(\"shell\") and\n      arg.asExpr().(BooleanLiteral).booleanValue() = true\n    )\n  ) or\n  (\n    call = API::moduleImport(\"os\").getMember([\"system\", \"popen\"]).getACall()\n  )\nselect call, \"Potentially dangerous subprocess/system call that may enable command injection.\"\n",
+   "hypothesis": "Detect subprocess calls with shell=True or dangerous argument patterns that could lead to command injection",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-078"
+   ],
+   "results_count": 4,
+   "results": [
+    {
+     "ruleId": "py/subprocess-shell-true",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/subprocess-shell-true",
+      "index": 0
+     },
+     "message": {
+      "text": "Potentially dangerous subprocess/system call that may enable command injection."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "setup.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 126,
+         "startColumn": 10,
+         "endColumn": 42
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "27f415e6226d9c56:1",
+      "primaryLocationStartColumnFingerprint": "5"
+     }
+    },
+    {
+     "ruleId": "py/subprocess-shell-true",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/subprocess-shell-true",
+      "index": 0
+     },
+     "message": {
+      "text": "Potentially dangerous subprocess/system call that may enable command injection."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "testing/cffi1/test_cffi_binary.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 11,
+         "startColumn": 9,
+         "endColumn": 66
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "8f6d99c484260e04:1",
+      "primaryLocationStartColumnFingerprint": "4"
+     }
+    },
+    {
+     "ruleId": "py/subprocess-shell-true",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/subprocess-shell-true",
+      "index": 0
+     },
+     "message": {
+      "text": "Potentially dangerous subprocess/system call that may enable command injection."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "testing/cffi0/test_ownlib.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 161,
+         "startColumn": 17,
+         "endColumn": 72
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "acc9577da5cae1ca:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/subprocess-shell-true",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/subprocess-shell-true",
+      "index": 0
+     },
+     "message": {
+      "text": "Potentially dangerous subprocess/system call that may enable command injection."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "testing/cffi0/test_ownlib.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 177,
+         "startColumn": 13,
+         "endLine": 179,
+         "endColumn": 43
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "51e549a40a42574b:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251229040623",
+   "codeql_raw_query": "/**\n * @name Path traversal in file operations\n * @description Using user-controlled paths without validation can lead to path traversal attacks\n * @kind path-problem\n * @problem.severity error\n * @id py/path-injection\n * @tags security\n *        external/cwe/cwe-022\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.dataflow.new.RemoteFlowSources\nimport semmle.python.Concepts\n\nmodule PathTraversalConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    source instanceof RemoteFlowSource or\n    exists(DataFlow::AttrRead attr |\n      attr.getAttributeName() = \"name\" and\n      source = attr\n    )\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(FileSystemAccess fa |\n      sink = fa.getAPathArgument()\n    )\n  }\n}\n\nmodule PathTraversalFlow = TaintTracking::Global<PathTraversalConfig>;\nimport PathTraversalFlow::PathGraph\n\nfrom PathTraversalFlow::PathNode source, PathTraversalFlow::PathNode sink\nwhere PathTraversalFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"Potential path traversal from $@.\", source.getNode(), \"user-controlled data\"",
+   "hypothesis": "Path traversal vulnerabilities where user-controlled paths are used in file operations without proper validation",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-022"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251229040701",
+   "codeql_raw_query": "/**\n * @name Use of eval/exec/compile\n * @description Using eval, exec, or compile can lead to arbitrary code execution if inputs are not properly sanitized\n * @kind problem\n * @problem.severity warning\n * @id py/eval-exec-usage\n * @tags security\n *        external/cwe/cwe-094\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call, string funcName\nwhere\n  (\n    call = API::builtin(\"eval\").getACall() and funcName = \"eval\"\n    or\n    call = API::builtin(\"exec\").getACall() and funcName = \"exec\"\n    or\n    call = API::builtin(\"compile\").getACall() and funcName = \"compile\"\n  )\nselect call, \"Use of \" + funcName + \"() which can execute arbitrary code if input is not sanitized.\"\n",
+   "hypothesis": "Check for use of eval/exec/compile that could lead to code injection",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-094"
+   ],
+   "results_count": 15,
+   "results": [
+    {
+     "ruleId": "py/eval-exec-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/eval-exec-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of compile() which can execute arbitrary code if input is not sanitized."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/cffi/api.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 777,
+         "startColumn": 9,
+         "endColumn": 47
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "53cc94e62ad0c8c8:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/eval-exec-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/eval-exec-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of eval() which can execute arbitrary code if input is not sanitized."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/cffi/recompiler.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 78,
+         "startColumn": 17,
+         "endColumn": 42
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "8d0bf7928e77be38:1",
+      "primaryLocationStartColumnFingerprint": "8"
+     }
+    },
+    {
+     "ruleId": "py/eval-exec-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/eval-exec-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of compile() which can execute arbitrary code if input is not sanitized."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/cffi/setuptools_ext.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 25,
+         "startColumn": 12,
+         "endColumn": 42
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "711874245ccdcf42:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/eval-exec-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/eval-exec-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of exec() which can execute arbitrary code if input is not sanitized."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/cffi/setuptools_ext.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 26,
+         "startColumn": 5,
+         "endColumn": 27
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "a120cbab5e9af5cb:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/eval-exec-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/eval-exec-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of eval() which can execute arbitrary code if input is not sanitized."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "testing/support.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 3
+        },
+        "region": {
+         "startLine": 9,
+         "startColumn": 20,
+         "endLine": 10,
+         "endColumn": 64
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "a9b72482a722b8bc:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/eval-exec-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/eval-exec-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of eval() which can execute arbitrary code if input is not sanitized."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "testing/support.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 3
+        },
+        "region": {
+         "startLine": 13,
+         "startColumn": 26,
+         "endColumn": 44
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "b0a54cac530a52f1:1",
+      "primaryLocationStartColumnFingerprint": "21"
+     }
+    },
+    {
+     "ruleId": "py/eval-exec-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/eval-exec-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of eval() which can execute arbitrary code if input is not sanitized."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "testing/support.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 3
+        },
+        "region": {
+         "startLine": 14,
+         "startColumn": 28,
+         "endColumn": 48
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "aae22d46db9b45b:1",
+      "primaryLocationStartColumnFingerprint": "23"
+     }
+    },
+    {
+     "ruleId": "py/eval-exec-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/eval-exec-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of eval() which can execute arbitrary code if input is not sanitized."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "testing/support.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 3
+        },
+        "region": {
+         "startLine": 15,
+         "startColumn": 32,
+         "endColumn": 56
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "b0cdd995e40b534:1",
+      "primaryLocationStartColumnFingerprint": "27"
+     }
+    },
+    {
+     "ruleId": "py/eval-exec-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/eval-exec-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of eval() which can execute arbitrary code if input is not sanitized."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/c/test_c.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 4
+        },
+        "region": {
+         "startLine": 77,
+         "startColumn": 20,
+         "endLine": 78,
+         "endColumn": 64
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "9bf8381febb96035:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/eval-exec-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/eval-exec-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of compile() which can execute arbitrary code if input is not sanitized."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "testing/cffi1/test_dlopen_unicode_literals.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 5
+        },
+        "region": {
+         "startLine": 9,
+         "startColumn": 6,
+         "endColumn": 56
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "6683837df0d28ca1:1",
+      "primaryLocationStartColumnFingerprint": "5"
+     }
+    },
+    {
+     "ruleId": "py/eval-exec-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/eval-exec-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of exec() which can execute arbitrary code if input is not sanitized."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "testing/cffi1/test_dlopen_unicode_literals.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 5
+        },
+        "region": {
+         "startLine": 9,
+         "endColumn": 57
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "6683837df0d28ca1:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/eval-exec-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/eval-exec-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of exec() which can execute arbitrary code if input is not sanitized."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "testing/cffi1/test_new_ffi_1.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 6
+        },
+        "region": {
+         "startLine": 1806,
+         "startColumn": 9,
+         "endColumn": 59
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "cd16557600d16389:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/eval-exec-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/eval-exec-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of exec() which can execute arbitrary code if input is not sanitized."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "testing/cffi1/test_new_ffi_1.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 6
+        },
+        "region": {
+         "startLine": 1813,
+         "startColumn": 9,
+         "endColumn": 55
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "e32aeda0876a63da:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/eval-exec-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/eval-exec-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of eval() which can execute arbitrary code if input is not sanitized."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "testing/cffi0/test_verify.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 7
+        },
+        "region": {
+         "startLine": 1786,
+         "startColumn": 26,
+         "endColumn": 78
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "80cbc90c5369451a:1",
+      "primaryLocationStartColumnFingerprint": "17"
+     }
+    },
+    {
+     "ruleId": "py/eval-exec-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/eval-exec-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of eval() which can execute arbitrary code if input is not sanitized."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "testing/cffi1/test_verify1.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 8
+        },
+        "region": {
+         "startLine": 1752,
+         "startColumn": 26,
+         "endColumn": 78
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "80cbc90c5369451a:1",
+      "primaryLocationStartColumnFingerprint": "17"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251229040729",
+   "codeql_raw_query": "/**\n * @name Code injection via compile/exec\n * @description Using compile/exec with user-controlled input can lead to arbitrary code execution\n * @kind path-problem\n * @problem.severity error\n * @id py/code-injection-compile-exec\n * @tags security\n *        external/cwe/cwe-094\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.ApiGraphs\n\nmodule CodeInjectionConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    // File read operations\n    exists(DataFlow::CallCfgNode call |\n      (\n        call = API::builtin(\"open\").getACall() or\n        call = API::moduleImport(\"io\").getMember(\"open\").getACall() or\n        call = API::moduleImport(\"os\").getMember(\"environ\").getASubscript().getAValueReachableFromSource()\n      ) and\n      source = call\n    )\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(DataFlow::CallCfgNode call |\n      (\n        call = API::builtin(\"compile\").getACall() or\n        call = API::builtin(\"exec\").getACall() or\n        call = API::builtin(\"eval\").getACall()\n      ) and\n      sink = call.getArg(0)\n    )\n  }\n}\n\nmodule CodeInjectionFlow = TaintTracking::Global<CodeInjectionConfig>;\nimport CodeInjectionFlow::PathGraph\n\nfrom CodeInjectionFlow::PathNode source, CodeInjectionFlow::PathNode sink\nwhere CodeInjectionFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"Code injection from $@.\", source.getNode(), \"file or environment variable\"",
+   "hypothesis": "Code injection through compile/exec with user-controlled data in setuptools_ext.py and api.py",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-094"
+   ],
+   "results_count": 4,
+   "results": [
+    {
+     "ruleId": "py/code-injection-compile-exec",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/code-injection-compile-exec",
+      "index": 0
+     },
+     "message": {
+      "text": "Code injection from [file or environment variable](1)."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/cffi/setuptools_ext.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 25,
+         "startColumn": 20,
+         "endColumn": 23
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "711874245ccdcf42:1",
+      "primaryLocationStartColumnFingerprint": "15"
+     },
+     "codeFlows": [
+      {
+       "threadFlows": [
+        {
+         "locations": [
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/cffi/setuptools_ext.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 22,
+              "startColumn": 10,
+              "endColumn": 24
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for open()"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/cffi/setuptools_ext.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 22,
+              "startColumn": 28,
+              "endColumn": 29
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for f"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/cffi/setuptools_ext.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 23,
+              "startColumn": 9,
+              "endColumn": 12
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for src"
+            }
+           },
+           "taxa": [
+            {
+             "id": "AdditionalTaintStep",
+             "properties": {
+              "CodeQL/DataflowRole": "step"
+             }
+            }
+           ]
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/cffi/setuptools_ext.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 24,
+              "startColumn": 5,
+              "endColumn": 8
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for src"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/cffi/setuptools_ext.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 25,
+              "startColumn": 20,
+              "endColumn": 23
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for src"
+            }
+           }
+          }
+         ]
+        }
+       ]
+      }
+     ],
+     "relatedLocations": [
+      {
+       "id": 1,
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/cffi/setuptools_ext.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 22,
+         "startColumn": 10,
+         "endColumn": 24
+        }
+       },
+       "message": {
+        "text": "file or environment variable"
+       }
+      },
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/cffi/setuptools_ext.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 22,
+         "startColumn": 10,
+         "endColumn": 24
+        }
+       }
+      }
+     ]
+    },
+    {
+     "ruleId": "py/code-injection-compile-exec",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/code-injection-compile-exec",
+      "index": 0
+     },
+     "message": {
+      "text": "Code injection from [file or environment variable](1)."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/cffi/setuptools_ext.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 26,
+         "startColumn": 10,
+         "endColumn": 14
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "a120cbab5e9af5cb:1",
+      "primaryLocationStartColumnFingerprint": "5"
+     },
+     "codeFlows": [
+      {
+       "threadFlows": [
+        {
+         "locations": [
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/cffi/setuptools_ext.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 22,
+              "startColumn": 10,
+              "endColumn": 24
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for open()"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/cffi/setuptools_ext.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 22,
+              "startColumn": 28,
+              "endColumn": 29
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for f"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/cffi/setuptools_ext.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 23,
+              "startColumn": 9,
+              "endColumn": 12
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for src"
+            }
+           },
+           "taxa": [
+            {
+             "id": "AdditionalTaintStep",
+             "properties": {
+              "CodeQL/DataflowRole": "step"
+             }
+            }
+           ]
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/cffi/setuptools_ext.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 24,
+              "startColumn": 5,
+              "endColumn": 8
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for src"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/cffi/setuptools_ext.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 25,
+              "startColumn": 5,
+              "endColumn": 9
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for code"
+            }
+           },
+           "taxa": [
+            {
+             "id": "AdditionalTaintStep",
+             "properties": {
+              "CodeQL/DataflowRole": "step"
+             }
+            }
+           ]
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/cffi/setuptools_ext.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 26,
+              "startColumn": 10,
+              "endColumn": 14
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for code"
+            }
+           }
+          }
+         ]
+        }
+       ]
+      }
+     ],
+     "relatedLocations": [
+      {
+       "id": 1,
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/cffi/setuptools_ext.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 22,
+         "startColumn": 10,
+         "endColumn": 24
+        }
+       },
+       "message": {
+        "text": "file or environment variable"
+       }
+      },
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/cffi/setuptools_ext.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 22,
+         "startColumn": 10,
+         "endColumn": 24
+        }
+       }
+      }
+     ]
+    },
+    {
+     "ruleId": "py/code-injection-compile-exec",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/code-injection-compile-exec",
+      "index": 0
+     },
+     "message": {
+      "text": "Code injection from [file or environment variable](1)."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "testing/cffi1/test_dlopen_unicode_literals.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 9,
+         "startColumn": 14,
+         "endColumn": 15
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "6683837df0d28ca1:1",
+      "primaryLocationStartColumnFingerprint": "13"
+     },
+     "codeFlows": [
+      {
+       "threadFlows": [
+        {
+         "locations": [
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "testing/cffi1/test_dlopen_unicode_literals.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 1
+             },
+             "region": {
+              "startLine": 6,
+              "startColumn": 6,
+              "endColumn": 69
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for open()"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "testing/cffi1/test_dlopen_unicode_literals.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 1
+             },
+             "region": {
+              "startLine": 6,
+              "startColumn": 73,
+              "endColumn": 74
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for f"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "testing/cffi1/test_dlopen_unicode_literals.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 1
+             },
+             "region": {
+              "startLine": 7,
+              "startColumn": 5,
+              "endColumn": 6
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for s"
+            }
+           },
+           "taxa": [
+            {
+             "id": "AdditionalTaintStep",
+             "properties": {
+              "CodeQL/DataflowRole": "step"
+             }
+            }
+           ]
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "testing/cffi1/test_dlopen_unicode_literals.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 1
+             },
+             "region": {
+              "startLine": 9,
+              "startColumn": 14,
+              "endColumn": 15
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for s"
+            }
+           }
+          }
+         ]
+        }
+       ]
+      }
+     ],
+     "relatedLocations": [
+      {
+       "id": 1,
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "testing/cffi1/test_dlopen_unicode_literals.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 6,
+         "startColumn": 6,
+         "endColumn": 69
+        }
+       },
+       "message": {
+        "text": "file or environment variable"
+       }
+      },
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "testing/cffi1/test_dlopen_unicode_literals.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 6,
+         "startColumn": 6,
+         "endColumn": 69
+        }
+       }
+      }
+     ]
+    },
+    {
+     "ruleId": "py/code-injection-compile-exec",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/code-injection-compile-exec",
+      "index": 0
+     },
+     "message": {
+      "text": "Code injection from [file or environment variable](1)."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "testing/cffi1/test_dlopen_unicode_literals.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 9,
+         "startColumn": 6,
+         "endColumn": 56
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "6683837df0d28ca1:1",
+      "primaryLocationStartColumnFingerprint": "5"
+     },
+     "codeFlows": [
+      {
+       "threadFlows": [
+        {
+         "locations": [
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "testing/cffi1/test_dlopen_unicode_literals.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 1
+             },
+             "region": {
+              "startLine": 6,
+              "startColumn": 6,
+              "endColumn": 69
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for open()"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "testing/cffi1/test_dlopen_unicode_literals.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 1
+             },
+             "region": {
+              "startLine": 6,
+              "startColumn": 73,
+              "endColumn": 74
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for f"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "testing/cffi1/test_dlopen_unicode_literals.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 1
+             },
+             "region": {
+              "startLine": 7,
+              "startColumn": 5,
+              "endColumn": 6
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for s"
+            }
+           },
+           "taxa": [
+            {
+             "id": "AdditionalTaintStep",
+             "properties": {
+              "CodeQL/DataflowRole": "step"
+             }
+            }
+           ]
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "testing/cffi1/test_dlopen_unicode_literals.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 1
+             },
+             "region": {
+              "startLine": 9,
+              "startColumn": 6,
+              "endColumn": 56
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for compile()"
+            }
+           },
+           "taxa": [
+            {
+             "id": "AdditionalTaintStep",
+             "properties": {
+              "CodeQL/DataflowRole": "step"
+             }
+            }
+           ]
+          }
+         ]
+        }
+       ]
+      }
+     ],
+     "relatedLocations": [
+      {
+       "id": 1,
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "testing/cffi1/test_dlopen_unicode_literals.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 6,
+         "startColumn": 6,
+         "endColumn": 69
+        }
+       },
+       "message": {
+        "text": "file or environment variable"
+       }
+      },
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "testing/cffi1/test_dlopen_unicode_literals.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 6,
+         "startColumn": 6,
+         "endColumn": 69
+        }
+       }
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251229040801",
+   "codeql_raw_query": "/**\n * @name Unsafe deserialization\n * @description Deserializing untrusted data using pickle or other unsafe methods can lead to arbitrary code execution\n * @kind problem\n * @problem.severity error\n * @id py/unsafe-deserialization\n * @tags security\n *        external/cwe/cwe-502\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  (\n    call = API::moduleImport(\"pickle\").getMember([\"load\", \"loads\", \"Unpickler\"]).getACall() or\n    call = API::moduleImport(\"marshal\").getMember([\"load\", \"loads\"]).getACall() or\n    call = API::moduleImport(\"shelve\").getMember(\"open\").getACall() or\n    call = API::moduleImport(\"dill\").getMember([\"load\", \"loads\"]).getACall()\n  )\nselect call, \"Potentially unsafe deserialization operation that could execute arbitrary code.\"",
+   "hypothesis": "Check for unsafe deserialization functions (pickle, marshal, shelve) that could lead to arbitrary code execution",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-502"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251229040828",
+   "codeql_raw_query": "/**\n * @name Insecure temporary file usage\n * @description Using insecure temporary file creation methods can lead to race conditions\n * @kind problem\n * @problem.severity warning\n * @id py/insecure-temp-file\n * @tags security\n *        external/cwe/cwe-377\n *        external/cwe/cwe-379\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  (\n    call = API::moduleImport(\"tempfile\").getMember([\"mktemp\", \"TemporaryFile\", \"NamedTemporaryFile\", \"mkdtemp\", \"mkstemp\"]).getACall() or\n    call = API::moduleImport(\"os\").getMember([\"tmpnam\", \"tempnam\"]).getACall()\n  )\nselect call, \"Usage of temporary file operation that may have security implications.\"",
+   "hypothesis": "Insecure temporary file creation that could lead to race conditions or predictable file paths",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-377",
+    "cwe-379"
+   ],
+   "results_count": 7,
+   "results": [
+    {
+     "ruleId": "py/insecure-temp-file",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/insecure-temp-file",
+      "index": 0
+     },
+     "message": {
+      "text": "Usage of temporary file operation that may have security implications."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "testing/cffi0/backend_tests.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 1244,
+         "startColumn": 24,
+         "endColumn": 42
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "ac100f1f7ac371fb:1",
+      "primaryLocationStartColumnFingerprint": "15"
+     }
+    },
+    {
+     "ruleId": "py/insecure-temp-file",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/insecure-temp-file",
+      "index": 0
+     },
+     "message": {
+      "text": "Usage of temporary file operation that may have security implications."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "testing/cffi1/test_new_ffi_1.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 1213,
+         "startColumn": 24,
+         "endColumn": 42
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "ac100f1f7ac371fb:1",
+      "primaryLocationStartColumnFingerprint": "15"
+     }
+    },
+    {
+     "ruleId": "py/insecure-temp-file",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/insecure-temp-file",
+      "index": 0
+     },
+     "message": {
+      "text": "Usage of temporary file operation that may have security implications."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "testing/cffi0/test_verify.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 1430,
+         "startColumn": 14,
+         "endColumn": 45
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "fdb40bffb9c1d148:1",
+      "primaryLocationStartColumnFingerprint": "9"
+     }
+    },
+    {
+     "ruleId": "py/insecure-temp-file",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/insecure-temp-file",
+      "index": 0
+     },
+     "message": {
+      "text": "Usage of temporary file operation that may have security implications."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "testing/cffi0/test_verify.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 1440,
+         "startColumn": 14,
+         "endColumn": 45
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "f68f68da9ccfa108:1",
+      "primaryLocationStartColumnFingerprint": "9"
+     }
+    },
+    {
+     "ruleId": "py/insecure-temp-file",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/insecure-temp-file",
+      "index": 0
+     },
+     "message": {
+      "text": "Usage of temporary file operation that may have security implications."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "testing/cffi1/test_verify1.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 3
+        },
+        "region": {
+         "startLine": 1399,
+         "startColumn": 14,
+         "endColumn": 45
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "fdb40bffb9c1d148:1",
+      "primaryLocationStartColumnFingerprint": "9"
+     }
+    },
+    {
+     "ruleId": "py/insecure-temp-file",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/insecure-temp-file",
+      "index": 0
+     },
+     "message": {
+      "text": "Usage of temporary file operation that may have security implications."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "testing/cffi1/test_verify1.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 3
+        },
+        "region": {
+         "startLine": 1410,
+         "startColumn": 14,
+         "endColumn": 45
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "f68f68da9ccfa108:1",
+      "primaryLocationStartColumnFingerprint": "9"
+     }
+    },
+    {
+     "ruleId": "py/insecure-temp-file",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/insecure-temp-file",
+      "index": 0
+     },
+     "message": {
+      "text": "Usage of temporary file operation that may have security implications."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "testing/cffi1/test_zdist.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 4
+        },
+        "region": {
+         "startLine": 45,
+         "startColumn": 20,
+         "endColumn": 29
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "fdbd072d377090ed:1",
+      "primaryLocationStartColumnFingerprint": "11"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251229040952",
+   "codeql_raw_query": "/**\n * @name SQL injection\n * @description SQL query constructed from user input can lead to SQL injection\n * @kind path-problem\n * @problem.severity error\n * @id py/sql-injection\n * @tags security\n *        external/cwe/cwe-089\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.dataflow.new.RemoteFlowSources\nimport semmle.python.Concepts\n\nmodule SqlInjectionConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    source instanceof RemoteFlowSource\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(SqlExecution sql |\n      sink = sql.getSql()\n    )\n  }\n}\n\nmodule SqlInjectionFlow = TaintTracking::Global<SqlInjectionConfig>;\nimport SqlInjectionFlow::PathGraph\n\nfrom SqlInjectionFlow::PathNode source, SqlInjectionFlow::PathNode sink\nwhere SqlInjectionFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"SQL injection from $@.\", source.getNode(), \"user input\"",
+   "hypothesis": "SQL query constructed from user input can lead to SQL injection",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-089"
+   ],
+   "results_count": 0,
+   "results": []
+  }
+ ]
+}

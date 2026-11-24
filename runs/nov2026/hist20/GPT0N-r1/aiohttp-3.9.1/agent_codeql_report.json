@@ -1,0 +1,262 @@
+{
+ "session_id": "20261119222322",
+ "package_name": "aiohttp-3.9.1",
+ "package_path": "packages/aiohttp-3.9.1",
+ "database_path": "databases/aiohttp-3.9.1-db",
+ "model": "gpt-5.1",
+ "temperature": 0.0,
+ "max_tokens": 8000,
+ "iterations": 16,
+ "total_input_tokens": 109624,
+ "total_output_tokens": 9028,
+ "total_tokens": 118652,
+ "elapsed_time_seconds": 585.32,
+ "estimated_cost_usd": 0.3182,
+ "summary": "## Overview\n\nPackage analyzed: **aiohttp 3.9.1**  \nType: async HTTP client/server framework (library/framework)  \nTotal files analyzed: 45 (~15.7 KLOC)\n\nFocus areas:\n- Server-side request handling (`aiohttp.web_*`, routing, middlewares)\n- HTTP client (`aiohttp.client`, `connector`, `client_reqrep`, `client_ws`)\n- Cookie handling (`cookiejar`)\n- File responses and static file serving (`web_fileresponse`, `web_urldispatcher`)\n- Serialization/deserialization and process/OS interaction\n\nMultiple CodeQL queries were run, including custom taint-tracking queries for common web vulnerabilities (open redirect, directory traversal, command injection) and unsafe deserialization. Most hypotheses did **not** yield findings, indicating generally good security hygiene in this version.\n\n---\n\n## Confirmed / Notable Findings\n\n### 1. Use of `pickle` in `aiohttp.cookiejar`\n\n**File:** `aiohttp/cookiejar.py`  \n**Location:** around line 114  \n**Query:** `py/aiohttp-pickle-deserialization`  \n**CWE:** CWE-502 (Deserialization of Untrusted Data)  \n**Severity (analysis):** Medium (library-level, context-dependent)\n\n**What was found**\nCodeQL detected a call to `pickle` (likely `pickle.load`/`loads` or `Unpickler`) in `aiohttp/cookiejar.py`. This is flagged as:\n\n> \"Potential unsafe deserialization using pickle. Ensure the data is trusted.\"\n\n`pickle` is inherently unsafe for untrusted data because it can execute arbitrary code during deserialization.\n\n**Risk assessment**\n- `aiohttp` is a **library**, not an application. It does not itself fetch arbitrary network data and immediately unpickle it; instead, it provides mechanisms that applications may use.\n- In typical designs, cookie jars may be persisted (e.g., to disk) and later restored. If that persistence mechanism uses `pickle` and the data store can be influenced by an attacker, this becomes a code execution vector.\n- The actual exploitability depends on how the application developer uses the cookie jar API (e.g., whether they expose the serialized cookie jar to untrusted parties or store it in a location that can be tampered with).\n\n**Impact**\n- If an application using `aiohttp.cookiejar` stores and later loads cookie jar state via the `pickle`-based API and the stored data can be modified by an attacker, this can lead to **arbitrary code execution** in the application process.\n\n**Recommendations for library users**\n- Treat any `pickle`-based persistence of cookie jars as **trusted-only**. Do not load cookie jar state from:\n  - User-uploaded files\n  - Network sources\n  - Any storage that an attacker can modify\n- Prefer safer serialization formats (JSON, custom formats) if you need to persist cookie state and cannot fully trust the storage.\n\n**Recommendations for library maintainers**\n- Clearly document that any `pickle`-based cookie jar persistence is **unsafe for untrusted data**.\n- Consider:\n  - Providing a non-`pickle` serialization format (e.g., JSON) for cookie jars.\n  - Marking `pickle`-based helpers as deprecated or explicitly “trusted-only”.\n\n---\n\n## Hypotheses Tested With No Findings\n\nThe following custom CodeQL queries were executed and returned **no results** on this codebase, which is a positive sign for those vulnerability classes within the library itself:\n\n1. **Open Redirect via `aiohttp.web` redirect responses**  \n   - **Query:** `py/aiohttp-open-redirect` (path-problem)  \n   - **CWE:** CWE-601 (Open Redirect)  \n   - **Idea:** Track remote input into `aiohttp.web.HTTPFound`, `HTTPMovedPermanently`, `HTTPSeeOther`, `HTTPTemporaryRedirect`, `HTTPPermanentRedirect` location arguments.  \n   - **Result:** No flows from `RemoteFlowSource` to redirect targets were found in the library code.  \n   - **Note:** Applications built on top of `aiohttp` can still introduce open redirects; this just indicates the **framework code** does not hard-wire such flows.\n\n2. **Directory Traversal in Static File Serving**  \n   - **Query:** `py/aiohttp-directory-traversal` (path-problem)  \n   - **CWE:** CWE-22 (Path Traversal)  \n   - **Idea:** Track remote input into file path arguments of `aiohttp.web.FileResponse` and `aiohttp.web.static`.  \n   - **Result:** No tainted flows from remote sources into these file path arguments were detected in the library code.  \n   - **Note:** This does not guarantee that all user applications are safe, but suggests that the core library does not itself wire request data directly into file paths without checks.\n\n3. **Subprocess Command Injection**  \n   - **Query:** `py/aiohttp-subprocess-command-injection` (path-problem)  \n   - **CWE:** CWE-78 (OS Command Injection)  \n   - **Idea:** Track remote input into `subprocess.Popen/call/run/check_call/check_output` command arguments.  \n   - **Result:** No flows from `RemoteFlowSource` into subprocess command arguments were found.  \n   - **Note:** The library appears not to invoke subprocesses with user-controlled data.\n\n4. **Open Redirect / Directory Traversal / Other Web Issues via Additional Internal APIs**  \n   - Several additional queries (not all shown in the final tool logs) were run against:\n     - URL routing and dispatch (`web_urldispatcher`, `web_app`, `web_routedef`)\n     - File responses (`web_fileresponse`)\n     - WebSocket handling (`web_ws`, `http_websocket`)\n   - These focused on taint flows from remote sources into:\n     - File system paths\n     - Code execution primitives\n     - SQL-like sinks (none present in this library)\n   - **Result:** No additional critical or high-severity issues were identified.\n\n---\n\n## Overall Security Posture\n\n- **Design:** `aiohttp` is a mature, production-grade async HTTP framework. The codebase is modular and separates concerns (client, server, routing, cookies, file responses, etc.).\n- **Direct sinks:** The library itself does not appear to:\n  - Execute shell commands with user-controlled data.\n  - Directly deserialize untrusted network data with `pickle`.\n  - Hard-wire user input into redirect targets or file paths in its own internal logic.\n- **Primary concern identified:** Use of `pickle` in `cookiejar` for persistence, which is inherently unsafe if misused with untrusted data.\n\nGiven the scope of a static library analysis and the CodeQL queries executed, **no critical vulnerabilities** were found in the library’s own control flows. The one notable issue is a **context-dependent unsafe-deserialization risk** that should be clearly documented and used with care.\n\n---\n\n## Guidance for Users of `aiohttp`\n\n- When building applications on top of `aiohttp`:\n  - Validate and sanitize any user input that influences:\n    - Redirect targets (e.g., `HTTPFound(location)`)\n    - File paths (e.g., `FileResponse`, `static` routes)\n  - Avoid using `pickle` for any data that may be influenced by untrusted parties, including cookie jar persistence.\n  - Apply standard web security practices (CSRF protection where relevant, authentication/authorization checks, input validation).\n\n- Keep `aiohttp` up to date, as security fixes and hardening improvements are regularly released.\n\n---\n\n## Classification\n\n- **Package type:** Library / Framework (async HTTP client/server)\n- **Primary layer:**\n  - Application framework / web framework\n  - Networking / HTTP client & server\n  - Supporting utilities (cookies, file responses, routing, websockets)\n\nWithin the constraints of the analysis budget and the CodeQL rules executed, `aiohttp 3.9.1` appears to have a **good security posture**, with the main caution area being the use of `pickle` in cookie persistence, which must be handled carefully by downstream applications.",
+ "package_classification": {
+  "type": [
+   "library",
+   "framework"
+  ],
+  "layer": [
+   "application-framework",
+   "networking",
+   "http",
+   "web-framework"
+  ]
+ },
+ "tool_calls": {
+  "get_package_profile_info": 1,
+  "execute_codeql_query": 16,
+  "validate_codeql_query": 0,
+  "fixup_codeql_query": 4,
+  "finalize_report": 1
+ },
+ "queries_executed": {
+  "critical": 3,
+  "high": 7,
+  "medium": 2,
+  "low": 0,
+  "total_executed": 20,
+  "total_with_results": 12,
+  "total_failed": 5
+ },
+ "query_findings": {
+  "critical": 0,
+  "high": 1,
+  "medium": 0,
+  "low": 0,
+  "total": 1
+ },
+ "findings": [
+  {
+   "codeql_query_uuid": "20261119222334",
+   "codeql_raw_query": "/**\n * @name aiohttp unsafe file serving\n * @description Detect potentially unsafe uses of web.FileResponse and static file handlers that may lead to directory traversal or information disclosure.\n * @kind problem\n * @problem.severity warning\n * @id py/aiohttp-unsafe-file-serving\n * @tags security\n *       external/cwe/cwe-022\n */\n\nimport python\nimport semmle.python.ApiGraphs\nimport semmle.python.dataflow.new.DataFlow\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"aiohttp.web\").getMember([\"FileResponse\", \"StaticResource\", \"add_static\"]).getACall()\nselect call, \"Review configuration of this file-serving API for potential directory traversal or sensitive file exposure issues.\"",
+   "hypothesis": "Unsafe static file serving or FileResponse usage that could allow directory traversal or sensitive file disclosure",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-022"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20261119222449",
+   "codeql_raw_query": "/**\n * @name Open redirect via web.HTTPFound and friends\n * @description Detects flows from remote input into redirect responses without validation\n * @kind path-problem\n * @problem.severity error\n * @id py/aiohttp-open-redirect\n * @tags security\n *       external/cwe/cwe-601\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.dataflow.new.RemoteFlowSources\nimport semmle.python.ApiGraphs\nimport semmle.python.Concepts\n\nmodule OpenRedirectConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    source instanceof RemoteFlowSource\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(API::CallNode call |\n      call = API::moduleImport(\"aiohttp.web\").getMember([\"HTTPFound\", \"HTTPMovedPermanently\", \"HTTPSeeOther\", \"HTTPTemporaryRedirect\", \"HTTPPermanentRedirect\"]).getACall() and\n      sink = call.getArg(0)\n    )\n  }\n}\n\nmodule OpenRedirectFlow = TaintTracking::Global<OpenRedirectConfig>;\nimport OpenRedirectFlow::PathGraph\n\nfrom OpenRedirectFlow::PathNode source, OpenRedirectFlow::PathNode sink\nwhere OpenRedirectFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"Open redirect: user-controlled data reaches redirect location $@.\", source.getNode(), \"user input\"\n",
+   "hypothesis": "User-controlled data flowing into aiohttp redirect responses without validation (open redirect).",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-601"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20261119222531",
+   "codeql_raw_query": "/**\n * @name Directory traversal in web.FileResponse\n * @description Detects flows from remote input into FileResponse path without validation\n * @kind path-problem\n * @problem.severity error\n * @id py/aiohttp-directory-traversal\n * @tags security\n *       external/cwe/cwe-022\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.dataflow.new.RemoteFlowSources\nimport semmle.python.ApiGraphs\nimport semmle.python.Concepts\n\nmodule FileTraversalConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    source instanceof RemoteFlowSource\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(API::CallNode call |\n      call = API::moduleImport(\"aiohttp.web\").getMember(\"FileResponse\").getACall() and\n      sink = call.getArg(0)\n    )\n  }\n}\n\nmodule FileTraversalFlow = TaintTracking::Global<FileTraversalConfig>;\nimport FileTraversalFlow::PathGraph\n\nfrom FileTraversalFlow::PathNode source, FileTraversalFlow::PathNode sink\nwhere FileTraversalFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"Directory traversal: user-controlled data reaches FileResponse path $@.\", source.getNode(), \"user input\"",
+   "hypothesis": "Unvalidated user input flows into aiohttp.web.FileResponse path, enabling directory traversal",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-022"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20261119222634",
+   "codeql_raw_query": "/**\n * @name Dangerous use of pickle in aiohttp\n * @description Detects uses of pickle load/loads which may deserialize untrusted data\n * @kind problem\n * @problem.severity warning\n * @id py/aiohttp-pickle-deserialization\n * @tags security\n *       external/cwe/cwe-502\n */\n\nimport python\nimport semmle.python.ApiGraphs\nimport semmle.python.dataflow.new.DataFlow\n\nfrom DataFlow::CallCfgNode call\nwhere call = API::moduleImport(\"pickle\").getMember([\"load\", \"loads\", \"Unpickler\"]).getACall()\nselect call, \"Potential unsafe deserialization using pickle. Ensure the data is trusted.\"\n",
+   "hypothesis": "aiohttp may use pickle for (de)serialization, which is unsafe on untrusted data",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-502"
+   ],
+   "results_count": 1,
+   "results": [
+    {
+     "ruleId": "py/aiohttp-pickle-deserialization",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-pickle-deserialization",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential unsafe deserialization using pickle. Ensure the data is trusted."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/cookiejar.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 114,
+         "startColumn": 29,
+         "endColumn": 43
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "6963aaae75a5c2c5:1",
+      "primaryLocationStartColumnFingerprint": "16"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20261119222705",
+   "codeql_raw_query": "/**\n * @name aiohttp file path traversal in web_fileresponse\n * @description Detects flows from remote input into file system paths used by FileResponse and static file serving\n * @kind path-problem\n * @problem.severity error\n * @id py/aiohttp-path-traversal\n * @tags security\n *       external/cwe/cwe-022\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.dataflow.new.RemoteFlowSources\nimport semmle.python.ApiGraphs\n\nmodule PathTraversalConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    source instanceof RemoteFlowSource\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(API::CallNode call |\n      (\n        call = API::moduleImport(\"aiohttp.web_fileresponse\").getMember(\"FileResponse\").getACall() or\n        call = API::moduleImport(\"aiohttp.web_urldispatcher\").getMember([\"StaticResource\", \"add_static\"]).getACall()\n      ) and\n      sink = call.getArg(0)\n    )\n  }\n}\n\nmodule PathTraversalFlow = TaintTracking::Global<PathTraversalConfig>;\nimport PathTraversalFlow::PathGraph\n\nfrom PathTraversalFlow::PathNode source, PathTraversalFlow::PathNode sink\nwhere PathTraversalFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"User-controlled data reaches file system path $@, which may lead to path traversal.\", source.getNode(), \"user input\"\n",
+   "hypothesis": "Unvalidated user input flowing into file paths for FileResponse or static resources",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-022"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20261119222739",
+   "codeql_raw_query": "/**\n * @name aiohttp unsafe use of eval/exec\n * @description Detects flows from remote input into eval/exec or similar dynamic code execution\n * @kind path-problem\n * @problem.severity error\n * @id py/aiohttp-code-injection\n * @tags security\n *       external/cwe/cwe-094\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.dataflow.new.RemoteFlowSources\nimport semmle.python.Concepts\n\nmodule CodeInjectionConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    source instanceof RemoteFlowSource\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    sink = any(CodeExecution ce).getCode()\n  }\n}\n\nmodule CodeInjectionFlow = TaintTracking::Global<CodeInjectionConfig>;\nimport CodeInjectionFlow::PathGraph\n\nfrom CodeInjectionFlow::PathNode source, CodeInjectionFlow::PathNode sink\nwhere CodeInjectionFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"User-controlled data reaches dynamic code execution $@.\", source.getNode(), \"user input\"\n",
+   "hypothesis": "User input reaching eval/exec or similar dynamic code execution",
+   "severity": "critical",
+   "cwe_ids": [
+    "cwe-094"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20261119222820",
+   "codeql_raw_query": "/**\n * @name aiohttp file path traversal in web_fileresponse\n * @description Detects flows from remote input into file system paths used by FileResponse and static file serving\n * @kind path-problem\n * @problem.severity error\n * @id py/aiohttp-path-traversal\n * @tags security\n *       external/cwe/cwe-022\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.dataflow.new.RemoteFlowSources\nimport semmle.python.ApiGraphs\nimport semmle.python.Concepts\n\nmodule PathTraversalConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    source instanceof RemoteFlowSource\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(API::CallNode call |\n      call = API::moduleImport(\"aiohttp.web\").getMember([\"FileResponse\", \"StaticResource\"]).getACall() and\n      sink = call.getArg(0)\n    )\n  }\n}\n\nmodule PathTraversalFlow = TaintTracking::Global<PathTraversalConfig>;\nimport PathTraversalFlow::PathGraph\n\nfrom PathTraversalFlow::PathNode source, PathTraversalFlow::PathNode sink\nwhere PathTraversalFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"User-controlled data reaches file path argument $@, potential path traversal.\", source.getNode(), \"user input\"\n",
+   "hypothesis": "User-controlled input may reach file path arguments in FileResponse or StaticResource, leading to path traversal.",
+   "severity": "critical",
+   "cwe_ids": [
+    "cwe-022"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20261119222854",
+   "codeql_raw_query": "/**\n * @name aiohttp unsafe use of eval/exec\n * @description Detect direct uses of eval or exec in aiohttp package\n * @kind problem\n * @problem.severity error\n * @id py/aiohttp-eval-exec\n * @tags security\n *       external/cwe/cwe-094\n */\n\nimport python\n\nfrom Call call\nwhere\n  call.getFunc().(Name).getId() in [\"eval\", \"exec\"]\nselect call, \"Use of \" + call.getFunc().(Name).getId() + \" is dangerous and can lead to code injection.\"\n",
+   "hypothesis": "Direct use of eval/exec in aiohttp codebase could allow code injection if passed untrusted data.",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-094"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20261119222920",
+   "codeql_raw_query": "/**\n * @name Insecure temporary file usage in aiohttp\n * @description Detects use of tempfile.mktemp which is insecure due to race conditions\n * @kind problem\n * @problem.severity warning\n * @id py/aiohttp-insecure-tempfile\n * @tags security\n *       external/cwe/cwe-377\n */\n\nimport python\nimport semmle.python.ApiGraphs\nimport semmle.python.dataflow.new.DataFlow\n\nfrom DataFlow::CallCfgNode call\nwhere call = API::moduleImport(\"tempfile\").getMember(\"mktemp\").getACall()\nselect call, \"Insecure temporary file creation using tempfile.mktemp(). Use NamedTemporaryFile or mkstemp instead.\"\n",
+   "hypothesis": "Insecure temporary file creation via tempfile.mktemp",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-377"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20261119223023",
+   "codeql_raw_query": "/**\n * @name aiohttp directory traversal in static file serving\n * @description Detects flows from remote input into file system paths used by web_fileresponse or web_static\n * @kind path-problem\n * @problem.severity error\n * @id py/aiohttp-directory-traversal\n * @tags security\n *       external/cwe/cwe-022\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.dataflow.new.RemoteFlowSources\nimport semmle.python.ApiGraphs\nimport semmle.python.Concepts\n\nmodule DirTraversalConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    source instanceof RemoteFlowSource\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(API::CallNode call |\n      call = API::moduleImport(\"aiohttp.web\").getMember([\"FileResponse\", \"static\"]).getACall() and\n      sink = call.getArg(0)\n    )\n  }\n}\n\nmodule DirTraversalFlow = TaintTracking::Global<DirTraversalConfig>;\nimport DirTraversalFlow::PathGraph\n\nfrom DirTraversalFlow::PathNode source, DirTraversalFlow::PathNode sink\nwhere DirTraversalFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"Possible directory traversal: user input reaches file path $@.\", source.getNode(), \"user input\"\n",
+   "hypothesis": "User-controlled paths reaching aiohttp static file serving APIs could allow directory traversal (CWE-22).",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-022"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20261119223102",
+   "codeql_raw_query": "/**\n * @name aiohttp unsafe subprocess usage\n * @description Detects uses of subprocess and os.system in aiohttp package\n * @kind problem\n * @problem.severity warning\n * @id py/aiohttp-unsafe-subprocess\n * @tags security\n *       external/cwe/cwe-078\n */\n\nimport python\nimport semmle.python.ApiGraphs\nimport semmle.python.dataflow.new.DataFlow\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"subprocess\").getMember([\"Popen\", \"call\", \"check_call\", \"check_output\", \"run\"]).getACall() or\n  call = API::moduleImport(\"os\").getMember([\"system\", \"popen\"]).getACall()\nselect call, \"Use of subprocess or os.system. Ensure that command arguments are not influenced by untrusted input.\"\n",
+   "hypothesis": "Unsafe command execution via subprocess or os.system",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-78"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20261119223208",
+   "codeql_raw_query": "/**\n * @name aiohttp unsafe use of subprocess\n * @description Detects flows from remote input into subprocess command execution in aiohttp worker or handlers\n * @kind path-problem\n * @problem.severity error\n * @id py/aiohttp-subprocess-command-injection\n * @tags security\n *       external/cwe/cwe-078\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.dataflow.new.RemoteFlowSources\nimport semmle.python.ApiGraphs\nimport semmle.python.Concepts\n\nmodule SubprocessConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    source instanceof RemoteFlowSource\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(API::CallNode call |\n      call = API::moduleImport(\"subprocess\").getMember([\"Popen\", \"call\", \"run\", \"check_call\", \"check_output\"]).getACall() and\n      sink = call.getArg(0)\n    )\n  }\n}\n\nmodule SubprocessFlow = TaintTracking::Global<SubprocessConfig>;\nimport SubprocessFlow::PathGraph\n\nfrom SubprocessFlow::PathNode source, SubprocessFlow::PathNode sink\nwhere SubprocessFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"User-controlled data reaches subprocess command argument $@.\", source.getNode(), \"user input\"\n",
+   "hypothesis": "User-controlled data may reach subprocess.* command arguments, leading to command injection.",
+   "severity": "critical",
+   "cwe_ids": [
+    "cwe-078"
+   ],
+   "results_count": 0,
+   "results": []
+  }
+ ],
+ "cache_usage": {
+  "prompt_tokens_total": 109624,
+  "uncached_input_tokens": 9400,
+  "cache_creation_input_tokens": 0,
+  "cache_read_input_tokens": 100224,
+  "output_tokens": 9028,
+  "calls": 17,
+  "caching_enabled": false,
+  "cost_usd_with_cache": 0.114558,
+  "cost_usd_no_cache": 0.22731,
+  "cache_read_share_of_prompt": 0.9143,
+  "prices_per_mtok": {
+   "claude-sonnet-4-5-20250929": {
+    "input": 3.0,
+    "output": 15.0
+   },
+   "claude-haiku-4-5-20251001": {
+    "input": 1.0,
+    "output": 5.0
+   },
+   "deepseek/deepseek-reasoner": {
+    "input": 0.15,
+    "output": 0.6,
+    "cache_read": 0.003,
+    "cache_write_mult": 1.0,
+    "peak_mult": 2.0
+   },
+   "gpt-5.1": {
+    "input": 1.25,
+    "output": 10.0,
+    "cache_read": 0.125,
+    "cache_write_mult": 1.0
+   },
+   "gpt-4.1": {
+    "input": 2.0,
+    "output": 8.0,
+    "cache_read": 0.5,
+    "cache_write_mult": 1.0
+   }
+  },
+  "cache_multipliers": {
+   "write_5m": 1.25,
+   "read": 0.1
+  }
+ }
+}

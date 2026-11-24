@@ -1,0 +1,234 @@
+{
+ "session_id": "20251226142632",
+ "package_name": "tqdm-4.67.1",
+ "package_path": "packages/tqdm-4.67.1",
+ "database_path": "databases/tqdm-4.67.1-db",
+ "model": "gpt-5.1",
+ "temperature": 1.0,
+ "max_tokens": 8000,
+ "iterations": 12,
+ "total_input_tokens": 94344,
+ "total_output_tokens": 7706,
+ "total_tokens": 102050,
+ "elapsed_time_seconds": 286.14,
+ "estimated_cost_usd": 0.195,
+ "summary": "## Overview\n\nAnalyzed PyPI package **tqdm 4.67.1** (fast, extensible progress meter) using CodeQL against the distributed source. The package is primarily a Python library with an optional CLI entry point (`tqdm` → `tqdm.cli:main`). Focus was on code-execution, injection, and typical library/CLI misuse patterns.\n\nTotal source: 32 Python files, ~3.6k LOC.\n\n## Package classification\n\n- **Type:** library, cli_tool\n- **Layer:** application-support / developer tooling\n\n## Key security-relevant components\n\n- `tqdm/cli.py`: implements the `tqdm` command-line interface.\n- `tqdm/std.py`, `tqdm/utils.py`: core progress bar logic and utilities.\n- `tqdm/contrib/*.py`: integrations with Slack, Telegram, Discord, concurrent utilities, etc.\n\n## Findings\n\n### 1. Use of `eval` in CLI code (potential code injection sink)\n\n**Location (from CodeQL SARIF):**\n- File: `tqdm/cli.py`\n- Approx. region: **line 38, columns 20–36**\n\n**What was found**\n\nMultiple queries (generic and package-focused) consistently reported a call to Python’s `eval` in `tqdm/cli.py`. This is flagged by:\n- `py/insecure-eval-exec`\n- `py/tqdm-insecure-eval-exec`\n- `py/tqdm-cli-eval-exec-context`\n\nAll point to the same call site around line 38.\n\n**Risk characterization**\n\n- **CWE:**\n  - CWE-94 – Improper Control of Generation of Code (‘Code Injection’)\n  - CWE-95 – Improper Neutralization of Directives in Dynamically Evaluated Code (‘Eval Injection’)\n- **Severity:** _Medium_ (in this version, based on typical usage patterns for `tqdm`)\n\n`tqdm` is primarily a library, but `tqdm/cli.py` is reachable as a user-facing CLI. A use of `eval` in CLI processing can become dangerous **if** any portion of the evaluated string is constructed from untrusted, non-sanitized command-line arguments or environment input.\n\nOur automated analysis confirmed the presence of `eval`, but did not, within this iteration budget, establish a complete taint flow from raw CLI input into the evaluated expression. The specialized taint-tracking query executed late in the analysis did not return any concrete exploit path, which suggests at least one of the following:\n\n- The evaluated expression is constant or built only from trusted literals; **or**\n- Any influence from user input is constrained to a safe domain (e.g., parsed integers, strictly validated tokens, or limited options); **or**\n- The dataflow is complex enough that our simple queries did not capture the path.\n\nThus, this is best described as a **potentially dangerous sink** present in CLI code, not as a confirmed remote code execution vulnerability.\n\n**Impact if misused**\n\nIf future changes (or incorrect backports/patches) cause untrusted CLI arguments to flow into this `eval` call without strict validation, it could allow:\n- Arbitrary Python expression evaluation in the CLI process context.\n- Execution of OS commands via Python APIs (`os.system`, `subprocess`, etc.).\n\nBecause `tqdm` is often run in developer or build environments, exploitation impact is proportional to the privileges of the invoking user.\n\n**Recommendations**\n\nFor maintainers:\n\n1. **Replace `eval` with safer alternatives**\n   - If the intent is to parse numeric or simple literal values, use `ast.literal_eval` or explicit parsers (e.g., `int`, `float`, `json.loads`) instead of `eval`.\n   - If the intent is to look up attribute names, use `getattr` on a safe, whitelisted module or mapping.\n\n2. **Constrain input domain explicitly**\n   - If you must map CLI tokens to internal Python objects (e.g., choices of bar format, style, or callbacks), use a **static mapping dict** from user-facing strings to callables/values.\n   - Avoid evaluating arbitrary expressions; only accept known, finite options.\n\n3. **Document and test**\n   - Add regression tests ensuring that `tqdm` CLI does not evaluate arbitrary, attacker-controlled strings.\n   - Consider adding a static check or linter rule in CI to flag reintroductions of `eval`/`exec` in argument-handling paths.\n\nFor downstream users:\n\n- Be aware that `tqdm`’s CLI currently contains an `eval` call. Do **not** expose the `tqdm` CLI as a generic, internet-facing service or bot wrapper that passes user-provided strings directly to its arguments without validation.\n\n**Evidence**\n\n- CodeQL rules `py/insecure-eval-exec`, `py/tqdm-insecure-eval-exec`, and `py/tqdm-cli-eval-exec-context` all reported a single finding at `tqdm/cli.py`, line ~38.\n- No additional uses of `eval`/`exec` were detected elsewhere in the package.\n\n## Other vulnerability classes investigated\n\nWithin the iteration budget, the following areas were probed using CodeQL. None produced confirmed issues in the package code as shipped.\n\n1. **Subprocess with `shell=True` (CWE-78)**\n   - Attempted several variants of a CodeQL query against `subprocess.{run,Popen,check_call,check_output,call}` with `shell=True`.\n   - Queries encountered compilation issues that required multiple fixup attempts; no successfully executed query produced any findings.\n   - There is no evidence from the successful queries that `tqdm` uses `subprocess` in a clearly unsafe way.\n\n2. **Remote-input-driven code execution / taint to sinks**\n   - A tailored query was run to look for flows into `eval`/`exec` in the context of CLI processing.\n   - No concrete taint paths from untrusted sources (e.g., raw CLI args without validation) to the `eval` sink were identified in the executed query results.\n\n3. **Other high-risk patterns**\n   - No findings for unsafe `pickle`/`yaml.load`-style deserialization, no direct SQL usage, and no obvious OS command execution primitives tied to external input were reported within the queries that compiled and ran.\n\n## Overall assessment\n\n- The **codebase is generally in good shape from a security standpoint** for a progress-bar library and CLI tool.\n- The primary point of concern is the **presence of `eval` in CLI code**. This is a well-known footgun and merits refactoring even if current usage is not trivially exploitable.\n- No confirmed command-injection, deserialization RCE, or similar critical vulnerabilities were discovered within the constraints of the analysis.\n\n## Recommended next steps\n\nFor maintainers:\n\n1. **Refactor `tqdm/cli.py` to remove `eval`** and replace it with safer parsing or mapping logic, as described above.\n2. **Add tests and/or static checks** to prevent reintroducing `eval`/`exec` in CLI argument-handling paths.\n3. Optionally, **publish a short note in the changelog** explaining that internal CLI parsing was hardened and that no known exploit path existed, to reassure users.\n\nFor security reviewers or downstream integrators:\n\n- Treat `tqdm` 4.67.1 as **generally safe** for typical local and development use.\n- If embedding the `tqdm` CLI in services that execute on behalf of others, validate and constrain the CLI input, or consider using `tqdm` via its Python API instead of through the CLI wrapper.\n",
+ "package_classification": {
+  "type": [
+   "library",
+   "cli_tool"
+  ],
+  "layer": [
+   "application-support",
+   "developer-tooling"
+  ]
+ },
+ "tool_calls": {
+  "get_package_profile_info": 1,
+  "execute_codeql_query": 10,
+  "validate_codeql_query": 0,
+  "fixup_codeql_query": 3,
+  "finalize_report": 1
+ },
+ "queries_executed": {
+  "critical": 2,
+  "high": 2,
+  "medium": 1,
+  "low": 0,
+  "total_executed": 11,
+  "total_with_results": 5,
+  "total_failed": 11
+ },
+ "query_findings": {
+  "critical": 1,
+  "high": 2,
+  "medium": 1,
+  "low": 0,
+  "total": 4
+ },
+ "findings": [
+  {
+   "codeql_query_uuid": "20251226142746",
+   "codeql_raw_query": "/**\n * @name Insecure use of eval/exec\n * @description Finds uses of eval or exec which may lead to code injection if used on untrusted input\n * @kind problem\n * @problem.severity error\n * @id py/insecure-eval-exec\n * @tags security\n *       external/cwe/cwe-094\n */\n\nimport python\nimport semmle.python.ApiGraphs\nimport semmle.python.dataflow.new.DataFlow\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::builtin([\"eval\", \"exec\"]).getACall() and\n  call.getLocation().getFile().getRelativePath().regexpMatch(\".*tqdm.*\")\nselect call, \"Use of eval/exec may lead to code injection if passed untrusted input.\"",
+   "hypothesis": "tqdm may use eval/exec which can be dangerous if applied to untrusted data",
+   "severity": "critical",
+   "cwe_ids": [
+    "cwe-094"
+   ],
+   "results_count": 1,
+   "results": [
+    {
+     "ruleId": "py/insecure-eval-exec",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/insecure-eval-exec",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of eval/exec may lead to code injection if passed untrusted input."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "tqdm/cli.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 38,
+         "startColumn": 20,
+         "endColumn": 36
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "6b53db96e6d1a5d8:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251226142855",
+   "codeql_raw_query": "/**\n * @name Insecure use of eval/exec in tqdm\n * @description Finds uses of eval or exec inside the tqdm package which may lead to code injection if used on untrusted input\n * @kind problem\n * @problem.severity error\n * @id py/tqdm-insecure-eval-exec\n * @tags security\n *       external/cwe/cwe-094\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::builtin([\"eval\", \"exec\"]).getACall() and\n  call.getLocation().getFile().getRelativePath().regexpMatch(\"^tqdm/.*\")\nselect call, \"Use of eval/exec in tqdm may lead to code injection if passed untrusted input.\"",
+   "hypothesis": "There may be insecure uses of eval/exec within the tqdm package itself, not just in dependencies.",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-094"
+   ],
+   "results_count": 1,
+   "results": [
+    {
+     "ruleId": "py/tqdm-insecure-eval-exec",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/tqdm-insecure-eval-exec",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of eval/exec in tqdm may lead to code injection if passed untrusted input."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "tqdm/cli.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 38,
+         "startColumn": 20,
+         "endColumn": 36
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "6b53db96e6d1a5d8:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251226142946",
+   "codeql_raw_query": "/**\n * @name Insecure eval/exec in tqdm package\n * @description Finds uses of eval or exec within the tqdm package which may lead to code injection if used on untrusted input\n * @kind problem\n * @problem.severity error\n * @id py/tqdm-insecure-eval-exec\n * @tags security\n *       external/cwe/cwe-094\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::builtin([\"eval\", \"exec\"]).getACall() and\n  call.getLocation().getFile().getRelativePath().regexpMatch(\".*tqdm.*\")\nselect call, \"Use of eval/exec in tqdm may lead to code injection if passed untrusted input.\"\n",
+   "hypothesis": "tqdm may use eval/exec which can lead to code injection if given untrusted input",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-094"
+   ],
+   "results_count": 1,
+   "results": [
+    {
+     "ruleId": "py/tqdm-insecure-eval-exec",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/tqdm-insecure-eval-exec",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of eval/exec in tqdm may lead to code injection if passed untrusted input."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "tqdm/cli.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 38,
+         "startColumn": 20,
+         "endColumn": 36
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "6b53db96e6d1a5d8:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251226143008",
+   "codeql_raw_query": "/**\n * @name TQDM CLI use of eval/exec\n * @description Flags uses of eval/exec in tqdm's CLI implementation, which may be risky if CLI input is passed directly.\n * @kind problem\n * @problem.severity warning\n * @id py/tqdm-cli-eval-exec-context\n * @tags security\n *       external/cwe/cwe-094\n */\n\nimport python\n\nfrom Call call, Name callee\nwhere\n  call.getLocation().getFile().getRelativePath() = \"tqdm/cli.py\" and\n  callee = call.getFunc() and\n  callee.getId() in [\"eval\", \"exec\"]\nselect call, \"Use of \" + callee.getId() + \" in tqdm/cli.py – review how arguments are constructed from CLI input.\"",
+   "hypothesis": "Identify the exact locations and context of eval/exec usage in tqdm CLI to assess exploitability.",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-094"
+   ],
+   "results_count": 1,
+   "results": [
+    {
+     "ruleId": "py/tqdm-cli-eval-exec-context",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/tqdm-cli-eval-exec-context",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of eval in tqdm/cli.py – review how arguments are constructed from CLI input."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "tqdm/cli.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 38,
+         "startColumn": 20,
+         "endColumn": 36
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "6b53db96e6d1a5d8:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251226143030",
+   "codeql_raw_query": "/**\n * @name Taint flow from CLI arguments to eval in tqdm.cli\n * @description Tracks data flow from sys.argv/argparse into eval in tqdm/cli.py.\n * @kind path-problem\n * @problem.severity error\n * @id py/tqdm-cli-eval-taint\n * @tags security\n *       external/cwe/cwe-094\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.dataflow.new.RemoteFlowSources\nimport semmle.python.ApiGraphs\n\nmodule TqdmCliEvalConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    exists(API::CallNode argvCall |\n      // argparse or direct sys.argv usage in tqdm/cli.py\n      argvCall = API::moduleImport(\"argparse\").getMember(\"ArgumentParser\").getACall() or\n      argvCall = API::moduleImport(\"sys\").getMember(\"argv\").getACall()\n      |\n      source = argvCall\n    )\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(API::CallNode evalCall |\n      evalCall = API::builtin(\"eval\").getACall() and\n      evalCall.getLocation().getFile().getRelativePath() = \"tqdm/cli.py\" |\n      sink = evalCall.getArg(0)\n    )\n  }\n}\n\nmodule TqdmCliEvalFlow = TaintTracking::Global<TqdmCliEvalConfig>;\nimport TqdmCliEvalFlow::PathGraph\n\nfrom TqdmCliEvalFlow::PathNode source, TqdmCliEvalFlow::PathNode sink\nwhere TqdmCliEvalFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"User-controllable CLI data flows into eval($@) in tqdm/cli.py.\", source.getNode(), \"CLI input\"",
+   "hypothesis": "Check if CLI-controlled data can reach eval in tqdm/cli.py (potential code injection).",
+   "severity": "critical",
+   "cwe_ids": [
+    "cwe-094"
+   ],
+   "results_count": 0,
+   "results": []
+  }
+ ]
+}

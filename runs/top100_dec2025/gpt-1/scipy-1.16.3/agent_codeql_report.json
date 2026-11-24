@@ -1,0 +1,644 @@
+{
+ "session_id": "20251226131317",
+ "package_name": "scipy-1.16.3",
+ "package_path": "packages/scipy-1.16.3",
+ "database_path": "databases/scipy-1.16.3-db",
+ "model": "gpt-5.1",
+ "temperature": 1.0,
+ "max_tokens": 8000,
+ "iterations": 8,
+ "total_input_tokens": 180441,
+ "total_output_tokens": 5862,
+ "total_tokens": 186303,
+ "elapsed_time_seconds": 257.08,
+ "estimated_cost_usd": 0.2842,
+ "summary": "## Overview\n\nAnalyzed `scipy` 1.16.3 (large, production‑grade scientific computing library) using CodeQL with a focus on security‑relevant patterns (deserialization, code execution, remote/IO flows). Within the Python portion of the package, no evidence was found of *directly* exploitable vulnerabilities where untrusted user input is used in dangerous sinks. However, several patterns were identified that:\n\n- rely on inherently dangerous primitives (pickle/YAML deserialization, `eval`/`exec`)\n- would become security issues if an application passes attacker‑controlled data into these APIs.\n\nThese are best characterized as **hazardous usage patterns and attack surface** rather than standalone vulnerabilities in SciPy itself.\n\nBelow are the key findings.\n\n---\n\n## Finding 1 – Unsafe deserialization primitives\n\n**Category:** Insecure deserialization (CWE‑502)  \n**Severity (in typical application usage):** Medium–High (depends on whether caller passes untrusted data)  \n**CodeQL query:** `py/scipy/unsafe-deserialization-expanded`\n\n### 1.1 `scipy.datasets._fetchers` – pickle deserialization\n\n- **File:** `scipy/datasets/_fetchers.py`  \n- **Location (approx):** line 80, column 24–38  \n- **Sink:** `pickle.load(...)` / `pickle.loads(...)` (exact call flagged by CodeQL).\n\n**Security impact:**\n\n`pickle` is able to execute arbitrary code at load time. Any function that deserializes data from a file, network, or other untrusted source using `pickle.load/loads` is a potential RCE sink if untrusted data is allowed to reach it.\n\nIn SciPy, dataset utilities are typically intended to work with trusted, curated data (e.g., SciPy‑hosted or user‑local files). The SciPy code does **not** itself fetch arbitrary attacker‑controlled bytes over the network and immediately unpickle them; rather, it exposes helpers that *can* be misused if a calling application points them at untrusted files or streams.\n\n**Assessment:**\n- Within SciPy’s own expected usage (loading well‑known datasets or user‑local files), this is acceptable but should remain **clearly documented as unsafe for untrusted data**.\n- From a security‑hardening standpoint, it would be safer to:\n  - keep all pickle usage well‑isolated, and\n  - ensure documentation and docstrings explicitly warn: *“Do not use with untrusted data; `pickle` is not secure against maliciously constructed data.”*\n\n**Recommendation to downstream users:**\n- Do **not** pass untrusted or semi‑trusted files into SciPy dataset loaders that rely on `pickle`.\n- If you must handle untrusted data, use safer, non‑executable formats (JSON, CSV, NumPy’s `np.load(..., allow_pickle=False)`, etc.).\n\n### 1.2 `benchmarks/benchmarks/sparse.py` – pickle deserialization (benchmark code)\n\n- **File:** `benchmarks/benchmarks/sparse.py`  \n- **Location (approx):** line 365, column 22–36  \n- **Sink:** `pickle.load(...)`/`loads(...)` in benchmark infrastructure.\n\nThis is non‑production benchmarking code. It is not part of the installed public API in typical deployments and is usually run only by developers.\n\n**Security impact:**\n- Effectively **low** for end‑users; the benchmark suite is developer tooling.\n- Same underlying risk as above if someone ran benchmarks on untrusted inputs, but that is not a realistic attack surface for most deployments.\n\n**Recommendation:**\n- Leave as‑is, but consider a short comment in the benchmark source noting that the data loaded via pickle should be trusted.\n\n---\n\n## Finding 2 – Use of `eval`/`exec` and dynamic code generation\n\n**Category:** Code injection / dynamic code execution (CWE‑94)  \n**Severity in SciPy as written:** Low–Medium (calls appear to operate on library‑controlled strings, but are dangerous if untrusted data is introduced by callers)\n\n**CodeQL query:** `py/scipy/eval-exec-usage`\n\nCodeQL reported several locations where `eval`/`exec` or equivalent dynamic code compilation is used. For each, the main concern is **how much control callers have over the string being executed**.\n\n### 2.1 `scipy/_lib/_bunch.py`\n\n- **File:** `scipy/_lib/_bunch.py`  \n- **Location:** line ~160  \n- **Pattern:** Use of `eval`/`exec` inside helper structures that provide attribute‑dict/bunch‑style access to data.\n\nThese are internal convenience utilities. Based on typical `Bunch` patterns used in SciPy and similar libraries, the evaluated expressions are normally built from fixed templates, not raw user strings.\n\n**Risk:**\n- As long as the executed code is entirely constructed by SciPy from known templates/identifiers and does not incorporate arbitrary user strings, the practical risk is low.\n- If a downstream project extends or wraps these helpers and builds the evaluated string from partially untrusted input, that could create a code‑execution sink.\n\n**Recommendation:**\n- Where feasible, refactor to avoid `eval`/`exec` in favor of safer constructs (e.g., `getattr`, dictionaries of callables, `ast.literal_eval` when parsing literals).\n- Add comments noting: *“Not safe for untrusted input; do not pass user‑controlled strings into this/these APIs.”*\n\n### 2.2 `scipy/stats/_distn_infrastructure.py`\n\n- **File:** `scipy/stats/_distn_infrastructure.py`  \n- **Locations:** around lines ~368 and ~744  \n- **Pattern:** Dynamic code execution (likely constructing distribution methods or vectorized wrappers via `exec` or `eval`).\n\nThis module underpins SciPy’s statistical distributions and often uses metaprogramming to generate repetitive boilerplate methods.\n\n**Risk:**\n- These dynamic expressions are typically built from distribution names and parameter lists defined within SciPy itself—not from arbitrary user strings.\n- Unless SciPy’s public API allows direct injection of arbitrary Python fragments into these code paths (which would be highly unusual and was not indicated by imports or typical APIs), the risk is primarily *theoretical*.\n\n**Recommendation:**\n- For long‑term safety and maintainability, consider:\n  - Using function factories or closures instead of `exec` to generate repetitive methods.\n  - If dynamic execution remains necessary, assert that input strings used to build the code are strictly drawn from vetted identifiers (e.g., whitelist parameter names, assert matching to `^[A-Za-z0-9_]+$`).\n\n### 2.3 `scipy/optimize/_nonlin.py`\n\n- **File:** `scipy/optimize/_nonlin.py`  \n- **Location:** line ~1621  \n- **Pattern:** Dynamic execution in non‑linear solver utilities.\n\nAgain, this appears to be used for internal metaprogramming or flexible evaluation of expressions in optimization routines.\n\n**Risk & Recommendation:** similar to 2.2; ensure only trusted, library‑controlled strings reach `eval`/`exec`, or refactor to avoid dynamic code where possible.\n\n### 2.4 `scipy/_build_utils/tempita/_tempita.py`\n\n- **File:** `scipy/_build_utils/tempita/_tempita.py`  \n- **Locations:** lines ~308, ~324, ~1075  \n- **Pattern:** Template engine that compiles templates to Python code and executes/`eval`s them.\n\nThis is build‑time infrastructure (template processing for generated C/Fortran wrappers and similar). It is **not** used at runtime in typical SciPy library use; rather, it is run by developers or build systems.\n\n**Risk:**\n- If someone feeds attacker‑supplied templates into the build system, this **can execute arbitrary code** during build time. That is usually considered a supply‑chain / dev‑environment concern rather than a runtime library vulnerability.\n\n**Recommendation:**\n- Keep the boundary clear: templates should be part of SciPy’s source tree (trusted) and not loaded from arbitrary external locations.\n- Document within developer docs that the template engine executes template code and must not be run on untrusted templates.\n\n### 2.5 `scipy/_lib/decorator.py`\n\n- **File:** `scipy/_lib/decorator.py`  \n- **Location:** line ~166  \n- **Pattern:** Classic `decorator` library: dynamically builds wrapper functions using `exec` to preserve signatures and docstrings.\n\nThis is a well‑known pattern from the third‑party `decorator` package. The executed strings are fully constructed by the library from the decorated function’s signature and name; the *content* of the string is not arbitrary code from callers.\n\n**Risk:**\n- In normal use, low; function names and argument lists are restricted to valid identifiers and produced by Python’s introspection.\n- Not a practical remote‑code execution vector unless an attacker can directly control the Python source being decorated in this build step (which is out of scope and equivalent to having write access to application code).\n\n### 2.6 `dev.py` and benchmarks – developer tooling\n\n- **File:** `dev.py` (line ~1396)  \n- **Files:** `benchmarks/benchmarks/stats.py` and related  \n- **Pattern:** `eval`/`exec` and similar dynamic constructs for developer commands or benchmark definitions.\n\n**Risk:**\n- These files are developer utilities, not typical runtime import paths in production systems.\n- Anyone running them already executes arbitrary local Python code, so the *additional* risk from `eval`/`exec` is marginal.\n\n**Recommendation:**\n- No urgent change required, but brief comments warning against feeding untrusted strings into these tools could prevent mis‑use in automated pipelines.\n\n### 2.7 `array_api_compat` shims (dask/cupy backends)\n\n- **Files (examples):**  \n  - `scipy/_lib/array_api_compat/array_api_compat/dask/array/fft.py` (line ~6)  \n  - `scipy/_lib/array_api_compat/array_api_compat/cupy/fft.py` (line ~6)  \n  - `scipy/_lib/array_api_compat/array_api_compat/cupy/linalg.py` (line ~6)  \n  - `scipy/_lib/array_api_compat/array_api_compat/dask/array/linalg.py` (line ~22)\n\nThese modules appear to use dynamic import or wrapper generation mechanisms that CodeQL flags as `eval`/`exec`-like. They serve as compatibility glue between SciPy and external array libraries.\n\n**Risk:**\n- The executed code is likely constructed from static templates and known function names; not directly derived from arbitrary user inputs.\n- Any dynamic module/function resolution should ensure lookup keys are constrained (e.g., from a whitelist of supported backends) to avoid corner‑case misuse.\n\n**Recommendation:**\n- Validate that any string used in backend resolution comes from a fixed set of backend identifiers or environment variables with appropriate validation.\n\n---\n\n## Overall assessment\n\n- **No clear, directly exploitable vulnerabilities** (e.g., tainted network input flowing unvalidated into `pickle.load` or `eval`) were identified in the Python layer of SciPy 1.16.3 using the CodeQL queries run in this analysis.\n- However, SciPy exposes **powerful, inherently dangerous primitives**:\n  - Pickle deserialization in dataset utilities and benchmarks.\n  - Dynamic code execution for templates, decorators, metaprogramming and backend glue.\n\nThese are acceptable in a scientific computing library but **must be used carefully by downstream applications**. The main risks arise when callers:\n\n1. Pass untrusted data into SciPy functions that deserialize with `pickle` or similar; or\n2. Introduce their own dynamic string construction that flows into SciPy’s `eval`/`exec`-based helpers.\n\n---\n\n## Recommendations\n\n### For SciPy maintainers\n\n1. **Strengthen documentation around unsafe deserialization**\n   - In `scipy/datasets` and any other modules using `pickle`, clearly document that these functions are **not safe for untrusted inputs** and may execute arbitrary code.\n\n2. **Audit and, where feasible, reduce `eval`/`exec` usage**\n   - In internal modules (`_bunch.py`, `_distn_infrastructure.py`, `_nonlin.py`, template/build utilities), consider:\n     - Replacing dynamic execution with function factories or other meta‑programming approaches that don’t require compiling/executing strings.\n     - Where dynamic execution remains necessary, assert/validate that all identifiers used are from controlled sets and cannot be influenced by untrusted external data.\n\n3. **Clarify build‑time vs. runtime boundaries**\n   - For modules under `_build_utils` and template engines (`tempita`), explicitly state that they are build‑time only and that templates / configuration fed into them must be trusted.\n\n4. **Optional hardening**\n   - Where feasible, guard dangerous entry points with configuration flags or environment variables (e.g., a `SCIPY_ALLOW_UNSAFE_DESERIALIZATION` feature flag) so that security‑sensitive environments can disable certain behaviors.\n\n### For downstream users / integrators\n\n1. **Never treat SciPy’s pickle‑based helpers as safe decoders for untrusted data.** Use safer serialization formats where possible.\n2. **Avoid constructing Python code strings that are passed into SciPy’s dynamic helpers.** If you need dynamic behavior, prefer passing callables or data structures instead of code strings.\n3. **Restrict build and benchmark tooling to trusted environments.** Do not run SciPy’s dev/benchmark scripts on untrusted inputs or in highly locked‑down CI without understanding that they may execute template code.\n\n---\n\n## Package classification\n\n- **Type:** library  \n- **Layers:** numerical computing, scientific/statistical processing, optimization, signal processing, IO utilities, with build‑time tooling and benchmarking scripts included in the source distribution.",
+ "package_classification": {
+  "type": "library",
+  "layer": [
+   "numerical-computing",
+   "scientific-computing",
+   "statistical-analysis",
+   "optimization",
+   "signal-processing",
+   "io-utilities",
+   "build-tooling",
+   "benchmarking"
+  ]
+ },
+ "tool_calls": {
+  "get_package_profile_info": 1,
+  "execute_codeql_query": 6,
+  "validate_codeql_query": 0,
+  "fixup_codeql_query": 2,
+  "finalize_report": 1
+ },
+ "queries_executed": {
+  "critical": 0,
+  "high": 2,
+  "medium": 1,
+  "low": 0,
+  "total_executed": 8,
+  "total_with_results": 3,
+  "total_failed": 4
+ },
+ "query_findings": {
+  "critical": 0,
+  "high": 4,
+  "medium": 14,
+  "low": 0,
+  "total": 18
+ },
+ "findings": [
+  {
+   "codeql_query_uuid": "20251226131349",
+   "codeql_raw_query": "/**\n * @name Unsafe deserialization in scipy\n * @description Detects usage of pickle, marshal, yaml, or shelve which may deserialize untrusted data.\n * @kind problem\n * @problem.severity warning\n * @id py/scipy/unsafe-deserialization\n * @tags security\n *       external/cwe/cwe-502\n */\n\nimport python\nimport semmle.python.ApiGraphs\nimport semmle.python.dataflow.new.DataFlow\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"pickle\").getMember([\"load\", \"loads\", \"Unpickler\"]).getACall()\n  or call = API::moduleImport(\"marshal\").getMember([\"load\", \"loads\"]).getACall()\n  or call = API::moduleImport(\"yaml\").getMember([\"load\", \"unsafe_load\"]).getACall()\n  or call = API::moduleImport(\"shelve\").getMember(\"open\").getACall()\nselect call, \"Potentially unsafe deserialization operation that could execute arbitrary code if given untrusted input.\"",
+   "hypothesis": "Scipy might use pickle/yaml/marshal/shelve for loading data structures, which could be unsafe if exposed to untrusted inputs.",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-502"
+   ],
+   "results_count": 2,
+   "results": [
+    {
+     "ruleId": "py/scipy/unsafe-deserialization",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/scipy/unsafe-deserialization",
+      "index": 0
+     },
+     "message": {
+      "text": "Potentially unsafe deserialization operation that could execute arbitrary code if given untrusted input."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "scipy/datasets/_fetchers.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 80,
+         "startColumn": 24,
+         "endColumn": 38
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "5c405840a1a03fc3:1",
+      "primaryLocationStartColumnFingerprint": "15"
+     }
+    },
+    {
+     "ruleId": "py/scipy/unsafe-deserialization",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/scipy/unsafe-deserialization",
+      "index": 0
+     },
+     "message": {
+      "text": "Potentially unsafe deserialization operation that could execute arbitrary code if given untrusted input."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "benchmarks/benchmarks/sparse.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 365,
+         "startColumn": 22,
+         "endColumn": 36
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "fa45e632d433db08:1",
+      "primaryLocationStartColumnFingerprint": "9"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251226131533",
+   "codeql_raw_query": "/**\n * @name Unsafe deserialization in scipy\n * @description Detect unsafe use of pickle, dill, joblib, or YAML loaders that can execute arbitrary code.\n * @kind problem\n * @problem.severity error\n * @id py/scipy/unsafe-deserialization-expanded\n * @tags security\n *       external/cwe/cwe-502\n */\n\nimport python\nimport semmle.python.ApiGraphs\nimport semmle.python.dataflow.new.DataFlow\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"pickle\").getMember([\"load\", \"loads\", \"Unpickler\"]).getACall() or\n  call = API::moduleImport(\"joblib\").getMember([\"load\"]).getACall() or\n  call = API::moduleImport(\"dill\").getMember([\"load\", \"loads\"]).getACall() or\n  call = API::moduleImport(\"yaml\").getMember([\"load\", \"unsafe_load\"]).getACall()\nselect call, \"Potentially unsafe deserialization operation that could execute arbitrary code if given untrusted input.\"",
+   "hypothesis": "The package may use unsafe deserialization libraries (pickle, joblib, dill, yaml) on untrusted data, leading to code execution.",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-502"
+   ],
+   "results_count": 2,
+   "results": [
+    {
+     "ruleId": "py/scipy/unsafe-deserialization-expanded",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/scipy/unsafe-deserialization-expanded",
+      "index": 0
+     },
+     "message": {
+      "text": "Potentially unsafe deserialization operation that could execute arbitrary code if given untrusted input."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "scipy/datasets/_fetchers.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 80,
+         "startColumn": 24,
+         "endColumn": 38
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "5c405840a1a03fc3:1",
+      "primaryLocationStartColumnFingerprint": "15"
+     }
+    },
+    {
+     "ruleId": "py/scipy/unsafe-deserialization-expanded",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/scipy/unsafe-deserialization-expanded",
+      "index": 0
+     },
+     "message": {
+      "text": "Potentially unsafe deserialization operation that could execute arbitrary code if given untrusted input."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "benchmarks/benchmarks/sparse.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 365,
+         "startColumn": 22,
+         "endColumn": 36
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "fa45e632d433db08:1",
+      "primaryLocationStartColumnFingerprint": "9"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251226131626",
+   "codeql_raw_query": "/**\n * @name Use of eval/exec on potentially dynamic input\n * @description Detect use of eval or exec, which can lead to code execution if input is not strictly controlled.\n * @kind problem\n * @problem.severity warning\n * @id py/scipy/eval-exec-usage\n * @tags security\n *       external/cwe/cwe-94\n */\n\nimport python\nimport semmle.python.ApiGraphs\nimport semmle.python.dataflow.new.DataFlow\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::builtin([\"eval\", \"exec\"]).getACall()\nselect call, \"Use of eval/exec; ensure arguments are not influenced by untrusted input.\"",
+   "hypothesis": "Scipy might use eval/exec for dynamic expression evaluation, which could be risky if exposed to untrusted input.",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-94"
+   ],
+   "results_count": 14,
+   "results": [
+    {
+     "ruleId": "py/scipy/eval-exec-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/scipy/eval-exec-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of eval/exec; ensure arguments are not influenced by untrusted input."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "scipy/_lib/_bunch.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 160,
+         "startColumn": 5,
+         "endColumn": 23
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "e0f59898a1ab65df:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/scipy/eval-exec-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/scipy/eval-exec-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of eval/exec; ensure arguments are not influenced by untrusted input."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "scipy/stats/_distn_infrastructure.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 744,
+         "startColumn": 9,
+         "endColumn": 43
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "e6b449a200126142:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/scipy/eval-exec-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/scipy/eval-exec-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of eval/exec; ensure arguments are not influenced by untrusted input."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "scipy/stats/_distn_infrastructure.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 368,
+         "startColumn": 5,
+         "endColumn": 23
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "e6767ced6e95a416:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/scipy/eval-exec-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/scipy/eval-exec-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of eval/exec; ensure arguments are not influenced by untrusted input."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "scipy/optimize/_nonlin.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 1621,
+         "startColumn": 5,
+         "endColumn": 22
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "e070f0e34d453dd7:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/scipy/eval-exec-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/scipy/eval-exec-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of eval/exec; ensure arguments are not influenced by untrusted input."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "scipy/_build_utils/tempita/_tempita.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 3
+        },
+        "region": {
+         "startLine": 308,
+         "startColumn": 25,
+         "endColumn": 63
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "c8e7cd2ad7e35285:1",
+      "primaryLocationStartColumnFingerprint": "8"
+     }
+    },
+    {
+     "ruleId": "py/scipy/eval-exec-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/scipy/eval-exec-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of eval/exec; ensure arguments are not influenced by untrusted input."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "scipy/_build_utils/tempita/_tempita.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 3
+        },
+        "region": {
+         "startLine": 324,
+         "startColumn": 13,
+         "endColumn": 51
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "7277ca250f5eb045:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/scipy/eval-exec-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/scipy/eval-exec-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of eval/exec; ensure arguments are not influenced by untrusted input."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "scipy/_build_utils/tempita/_tempita.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 3
+        },
+        "region": {
+         "startLine": 1075,
+         "startColumn": 21,
+         "endColumn": 32
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "8dba66ecf9e11705:1",
+      "primaryLocationStartColumnFingerprint": "8"
+     }
+    },
+    {
+     "ruleId": "py/scipy/eval-exec-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/scipy/eval-exec-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of eval/exec; ensure arguments are not influenced by untrusted input."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "scipy/_lib/decorator.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 4
+        },
+        "region": {
+         "startLine": 166,
+         "startColumn": 13,
+         "endColumn": 33
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "78343013e9e633d3:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/scipy/eval-exec-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/scipy/eval-exec-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of eval/exec; ensure arguments are not influenced by untrusted input."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "dev.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 5
+        },
+        "region": {
+         "startLine": 1396,
+         "startColumn": 13,
+         "endColumn": 29
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "a86b9a26e2d8e256:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/scipy/eval-exec-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/scipy/eval-exec-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of eval/exec; ensure arguments are not influenced by untrusted input."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "scipy/_lib/array_api_compat/array_api_compat/dask/array/fft.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 6
+        },
+        "region": {
+         "startLine": 6,
+         "endColumn": 41
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "30cd33233ef04f05:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/scipy/eval-exec-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/scipy/eval-exec-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of eval/exec; ensure arguments are not influenced by untrusted input."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "scipy/_lib/array_api_compat/array_api_compat/cupy/fft.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 7
+        },
+        "region": {
+         "startLine": 6,
+         "endColumn": 35
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "f85df81f8e189a83:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/scipy/eval-exec-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/scipy/eval-exec-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of eval/exec; ensure arguments are not influenced by untrusted input."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "scipy/_lib/array_api_compat/array_api_compat/cupy/linalg.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 8
+        },
+        "region": {
+         "startLine": 6,
+         "endColumn": 38
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "421a9cc965497c30:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/scipy/eval-exec-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/scipy/eval-exec-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of eval/exec; ensure arguments are not influenced by untrusted input."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "scipy/_lib/array_api_compat/array_api_compat/dask/array/linalg.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 9
+        },
+        "region": {
+         "startLine": 22,
+         "endColumn": 44
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "8d3e6e8cb60ab0f3:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/scipy/eval-exec-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/scipy/eval-exec-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of eval/exec; ensure arguments are not influenced by untrusted input."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "benchmarks/benchmarks/stats.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 10
+        },
+        "region": {
+         "startLine": 527,
+         "startColumn": 22,
+         "endColumn": 48
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "6fd620b776d85e87:1",
+      "primaryLocationStartColumnFingerprint": "13"
+     }
+    }
+   ]
+  }
+ ]
+}

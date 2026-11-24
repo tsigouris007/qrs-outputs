@@ -1,0 +1,605 @@
+{
+ "session_id": "20251226150840",
+ "package_name": "virtualenv-20.35.4",
+ "package_path": "packages/virtualenv-20.35.4",
+ "database_path": "databases/virtualenv-20.35.4-db",
+ "model": "gpt-5.1",
+ "temperature": 1.0,
+ "max_tokens": 8000,
+ "iterations": 9,
+ "total_input_tokens": 80034,
+ "total_output_tokens": 7028,
+ "total_tokens": 87062,
+ "elapsed_time_seconds": 281.12,
+ "estimated_cost_usd": 0.1703,
+ "summary": "## Overview\n\nPackage analyzed: **virtualenv 20.35.4**  \nType: Python package providing virtual environment creation and management (CLI + library)\n\nAnalysis used CodeQL queries focused on common security issues for this kind of tool: subprocess/command execution, wheel/zip handling, and related filesystem behaviors. Several custom rules executed successfully; some additional experimental queries failed to compile but do not affect the concrete findings below.\n\nThe package is mature, widely used, and the codebase generally follows safe patterns. The findings here are mostly **security-relevant hotspots** that deserve attention and documentation rather than clear-cut exploitable vulnerabilities inside virtualenv itself.\n\n---\n\n## Key Findings\n\n### 1. Use of subprocesses and shell commands\n\n**Relevant files (CodeQL rule `py/virtualenv/subprocess-os-system`):**\n- `src/virtualenv/util/subprocess/__init__.py` (lines ~10–17)\n- `src/virtualenv/seed/wheels/acquire.py` (around line 74)\n- `src/virtualenv/discovery/cached_py_info.py` (around lines 130–138)\n- `src/virtualenv/create/via_global_ref/builtin/cpython/mac_os.py` (around line 126)\n- `src/virtualenv/seed/wheels/periodic_update.py` (around line 223)\n- `src/virtualenv/seed/embed/pip_invoke.py` (around line 29)\n- `src/virtualenv/seed/embed/via_app_data/pip_install/symlink.py` (around line 19)\n\n**What was detected**  \nThese locations create subprocesses or invoke shell commands, likely via `subprocess` helpers or OS-level mechanisms, to perform tasks such as:\n- discovering Python interpreters,\n- invoking `pip` or other tools,\n- managing symlinks or filesystem operations,\n- performing periodic updates of embedded wheels.\n\n**Security impact**  \nBy itself, calling subprocesses is expected for a tool like virtualenv and is **not inherently a vulnerability**. The risk depends on where the command arguments come from:\n- If arguments are built from **untrusted input** (e.g., environment variables, paths or commands provided by other tools, or data downloaded from the network) without strong validation or sanitization, this could lead to **command injection** or **arbitrary code execution**.\n\nBased on virtualenv’s purpose and typical usage, *direct raw user input* is usually limited to:\n- environment paths and interpreter locations,\n- directories where virtual environments are created.\n\nThose are still partially controlled by the user running virtualenv, but not typically by a remote attacker. Consequently, in standard usage, these subprocess calls are:\n- **Risk level:** Medium to Low in common scenarios,\n- **CWE classification:**\n  - CWE-78: Improper Neutralization of Special Elements used in an OS Command ('OS Command Injection') – *potential*, depending on argument construction.\n\n**Recommendations**\n- Ensure all subprocess invocation helpers (especially in `util/subprocess/__init__.py`) use safe patterns:\n  - Prefer `subprocess.run([...], shell=False)` over `os.system` or `subprocess` with `shell=True`.\n  - When using `shell=True` cannot be avoided, carefully constrain and validate every argument.\n- When interpreter paths or other user-specified paths are passed to subprocesses, they should be treated as data (single arguments) rather than concatenated into shell command strings.\n- Document that virtualenv assumes the local user has full control and that using it on behalf of *untrusted remote inputs* is out of scope.\n\nAt this time, **no specific, clearly exploitable injection path** was identified solely from the CodeQL findings, but the above locations are important *security-relevant hotspots* and should be re-reviewed manually.\n\n---\n\n### 2. Handling of wheel and zip archives\n\n**Relevant files (CodeQL rules `py/virtualenv/wheel-handling` and `py/virtualenv/untrusted-wheel-handling`):**\n- `src/virtualenv/seed/wheels/util.py` (around line 50)\n- `src/virtualenv/seed/embed/via_app_data/pip_install/base.py` (around line 50)\n- `src/virtualenv/util/zipapp.py` (around lines 14 and 21)\n- `tasks/__main__zipapp.py` (around line 18)\n- `tasks/make_zipapp.py` (around lines 43, 61, 152)\n\n**What was detected**  \nThese locations deal with wheel and/or zip files:\n- Downloading, caching, unpacking, and using wheels (`seed/wheels/*`, `seed/embed/*`).\n- Creating or managing zipapps and archives used for packaging (\n  `util/zipapp.py`, `tasks/make_zipapp.py`, `tasks/__main__zipapp.py`).\n\n**Security impact**\n- virtualenv frequently needs to **download and use third-party wheels** (e.g., for `pip`, `setuptools`, etc.).\n- If an attacker can tamper with the source of these wheels (e.g., via a compromised index, MITM on HTTP, or a manipulated local cache directory), they can influence what code gets executed inside the resulting virtual environment.\n\nThis is largely inherent to Python’s packaging model rather than unique to virtualenv; however, a few risk dimensions are:\n- **Integrity of wheel sources** – whether virtualenv enforces HTTPS-only index URLs, checksum verification, or pins versions.\n- **Extraction safety** – whether wheel/zip extraction prevents directory traversal (e.g., paths like `../../evil.py`) or other path manipulation issues when unpacking archives.\n\nThe CodeQL findings are **generic hotspots** rather than proven exploits. Still, they map to:\n- **CWE-345:** Insufficient Verification of Data Authenticity.\n- **CWE-829:** Inclusion of Functionality from Untrusted Control Sphere.\n- **CWE-22 (potential):** Path Traversal, if zip extraction is not constrained.\n\n**Recommendations**\n- Confirm that all network retrieval of wheels uses secure transports and trusted indices (e.g., HTTPS, PyPI or configured indexes) and that insecure schemes are either blocked or strongly warned about.\n- Where feasible, support or encourage:\n  - hash-checking and pinning for embedded wheels,\n  - configuration to restrict or validate which indices can be used.\n- Ensure wheel/zip extraction uses safe APIs that prevent directory traversal and disallow absolute or `..`-containing paths from being written outside the intended directory.\n- Clarify in documentation that if local cache directories or embedded wheel locations are writable by other untrusted users on the same system, they could be used to influence what code gets installed into virtual environments.\n\nAt present, no direct path-traversal bug was proven by the queries, but the identified locations are **security-sensitive archive handling points** and merit continued review.\n\n---\n\n## Overall Assessment\n\n- **No definitive, new exploitable vulnerabilities** were identified solely from the automated CodeQL analysis run here.\n- The tool highlighted **expected hotspots** for a virtual environment manager:\n  - subprocess and command execution,\n  - downloading and handling of wheels/archives.\n- Security risk is highly dependent on how virtualenv is deployed:\n  - In typical use (local developer controlling input and network configuration), risks are moderate and align with standard Python packaging/security assumptions.\n  - In untrusted or multi-tenant contexts (e.g., running virtualenv on behalf of remote users or in online build services that ingest arbitrary configuration), these hotspots become more critical and must be guarded by the surrounding system.\n\n---\n\n## Recommendations for Consumers\n\n- Treat virtualenv as a **developer tool**, not as a sandbox or security boundary.\n- Do not run virtualenv in response to arbitrary, untrusted remote input (e.g., user-submitted project archives) without additional confinement (containers, sandboxes, restrictive OS-level controls).\n- Ensure that:\n  - Python interpreters and paths fed to virtualenv come from trusted origins.\n  - Network configuration (proxies, indexes, certificates) is locked down.\n  - Cache and app-data directories used by virtualenv are not writable by untrusted local users.\n\n---\n\n## Recommendations for Maintainers\n\n- Re-review subprocess call sites for:\n  - `shell=True` usage,\n  - any string-based command building, especially with values ultimately derived from environment or config.\n- Consider adding explicit tests and/or defensive code for:\n  - safe zip/wheel extraction (no directory traversal),\n  - handling of malformed or adversarial wheel files.\n- Enhance documentation about the security model and assumptions, and make clear that virtualenv is not designed to run against untrusted inputs without external sandboxing.\n\nWithin the scope of this analysis, virtualenv 20.35.4 appears **generally robust** and aligned with its role as a widely used development tool, with the caveat that its subprocess and archive-handling hotspots should continue to receive regular security scrutiny.",
+ "package_classification": {
+  "type": "cli_tool",
+  "layer": [
+   "application",
+   "packaging",
+   "environment-management"
+  ]
+ },
+ "tool_calls": {
+  "get_package_profile_info": 1,
+  "execute_codeql_query": 12,
+  "validate_codeql_query": 0,
+  "fixup_codeql_query": 1,
+  "finalize_report": 1
+ },
+ "queries_executed": {
+  "critical": 1,
+  "high": 2,
+  "medium": 2,
+  "low": 0,
+  "total_executed": 13,
+  "total_with_results": 5,
+  "total_failed": 8
+ },
+ "query_findings": {
+  "critical": 0,
+  "high": 7,
+  "medium": 9,
+  "low": 0,
+  "total": 16
+ },
+ "findings": [
+  {
+   "codeql_query_uuid": "20251226150849",
+   "codeql_raw_query": "/**\n * @name Untrusted input to subprocess and shell execution in virtualenv\n * @description Detects flows from remote/user-controlled input (CLI, env vars, config) into subprocess or shell execution APIs.\n * @kind path-problem\n * @problem.severity error\n * @id py/virtualenv-subprocess-taint\n * @tags security\n *       external/cwe/cwe-078\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.dataflow.new.RemoteFlowSources\nimport semmle.python.ApiGraphs\n\nmodule SubprocessTaintConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    source instanceof RemoteFlowSource\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(API::CallNode call |\n      sink = call and\n      (\n        call = API::moduleImport(\"subprocess\").getMember([\"Popen\", \"call\", \"run\", \"check_call\", \"check_output\"]).getACall() or\n        call = API::moduleImport(\"os\").getMember([\"system\", \"popen\"]).getACall()\n      )\n    )\n  }\n}\n\nmodule SubprocessTaintFlow = TaintTracking::Global<SubprocessTaintConfig>;\nimport SubprocessTaintFlow::PathGraph\n\nfrom SubprocessTaintFlow::PathNode source, SubprocessTaintFlow::PathNode sink\nwhere SubprocessTaintFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"User-controlled data reaches subprocess or shell execution $@.\", source.getNode(), \"user input\"",
+   "hypothesis": "User-controlled input (CLI arguments, env vars, config) may reach subprocess or shell execution within virtualenv, enabling command injection.",
+   "severity": "critical",
+   "cwe_ids": [
+    "cwe-078"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251226150909",
+   "codeql_raw_query": "/**\n * @name Path traversal in file operations in virtualenv\n * @description Detects untrusted input flowing into filesystem path operations, which may allow overwriting arbitrary files.\n * @kind path-problem\n * @problem.severity error\n * @id py/virtualenv-path-traversal\n * @tags security\n *       external/cwe/cwe-022\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.dataflow.new.RemoteFlowSources\nimport semmle.python.ApiGraphs\n\nmodule FsPathTaintConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    source instanceof RemoteFlowSource\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(API::CallNode call |\n      sink = call and\n      (\n        call = API::moduleImport(\"os\").getMember([\"open\", \"remove\", \"unlink\", \"mkdir\", \"makedirs\", \"rmdir\"]).getACall() or\n        call = API::moduleImport(\"shutil\").getMember([\"copy\", \"copy2\", \"copytree\", \"rmtree\", \"move\"]).getACall() or\n        call = API::moduleImport(\"pathlib\").getMember([\"Path\"]).getACall()\n      )\n    )\n  }\n}\n\nmodule FsPathTaintFlow = TaintTracking::Global<FsPathTaintConfig>;\nimport FsPathTaintFlow::PathGraph\n\nfrom FsPathTaintFlow::PathNode source, FsPathTaintFlow::PathNode sink\nwhere FsPathTaintFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"User-controlled data reaches filesystem path operation $@.\", source.getNode(), \"user input\"",
+   "hypothesis": "User-controlled input may reach sensitive filesystem operations (like remove, rmtree, copytree) in virtualenv, allowing path traversal or arbitrary file overwrite.",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-022"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251226151106",
+   "codeql_raw_query": "/**\n * @name Suspicious use of subprocess and os.system in virtualenv\n * @description Detect potentially dangerous creation of subprocesses or shell commands that may be influenced by external input\n * @kind problem\n * @problem.severity warning\n * @id py/virtualenv/subprocess-os-system\n * @tags security\n *       external/cwe/cwe-078\n */\n\nimport python\nimport semmle.python.ApiGraphs\nimport semmle.python.dataflow.new.DataFlow\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call.getLocation().getFile().getRelativePath().matches(\"src/virtualenv/%\") and\n  (\n    // subprocess.* calls\n    call = API::moduleImport(\"subprocess\").getMember([\"run\", \"Popen\", \"call\", \"check_call\", \"check_output\"]).getACall() or\n    // os.system calls\n    call = API::moduleImport(\"os\").getMember(\"system\").getACall()\n  )\nselect call, \"Creation of a subprocess or shell command; ensure arguments are not derived from untrusted input.\"",
+   "hypothesis": "virtualenv might use subprocess or os.system with user-controlled data when invoking interpreters or pip, leading to command injection (CWE-78).",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-078"
+   ],
+   "results_count": 7,
+   "results": [
+    {
+     "ruleId": "py/virtualenv/subprocess-os-system",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/virtualenv/subprocess-os-system",
+      "index": 0
+     },
+     "message": {
+      "text": "Creation of a subprocess or shell command; ensure arguments are not derived from untrusted input."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/virtualenv/util/subprocess/__init__.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 10,
+         "startColumn": 19,
+         "endLine": 17,
+         "endColumn": 10
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "a4fae47814118f18:1",
+      "primaryLocationStartColumnFingerprint": "10"
+     }
+    },
+    {
+     "ruleId": "py/virtualenv/subprocess-os-system",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/virtualenv/subprocess-os-system",
+      "index": 0
+     },
+     "message": {
+      "text": "Creation of a subprocess or shell command; ensure arguments are not derived from untrusted input."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/virtualenv/seed/wheels/acquire.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 74,
+         "startColumn": 15,
+         "endColumn": 103
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "6247083a52b036a1:1",
+      "primaryLocationStartColumnFingerprint": "10"
+     }
+    },
+    {
+     "ruleId": "py/virtualenv/subprocess-os-system",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/virtualenv/subprocess-os-system",
+      "index": 0
+     },
+     "message": {
+      "text": "Creation of a subprocess or shell command; ensure arguments are not derived from untrusted input."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/virtualenv/discovery/cached_py_info.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 130,
+         "startColumn": 23,
+         "endLine": 138,
+         "endColumn": 14
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "b16523f81a7cb563:1",
+      "primaryLocationStartColumnFingerprint": "10"
+     }
+    },
+    {
+     "ruleId": "py/virtualenv/subprocess-os-system",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/virtualenv/subprocess-os-system",
+      "index": 0
+     },
+     "message": {
+      "text": "Creation of a subprocess or shell command; ensure arguments are not derived from untrusted input."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/virtualenv/create/via_global_ref/builtin/cpython/mac_os.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 3
+        },
+        "region": {
+         "startLine": 126,
+         "startColumn": 13,
+         "endColumn": 39
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "78af0c110ea72c41:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/virtualenv/subprocess-os-system",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/virtualenv/subprocess-os-system",
+      "index": 0
+     },
+     "message": {
+      "text": "Creation of a subprocess or shell command; ensure arguments are not derived from untrusted input."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/virtualenv/seed/wheels/periodic_update.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 4
+        },
+        "region": {
+         "startLine": 223,
+         "startColumn": 15,
+         "endColumn": 35
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "445800c52fff1f7b:1",
+      "primaryLocationStartColumnFingerprint": "10"
+     }
+    },
+    {
+     "ruleId": "py/virtualenv/subprocess-os-system",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/virtualenv/subprocess-os-system",
+      "index": 0
+     },
+     "message": {
+      "text": "Creation of a subprocess or shell command; ensure arguments are not derived from untrusted input."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/virtualenv/seed/embed/pip_invoke.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 5
+        },
+        "region": {
+         "startLine": 29,
+         "startColumn": 19,
+         "endColumn": 38
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "25c3d3ae90ef76fe:1",
+      "primaryLocationStartColumnFingerprint": "10"
+     }
+    },
+    {
+     "ruleId": "py/virtualenv/subprocess-os-system",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/virtualenv/subprocess-os-system",
+      "index": 0
+     },
+     "message": {
+      "text": "Creation of a subprocess or shell command; ensure arguments are not derived from untrusted input."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/virtualenv/seed/embed/via_app_data/pip_install/symlink.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 6
+        },
+        "region": {
+         "startLine": 19,
+         "startColumn": 19,
+         "endColumn": 55
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "2cb9de2a7350eaae:1",
+      "primaryLocationStartColumnFingerprint": "10"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251226151127",
+   "codeql_raw_query": "/**\n * @name Potential unsafe loading or execution of downloaded wheels in virtualenv\n * @description Find places where virtualenv handles wheel files that might be downloaded or updated, to check for insufficient validation\n * @kind problem\n * @problem.severity warning\n * @id py/virtualenv/wheel-handling\n * @tags security\n *       external/cwe/cwe-829\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call.getLocation().getFile().getRelativePath().matches(\"src/virtualenv/seed/wheels/%\") and\n  (\n    // Zip/wheel file access that may load untrusted code\n    call = API::moduleImport(\"zipfile\").getMember([\"ZipFile\", \"PyZipFile\"]).getACall() or\n    call = API::moduleImport(\"zipimport\").getMember(\"zipimporter\").getACall()\n  )\nselect call, \"Handling of wheel/zip files; ensure these are obtained from trusted sources and validated.\"",
+   "hypothesis": "virtualenv's wheel seeding/updating logic could open or execute wheel/zip files from untrusted sources without adequate verification (CWE-829).",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-829"
+   ],
+   "results_count": 1,
+   "results": [
+    {
+     "ruleId": "py/virtualenv/wheel-handling",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/virtualenv/wheel-handling",
+      "index": 0
+     },
+     "message": {
+      "text": "Handling of wheel/zip files; ensure these are obtained from trusted sources and validated."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/virtualenv/seed/wheels/util.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 50,
+         "startColumn": 14,
+         "endColumn": 42
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "58523a43869e6822:1",
+      "primaryLocationStartColumnFingerprint": "5"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251226151204",
+   "codeql_raw_query": "/**\n * @name Untrusted zip/wheel handling in virtualenv\n * @description Find places where virtualenv loads or unpacks wheel/zip files; these should come from trusted sources and be validated.\n * @kind problem\n * @problem.severity warning\n * @id py/virtualenv/untrusted-wheel-handling\n * @tags security\n *       external/cwe/cwe-347\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  // zipfile.ZipFile(...)\n  call = API::moduleImport(\"zipfile\").getMember(\"ZipFile\").getACall()\n  or\n  // zipfile functions\n  call = API::moduleImport(\"zipfile\").getMember([\"is_zipfile\", \"PyZipFile\"]).getACall()\nselect call, \"Handling of wheel/zip files; ensure these archives come from trusted locations and are validated before use.\"",
+   "hypothesis": "Wheel/zip handling in virtualenv may trust unvalidated local/remote archives (integrity issues).",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-347"
+   ],
+   "results_count": 8,
+   "results": [
+    {
+     "ruleId": "py/virtualenv/untrusted-wheel-handling",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/virtualenv/untrusted-wheel-handling",
+      "index": 0
+     },
+     "message": {
+      "text": "Handling of wheel/zip files; ensure these archives come from trusted locations and are validated before use."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "tasks/__main__zipapp.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 18,
+         "startColumn": 26,
+         "endColumn": 49
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "9c4f32f7d19b955a:1",
+      "primaryLocationStartColumnFingerprint": "17"
+     }
+    },
+    {
+     "ruleId": "py/virtualenv/untrusted-wheel-handling",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/virtualenv/untrusted-wheel-handling",
+      "index": 0
+     },
+     "message": {
+      "text": "Handling of wheel/zip files; ensure these archives come from trusted locations and are validated before use."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/virtualenv/seed/embed/via_app_data/pip_install/base.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 50,
+         "startColumn": 14,
+         "endColumn": 47
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "5c2464ddd16d8624:1",
+      "primaryLocationStartColumnFingerprint": "5"
+     }
+    },
+    {
+     "ruleId": "py/virtualenv/untrusted-wheel-handling",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/virtualenv/untrusted-wheel-handling",
+      "index": 0
+     },
+     "message": {
+      "text": "Handling of wheel/zip files; ensure these archives come from trusted locations and are validated before use."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "tasks/make_zipapp.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 43,
+         "startColumn": 10,
+         "endColumn": 35
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "6304286281fe7990:1",
+      "primaryLocationStartColumnFingerprint": "5"
+     }
+    },
+    {
+     "ruleId": "py/virtualenv/untrusted-wheel-handling",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/virtualenv/untrusted-wheel-handling",
+      "index": 0
+     },
+     "message": {
+      "text": "Handling of wheel/zip files; ensure these archives come from trusted locations and are validated before use."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "tasks/make_zipapp.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 61,
+         "startColumn": 22,
+         "endColumn": 49
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "2bc003cab9cc97cd:1",
+      "primaryLocationStartColumnFingerprint": "5"
+     }
+    },
+    {
+     "ruleId": "py/virtualenv/untrusted-wheel-handling",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/virtualenv/untrusted-wheel-handling",
+      "index": 0
+     },
+     "message": {
+      "text": "Handling of wheel/zip files; ensure these archives come from trusted locations and are validated before use."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "tasks/make_zipapp.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 152,
+         "startColumn": 14,
+         "endColumn": 44
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "d371012a282d4978:1",
+      "primaryLocationStartColumnFingerprint": "5"
+     }
+    },
+    {
+     "ruleId": "py/virtualenv/untrusted-wheel-handling",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/virtualenv/untrusted-wheel-handling",
+      "index": 0
+     },
+     "message": {
+      "text": "Handling of wheel/zip files; ensure these archives come from trusted locations and are validated before use."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/virtualenv/seed/wheels/util.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 3
+        },
+        "region": {
+         "startLine": 50,
+         "startColumn": 14,
+         "endColumn": 42
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "58523a43869e6822:1",
+      "primaryLocationStartColumnFingerprint": "5"
+     }
+    },
+    {
+     "ruleId": "py/virtualenv/untrusted-wheel-handling",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/virtualenv/untrusted-wheel-handling",
+      "index": 0
+     },
+     "message": {
+      "text": "Handling of wheel/zip files; ensure these archives come from trusted locations and are validated before use."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/virtualenv/util/zipapp.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 4
+        },
+        "region": {
+         "startLine": 14,
+         "startColumn": 10,
+         "endColumn": 36
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "263997cc3a1c31a8:1",
+      "primaryLocationStartColumnFingerprint": "5"
+     }
+    },
+    {
+     "ruleId": "py/virtualenv/untrusted-wheel-handling",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/virtualenv/untrusted-wheel-handling",
+      "index": 0
+     },
+     "message": {
+      "text": "Handling of wheel/zip files; ensure these archives come from trusted locations and are validated before use."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/virtualenv/util/zipapp.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 4
+        },
+        "region": {
+         "startLine": 21,
+         "startColumn": 10,
+         "endColumn": 36
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "78d74673ceed34a:1",
+      "primaryLocationStartColumnFingerprint": "5"
+     }
+    }
+   ]
+  }
+ ]
+}

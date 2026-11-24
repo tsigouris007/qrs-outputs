@@ -1,0 +1,519 @@
+{
+ "session_id": "20251226035529",
+ "package_name": "pycparser-2.23",
+ "package_path": "packages/pycparser-2.23",
+ "database_path": "databases/pycparser-2.23-db",
+ "model": "gpt-5.1",
+ "temperature": 1.0,
+ "max_tokens": 8000,
+ "iterations": 11,
+ "total_input_tokens": 66800,
+ "total_output_tokens": 3662,
+ "total_tokens": 70462,
+ "elapsed_time_seconds": 318.03,
+ "estimated_cost_usd": 0.1201,
+ "summary": "## Overview\nSecurity analysis was performed on the `pycparser` package, version 2.23 (C parser in Python, including vendored PLY). The package is primarily a library used as a front-end for C analysis/compilation tools. CodeQL-based analysis focused on common Python security issues, especially around deserialization and subprocess invocation.\n\nPackage profile:\n- Type: Python library (with some build/CLI helper code)\n- Notable modules: `pycparser/__init__.py`, `pycparser/c_parser.py`, `pycparser/c_ast.py`, `pycparser/ply/*`, `setup.py`.\n- Notable imports: `pickle`, `cPickle`, `subprocess`, `os`, `shutil`, etc.\n\n## Key Findings\n\n### 1. Unsafe deserialization via pickle/cPickle in vendored PLY\n- **Location:** `pycparser/ply/yacc.py`, around lines 2009–2016.\n- **Finding:** CodeQL queries `py/pickle-deserialization` and `py/pycparser-unsafe-deserialization` both reported 6 instances of pickle/cPickle deserialization in `yacc.py`.\n- **Technical details:**\n  - The vendored PLY `yacc` module supports loading pre-generated parser tables from disk using `pickle`/`cPickle`.\n  - These calls deserialize data from a file into Python objects.\n  - Pickle deserialization is inherently unsafe when applied to untrusted data because pickle opcodes can execute arbitrary code during object construction.\n- **Impact:**\n  - If an application using `pycparser` (and thus its vendored PLY) exposes functionality that allows an attacker to control which file is loaded for parser tables, or otherwise feeds attacker-controlled data into these pickle loads, this can lead to **arbitrary code execution**.\n  - Whether this is exploitable in a particular deployment depends on how the host application surfaces PLY’s table-loading functionality. `pycparser` itself primarily uses generated tables shipped with the package, but the presence of generic loading helpers means risk is contextual.\n- **CWE classification:**\n  - CWE-502: Deserialization of Untrusted Data.\n- **Severity:** High in untrusted-data contexts; in typical local/offline use where only trusted files are loaded, the practical risk is lower, but the pattern is still dangerous if used incorrectly by consumers.\n- **Recommendations:**\n  - **For pycparser maintainers:**\n    - Document clearly that any pickle table loading in the vendored PLY code must only be used with trusted, local data.\n    - If feasible, gate or discourage direct exposure of table-loading APIs in user-facing examples.\n    - Consider adding runtime checks or helper APIs that only load from expected, trusted locations.\n  - **For downstream users:**\n    - Never load parser tables or other pickled data from user-uploaded or otherwise untrusted sources.\n    - Prefer generating parser tables at build time and shipping them as part of the package, not allowing dynamic uploads.\n\n### 2. Subprocess usage\n- **Locations:**\n  - `pycparser/__init__.py`, around line 42.\n  - `setup.py`, around lines 17–18.\n- **Finding:** CodeQL query `py/pycparser-subprocess-use` reported 2 subprocess invocations.\n- **Technical details and risk assessment:**\n  - These calls are used in tooling/build contexts (e.g., helper scripts or setup-time logic) rather than in the primary library parsing logic.\n  - No evidence from the static analysis indicates that untrusted user input is passed directly to these subprocess calls or that `shell=True` is misused in a way that obviously enables command injection.\n- **CWE classification:**\n  - Potentially CWE-78 (Improper Neutralization of Special Elements used in an OS Command), but in this code base they appear as **generic cautionary spots**, not confirmed vulnerabilities.\n- **Severity:** Low based on current evidence. They should still be reviewed if the host application exposes parameters down into these calls.\n- **Recommendations:**\n  - Ensure all arguments to subprocess calls are constructed from trusted or validated data.\n  - Prefer list-style invocation (`subprocess.check_call([...])`) without `shell=True` for safety.\n  - Avoid using these helper routines in contexts where remote/untrusted input can influence command construction.\n\n## Other Considerations\n\n- No additional high-impact issues (such as direct `eval/exec` on user input, obvious SQL injection points, or direct code execution sinks) were identified in the executed CodeQL queries.\n- The core `pycparser` modules (`c_parser.py`, `c_ast.py`, `c_generator.py`, etc.) primarily implement parsing, AST structures, and code generation with no clear direct remote-input-to-dangerous-sink flows found in this analysis.\n\n## Overall Risk Assessment\n\n- **Primary risk:** Use of pickle/cPickle deserialization in vendored PLY (`yacc.py`) — classic unsafe deserialization. This is a well-known aspect of PLY; the risk surfaces when callers load tables from attacker-controlled locations or data.\n- **Secondary risk:** Subprocess usage in helper/setup code that should be treated carefully but is not, by itself, an exploitable vulnerability given current evidence.\n\nFor most standard uses of `pycparser` in local tooling and analysis pipelines on trusted code, the library is reasonably safe provided that:\n- You do **not** deserialize pickle data from untrusted sources.\n- You do **not** feed untrusted data into any subprocess wrappers provided by this package.\n\nIf you plan to integrate `pycparser` into a multi-tenant or exposed service, carefully control or sandbox any functionality involving pickle or external process execution.\n",
+ "package_classification": {
+  "type": "library",
+  "layer": [
+   "application",
+   "library"
+  ]
+ },
+ "tool_calls": {
+  "get_package_profile_info": 1,
+  "execute_codeql_query": 10,
+  "validate_codeql_query": 0,
+  "fixup_codeql_query": 4,
+  "finalize_report": 1
+ },
+ "queries_executed": {
+  "critical": 0,
+  "high": 2,
+  "medium": 1,
+  "low": 0,
+  "total_executed": 14,
+  "total_with_results": 3,
+  "total_failed": 8
+ },
+ "query_findings": {
+  "critical": 0,
+  "high": 12,
+  "medium": 2,
+  "low": 0,
+  "total": 14
+ },
+ "findings": [
+  {
+   "codeql_query_uuid": "20251226035921",
+   "codeql_raw_query": "/**\n * @name Use of pickle/cPickle deserialization\n * @description Flags uses of pickle or cPickle which may deserialize untrusted data.\n * @kind problem\n * @problem.severity warning\n * @id py/pickle-deserialization\n * @tags security\n *       external/cwe/cwe-502\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"pickle\").getMember([\"load\", \"loads\"]).getACall() or\n  call = API::moduleImport(\"cPickle\").getMember([\"load\", \"loads\"]).getACall()\nselect call, \"Use of pickle/cPickle deserialization here may be unsafe if input is untrusted.\"",
+   "hypothesis": "Unsafe deserialization via pickle/cPickle",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-502"
+   ],
+   "results_count": 6,
+   "results": [
+    {
+     "ruleId": "py/pickle-deserialization",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pickle-deserialization",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of pickle/cPickle deserialization here may be unsafe if input is untrusted."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pycparser/ply/yacc.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 2009,
+         "startColumn": 22,
+         "endColumn": 39
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "a75e8b117e623153:1",
+      "primaryLocationStartColumnFingerprint": "13"
+     }
+    },
+    {
+     "ruleId": "py/pickle-deserialization",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pickle-deserialization",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of pickle/cPickle deserialization here may be unsafe if input is untrusted."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pycparser/ply/yacc.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 2012,
+         "startColumn": 26,
+         "endColumn": 43
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "df5733ebc917b5:1",
+      "primaryLocationStartColumnFingerprint": "17"
+     }
+    },
+    {
+     "ruleId": "py/pickle-deserialization",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pickle-deserialization",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of pickle/cPickle deserialization here may be unsafe if input is untrusted."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pycparser/ply/yacc.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 2013,
+         "startColumn": 26,
+         "endColumn": 43
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "4e231edd45fde237:1",
+      "primaryLocationStartColumnFingerprint": "17"
+     }
+    },
+    {
+     "ruleId": "py/pickle-deserialization",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pickle-deserialization",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of pickle/cPickle deserialization here may be unsafe if input is untrusted."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pycparser/ply/yacc.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 2014,
+         "startColumn": 26,
+         "endColumn": 43
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "90ac67a43103c1ef:1",
+      "primaryLocationStartColumnFingerprint": "17"
+     }
+    },
+    {
+     "ruleId": "py/pickle-deserialization",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pickle-deserialization",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of pickle/cPickle deserialization here may be unsafe if input is untrusted."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pycparser/ply/yacc.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 2015,
+         "startColumn": 26,
+         "endColumn": 43
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "2c6d14495dbbf607:1",
+      "primaryLocationStartColumnFingerprint": "17"
+     }
+    },
+    {
+     "ruleId": "py/pickle-deserialization",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pickle-deserialization",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of pickle/cPickle deserialization here may be unsafe if input is untrusted."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pycparser/ply/yacc.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 2016,
+         "startColumn": 26,
+         "endColumn": 43
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "583e36c30f8470c1:1",
+      "primaryLocationStartColumnFingerprint": "17"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251226035944",
+   "codeql_raw_query": "/**\n * @name Unsafe pickle deserialization in pycparser\n * @description Find uses of pickle or cPickle load/loads in the package to assess unsafe deserialization risk\n * @kind problem\n * @problem.severity error\n * @id py/pycparser-unsafe-deserialization\n * @tags security\n *       external/cwe/cwe-502\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"pickle\").getMember([\"load\", \"loads\"]).getACall() or\n  call = API::moduleImport(\"cPickle\").getMember([\"load\", \"loads\"]).getACall()\nselect call, \"Use of pickle/cPickle deserialization here may be unsafe if input is untrusted.\"",
+   "hypothesis": "pycparser uses pickle or cPickle to deserialize data, which can be unsafe with untrusted input",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-502"
+   ],
+   "results_count": 6,
+   "results": [
+    {
+     "ruleId": "py/pycparser-unsafe-deserialization",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pycparser-unsafe-deserialization",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of pickle/cPickle deserialization here may be unsafe if input is untrusted."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pycparser/ply/yacc.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 2009,
+         "startColumn": 22,
+         "endColumn": 39
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "a75e8b117e623153:1",
+      "primaryLocationStartColumnFingerprint": "13"
+     }
+    },
+    {
+     "ruleId": "py/pycparser-unsafe-deserialization",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pycparser-unsafe-deserialization",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of pickle/cPickle deserialization here may be unsafe if input is untrusted."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pycparser/ply/yacc.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 2012,
+         "startColumn": 26,
+         "endColumn": 43
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "df5733ebc917b5:1",
+      "primaryLocationStartColumnFingerprint": "17"
+     }
+    },
+    {
+     "ruleId": "py/pycparser-unsafe-deserialization",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pycparser-unsafe-deserialization",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of pickle/cPickle deserialization here may be unsafe if input is untrusted."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pycparser/ply/yacc.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 2013,
+         "startColumn": 26,
+         "endColumn": 43
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "4e231edd45fde237:1",
+      "primaryLocationStartColumnFingerprint": "17"
+     }
+    },
+    {
+     "ruleId": "py/pycparser-unsafe-deserialization",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pycparser-unsafe-deserialization",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of pickle/cPickle deserialization here may be unsafe if input is untrusted."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pycparser/ply/yacc.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 2014,
+         "startColumn": 26,
+         "endColumn": 43
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "90ac67a43103c1ef:1",
+      "primaryLocationStartColumnFingerprint": "17"
+     }
+    },
+    {
+     "ruleId": "py/pycparser-unsafe-deserialization",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pycparser-unsafe-deserialization",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of pickle/cPickle deserialization here may be unsafe if input is untrusted."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pycparser/ply/yacc.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 2015,
+         "startColumn": 26,
+         "endColumn": 43
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "2c6d14495dbbf607:1",
+      "primaryLocationStartColumnFingerprint": "17"
+     }
+    },
+    {
+     "ruleId": "py/pycparser-unsafe-deserialization",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pycparser-unsafe-deserialization",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of pickle/cPickle deserialization here may be unsafe if input is untrusted."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pycparser/ply/yacc.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 2016,
+         "startColumn": 26,
+         "endColumn": 43
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "583e36c30f8470c1:1",
+      "primaryLocationStartColumnFingerprint": "17"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251226040010",
+   "codeql_raw_query": "/**\n * @name pycparser insecure use of subprocess\n * @description Detect potentially unsafe subprocess calls that could execute external commands.\n * @kind problem\n * @problem.severity warning\n * @id py/pycparser-subprocess-use\n * @tags security\n *       external/cwe/cwe-078\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom API::CallNode call\nwhere\n  call = API::moduleImport(\"subprocess\").getMember([\"Popen\", \"call\", \"run\", \"check_call\", \"check_output\"]).getACall()\nselect call, \"Subprocess call; ensure inputs are not attacker-controlled and shell is not misused.\"",
+   "hypothesis": "pycparser may invoke subprocess in a potentially unsafe manner (CWE-78).",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-078"
+   ],
+   "results_count": 2,
+   "results": [
+    {
+     "ruleId": "py/pycparser-subprocess-use",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pycparser-subprocess-use",
+      "index": 0
+     },
+     "message": {
+      "text": "Subprocess call; ensure inputs are not attacker-controlled and shell is not misused."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pycparser/__init__.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 42,
+         "startColumn": 16,
+         "endColumn": 64
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "f4bbb476e5d081b0:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/pycparser-subprocess-use",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pycparser-subprocess-use",
+      "index": 0
+     },
+     "message": {
+      "text": "Subprocess call; ensure inputs are not attacker-controlled and shell is not misused."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "setup.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 17,
+         "startColumn": 5,
+         "endLine": 18,
+         "endColumn": 51
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "c464253ff575c9f2:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    }
+   ]
+  }
+ ]
+}

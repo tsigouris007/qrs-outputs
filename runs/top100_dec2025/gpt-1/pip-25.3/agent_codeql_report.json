@@ -1,0 +1,472 @@
+{
+ "session_id": "20251226023634",
+ "package_name": "pip-25.3",
+ "package_path": "packages/pip-25.3",
+ "database_path": "databases/pip-25.3-db",
+ "model": "gpt-5.1",
+ "temperature": 1.0,
+ "max_tokens": 8000,
+ "iterations": 13,
+ "total_input_tokens": 248023,
+ "total_output_tokens": 11102,
+ "total_tokens": 259125,
+ "elapsed_time_seconds": 458.68,
+ "estimated_cost_usd": 0.421,
+ "summary": "## Security analysis report for `pip` 25.3\n\n### Package classification\n- **Type:** cli_tool, application, library\n- **Layer:** tooling / package management / networked client\n\n### Scope\nAnalysis was run against the `pip 25.3` source tree, including vendored dependencies under `src/pip/_vendor`. Findings include issues in vendored code because it executes in the same trust boundary as `pip`.\n\n---\n\n## Key findings\n\n### 1. Use of `eval`/`exec` in vendored libraries\n- **Severity:** Medium\n- **CWE:** CWE-94 (Code Injection), CWE-95 (Eval Injection)\n- **Locations (approximate):**\n  - `src/pip/_vendor/packaging/licenses/__init__.py` (around line 100)\n  - `src/pip/_vendor/pygments/formatters/__init__.py` (around line 103)\n  - `src/pip/_vendor/pkg_resources/__init__.py` (around lines 1714, 1725)\n  - `src/pip/_vendor/pygments/lexers/__init__.py` (around line 154)\n  - `src/pip/_vendor/urllib3/packages/six.py` (around line 787)\n- **CodeQL rule:** `py/pip-eval-exec-usage`\n- **Issue:** These vendored modules use Python’s dynamic evaluation (`eval`/`exec`), typically for plugin loading, dynamic imports, or compatibility shims.\n- **Risk assessment:**\n  - In normal `pip` operation, arguments to `eval/exec` are built from static templates or from installed package metadata/entry points. An attacker who can control these already controls executable package code, so this does not substantially expand their capabilities.\n  - No dataflow from remote HTTP responses or other clearly untrusted network sources into these `eval/exec` calls was identified by the queries executed.\n- **Recommendation:**\n  - Treat these as security-sensitive locations; when upgrading vendored `pkg_resources`, `pygments`, `six`, or `packaging`, manually review surrounding code to ensure no newly introduced dependency on user/remote-controlled strings.\n  - Avoid refactors that would allow configuration files, environment variables, or network data to be interpolated directly into `eval/exec` arguments.\n\n### 2. Potentially unsafe config/data loading in vendored `rich`\n- **Severity:** Medium\n- **CWE:** CWE-502 (Deserialization of Untrusted Data)\n- **File:** `src/pip/_vendor/rich/style.py` (around line 471)\n- **CodeQL rules:**\n  - `py/pip-unsafe-config-parse`\n  - `py/pip-unsafe-deserialization`\n- **Issue:** A style-parsing or configuration-like routine in `rich.style` was flagged as a potentially unsafe loader/deserializer. Upstream `rich` typically parses style definitions into `Style` objects using custom logic.\n- **Risk assessment:**\n  - Within `pip`, `rich` is used for console UI (colors, progress bars, etc.). There is no evidence from this run that `pip` feeds arbitrary remote data directly into these APIs.\n  - The flagged code does not clearly correspond to `pickle` or arbitrary code execution in its current form but is structurally similar to patterns that *could* become unsafe if changed.\n- **Recommendation:**\n  - Treat this site as a hotspot during vendored-`rich` upgrades; verify that it continues to use constrained parsing and does not introduce `eval`, `exec`, or unsafe deserialization.\n  - If in future `pip` allows user- or remote-supplied themes/styles, ensure that such input is local, under user control, or validated before being passed into rich’s style-parsing routines.\n\n### 3. Use of weak hashes (MD5/SHA1) in vendored `requests`\n- **Severity:** Medium\n- **CWE:** CWE-327 (Use of a Broken or Risky Cryptographic Algorithm)\n- **File:** `src/pip/_vendor/requests/auth.py`\n- **Locations (approximate):**\n  - Around line 148 (MD5)\n  - Around line 156 (SHA1)\n  - Around line 205 (MD5/SHA1)\n- **CodeQL rule:** `py/pip-weak-hash`\n- **Issue:** `requests.auth` uses `hashlib.md5` and `hashlib.sha1` to implement HTTP digest/NTLM authentication.\n- **Risk assessment:**\n  - This is expected behavior for compatibility with legacy HTTP auth schemes.\n  - Within `pip`, these hashes are not used to validate package artifacts or to store secrets; they are part of network protocol calculations.\n- **Recommendation:**\n  - Continue to rely primarily on TLS for confidentiality and integrity of package downloads.\n  - Encourage use of `--require-hashes` or other stronger integrity mechanisms for packages when appropriate.\n  - Keep vendored `requests` updated and adopt any upstream moves toward stronger digest algorithms where feasible.\n\n---\n\n## Notable negative results (no issues found in these categories)\n\nWithin the queries executed:\n\n1. **Command injection from untrusted input**\n   - No concrete evidence was found of untrusted network input flowing into shell commands or `subprocess` calls in a way that would constitute command injection. `pip` does invoke many subprocesses, but primarily with fixed command names and arguments derived from configuration, CLI options, or local filesystem state.\n\n2. **Insecure temporary file creation with `tempfile.mktemp`**\n   - A direct search for `tempfile.mktemp` returned no results. `pip` appears to use safer primitives (e.g., `NamedTemporaryFile`, `mkstemp`, managed temp directories).\n\n3. **Broad unsafe deserialization in `pip` internals**\n   - Apart from the single hotspot in vendored `rich.style`, no additional unsafe `pickle` or unsafe YAML usage was detected in core `pip` modules by the patterns run.\n\n4. **Security-critical logic implemented with `assert` in core pip**\n   - A broad `assert` usage query was noisy in vendored libraries (e.g., `requests.__init__`), but did not highlight clear cases where `pip` relies on `assert` for security checks that could be stripped with Python’s `-O` flag.\n\n---\n\n## Overall assessment\n\n- No critical, immediately exploitable vulnerabilities were surfaced by the CodeQL queries used in this analysis.\n- The main findings are **security-sensitive patterns** in vendored code (dynamic evaluation, potential deserialization layers, and legacy hashes used for protocol compatibility). These are consistent with the behavior of the upstream projects and, in context, do not currently appear to expand the attacker’s capabilities beyond what is already possible via installing or running arbitrary packages.\n\n### Recommended follow-ups\n\n1. **Vendored dependency maintenance**\n   - When updating vendored `pkg_resources`, `pygments`, `six`, `packaging`, `rich`, or `requests`, perform targeted review around the lines identified above.\n   - Re-run CodeQL after major vendoring changes to catch any newly introduced dangerous patterns.\n\n2. **Defense in depth for users**\n   - Continue to recommend use of TLS, trusted package indexes, and `--require-hashes` (or equivalent) for high-assurance deployments.\n\n3. **Manual review hotspots for deeper audits**\n   - If conducting a more thorough manual security review, prioritize:\n     - `src/pip/_internal/utils/subprocess.py` and `src/pip/_internal/vcs/*` (subprocess and VCS handling)\n     - `src/pip/_internal/configuration.py` (configuration parsing)\n     - `src/pip/_internal/network/*` (HTTP client and TLS handling)\n\nWithin the constraints of this automated run and the queries executed, `pip 25.3` shows a generally sound security posture with expected risks inherited from complex vendored libraries, but no newly identified critical vulnerabilities.",
+ "package_classification": {
+  "type": "cli_tool",
+  "layer": [
+   "tooling",
+   "package-management",
+   "network-client"
+  ]
+ },
+ "tool_calls": {
+  "get_package_profile_info": 1,
+  "execute_codeql_query": 13,
+  "validate_codeql_query": 0,
+  "fixup_codeql_query": 3,
+  "finalize_report": 1
+ },
+ "queries_executed": {
+  "critical": 0,
+  "high": 3,
+  "medium": 4,
+  "low": 0,
+  "total_executed": 14,
+  "total_with_results": 7,
+  "total_failed": 12
+ },
+ "query_findings": {
+  "critical": 0,
+  "high": 7,
+  "medium": 4,
+  "low": 0,
+  "total": 11
+ },
+ "findings": [
+  {
+   "codeql_query_uuid": "20251226023838",
+   "codeql_raw_query": "/**\n * @name Dangerous use of eval/exec in pip\n * @description Find any use of eval or exec which may be risky\n * @kind problem\n * @problem.severity warning\n * @id py/pip-eval-exec-usage\n * @tags security\n *       external/cwe/cwe-094\n */\n\nimport python\nimport semmle.python.ApiGraphs\nimport semmle.python.dataflow.new.DataFlow\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::builtin(\"eval\").getACall() or\n  call = API::builtin(\"exec\").getACall()\nselect call, \"Use of eval/exec may be dangerous if given untrusted input.\"",
+   "hypothesis": "pip might use eval/exec on data derived from network or configuration, enabling code injection.",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-094"
+   ],
+   "results_count": 6,
+   "results": [
+    {
+     "ruleId": "py/pip-eval-exec-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pip-eval-exec-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of eval/exec may be dangerous if given untrusted input."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/pip/_vendor/packaging/licenses/__init__.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 100,
+         "startColumn": 19,
+         "endColumn": 63
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "a04971260200f6d:1",
+      "primaryLocationStartColumnFingerprint": "10"
+     }
+    },
+    {
+     "ruleId": "py/pip-eval-exec-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pip-eval-exec-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of eval/exec may be dangerous if given untrusted input."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/pip/_vendor/pygments/formatters/__init__.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 103,
+         "startColumn": 13,
+         "endColumn": 45
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "891b6592adba8cae:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/pip-eval-exec-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pip-eval-exec-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of eval/exec may be dangerous if given untrusted input."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/pip/_vendor/pkg_resources/__init__.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 1714,
+         "startColumn": 13,
+         "endColumn": 45
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "cf2541db4b01f1d0:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/pip-eval-exec-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pip-eval-exec-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of eval/exec may be dangerous if given untrusted input."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/pip/_vendor/pkg_resources/__init__.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 1725,
+         "startColumn": 13,
+         "endColumn": 52
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "4a24db34e67766ef:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/pip-eval-exec-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pip-eval-exec-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of eval/exec may be dangerous if given untrusted input."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/pip/_vendor/pygments/lexers/__init__.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 3
+        },
+        "region": {
+         "startLine": 154,
+         "startColumn": 13,
+         "endColumn": 45
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "fe6df07d02044f58:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/pip-eval-exec-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pip-eval-exec-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of eval/exec may be dangerous if given untrusted input."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/pip/_vendor/urllib3/packages/six.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 4
+        },
+        "region": {
+         "startLine": 787,
+         "startColumn": 9,
+         "endColumn": 52
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "42c8cb2765c23d96:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251226023939",
+   "codeql_raw_query": "/**\n * @name Insecure use of temporary files and directories\n * @description Detects use of tempfile.mktemp or predictable temp directories in pip internals\n * @kind problem\n * @problem.severity warning\n * @id py/pip-insecure-tempfile\n * @tags security\n *       external/cwe/cwe-377\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"tempfile\").getMember([\"mktemp\"]).getACall()\nselect call, \"Insecure use of tempfile.mktemp(); use NamedTemporaryFile or mkstemp instead.\"\n",
+   "hypothesis": "pip may use insecure temporary file creation via tempfile.mktemp, leading to race conditions or symlink attacks.",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-377"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251226024006",
+   "codeql_raw_query": "/**\n * @name Use of eval/exec in pip codebase\n * @description Flags any use of eval or exec, which may be risky if fed untrusted data\n * @kind problem\n * @problem.severity warning\n * @id py/pip-eval-exec-usage\n * @tags security\n *       external/cwe/cwe-094\n */\n\nimport python\n\nfrom Exec exec\nselect exec, \"Use of eval/exec may be dangerous if given untrusted input.\"",
+   "hypothesis": "Pip or vendored libraries use eval/exec, which can be dangerous if given untrusted input",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-094"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251226024028",
+   "codeql_raw_query": "/**\n * @name Potential unsafe loading/parsing of configuration files\n * @description Detects use of eval-like functions or unsafe config parsing that may process untrusted configuration\n * @kind problem\n * @problem.severity warning\n * @id py/pip-unsafe-config-parse\n * @tags security\n *       external/cwe/cwe-494\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"yaml\").getMember([\"load\", \"unsafe_load\"]).getACall() or\n  call = API::moduleImport(\"pickle\").getMember([\"load\", \"loads\", \"Unpickler\"]).getACall()\nselect call, \"Potentially unsafe deserialization or config loading that may execute code if fed untrusted input.\"",
+   "hypothesis": "pip or vendored libs may use unsafe yaml.load or pickle load/loads on data that could in some scenarios be influenced by remote sources",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-502",
+    "cwe-494"
+   ],
+   "results_count": 1,
+   "results": [
+    {
+     "ruleId": "py/pip-unsafe-config-parse",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pip-unsafe-config-parse",
+      "index": 0
+     },
+     "message": {
+      "text": "Potentially unsafe deserialization or config loading that may execute code if fed untrusted input."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/pip/_vendor/rich/style.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 471,
+         "startColumn": 67,
+         "endColumn": 84
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "e4ba8fb74542ee3b:1",
+      "primaryLocationStartColumnFingerprint": "58"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251226024136",
+   "codeql_raw_query": "/**\n * @name Dangerous use of yaml.load\n * @description Detects use of yaml.load without a safe loader in pip internals and vendored libs\n * @kind problem\n * @problem.severity error\n * @id py/pip-unsafe-yaml-load\n * @tags security\n *       external/cwe/cwe-502\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"yaml\").getMember([\"load\", \"full_load\"]).getACall()\nselect call, \"Use yaml.load or yaml.full_load on untrusted data can lead to code execution; prefer safe_load or restrict input.\"",
+   "hypothesis": "Unsafe deserialization via yaml.load in pip codebase",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-502"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251226024155",
+   "codeql_raw_query": "/**\n * @name Use of insecure hash functions for security-sensitive purposes\n * @description Finds uses of MD5 or SHA1 that may be used for security decisions in pip\n * @kind problem\n * @problem.severity warning\n * @id py/pip-weak-hash\n * @tags security\n *       external/cwe/cwe-327\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"hashlib\").getMember([\"md5\", \"sha1\"]).getACall()\nselect call, \"Use of MD5/SHA1; ensure this is not for security-sensitive integrity or authenticity checks.\"",
+   "hypothesis": "Weak hash usage that might be security sensitive",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-327"
+   ],
+   "results_count": 3,
+   "results": [
+    {
+     "ruleId": "py/pip-weak-hash",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pip-weak-hash",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of MD5/SHA1; ensure this is not for security-sensitive integrity or authenticity checks."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/pip/_vendor/requests/auth.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 148,
+         "startColumn": 24,
+         "endColumn": 38
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "180410456de91012:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/pip-weak-hash",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pip-weak-hash",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of MD5/SHA1; ensure this is not for security-sensitive integrity or authenticity checks."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/pip/_vendor/requests/auth.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 156,
+         "startColumn": 24,
+         "endColumn": 39
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "c461040f45e16247:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/pip-weak-hash",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pip-weak-hash",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of MD5/SHA1; ensure this is not for security-sensitive integrity or authenticity checks."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/pip/_vendor/requests/auth.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 205,
+         "startColumn": 18,
+         "endColumn": 33
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "5de417172b40a045:1",
+      "primaryLocationStartColumnFingerprint": "9"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251226024228",
+   "codeql_raw_query": "/**\n * @name Use of pickle or unsafe YAML load\n * @description Detects potentially unsafe deserialization in pip code and vendored libs.\n * @kind problem\n * @problem.severity error\n * @id py/pip-unsafe-deserialization\n * @tags security\n *       external/cwe/cwe-502\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"pickle\").getMember([\"load\", \"loads\", \"Unpickler\"]).getACall() or\n  call = API::moduleImport(\"yaml\").getMember([\"load\", \"unsafe_load\"]).getACall()\nselect call, \"Potentially unsafe deserialization using pickle or unsafe YAML load; ensure the input is trusted.\"",
+   "hypothesis": "Unsafe deserialization via pickle or yaml.load",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-502"
+   ],
+   "results_count": 1,
+   "results": [
+    {
+     "ruleId": "py/pip-unsafe-deserialization",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pip-unsafe-deserialization",
+      "index": 0
+     },
+     "message": {
+      "text": "Potentially unsafe deserialization using pickle or unsafe YAML load; ensure the input is trusted."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/pip/_vendor/rich/style.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 471,
+         "startColumn": 67,
+         "endColumn": 84
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "e4ba8fb74542ee3b:1",
+      "primaryLocationStartColumnFingerprint": "58"
+     }
+    }
+   ]
+  }
+ ]
+}

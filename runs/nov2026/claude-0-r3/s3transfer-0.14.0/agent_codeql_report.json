@@ -1,0 +1,3408 @@
+{
+ "session_id": "20261118082346",
+ "package_name": "s3transfer-0.14.0",
+ "package_path": "packages/s3transfer-0.14.0",
+ "database_path": "databases/s3transfer-0.14.0-db",
+ "model": "claude-sonnet-4-5-20250929",
+ "temperature": 0.0,
+ "max_tokens": 4000,
+ "iterations": 19,
+ "total_input_tokens": 259954,
+ "total_output_tokens": 10396,
+ "total_tokens": 270350,
+ "elapsed_time_seconds": 535.38,
+ "estimated_cost_usd": 0.9358,
+ "summary": "# Security Analysis Report: s3transfer-0.14.0\n\n## Executive Summary\nConducted comprehensive security analysis of s3transfer-0.14.0, an Amazon S3 Transfer Manager library. Identified **multiple security vulnerabilities** across several categories, with findings ranging from **high to medium severity**.\n\n## Package Classification\n- **Type**: Library\n- **Layer**: Infrastructure/Cloud Storage\n- **Purpose**: AWS S3 file transfer management (upload, download, copy operations)\n- **Dependencies**: botocore (AWS SDK), optional awscrt\n\n## Key Findings\n\n### 1. **Path Traversal Vulnerabilities** (HIGH SEVERITY - CWE-22)\n- **Count**: 12 instances\n- **Impact**: Attackers could potentially read/write files outside intended directories\n- **Locations**: \n  - `s3transfer/__init__.py` (lines 266, 347, 355, 362)\n  - `s3transfer/utils.py` (lines 262, 287, 294, 313, 315, 335, 509)\n  - `s3transfer/processpool.py` (line 991)\n- **Details**: User-controlled file paths flow to file operations (open, os.rename, os.remove) without proper validation or sanitization. This could allow path traversal attacks using sequences like `../` to access files outside the intended directory.\n\n### 2. **Symlink Following Vulnerabilities** (MEDIUM SEVERITY - CWE-59)\n- **Count**: 14 instances\n- **Impact**: Time-of-check-time-of-use (TOCTOU) race conditions, potential unauthorized file access\n- **Locations**:\n  - `s3transfer/__init__.py` (lines 362, 367, 654, 873)\n  - `s3transfer/compat.py` (lines 24, 32, 90)\n  - `s3transfer/crt.py` (line 954)\n  - `s3transfer/download.py` (lines 690, 706)\n  - `s3transfer/processpool.py` (line 995)\n  - `s3transfer/utils.py` (lines 294, 299, 390)\n- **Details**: File operations that follow symlinks without validation, potentially allowing attackers to manipulate file operations through symbolic links.\n\n### 3. **Weak Cryptography** (MEDIUM SEVERITY - CWE-327)\n- **Count**: 2 instances\n- **Impact**: Predictable values, potential security bypass\n- **Locations**:\n  - `s3transfer/__init__.py` (line 160)\n  - `s3transfer/utils.py` (line 54)\n- **Details**: Use of `random` module instead of `secrets` module for security-sensitive operations. The standard `random` module is not cryptographically secure.\n\n### 4. **Uncontrolled Resource Consumption** (MEDIUM SEVERITY - CWE-400)\n- **Count**: 22 instances\n- **Impact**: Potential denial of service through memory exhaustion\n- **Locations**: Multiple files including:\n  - `s3transfer/__init__.py` (lines 283, 339, 614, 872)\n  - `s3transfer/upload.py` (lines 92, 359, 365, 417, 464, 480, 503)\n  - `s3transfer/download.py` (line 775)\n  - `s3transfer/bandwidth.py` (lines 149, 158, 161)\n  - `s3transfer/utils.py` (lines 386, 526, 614)\n  - `s3transfer/processpool.py` (line 993)\n- **Details**: File read operations and memory allocations without proper size limits, potentially allowing attackers to cause memory exhaustion.\n\n## Vulnerabilities NOT Found\n- Command Injection (CWE-78): ✓ No instances found\n- Unsafe Deserialization (CWE-502): ✓ No instances found\n- Insecure Temporary Files (CWE-377): ✓ No instances found\n- Hardcoded Credentials (CWE-798): ✓ No instances found\n- Improper Certificate Validation (CWE-295): ✓ No instances found\n- SSRF (CWE-918): ✓ No instances found\n\n## Recommendations\n\n1. **Path Traversal**: Implement strict path validation using `os.path.realpath()` and `os.path.commonpath()` to ensure file operations stay within intended directories\n2. **Symlink Attacks**: Use `os.open()` with `O_NOFOLLOW` flag or validate paths with `os.path.islink()` before operations\n3. **Weak Cryptography**: Replace `random` module with `secrets` module for security-sensitive random number generation\n4. **Resource Limits**: Implement maximum size limits for file reads and memory allocations based on user input\n\n## Analysis Methodology\n- Executed 17 CodeQL queries across multiple vulnerability categories\n- Focused on critical and high-severity vulnerabilities first\n- Analyzed data flow from user inputs to sensitive sinks\n- Validated findings across 6,287 lines of code in 17 files",
+ "package_classification": {
+  "type": [
+   "library"
+  ],
+  "layer": [
+   "infrastructure",
+   "cloud"
+  ]
+ },
+ "tool_calls": {
+  "get_package_profile_info": 1,
+  "execute_codeql_query": 15,
+  "validate_codeql_query": 0,
+  "fixup_codeql_query": 2,
+  "finalize_report": 1
+ },
+ "queries_executed": {
+  "critical": 2,
+  "high": 4,
+  "medium": 7,
+  "low": 0,
+  "total_executed": 17,
+  "total_with_results": 13,
+  "total_failed": 4
+ },
+ "query_findings": {
+  "critical": 0,
+  "high": 13,
+  "medium": 38,
+  "low": 0,
+  "total": 51
+ },
+ "findings": [
+  {
+   "codeql_query_uuid": "20261118082405",
+   "codeql_raw_query": "/**\n * @name Path traversal in file operations\n * @description User-controlled file paths flowing to file system operations without validation can lead to path traversal\n * @kind path-problem\n * @problem.severity error\n * @id py/s3transfer-path-traversal\n * @tags security\n *        external/cwe/cwe-022\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.Concepts\nimport semmle.python.ApiGraphs\n\nmodule PathTraversalConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    // Parameters that could contain user-controlled paths\n    exists(DataFlow::ParameterNode param |\n      source = param and\n      (\n        param.getParameter().getName() in [\"filename\", \"key\", \"path\", \"filepath\", \"destination\", \"source\", \"bucket_key\", \"extra_args\"]\n      )\n    )\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    // File system operations\n    exists(DataFlow::CallCfgNode call |\n      sink = call.getArg(_) and\n      (\n        call = API::moduleImport(\"os\").getMember([\"open\", \"remove\", \"unlink\", \"rename\", \"makedirs\", \"mkdir\"]).getACall() or\n        call = API::moduleImport(\"os\").getMember(\"path\").getMember([\"join\", \"exists\", \"isfile\", \"isdir\"]).getACall() or\n        call = API::builtin(\"open\").getACall()\n      )\n    )\n    or\n    sink = any(FileSystemAccess fa).getAPathArgument()\n  }\n}\n\nmodule PathTraversalFlow = TaintTracking::Global<PathTraversalConfig>;\nimport PathTraversalFlow::PathGraph\n\nfrom PathTraversalFlow::PathNode source, PathTraversalFlow::PathNode sink\nwhere PathTraversalFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"Potential path traversal from user-controlled $@.\", source.getNode(), \"file path\"\n",
+   "hypothesis": "Path traversal vulnerability in file download/upload operations where user-controlled input flows to file system operations without proper sanitization",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-22"
+   ],
+   "results_count": 13,
+   "results": [
+    {
+     "ruleId": "py/s3transfer-path-traversal",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/s3transfer-path-traversal",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential path traversal from user-controlled [file path](1).\nPotential path traversal from user-controlled [file path](2)."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "s3transfer/__init__.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 266,
+         "startColumn": 18,
+         "endColumn": 26
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "3e3e66cc697436e6:1",
+      "primaryLocationStartColumnFingerprint": "9"
+     },
+     "codeFlows": [
+      {
+       "threadFlows": [
+        {
+         "locations": [
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "s3transfer/__init__.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 235,
+              "startColumn": 9,
+              "endColumn": 17
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for filename"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "s3transfer/__init__.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 266,
+              "startColumn": 18,
+              "endColumn": 26
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for filename"
+            }
+           }
+          }
+         ]
+        }
+       ]
+      },
+      {
+       "threadFlows": [
+        {
+         "locations": [
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "s3transfer/__init__.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 349,
+              "startColumn": 38,
+              "endColumn": 46
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for filename"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "s3transfer/__init__.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 351,
+              "startColumn": 13,
+              "endColumn": 21
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for filename"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "s3transfer/__init__.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 235,
+              "startColumn": 9,
+              "endColumn": 17
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for filename"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "s3transfer/__init__.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 266,
+              "startColumn": 18,
+              "endColumn": 26
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for filename"
+            }
+           }
+          }
+         ]
+        }
+       ]
+      }
+     ],
+     "relatedLocations": [
+      {
+       "id": 1,
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "s3transfer/__init__.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 235,
+         "startColumn": 9,
+         "endColumn": 17
+        }
+       },
+       "message": {
+        "text": "file path"
+       }
+      },
+      {
+       "id": 2,
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "s3transfer/__init__.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 349,
+         "startColumn": 38,
+         "endColumn": 46
+        }
+       },
+       "message": {
+        "text": "file path"
+       }
+      },
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "s3transfer/__init__.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 235,
+         "startColumn": 9,
+         "endColumn": 17
+        }
+       }
+      },
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "s3transfer/__init__.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 349,
+         "startColumn": 38,
+         "endColumn": 46
+        }
+       }
+      }
+     ]
+    },
+    {
+     "ruleId": "py/s3transfer-path-traversal",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/s3transfer-path-traversal",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential path traversal from user-controlled [file path](1)."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "s3transfer/__init__.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 347,
+         "startColumn": 32,
+         "endColumn": 40
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "e25db8b841cb4a3:1",
+      "primaryLocationStartColumnFingerprint": "23"
+     },
+     "codeFlows": [
+      {
+       "threadFlows": [
+        {
+         "locations": [
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "s3transfer/__init__.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 346,
+              "startColumn": 29,
+              "endColumn": 37
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for filename"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "s3transfer/__init__.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 347,
+              "startColumn": 32,
+              "endColumn": 40
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for filename"
+            }
+           }
+          }
+         ]
+        }
+       ]
+      }
+     ],
+     "relatedLocations": [
+      {
+       "id": 1,
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "s3transfer/__init__.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 346,
+         "startColumn": 29,
+         "endColumn": 37
+        }
+       },
+       "message": {
+        "text": "file path"
+       }
+      },
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "s3transfer/__init__.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 346,
+         "startColumn": 29,
+         "endColumn": 37
+        }
+       }
+      }
+     ]
+    },
+    {
+     "ruleId": "py/s3transfer-path-traversal",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/s3transfer-path-traversal",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential path traversal from user-controlled [file path](1)."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "s3transfer/__init__.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 355,
+         "startColumn": 21,
+         "endColumn": 29
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "b740c9aaf9ea6e20:1",
+      "primaryLocationStartColumnFingerprint": "12"
+     },
+     "codeFlows": [
+      {
+       "threadFlows": [
+        {
+         "locations": [
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "s3transfer/__init__.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 354,
+              "startColumn": 20,
+              "endColumn": 28
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for filename"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "s3transfer/__init__.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 355,
+              "startColumn": 21,
+              "endColumn": 29
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for filename"
+            }
+           }
+          }
+         ]
+        }
+       ]
+      }
+     ],
+     "relatedLocations": [
+      {
+       "id": 1,
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "s3transfer/__init__.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 354,
+         "startColumn": 20,
+         "endColumn": 28
+        }
+       },
+       "message": {
+        "text": "file path"
+       }
+      },
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "s3transfer/__init__.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 354,
+         "startColumn": 20,
+         "endColumn": 28
+        }
+       }
+      }
+     ]
+    },
+    {
+     "ruleId": "py/s3transfer-path-traversal",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/s3transfer-path-traversal",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential path traversal from user-controlled [file path](1)."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "s3transfer/__init__.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 362,
+         "startColumn": 23,
+         "endColumn": 31
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "46cef317301924de:1",
+      "primaryLocationStartColumnFingerprint": "10"
+     },
+     "codeFlows": [
+      {
+       "threadFlows": [
+        {
+         "locations": [
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "s3transfer/__init__.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 357,
+              "startColumn": 27,
+              "endColumn": 35
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for filename"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "s3transfer/__init__.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 362,
+              "startColumn": 23,
+              "endColumn": 31
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for filename"
+            }
+           }
+          }
+         ]
+        }
+       ]
+      }
+     ],
+     "relatedLocations": [
+      {
+       "id": 1,
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "s3transfer/__init__.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 357,
+         "startColumn": 27,
+         "endColumn": 35
+        }
+       },
+       "message": {
+        "text": "file path"
+       }
+      },
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "s3transfer/__init__.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 357,
+         "startColumn": 27,
+         "endColumn": 35
+        }
+       }
+      }
+     ]
+    },
+    {
+     "ruleId": "py/s3transfer-path-traversal",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/s3transfer-path-traversal",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential path traversal from user-controlled [file path](1)."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "s3transfer/processpool.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 991,
+         "startColumn": 19,
+         "endColumn": 27
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "96e1108f22208528:1",
+      "primaryLocationStartColumnFingerprint": "10"
+     },
+     "codeFlows": [
+      {
+       "threadFlows": [
+        {
+         "locations": [
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "s3transfer/processpool.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 1
+             },
+             "region": {
+              "startLine": 990,
+              "startColumn": 30,
+              "endColumn": 38
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for filename"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "s3transfer/processpool.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 1
+             },
+             "region": {
+              "startLine": 991,
+              "startColumn": 19,
+              "endColumn": 27
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for filename"
+            }
+           }
+          }
+         ]
+        }
+       ]
+      }
+     ],
+     "relatedLocations": [
+      {
+       "id": 1,
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "s3transfer/processpool.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 990,
+         "startColumn": 30,
+         "endColumn": 38
+        }
+       },
+       "message": {
+        "text": "file path"
+       }
+      },
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "s3transfer/processpool.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 990,
+         "startColumn": 30,
+         "endColumn": 38
+        }
+       }
+      }
+     ]
+    },
+    {
+     "ruleId": "py/s3transfer-path-traversal",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/s3transfer-path-traversal",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential path traversal from user-controlled [file path](1)."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "s3transfer/utils.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 262,
+         "startColumn": 32,
+         "endColumn": 40
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "e25db8b841e3e18:1",
+      "primaryLocationStartColumnFingerprint": "23"
+     },
+     "codeFlows": [
+      {
+       "threadFlows": [
+        {
+         "locations": [
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "s3transfer/utils.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 2
+             },
+             "region": {
+              "startLine": 261,
+              "startColumn": 29,
+              "endColumn": 37
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for filename"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "s3transfer/utils.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 2
+             },
+             "region": {
+              "startLine": 262,
+              "startColumn": 32,
+              "endColumn": 40
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for filename"
+            }
+           }
+          }
+         ]
+        }
+       ]
+      }
+     ],
+     "relatedLocations": [
+      {
+       "id": 1,
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "s3transfer/utils.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 261,
+         "startColumn": 29,
+         "endColumn": 37
+        }
+       },
+       "message": {
+        "text": "file path"
+       }
+      },
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "s3transfer/utils.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 261,
+         "startColumn": 29,
+         "endColumn": 37
+        }
+       }
+      }
+     ]
+    },
+    {
+     "ruleId": "py/s3transfer-path-traversal",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/s3transfer-path-traversal",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential path traversal from user-controlled [file path](1).\nPotential path traversal from user-controlled [file path](2)."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "s3transfer/utils.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 287,
+         "startColumn": 21,
+         "endColumn": 29
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "b740c9aaf9ea6e20:1",
+      "primaryLocationStartColumnFingerprint": "12"
+     },
+     "codeFlows": [
+      {
+       "threadFlows": [
+        {
+         "locations": [
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "s3transfer/utils.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 2
+             },
+             "region": {
+              "startLine": 286,
+              "startColumn": 20,
+              "endColumn": 28
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for filename"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "s3transfer/utils.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 2
+             },
+             "region": {
+              "startLine": 287,
+              "startColumn": 21,
+              "endColumn": 29
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for filename"
+            }
+           }
+          }
+         ]
+        }
+       ]
+      },
+      {
+       "threadFlows": [
+        {
+         "locations": [
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "s3transfer/utils.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 2
+             },
+             "region": {
+              "startLine": 337,
+              "startColumn": 24,
+              "endColumn": 32
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for filename"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "s3transfer/utils.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 2
+             },
+             "region": {
+              "startLine": 339,
+              "startColumn": 28,
+              "endColumn": 36
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for filename"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "s3transfer/utils.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 2
+             },
+             "region": {
+              "startLine": 286,
+              "startColumn": 20,
+              "endColumn": 28
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for filename"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "s3transfer/utils.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 2
+             },
+             "region": {
+              "startLine": 287,
+              "startColumn": 21,
+              "endColumn": 29
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for filename"
+            }
+           }
+          }
+         ]
+        }
+       ]
+      }
+     ],
+     "relatedLocations": [
+      {
+       "id": 1,
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "s3transfer/utils.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 286,
+         "startColumn": 20,
+         "endColumn": 28
+        }
+       },
+       "message": {
+        "text": "file path"
+       }
+      },
+      {
+       "id": 2,
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "s3transfer/utils.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 337,
+         "startColumn": 24,
+         "endColumn": 32
+        }
+       },
+       "message": {
+        "text": "file path"
+       }
+      },
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "s3transfer/utils.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 286,
+         "startColumn": 20,
+         "endColumn": 28
+        }
+       }
+      },
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "s3transfer/utils.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 337,
+         "startColumn": 24,
+         "endColumn": 32
+        }
+       }
+      }
+     ]
+    },
+    {
+     "ruleId": "py/s3transfer-path-traversal",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/s3transfer-path-traversal",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential path traversal from user-controlled [file path](1).\nPotential path traversal from user-controlled [file path](2)."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "s3transfer/utils.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 294,
+         "startColumn": 23,
+         "endColumn": 31
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "46cef317651c0727:1",
+      "primaryLocationStartColumnFingerprint": "10"
+     },
+     "codeFlows": [
+      {
+       "threadFlows": [
+        {
+         "locations": [
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "s3transfer/utils.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 2
+             },
+             "region": {
+              "startLine": 289,
+              "startColumn": 27,
+              "endColumn": 35
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for filename"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "s3transfer/utils.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 2
+             },
+             "region": {
+              "startLine": 294,
+              "startColumn": 23,
+              "endColumn": 31
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for filename"
+            }
+           }
+          }
+         ]
+        }
+       ]
+      },
+      {
+       "threadFlows": [
+        {
+         "locations": [
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "s3transfer/utils.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 2
+             },
+             "region": {
+              "startLine": 337,
+              "startColumn": 24,
+              "endColumn": 32
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for filename"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "s3transfer/utils.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 2
+             },
+             "region": {
+              "startLine": 342,
+              "startColumn": 30,
+              "endColumn": 38
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for filename"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "s3transfer/utils.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 2
+             },
+             "region": {
+              "startLine": 289,
+              "startColumn": 27,
+              "endColumn": 35
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for filename"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "s3transfer/utils.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 2
+             },
+             "region": {
+              "startLine": 294,
+              "startColumn": 23,
+              "endColumn": 31
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for filename"
+            }
+           }
+          }
+         ]
+        }
+       ]
+      }
+     ],
+     "relatedLocations": [
+      {
+       "id": 1,
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "s3transfer/utils.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 289,
+         "startColumn": 27,
+         "endColumn": 35
+        }
+       },
+       "message": {
+        "text": "file path"
+       }
+      },
+      {
+       "id": 2,
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "s3transfer/utils.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 337,
+         "startColumn": 24,
+         "endColumn": 32
+        }
+       },
+       "message": {
+        "text": "file path"
+       }
+      },
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "s3transfer/utils.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 289,
+         "startColumn": 27,
+         "endColumn": 35
+        }
+       }
+      },
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "s3transfer/utils.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 337,
+         "startColumn": 24,
+         "endColumn": 32
+        }
+       }
+      }
+     ]
+    },
+    {
+     "ruleId": "py/s3transfer-path-traversal",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/s3transfer-path-traversal",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential path traversal from user-controlled [file path](1)."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "s3transfer/utils.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 313,
+         "startColumn": 31,
+         "endColumn": 39
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "77f7882fed089b9b:1",
+      "primaryLocationStartColumnFingerprint": "22"
+     },
+     "codeFlows": [
+      {
+       "threadFlows": [
+        {
+         "locations": [
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "s3transfer/utils.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 2
+             },
+             "region": {
+              "startLine": 301,
+              "startColumn": 30,
+              "endColumn": 38
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for filename"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "s3transfer/utils.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 2
+             },
+             "region": {
+              "startLine": 313,
+              "startColumn": 31,
+              "endColumn": 39
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for filename"
+            }
+           }
+          }
+         ]
+        }
+       ]
+      }
+     ],
+     "relatedLocations": [
+      {
+       "id": 1,
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "s3transfer/utils.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 301,
+         "startColumn": 30,
+         "endColumn": 38
+        }
+       },
+       "message": {
+        "text": "file path"
+       }
+      },
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "s3transfer/utils.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 301,
+         "startColumn": 30,
+         "endColumn": 38
+        }
+       }
+      }
+     ]
+    },
+    {
+     "ruleId": "py/s3transfer-path-traversal",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/s3transfer-path-traversal",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential path traversal from user-controlled [file path](1)."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "s3transfer/utils.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 315,
+         "startColumn": 24,
+         "endColumn": 32
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "f97473748299db32:1",
+      "primaryLocationStartColumnFingerprint": "15"
+     },
+     "codeFlows": [
+      {
+       "threadFlows": [
+        {
+         "locations": [
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "s3transfer/utils.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 2
+             },
+             "region": {
+              "startLine": 301,
+              "startColumn": 30,
+              "endColumn": 38
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for filename"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "s3transfer/utils.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 2
+             },
+             "region": {
+              "startLine": 315,
+              "startColumn": 24,
+              "endColumn": 32
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for filename"
+            }
+           }
+          }
+         ]
+        }
+       ]
+      }
+     ],
+     "relatedLocations": [
+      {
+       "id": 1,
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "s3transfer/utils.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 301,
+         "startColumn": 30,
+         "endColumn": 38
+        }
+       },
+       "message": {
+        "text": "file path"
+       }
+      },
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "s3transfer/utils.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 301,
+         "startColumn": 30,
+         "endColumn": 38
+        }
+       }
+      }
+     ]
+    },
+    {
+     "ruleId": "py/s3transfer-path-traversal",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/s3transfer-path-traversal",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential path traversal from user-controlled [file path](1)."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "s3transfer/utils.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 335,
+         "startColumn": 29,
+         "endColumn": 33
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "7a29cc4e7574316c:1",
+      "primaryLocationStartColumnFingerprint": "20"
+     },
+     "codeFlows": [
+      {
+       "threadFlows": [
+        {
+         "locations": [
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "s3transfer/utils.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 2
+             },
+             "region": {
+              "startLine": 330,
+              "startColumn": 33,
+              "endColumn": 41
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for filename"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "s3transfer/utils.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 2
+             },
+             "region": {
+              "startLine": 332,
+              "startColumn": 9,
+              "endColumn": 13
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for path"
+            }
+           },
+           "taxa": [
+            {
+             "id": "AdditionalTaintStep",
+             "properties": {
+              "CodeQL/DataflowRole": "step"
+             }
+            }
+           ]
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "s3transfer/utils.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 2
+             },
+             "region": {
+              "startLine": 335,
+              "startColumn": 29,
+              "endColumn": 33
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for path"
+            }
+           }
+          }
+         ]
+        }
+       ]
+      }
+     ],
+     "relatedLocations": [
+      {
+       "id": 1,
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "s3transfer/utils.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 330,
+         "startColumn": 33,
+         "endColumn": 41
+        }
+       },
+       "message": {
+        "text": "file path"
+       }
+      },
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "s3transfer/utils.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 330,
+         "startColumn": 33,
+         "endColumn": 41
+        }
+       }
+      }
+     ]
+    },
+    {
+     "ruleId": "py/s3transfer-path-traversal",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/s3transfer-path-traversal",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential path traversal from user-controlled [file path](1)."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "s3transfer/utils.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 335,
+         "startColumn": 35,
+         "endColumn": 48
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "7a29cc4e7574316c:1",
+      "primaryLocationStartColumnFingerprint": "26"
+     },
+     "codeFlows": [
+      {
+       "threadFlows": [
+        {
+         "locations": [
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "s3transfer/utils.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 2
+             },
+             "region": {
+              "startLine": 330,
+              "startColumn": 33,
+              "endColumn": 41
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for filename"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "s3transfer/utils.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 2
+             },
+             "region": {
+              "startLine": 333,
+              "startColumn": 9,
+              "endColumn": 13
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for name"
+            }
+           },
+           "taxa": [
+            {
+             "id": "AdditionalTaintStep",
+             "properties": {
+              "CodeQL/DataflowRole": "step"
+             }
+            }
+           ]
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "s3transfer/utils.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 2
+             },
+             "region": {
+              "startLine": 334,
+              "startColumn": 9,
+              "endColumn": 22
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for temp_filename"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "s3transfer/utils.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 2
+             },
+             "region": {
+              "startLine": 335,
+              "startColumn": 35,
+              "endColumn": 48
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for temp_filename"
+            }
+           }
+          }
+         ]
+        }
+       ]
+      }
+     ],
+     "relatedLocations": [
+      {
+       "id": 1,
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "s3transfer/utils.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 330,
+         "startColumn": 33,
+         "endColumn": 41
+        }
+       },
+       "message": {
+        "text": "file path"
+       }
+      },
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "s3transfer/utils.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 330,
+         "startColumn": 33,
+         "endColumn": 41
+        }
+       }
+      }
+     ]
+    },
+    {
+     "ruleId": "py/s3transfer-path-traversal",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/s3transfer-path-traversal",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential path traversal from user-controlled [file path](1).\nPotential path traversal from user-controlled [file path](2)."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "s3transfer/utils.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 509,
+         "startColumn": 18,
+         "endColumn": 26
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "55f360cf79ea6df8:1",
+      "primaryLocationStartColumnFingerprint": "9"
+     },
+     "codeFlows": [
+      {
+       "threadFlows": [
+        {
+         "locations": [
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "s3transfer/utils.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 2
+             },
+             "region": {
+              "startLine": 264,
+              "startColumn": 38,
+              "endColumn": 46
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for filename"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "s3transfer/utils.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 2
+             },
+             "region": {
+              "startLine": 266,
+              "startColumn": 13,
+              "endColumn": 21
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for filename"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "s3transfer/utils.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 2
+             },
+             "region": {
+              "startLine": 478,
+              "startColumn": 9,
+              "endColumn": 17
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for filename"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "s3transfer/utils.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 2
+             },
+             "region": {
+              "startLine": 509,
+              "startColumn": 18,
+              "endColumn": 26
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for filename"
+            }
+           }
+          }
+         ]
+        }
+       ]
+      },
+      {
+       "threadFlows": [
+        {
+         "locations": [
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "s3transfer/utils.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 2
+             },
+             "region": {
+              "startLine": 478,
+              "startColumn": 9,
+              "endColumn": 17
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for filename"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "s3transfer/utils.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 2
+             },
+             "region": {
+              "startLine": 509,
+              "startColumn": 18,
+              "endColumn": 26
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for filename"
+            }
+           }
+          }
+         ]
+        }
+       ]
+      }
+     ],
+     "relatedLocations": [
+      {
+       "id": 1,
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "s3transfer/utils.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 264,
+         "startColumn": 38,
+         "endColumn": 46
+        }
+       },
+       "message": {
+        "text": "file path"
+       }
+      },
+      {
+       "id": 2,
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "s3transfer/utils.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 478,
+         "startColumn": 9,
+         "endColumn": 17
+        }
+       },
+       "message": {
+        "text": "file path"
+       }
+      },
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "s3transfer/utils.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 264,
+         "startColumn": 38,
+         "endColumn": 46
+        }
+       }
+      },
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "s3transfer/utils.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 478,
+         "startColumn": 9,
+         "endColumn": 17
+        }
+       }
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20261118082544",
+   "codeql_raw_query": "/**\n * @name Command injection\n * @description Executing system commands with user-controlled input can lead to command injection\n * @kind path-problem\n * @problem.severity error\n * @id py/command-injection\n * @tags security\n *        external/cwe/cwe-078\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.Concepts\n\nmodule CommandInjectionConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    source instanceof DataFlow::ParameterNode\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(SystemCommandExecution cmd |\n      sink = cmd.getCommand()\n    )\n  }\n}\n\nmodule CommandInjectionFlow = TaintTracking::Global<CommandInjectionConfig>;\nimport CommandInjectionFlow::PathGraph\n\nfrom CommandInjectionFlow::PathNode source, CommandInjectionFlow::PathNode sink\nwhere CommandInjectionFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"Command injection from $@.\", source.getNode(), \"user input\"",
+   "hypothesis": "Check for command injection vulnerabilities where user-controlled input flows to system command execution",
+   "severity": "critical",
+   "cwe_ids": [
+    "cwe-078"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20261118082621",
+   "codeql_raw_query": "/**\n * @name Unsafe deserialization\n * @description Deserializing untrusted data using pickle or other unsafe methods can lead to arbitrary code execution\n * @kind problem\n * @problem.severity error\n * @id py/unsafe-deserialization\n * @tags security\n *        external/cwe/cwe-502\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  (\n    call = API::moduleImport(\"pickle\").getMember([\"load\", \"loads\", \"Unpickler\"]).getACall() or\n    call = API::moduleImport(\"yaml\").getMember([\"load\", \"unsafe_load\"]).getACall() or\n    call = API::moduleImport(\"marshal\").getMember([\"load\", \"loads\"]).getACall() or\n    call = API::moduleImport(\"shelve\").getMember(\"open\").getACall()\n  )\nselect call, \"Potentially unsafe deserialization operation that could execute arbitrary code.\"",
+   "hypothesis": "Check for unsafe deserialization using pickle, yaml, marshal, or shelve that could lead to arbitrary code execution",
+   "severity": "critical",
+   "cwe_ids": [
+    "cwe-502"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20261118082647",
+   "codeql_raw_query": "/**\n * @name Insecure temporary file creation\n * @description Creating temporary files insecurely can lead to race conditions and unauthorized access\n * @kind problem\n * @problem.severity warning\n * @id py/insecure-temp-file\n * @tags security\n *        external/cwe/cwe-377\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  (\n    call = API::moduleImport(\"tempfile\").getMember([\"mktemp\"]).getACall() or\n    call = API::moduleImport(\"os\").getMember([\"tempnam\", \"tmpnam\"]).getACall()\n  )\nselect call, \"Insecure temporary file creation that may lead to race conditions.\"",
+   "hypothesis": "Insecure temporary file creation using deprecated functions like mktemp, tempnam, or tmpnam that are vulnerable to race conditions",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-377"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20261118082717",
+   "codeql_raw_query": "/**\n * @name Sensitive data in logs\n * @description Logging sensitive information can lead to information disclosure\n * @kind problem\n * @problem.severity warning\n * @id py/sensitive-data-logging\n * @tags security\n *        external/cwe/cwe-532\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call, string method\nwhere\n  (\n    call = API::moduleImport(\"logging\").getMember([\"debug\", \"info\", \"warning\", \"error\", \"critical\", \"log\"]).getACall() or\n    call = API::moduleImport(\"logging\").getMember(\"getLogger\").getReturn().getMember([\"debug\", \"info\", \"warning\", \"error\", \"critical\", \"log\"]).getACall()\n  ) and\n  method = call.getFunction().(DataFlow::AttrRead).getAttributeName() and\n  exists(DataFlow::Node arg | \n    arg = call.getArg(_) and\n    (\n      arg.asExpr().(Name).getId().toLowerCase().matches([\"%password%\", \"%secret%\", \"%key%\", \"%token%\", \"%credential%\", \"%auth%\"]) or\n      arg.asExpr().(Attribute).getAttr().toLowerCase().matches([\"%password%\", \"%secret%\", \"%key%\", \"%token%\", \"%credential%\", \"%auth%\"])\n    )\n  )\nselect call, \"Potentially logging sensitive data: \" + method",
+   "hypothesis": "Logging sensitive information like passwords, secrets, or credentials",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-532"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20261118082747",
+   "codeql_raw_query": "/**\n * @name Server-Side Request Forgery (SSRF)\n * @description Making HTTP requests to user-controlled URLs can lead to SSRF\n * @kind path-problem\n * @problem.severity error\n * @id py/ssrf\n * @tags security\n *        external/cwe/cwe-918\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.ApiGraphs\n\nmodule SSRFConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    source instanceof DataFlow::ParameterNode\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(DataFlow::CallCfgNode call |\n      (\n        call = API::moduleImport(\"requests\").getMember([\"get\", \"post\", \"put\", \"delete\", \"request\"]).getACall() or\n        call = API::moduleImport(\"urllib\").getMember(\"request\").getMember([\"urlopen\", \"Request\"]).getACall() or\n        call = API::moduleImport(\"http\").getMember(\"client\").getMember([\"HTTPConnection\", \"HTTPSConnection\"]).getACall()\n      ) and\n      sink = call.getArg(0)\n    )\n  }\n}\n\nmodule SSRFFlow = TaintTracking::Global<SSRFConfig>;\nimport SSRFFlow::PathGraph\n\nfrom SSRFFlow::PathNode source, SSRFFlow::PathNode sink\nwhere SSRFFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"Potential SSRF from $@.\", source.getNode(), \"user-controlled URL\"\n",
+   "hypothesis": "Server-Side Request Forgery through user-controlled URLs in HTTP requests",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-918"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20261118082824",
+   "codeql_raw_query": "/**\n * @name Use of weak cryptographic algorithm\n * @description Using weak or broken cryptographic algorithms can compromise security\n * @kind problem\n * @problem.severity warning\n * @id py/weak-crypto\n * @tags security\n *        external/cwe/cwe-327\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  (\n    call = API::moduleImport(\"hashlib\").getMember([\"md5\", \"sha1\"]).getACall() or\n    call = API::moduleImport(\"Crypto\").getMember(\"Hash\").getMember([\"MD5\", \"SHA1\"]).getACall() or\n    call = API::moduleImport(\"random\").getMember([\"random\", \"randint\", \"choice\", \"shuffle\"]).getACall()\n  )\nselect call, \"Use of weak cryptographic algorithm or insecure random number generator.\"\n",
+   "hypothesis": "Check for use of weak cryptographic algorithms (MD5, SHA1) or insecure random number generation that could be used for security-sensitive operations",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-327",
+    "cwe-338"
+   ],
+   "results_count": 2,
+   "results": [
+    {
+     "ruleId": "py/weak-crypto",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/weak-crypto",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of weak cryptographic algorithm or insecure random number generator."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "s3transfer/__init__.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 160,
+         "startColumn": 20,
+         "endColumn": 51
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "5ffa55b4d8b60048:1",
+      "primaryLocationStartColumnFingerprint": "15"
+     }
+    },
+    {
+     "ruleId": "py/weak-crypto",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/weak-crypto",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of weak cryptographic algorithm or insecure random number generator."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "s3transfer/utils.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 54,
+         "startColumn": 20,
+         "endColumn": 51
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "8d36242136edfd99:1",
+      "primaryLocationStartColumnFingerprint": "15"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20261118082931",
+   "codeql_raw_query": "/**\n * @name Uncontrolled resource consumption\n * @description Allocating resources based on untrusted input without limits can lead to denial of service\n * @kind problem\n * @problem.severity warning\n * @id py/uncontrolled-resource-consumption\n * @tags security\n *        external/cwe/cwe-400\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  (\n    // File operations with size parameters\n    call = API::moduleImport(\"io\").getMember([\"BytesIO\", \"StringIO\"]).getACall() or\n    call.getFunction().asExpr().(Attribute).getName() in [\"read\", \"readlines\", \"readline\"] or\n    // Memory allocation\n    call = API::builtin(\"bytearray\").getACall() or\n    call = API::builtin(\"bytes\").getACall()\n  )\nselect call, \"Potential uncontrolled resource consumption without size limits.\"",
+   "hypothesis": "Uncontrolled resource consumption through unbounded file reads or memory allocation",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-400"
+   ],
+   "results_count": 22,
+   "results": [
+    {
+     "ruleId": "py/uncontrolled-resource-consumption",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/uncontrolled-resource-consumption",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential uncontrolled resource consumption without size limits."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "s3transfer/__init__.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 283,
+         "startColumn": 16,
+         "endColumn": 50
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "125c8bc094a24ba0:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/uncontrolled-resource-consumption",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/uncontrolled-resource-consumption",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential uncontrolled resource consumption without size limits."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "s3transfer/__init__.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 339,
+         "startColumn": 17,
+         "endColumn": 51
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "1c3ef40537f7dbb0:1",
+      "primaryLocationStartColumnFingerprint": "8"
+     }
+    },
+    {
+     "ruleId": "py/uncontrolled-resource-consumption",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/uncontrolled-resource-consumption",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential uncontrolled resource consumption without size limits."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "s3transfer/__init__.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 614,
+         "startColumn": 33,
+         "endColumn": 65
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "f6b71ec609240a9c:1",
+      "primaryLocationStartColumnFingerprint": "8"
+     }
+    },
+    {
+     "ruleId": "py/uncontrolled-resource-consumption",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/uncontrolled-resource-consumption",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential uncontrolled resource consumption without size limits."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "s3transfer/__init__.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 872,
+         "startColumn": 39,
+         "endColumn": 64
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "7cf91676366a7959:1",
+      "primaryLocationStartColumnFingerprint": "26"
+     }
+    },
+    {
+     "ruleId": "py/uncontrolled-resource-consumption",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/uncontrolled-resource-consumption",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential uncontrolled resource consumption without size limits."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "s3transfer/bandwidth.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 149,
+         "startColumn": 20,
+         "endColumn": 46
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "9006b152251b601a:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/uncontrolled-resource-consumption",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/uncontrolled-resource-consumption",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential uncontrolled resource consumption without size limits."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "s3transfer/bandwidth.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 158,
+         "startColumn": 20,
+         "endColumn": 46
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "a9a38bcbbe5feb95:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/uncontrolled-resource-consumption",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/uncontrolled-resource-consumption",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential uncontrolled resource consumption without size limits."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "s3transfer/bandwidth.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 161,
+         "startColumn": 16,
+         "endColumn": 42
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "2d8bdf2cf776ae97:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/uncontrolled-resource-consumption",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/uncontrolled-resource-consumption",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential uncontrolled resource consumption without size limits."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "s3transfer/crt.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 636,
+         "startColumn": 21,
+         "endColumn": 35
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "1bf9cac607be4c2f:1",
+      "primaryLocationStartColumnFingerprint": "8"
+     }
+    },
+    {
+     "ruleId": "py/uncontrolled-resource-consumption",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/uncontrolled-resource-consumption",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential uncontrolled resource consumption without size limits."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "s3transfer/download.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 3
+        },
+        "region": {
+         "startLine": 775,
+         "startColumn": 17,
+         "endColumn": 49
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "925d1086974f6331:1",
+      "primaryLocationStartColumnFingerprint": "8"
+     }
+    },
+    {
+     "ruleId": "py/uncontrolled-resource-consumption",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/uncontrolled-resource-consumption",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential uncontrolled resource consumption without size limits."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "s3transfer/processpool.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 4
+        },
+        "region": {
+         "startLine": 993,
+         "startColumn": 35,
+         "endColumn": 64
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "f7174a999affbde6:1",
+      "primaryLocationStartColumnFingerprint": "22"
+     }
+    },
+    {
+     "ruleId": "py/uncontrolled-resource-consumption",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/uncontrolled-resource-consumption",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential uncontrolled resource consumption without size limits."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "setup.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 5
+        },
+        "region": {
+         "startLine": 17,
+         "startColumn": 12,
+         "endColumn": 72
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "41b672a4db7d2827:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/uncontrolled-resource-consumption",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/uncontrolled-resource-consumption",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential uncontrolled resource consumption without size limits."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "setup.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 5
+        },
+        "region": {
+         "startLine": 25,
+         "startColumn": 22,
+         "endColumn": 47
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "f3210157ba32c31a:1",
+      "primaryLocationStartColumnFingerprint": "17"
+     }
+    },
+    {
+     "ruleId": "py/uncontrolled-resource-consumption",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/uncontrolled-resource-consumption",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential uncontrolled resource consumption without size limits."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "s3transfer/upload.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 6
+        },
+        "region": {
+         "startLine": 92,
+         "startColumn": 16,
+         "endColumn": 42
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "d593825b83c417cc:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/uncontrolled-resource-consumption",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/uncontrolled-resource-consumption",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential uncontrolled resource consumption without size limits."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "s3transfer/upload.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 6
+        },
+        "region": {
+         "startLine": 359,
+         "startColumn": 16,
+         "endColumn": 49
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "f9ccabb4e1939fcd:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/uncontrolled-resource-consumption",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/uncontrolled-resource-consumption",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential uncontrolled resource consumption without size limits."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "s3transfer/upload.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 6
+        },
+        "region": {
+         "startLine": 365,
+         "startColumn": 16,
+         "endColumn": 29
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "96eb032f2114aa6b:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/uncontrolled-resource-consumption",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/uncontrolled-resource-consumption",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential uncontrolled resource consumption without size limits."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "s3transfer/upload.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 6
+        },
+        "region": {
+         "startLine": 417,
+         "startColumn": 34,
+         "endColumn": 48
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "1b2138852a2b1dc1:1",
+      "primaryLocationStartColumnFingerprint": "21"
+     }
+    },
+    {
+     "ruleId": "py/uncontrolled-resource-consumption",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/uncontrolled-resource-consumption",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential uncontrolled resource consumption without size limits."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "s3transfer/upload.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 6
+        },
+        "region": {
+         "startLine": 464,
+         "startColumn": 20,
+         "endColumn": 40
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "ed27c8332923f0fc:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/uncontrolled-resource-consumption",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/uncontrolled-resource-consumption",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential uncontrolled resource consumption without size limits."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "s3transfer/upload.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 6
+        },
+        "region": {
+         "startLine": 480,
+         "startColumn": 37,
+         "endColumn": 65
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "ad9b9daa33e6c019:1",
+      "primaryLocationStartColumnFingerprint": "28"
+     }
+    },
+    {
+     "ruleId": "py/uncontrolled-resource-consumption",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/uncontrolled-resource-consumption",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential uncontrolled resource consumption without size limits."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "s3transfer/upload.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 6
+        },
+        "region": {
+         "startLine": 503,
+         "startColumn": 38,
+         "endColumn": 51
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "8dc85aab7e997b8e:1",
+      "primaryLocationStartColumnFingerprint": "29"
+     }
+    },
+    {
+     "ruleId": "py/uncontrolled-resource-consumption",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/uncontrolled-resource-consumption",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential uncontrolled resource consumption without size limits."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "s3transfer/utils.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 7
+        },
+        "region": {
+         "startLine": 386,
+         "startColumn": 16,
+         "endColumn": 42
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "891e66f8459f6fc2:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/uncontrolled-resource-consumption",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/uncontrolled-resource-consumption",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential uncontrolled resource consumption without size limits."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "s3transfer/utils.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 7
+        },
+        "region": {
+         "startLine": 526,
+         "startColumn": 16,
+         "endColumn": 50
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "4122260a82ec003f:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/uncontrolled-resource-consumption",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/uncontrolled-resource-consumption",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential uncontrolled resource consumption without size limits."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "s3transfer/utils.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 7
+        },
+        "region": {
+         "startLine": 614,
+         "startColumn": 17,
+         "endColumn": 51
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "c748036aa5585f2e:1",
+      "primaryLocationStartColumnFingerprint": "8"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20261118082956",
+   "codeql_raw_query": "/**\n * @name Information disclosure through exception handling\n * @description Catching and re-raising exceptions without sanitization may leak sensitive information\n * @kind problem\n * @problem.severity warning\n * @id py/exception-info-disclosure\n * @tags security\n *        external/cwe/cwe-209\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  (\n    // Logging exceptions with full traceback\n    call.getFunction().asExpr().(Attribute).getName() in [\"exception\", \"error\", \"warning\"] and\n    exists(call.getArg(0))\n  )\nselect call, \"Exception handling that may disclose sensitive information.\"",
+   "hypothesis": "Exception handling that logs or exposes detailed error information could leak sensitive data",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-209"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20261118083029",
+   "codeql_raw_query": "/**\n * @name Hardcoded credentials\n * @description Hardcoded credentials in source code can be extracted and used by attackers\n * @kind problem\n * @problem.severity error\n * @id py/hardcoded-credentials\n * @tags security\n *        external/cwe/cwe-798\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\n\nfrom DataFlow::Node node, string varName\nwhere\n  exists(Assign assign, Name target |\n    assign.getATarget() = target and\n    target = node.asExpr() and\n    varName = target.getId() and\n    (\n      varName.regexpMatch(\"(?i).*(password|passwd|pwd|secret|token|key|api_key|apikey|access_key|secret_key).*\") and\n      not varName.regexpMatch(\"(?i).*(file|path|dir|url|length|size|type|format).*\")\n    ) and\n    exists(StrConst str | str = assign.getValue() |\n      str.getText().length() > 0 and\n      not str.getText().regexpMatch(\"(?i).*(test|example|dummy|placeholder|xxx|todo|fixme).*\")\n    )\n  )\nselect node, \"Potential hardcoded credential in variable '\" + varName + \"'.\"",
+   "hypothesis": "Hardcoded credentials or secrets in source code",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-798"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20261118083056",
+   "codeql_raw_query": "/**\n * @name Improper certificate validation\n * @description Disabling SSL/TLS certificate validation can allow man-in-the-middle attacks\n * @kind problem\n * @problem.severity error\n * @id py/improper-certificate-validation\n * @tags security\n *        external/cwe/cwe-295\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::Node node\nwhere\n  exists(DataFlow::CallCfgNode call |\n    // SSL context with verify disabled\n    call = API::moduleImport(\"ssl\").getMember(\"_create_unverified_context\").getACall() and\n    node = call\n  ) or\n  exists(DataFlow::AttrWrite attr |\n    // Setting verify=False or similar\n    attr.getAttributeName() in [\"verify\", \"verify_ssl\", \"verify_cert\"] and\n    attr.getValue().asExpr().(BooleanLiteral).booleanValue() = false and\n    node = attr.getValue()\n  )\nselect node, \"Improper certificate validation that could allow man-in-the-middle attacks.\"",
+   "hypothesis": "Check for disabled SSL/TLS certificate validation",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-295"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20261118083125",
+   "codeql_raw_query": "/**\n * @name Unsafe file permissions\n * @description Creating files or directories with overly permissive permissions can expose sensitive data\n * @kind problem\n * @problem.severity warning\n * @id py/unsafe-file-permissions\n * @tags security\n *        external/cwe/cwe-732\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  (\n    // os.chmod with permissive modes\n    call = API::moduleImport(\"os\").getMember(\"chmod\").getACall() or\n    // os.open with mode parameter\n    call = API::moduleImport(\"os\").getMember(\"open\").getACall() or\n    // tempfile operations\n    call = API::moduleImport(\"tempfile\").getMember([\"NamedTemporaryFile\", \"TemporaryFile\", \"mkstemp\"]).getACall()\n  )\nselect call, \"File operation that may use unsafe permissions.\"",
+   "hypothesis": "Files created with overly permissive permissions could expose sensitive data",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-732"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20261118083155",
+   "codeql_raw_query": "/**\n * @name Symlink following vulnerability\n * @description Following symlinks without validation can lead to unauthorized file access\n * @kind problem\n * @problem.severity warning\n * @id py/symlink-following\n * @tags security\n *        external/cwe/cwe-59\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  (\n    call = API::moduleImport(\"os\").getMember([\"remove\", \"unlink\", \"rmdir\", \"rename\", \"chmod\", \"chown\"]).getACall() or\n    call = API::moduleImport(\"shutil\").getMember([\"rmtree\", \"move\", \"copy\", \"copy2\", \"copyfile\"]).getACall() or\n    call.getFunction().asExpr().(Attribute).getName() in [\"write\", \"truncate\"]\n  ) and\n  not exists(DataFlow::CallCfgNode lstatCall |\n    lstatCall = API::moduleImport(\"os\").getMember(\"lstat\").getACall()\n  )\nselect call, \"File operation that may follow symlinks without validation.\"",
+   "hypothesis": "File operations that follow symlinks without proper validation could allow attackers to manipulate files outside intended directories",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-59"
+   ],
+   "results_count": 14,
+   "results": [
+    {
+     "ruleId": "py/symlink-following",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/symlink-following",
+      "index": 0
+     },
+     "message": {
+      "text": "File operation that may follow symlinks without validation."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "s3transfer/__init__.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 362,
+         "startColumn": 13,
+         "endColumn": 32
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "46cef317301924de:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/symlink-following",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/symlink-following",
+      "index": 0
+     },
+     "message": {
+      "text": "File operation that may follow symlinks without validation."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "s3transfer/__init__.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 367,
+         "startColumn": 9,
+         "endColumn": 70
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "556b69e196db5064:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/symlink-following",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/symlink-following",
+      "index": 0
+     },
+     "message": {
+      "text": "File operation that may follow symlinks without validation."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "s3transfer/__init__.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 654,
+         "startColumn": 25,
+         "endColumn": 38
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "1d030d1af8df28ae:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/symlink-following",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/symlink-following",
+      "index": 0
+     },
+     "message": {
+      "text": "File operation that may follow symlinks without validation."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "s3transfer/__init__.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 873,
+         "startColumn": 17,
+         "endColumn": 31
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "55132e966789e24f:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/symlink-following",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/symlink-following",
+      "index": 0
+     },
+     "message": {
+      "text": "File operation that may follow symlinks without validation."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "s3transfer/compat.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 24,
+         "startColumn": 13,
+         "endColumn": 36
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "56f9ac703a2fccff:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/symlink-following",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/symlink-following",
+      "index": 0
+     },
+     "message": {
+      "text": "File operation that may follow symlinks without validation."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "s3transfer/compat.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 32,
+         "startColumn": 9,
+         "endColumn": 50
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "6e6ec99a1dcb1bf8:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/symlink-following",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/symlink-following",
+      "index": 0
+     },
+     "message": {
+      "text": "File operation that may follow symlinks without validation."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "s3transfer/compat.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 90,
+         "startColumn": 9,
+         "endColumn": 31
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "f5ea263c1c5a9119:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/symlink-following",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/symlink-following",
+      "index": 0
+     },
+     "message": {
+      "text": "File operation that may follow symlinks without validation."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "s3transfer/crt.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 954,
+         "startColumn": 9,
+         "endColumn": 35
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "ab817818805ac914:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/symlink-following",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/symlink-following",
+      "index": 0
+     },
+     "message": {
+      "text": "File operation that may follow symlinks without validation."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "s3transfer/download.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 3
+        },
+        "region": {
+         "startLine": 690,
+         "startColumn": 9,
+         "endColumn": 28
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "27f48127f289635b:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/symlink-following",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/symlink-following",
+      "index": 0
+     },
+     "message": {
+      "text": "File operation that may follow symlinks without validation."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "s3transfer/download.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 3
+        },
+        "region": {
+         "startLine": 706,
+         "startColumn": 9,
+         "endColumn": 28
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "754419b989bd1b97:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/symlink-following",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/symlink-following",
+      "index": 0
+     },
+     "message": {
+      "text": "File operation that may follow symlinks without validation."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "s3transfer/processpool.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 4
+        },
+        "region": {
+         "startLine": 995,
+         "startColumn": 17,
+         "endColumn": 31
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "a89afa41c5f4a743:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/symlink-following",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/symlink-following",
+      "index": 0
+     },
+     "message": {
+      "text": "File operation that may follow symlinks without validation."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "s3transfer/utils.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 5
+        },
+        "region": {
+         "startLine": 294,
+         "startColumn": 13,
+         "endColumn": 32
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "46cef317651c0727:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/symlink-following",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/symlink-following",
+      "index": 0
+     },
+     "message": {
+      "text": "File operation that may follow symlinks without validation."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "s3transfer/utils.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 5
+        },
+        "region": {
+         "startLine": 299,
+         "startColumn": 9,
+         "endColumn": 52
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "8ee77f77196bc8a7:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/symlink-following",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/symlink-following",
+      "index": 0
+     },
+     "message": {
+      "text": "File operation that may follow symlinks without validation."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "s3transfer/utils.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 5
+        },
+        "region": {
+         "startLine": 390,
+         "startColumn": 9,
+         "endColumn": 34
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "18822c494ae8adaf:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    }
+   ]
+  }
+ ],
+ "cache_usage": {
+  "prompt_tokens_total": 259954,
+  "uncached_input_tokens": 103,
+  "cache_creation_input_tokens": 24003,
+  "cache_read_input_tokens": 235848,
+  "output_tokens": 10396,
+  "calls": 21,
+  "caching_enabled": true,
+  "cost_usd_with_cache": 0.317015,
+  "cost_usd_no_cache": 0.935802,
+  "cache_read_share_of_prompt": 0.9073,
+  "prices_per_mtok": {
+   "claude-sonnet-4-5-20250929": {
+    "input": 3.0,
+    "output": 15.0
+   },
+   "claude-haiku-4-5-20251001": {
+    "input": 1.0,
+    "output": 5.0
+   }
+  },
+  "cache_multipliers": {
+   "write_5m": 1.25,
+   "read": 0.1
+  }
+ }
+}

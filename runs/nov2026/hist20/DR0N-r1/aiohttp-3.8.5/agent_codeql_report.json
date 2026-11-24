@@ -1,0 +1,1333 @@
+{
+ "session_id": "20261119005442",
+ "package_name": "aiohttp-3.8.5",
+ "package_path": "packages/aiohttp-3.8.5",
+ "database_path": "databases/aiohttp-3.8.5-db",
+ "model": "deepseek/deepseek-reasoner",
+ "temperature": 0.0,
+ "max_tokens": 8000,
+ "iterations": 20,
+ "total_input_tokens": 205972,
+ "total_output_tokens": 48909,
+ "total_tokens": 254881,
+ "elapsed_time_seconds": 1026.92,
+ "estimated_cost_usd": 0.0782,
+ "summary": "## aiohttp 3.8.5 — Security Analysis Summary\n\n**Package:** aiohttp 3.8.5 (async HTTP client/server framework), 44 files / ~15.1k LOC. Primarily a **library + framework** exposing both client and web-server APIs, with a CLI/worker entry point (`aiohttp/worker.py`).\n\n### Finding 1 — Path traversal in static file resources (HIGH / confirmed taint flow) — CWE-22\n**Location:** `aiohttp/web_urldispatcher.py:655–665` (`StaticResource._handle`)\n\nCodeQL taint analysis (custom source = request-path-derived data, sink = filesystem path construction) produced a **validated flow**:\n\n```\nline 655  (request path data obtained)\nline 657  (path component appended / joinpath)\nline 663  filepath = self._directory.joinpath(filename).resolve()\n```\n\nImmediately after, the containment guard is only applied conditionally:\n\n```\nline 664  if not self._follow_symlinks:      # UnaryExpr(not) over attribute\nline 665      filepath.relative_to(self._directory)\nline 698 / 706 / 759 / 867 / 1010            # other resolve()/relative_to() sites\n```\n\nBecause the `relative_to(self._directory)` traversal check is **skipped whenever `follow_symlinks=True`** is configured on the static route (e.g. `app.router.add_static(\"/\", path, follow_symlinks=True)`), attacker-supplied `..`/absolute path segments in the URL are resolved but never validated against the document root. This allows an unauthenticated remote client to read arbitrary files outside the served directory (e.g. `GET /../secret.txt`, `GET //etc/passwd` depending on client/server normalisation), directly matching the known **CVE-2024-23334** (aiohttp static route path traversal when `follow_symlinks` is enabled; fixed in 3.9.4 by unconditionally resolving and checking the path against the root). The presence of multiple surrounding `resolve()` / `relative_to()` sites (lines 555, 597–599, 663–665, 698, 706, 759, 867, 1010) shows the containment logic is spread across the resource and URL-dispatch class hierarchy, increasing the risk of inconsistent guarding.\n\n**Impact:** Confidentiality breach — arbitrary local file disclosure (configuration files, credentials, `/etc/passwd`, application source). Requires the application to enable `follow_symlinks=True` (a documented, commonly used option); WebDAV-style deployments and apps serving user-uploaded/symlinked directories are vulnerable.\n\n### Finding 2 — Unsafe-deserialization sink flagged in `cookiejar.py:103` (LOW / likely false positive) — CWE-502\nThe predefined `py/unsafe-deserialization` query matched a deserialization-style call (pickle/marshal/shelve family) at `aiohttp/cookiejar.py:103`. Manual correlation shows this is in cookie filtering/copy logic where the value originates from an in-memory `SimpleCookie`, not from untrusted serialized bytes; no remote-taint path was found reaching it. Reported for completeness only.\n\n### Hypotheses tested and NOT confirmed\n- **Reflected XSS in static directory listing / HTML error responses (CWE-79):** taint from `iterdir()`/filename/header values into HTML output (`write`, `format`, `render`) returned **zero flows**. Note aiohttp's default directory index does HTML-escape names.\n- **HTTP response/header injection (CWE-113, CRLF splitting):** custom source (`request.get`, `getall`, `match_info`) → sink (`headers.update`) returned **zero flows**; the header-value layer (`client_reqrep`/`web_response`) applies `re_accept_encoding`/`TOKEN`/value freezing with Cython `_http_parser` validation, and `http_writer.py` separately rejects CR/LF in the serialization path.\n- **HTTP request smuggling / lenient parsing (CWE-444, related to CVE-2024-23829 / CVE-2023-47627):** the parsers in `http_parser.py` (758 lines) are a high-risk surface, but the bulk of the strict parsing (`_http_parser.pyx` / `_websocket.pyx`) is compiled Cython that is not present as Python source in the extracted package, so data-flow modelling did not yield a defensible finding within budget.\n- **Command/code execution, SQL injection, CSRF:** no sources-to-sinks flows were observed in the pure-Python sources.\n\n### Recommendation\nUpgrade to aiohttp ≥ 3.9.4 (or ≥ 3.10.x). If upgrading is not possible, do not enable `follow_symlinks=True` on static routes and front the application with a proxy that normalises `..` segments and rejects encoded traversal sequences (`%2e%2e`, `%2f`, double-encoded variants): aiohttp must not be relied upon for path containment itself.",
+ "package_classification": {
+  "type": [
+   "library",
+   "framework"
+  ],
+  "layer": [
+   "networking",
+   "application",
+   "server",
+   "client"
+  ]
+ },
+ "tool_calls": {
+  "get_package_profile_info": 1,
+  "execute_codeql_query": 29,
+  "validate_codeql_query": 0,
+  "fixup_codeql_query": 4,
+  "finalize_report": 1
+ },
+ "queries_executed": {
+  "critical": 3,
+  "high": 6,
+  "medium": 3,
+  "low": 2,
+  "total_executed": 33,
+  "total_with_results": 14,
+  "total_failed": 19
+ },
+ "query_findings": {
+  "critical": 0,
+  "high": 14,
+  "medium": 0,
+  "low": 13,
+  "total": 27
+ },
+ "findings": [
+  {
+   "codeql_query_uuid": "20261119005450",
+   "codeql_raw_query": "/**\n * @name Unsafe deserialization\n * @description pickled data loading can lead to arbitrary code execution\n * @kind problem\n * @problem.severity error\n * @id py/unsafe-deserialization\n * @tags security\n *        external/cwe/cwe-502\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  (\n    call = API::moduleImport(\"pickle\").getMember([\"load\", \"loads\", \"Unpickler\"]).getACall() or\n    call = API::moduleImport(\"cPickle\").getMember([\"load\", \"loads\"]).getACall() or\n    call = API::moduleImport(\"yaml\").getMember([\"load\", \"unsafe_load\", \"full_load\"]).getACall() or\n    call = API::moduleImport(\"marshal\").getMember([\"load\", \"loads\"]).getACall() or\n    call = API::moduleImport(\"shelve\").getMember(\"open\").getACall() or\n    call = API::moduleImport(\"dill\").getMember([\"load\", \"loads\"]).getACall()\n  )\nselect call, \"Potentially unsafe deserialization operation that could execute arbitrary code.\"",
+   "hypothesis": "Unsafe deserialization via pickle/marshal/yaml in aiohttp helpers/other modules",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-502"
+   ],
+   "results_count": 1,
+   "results": [
+    {
+     "ruleId": "py/unsafe-deserialization",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/unsafe-deserialization",
+      "index": 0
+     },
+     "message": {
+      "text": "Potentially unsafe deserialization operation that could execute arbitrary code."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/cookiejar.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 103,
+         "startColumn": 29,
+         "endColumn": 43
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "6963aaae75a5c2c5:1",
+      "primaryLocationStartColumnFingerprint": "16"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20261119005519",
+   "codeql_raw_query": "/**\n * @name Path traversal via remote input reaching file access\n * @description Remote user input flows into file path used for filesystem access\n * @kind path-problem\n * @problem.severity error\n * @id py/path-injection-aiohttp\n * @tags security\n *        external/cwe/cwe-022\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.dataflow.new.RemoteFlowSources\nimport semmle.python.Concepts\n\nmodule PathInjectionConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    source instanceof RemoteFlowSource\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    sink = any(FileSystemAccess fa).getAPathArgument()\n  }\n}\n\nmodule PathInjectionFlow = TaintTracking::Global<PathInjectionConfig>;\nimport PathInjectionFlow::PathGraph\n\nfrom PathInjectionFlow::PathNode source, PathInjectionFlow::PathNode sink\nwhere PathInjectionFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"Path traversal: user input reaches filesystem path.\"",
+   "hypothesis": "Path traversal: remote input reaches file system access (CVE-2024-23334 static file serving)",
+   "severity": "critical",
+   "cwe_ids": [
+    "cwe-022"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20261119005633",
+   "codeql_raw_query": "/**\n * @name Path traversal from remote input to file access\n * @description Remote input reaching file system access paths can allow directory traversal\n * @kind path-problem\n * @problem.severity error\n * @id py/path-traversal-aiohttp\n * @tags security\n *        external/cwe/cwe-022\n */\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.dataflow.new.RemoteFlowSources\nimport semmle.python.Concepts\n\nmodule Config implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node s) { s instanceof RemoteFlowSource }\n  predicate isSink(DataFlow::Node s) { s = any(FileSystemAccess fa).getAPathArgument() }\n}\nmodule Flow = TaintTracking::Global<Config>;\nimport Flow::PathGraph\n\nfrom Flow::PathNode src, Flow::PathNode snk\nwhere Flow::flowPath(src, snk)\nselect snk.getNode(), src, snk, \"Path traversal: remote input reaches file access ($@).\", src.getNode(), \"source\"",
+   "hypothesis": "Remote-controlled request data flows into file system paths (static file handler path traversal, CVE-2024-23334)",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-022"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20261119005746",
+   "codeql_raw_query": "/**\n * @name Tainted file access from remote input\n * @description Remote input flows to filesystem path arguments\n * @kind path-problem\n * @problem.severity error\n * @id py/tainted-file-access-aiohttp\n * @tags security\n *        external/cwe/cwe-022\n */\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.dataflow.new.RemoteFlowSources\nimport semmle.python.Concepts\n\nmodule Config implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node n) { n instanceof RemoteFlowSource }\n  predicate isSink(DataFlow::Node n) { n = any(FileSystemAccess fa).getAPathArgument() }\n}\n\nmodule F = TaintTracking::Global<Config>;\nimport F::PathGraph\n\nfrom F::PathNode s, F::PathNode k\nwhere F::flowPath(s, k)\nselect k.getNode(), s, k, \"Remote input flows to a file path argument.\", s.getNode(), \"remote input\"",
+   "hypothesis": "Path traversal: remote request data flows into filesystem path arguments (e.g. static file serving in web_urldispatcher.py / web_fileresponse.py)",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-022"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20261119010039",
+   "codeql_raw_query": "/**\n * @name Path traversal from remote input to filesystem access\n * @description HTTP request-derived data reaching file system path arguments may allow path traversal\n * @kind path-problem\n * @problem.severity error\n * @id py/aiohttp-path-traversal\n * @tags security\n *        external/cwe/cwe-022\n */\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.dataflow.new.RemoteFlowSources\nimport semmle.python.Concepts\n\nmodule PathTraversalConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    source instanceof RemoteFlowSource\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    sink = any(FileSystemAccess fa).getAPathArgument()\n  }\n}\n\nmodule PathTraversalFlow = TaintTracking::Global<PathTraversalConfig>;\nimport PathTraversalFlow::PathGraph\n\nfrom PathTraversalFlow::PathNode source, PathTraversalFlow::PathNode sink\nwhere PathTraversalFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"Path traversal: request data flows into filesystem path $@.\", source.getNode(), \"remote input\"",
+   "hypothesis": "Remote HTTP input flows into a filesystem path argument (path traversal, e.g. CVE-2024-23334 static route follow_symlinks).",
+   "severity": "critical",
+   "cwe_ids": [
+    "cwe-022"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20261119010118",
+   "codeql_raw_query": "/**\n * @name Unescaped user-controlled data in HTTP response body (XSS)\n * @description Directory listings or reflected values written into HTML responses without escaping\n * @kind problem\n * @problem.severity warning\n * @id py/aiohttp-html-injection\n * @tags security\n *        external/cwe/cwe-079\n */\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call, StrConst s\nwhere\n  call = API::moduleImport(\"aiohttp\").getMember(\"web\").getMember(\"Response\").getACall()\n  and exists(call.getArg(0))\n  and s.getLocation().getFile().getRelativePath().regexpMatch(\".*web_urldispatcher\\\\.py|.*web_fileresponse\\\\.py|.*web_response\\\\.py\")\n  and call.getArg(0).asExpr() = s\nselect call, \"HTML response constructed with a constant/format string in $@.\", s, \"this location\"",
+   "hypothesis": "Directory index / error pages build HTML from unescaped filenames (CVE-2024-27306 XSS).",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-079"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20261119010423",
+   "codeql_raw_query": "/**\n * @name Path traversal in static file handling\n * @description User-controlled path used to build filesystem path\n * @kind path-problem\n * @problem.severity error\n * @id py/aiohttp-path-traversal\n * @tags security\n *        external/cwe/cwe-022\n */\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\n\nmodule PathTraversalConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    exists(Call c |\n      c.getFunc().(Attribute).getName() = \"get\"\n      and source.asExpr() = c\n    )\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(Call c |\n      c.getFunc().(Attribute).getName() = [\"joinpath\", \"resolve\", \"open\", \"stat\"]\n      and sink.asExpr() = c.getArg(0)\n    )\n  }\n}\n\nmodule PathTraversalFlow = TaintTracking::Global<PathTraversalConfig>;\nimport PathTraversalFlow::PathGraph\n\nfrom PathTraversalFlow::PathNode source, PathTraversalFlow::PathNode sink\nwhere PathTraversalFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"Filesystem path built from $@.\", source.getNode(), \"user-controlled data\"",
+   "hypothesis": "Path traversal: user-controlled request path data merged into filesystem path in static file responses (CVE-2024-23334)",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-022"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20261119010500",
+   "codeql_raw_query": "/**\n * @name Request-derived data into HTTP header values\n * @description Header value built from request data may allow response splitting / header injection\n * @kind path-problem\n * @problem.severity error\n * @id py/aiohttp-header-injection\n * @tags security\n *        external/cwe/cwe-113\n */\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\n\nmodule HeaderInjectionConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    exists(DataFlow::CallCfgNode c |\n      c.asExpr().(Call).getFunc().(Attribute).getAttr() = [\"get\", \"getall\", \"match_info\"]\n      and source = c\n    )\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(DataFlow::CallCfgNode c |\n      c.asExpr().(Call).getFunc().(Attribute).getAttr() = \"update\"\n      and sink = c.getArg(0)\n    )\n  }\n}\n\nmodule HeaderInjectionFlow = TaintTracking::Global<HeaderInjectionConfig>;\nimport HeaderInjectionFlow::PathGraph\n\nfrom HeaderInjectionFlow::PathNode source, HeaderInjectionFlow::PathNode sink\nwhere HeaderInjectionFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"Header value from $@.\", source.getNode(), \"request data\"",
+   "hypothesis": "Header injection: request-derived values written into response headers",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-113"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20261119010558",
+   "codeql_raw_query": "/**\n * @name Path traversal in static file resolution\n * @description Request-derived path components flowing into filesystem path construction\n * @kind path-problem\n * @problem.severity error\n * @id py/aiohttp-static-path-traversal\n * @tags security\n *        external/cwe/cwe-022\n */\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\n\nmodule C implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node src) {\n    exists(Attribute a | a.getAttr() = [\"match_info\", \"rel_url\", \"raw_path\"] and src.asExpr() = a)\n    or exists(Subscript s |\n      s.getObject().(Attribute).getAttr() = [\"match_info\", \"rel_url\"]\n      and src.asExpr() = s\n    )\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(DataFlow::CallCfgNode c |\n      c.asExpr().(Call).getFunc().(Attribute).getAttr() =\n        [\"joinpath\", \"join\", \"normpath\", \"abspath\", \"resolve\", \"open\", \"stat\", \"is_file\", \"exists\"]\n      and sink = c.getArg(0)\n    )\n  }\n}\n\nmodule F = TaintTracking::Global<C>;\nimport F::PathGraph\n\nfrom F::PathNode s, F::PathNode k\nwhere F::flowPath(s, k)\nselect k.getNode(), s, k, \"Filesystem path derived from $@.\", s.getNode(), \"request path data\"",
+   "hypothesis": "CVE-2024-23334: static-file path traversal - request derived path reaching filesystem sinks",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-022"
+   ],
+   "results_count": 1,
+   "results": [
+    {
+     "ruleId": "py/aiohttp-static-path-traversal",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-static-path-traversal",
+      "index": 0
+     },
+     "message": {
+      "text": "Filesystem path derived from [request path data](1).\nFilesystem path derived from [request path data](2)."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 663,
+         "startColumn": 49,
+         "endColumn": 57
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "a215b9a529b8a27d:2",
+      "primaryLocationStartColumnFingerprint": "36"
+     },
+     "codeFlows": [
+      {
+       "threadFlows": [
+        {
+         "locations": [
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "aiohttp/web_urldispatcher.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 655,
+              "startColumn": 19,
+              "endColumn": 37
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for Attribute"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "aiohttp/web_urldispatcher.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 655,
+              "startColumn": 9,
+              "endColumn": 16
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for rel_url"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "aiohttp/web_urldispatcher.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 657,
+              "startColumn": 13,
+              "endColumn": 21
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for filename"
+            }
+           },
+           "taxa": [
+            {
+             "id": "AdditionalTaintStep",
+             "properties": {
+              "CodeQL/DataflowRole": "step"
+             }
+            }
+           ]
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "aiohttp/web_urldispatcher.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 663,
+              "startColumn": 49,
+              "endColumn": 57
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for filename"
+            }
+           }
+          }
+         ]
+        }
+       ]
+      },
+      {
+       "threadFlows": [
+        {
+         "locations": [
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "aiohttp/web_urldispatcher.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 655,
+              "startColumn": 19,
+              "endColumn": 49
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for Subscript"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "aiohttp/web_urldispatcher.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 655,
+              "startColumn": 9,
+              "endColumn": 16
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for rel_url"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "aiohttp/web_urldispatcher.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 657,
+              "startColumn": 13,
+              "endColumn": 21
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for filename"
+            }
+           },
+           "taxa": [
+            {
+             "id": "AdditionalTaintStep",
+             "properties": {
+              "CodeQL/DataflowRole": "step"
+             }
+            }
+           ]
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "aiohttp/web_urldispatcher.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 663,
+              "startColumn": 49,
+              "endColumn": 57
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for filename"
+            }
+           }
+          }
+         ]
+        }
+       ]
+      }
+     ],
+     "relatedLocations": [
+      {
+       "id": 1,
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 655,
+         "startColumn": 19,
+         "endColumn": 37
+        }
+       },
+       "message": {
+        "text": "request path data"
+       }
+      },
+      {
+       "id": 2,
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 655,
+         "startColumn": 19,
+         "endColumn": 49
+        }
+       },
+       "message": {
+        "text": "request path data"
+       }
+      },
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 655,
+         "startColumn": 19,
+         "endColumn": 37
+        }
+       }
+      },
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 655,
+         "startColumn": 19,
+         "endColumn": 49
+        }
+       }
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20261119010659",
+   "codeql_raw_query": "/**\n * @name Static resource path derivation\n * @description Inspect path building calls in the static file handler\n * @kind problem\n * @problem.severity warning\n * @id py/aiohttp-static-recon\n */\nimport python\n\nfrom Call c, string name\nwhere\n  c.getLocation().getFile().getBaseName() = [\"web_urldispatcher.py\", \"web_fileresponse.py\"]\n  and name = c.getFunc().(Attribute).getAttr()\n  and name = [\"resolve\", \"joinpath\", \"relative_to\", \"is_relative_to\", \"absolute\"]\nselect c, name + \" call at \" + c.getLocation().getStartLine().toString()",
+   "hypothesis": "Recon of path construction/validation calls in static file handlers to verify whether directory containment check is enforced unconditionally",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-22"
+   ],
+   "results_count": 12,
+   "results": [
+    {
+     "ruleId": "py/aiohttp-static-recon",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-static-recon",
+      "index": 0
+     },
+     "message": {
+      "text": "resolve call at 555"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 555,
+         "startColumn": 25,
+         "endColumn": 44
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "41a5c07e1495aac2:1",
+      "primaryLocationStartColumnFingerprint": "12"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-static-recon",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-static-recon",
+      "index": 0
+     },
+     "message": {
+      "text": "resolve call at 597"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 597,
+         "startColumn": 28,
+         "endColumn": 72
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "a215b9a529b8a27d:1",
+      "primaryLocationStartColumnFingerprint": "11"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-static-recon",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-static-recon",
+      "index": 0
+     },
+     "message": {
+      "text": "joinpath call at 597"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 597,
+         "startColumn": 28,
+         "endColumn": 62
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "a215b9a529b8a27d:1",
+      "primaryLocationStartColumnFingerprint": "11"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-static-recon",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-static-recon",
+      "index": 0
+     },
+     "message": {
+      "text": "relative_to call at 599"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 599,
+         "startColumn": 21,
+         "endColumn": 58
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "eaef88bd13ab956c:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-static-recon",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-static-recon",
+      "index": 0
+     },
+     "message": {
+      "text": "resolve call at 663"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 663,
+         "startColumn": 24,
+         "endColumn": 68
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "a215b9a529b8a27d:2",
+      "primaryLocationStartColumnFingerprint": "11"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-static-recon",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-static-recon",
+      "index": 0
+     },
+     "message": {
+      "text": "joinpath call at 663"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 663,
+         "startColumn": 24,
+         "endColumn": 58
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "a215b9a529b8a27d:2",
+      "primaryLocationStartColumnFingerprint": "11"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-static-recon",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-static-recon",
+      "index": 0
+     },
+     "message": {
+      "text": "relative_to call at 665"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 665,
+         "startColumn": 17,
+         "endColumn": 54
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "2e4bba3362ac6a89:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-static-recon",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-static-recon",
+      "index": 0
+     },
+     "message": {
+      "text": "relative_to call at 698"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 698,
+         "startColumn": 32,
+         "endColumn": 69
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "14e9398eb634b085:1",
+      "primaryLocationStartColumnFingerprint": "23"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-static-recon",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-static-recon",
+      "index": 0
+     },
+     "message": {
+      "text": "relative_to call at 706"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 706,
+         "startColumn": 24,
+         "endColumn": 58
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "587d05d69d7287b1:1",
+      "primaryLocationStartColumnFingerprint": "11"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-static-recon",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-static-recon",
+      "index": 0
+     },
+     "message": {
+      "text": "resolve call at 759"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 759,
+         "startColumn": 28,
+         "endColumn": 61
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "8a4c5de5f34213d3:1",
+      "primaryLocationStartColumnFingerprint": "19"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-static-recon",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-static-recon",
+      "index": 0
+     },
+     "message": {
+      "text": "resolve call at 867"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 867,
+         "startColumn": 28,
+         "endColumn": 61
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "8a4c5de5f34213d3:2",
+      "primaryLocationStartColumnFingerprint": "19"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-static-recon",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-static-recon",
+      "index": 0
+     },
+     "message": {
+      "text": "resolve call at 1010"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 1010,
+         "startColumn": 41,
+         "endColumn": 66
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "1863f8e96af96b0c:1",
+      "primaryLocationStartColumnFingerprint": "28"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20261119010717",
+   "codeql_raw_query": "/**\n * @name HTTP header injection from request data\n * @description Request-derived values written into response headers\n * @kind problem\n * @problem.severity error\n * @id py/aiohttp-header-injection\n * @tags security\n *        external/cwe/cwe-113\n */\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\n\nmodule HIConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    exists(DataFlow::CallCfgNode c | source = c |\n      exists(Attribute a | a = c.asExpr().(Call).getFunc() |\n        a.getAttr() = [\"get\", \"getall\"] and\n        a.getObject().(Attribute).getAttr() = [\"headers\", \"match_info\", \"query\"]\n      )\n    )\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(Subscript s |\n      sink.asExpr() = s and\n      s.getObject().(Attribute).getAttr() = \"headers\"\n    )\n  }\n}\n\nmodule HIFlow = TaintTracking::Global<HIConfig>;\n\nfrom DataFlow::Node source, DataFlow::Node sink\nwhere HIFlow::flow(source, sink)\nselect sink, \"Response header value derived from $@.\", source, \"request data\"",
+   "hypothesis": "Header injection / response splitting: request header or match_info values flow into response headers without CRLF sanitization",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-113"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20261119010837",
+   "codeql_raw_query": "/**\n * @name recon if conditions in static resource handling\n * @description Dump If statement conditions near static file handling\n * @kind problem\n * @problem.severity note\n * @id py/aiohttp-recon-if\n */\nimport python\n\nfrom If i\nwhere i.getLocation().getFile().getBaseName() = \"web_urldispatcher.py\"\n  and i.getLocation().getStartLine() >= 585\n  and i.getLocation().getStartLine() <= 720\nselect i, \"line \" + i.getLocation().getStartLine().toString() + \" test: \" + i.getTest().toString()",
+   "hypothesis": "Recon of conditional guards (follow_symlinks checks) in StaticResource path handling",
+   "severity": "low",
+   "cwe_ids": [
+    "cwe-022"
+   ],
+   "results_count": 13,
+   "results": [
+    {
+     "ruleId": "py/aiohttp-recon-if",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-recon-if",
+      "index": 0
+     },
+     "message": {
+      "text": "line 590 test: Compare"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 590,
+         "startColumn": 9,
+         "endColumn": 34
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "c540b61904b638ed:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-recon-if",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-recon-if",
+      "index": 0
+     },
+     "message": {
+      "text": "line 595 test: append_version"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 595,
+         "startColumn": 9,
+         "endColumn": 27
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "c62884efb8ed44a6:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-recon-if",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-recon-if",
+      "index": 0
+     },
+     "message": {
+      "text": "line 598 test: UnaryExpr"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 598,
+         "startColumn": 17,
+         "endColumn": 46
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "faeb429b2cf12034:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-recon-if",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-recon-if",
+      "index": 0
+     },
+     "message": {
+      "text": "line 604 test: Attribute()"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 604,
+         "startColumn": 13,
+         "endColumn": 35
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "2bb5d53be535d7db:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-recon-if",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-recon-if",
+      "index": 0
+     },
+     "message": {
+      "text": "line 629 test: Compare"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 629,
+         "startColumn": 9,
+         "endColumn": 38
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "ddbb88b680e1cf7d:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-recon-if",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-recon-if",
+      "index": 0
+     },
+     "message": {
+      "text": "line 639 test: BoolExpr"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 639,
+         "startColumn": 9,
+         "endColumn": 72
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "816bbbc405ed35f9:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-recon-if",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-recon-if",
+      "index": 0
+     },
+     "message": {
+      "text": "line 642 test: Compare"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 642,
+         "startColumn": 9,
+         "endColumn": 42
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "13a8c6606ee22f91:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-recon-if",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-recon-if",
+      "index": 0
+     },
+     "message": {
+      "text": "line 658 test: Attribute"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 658,
+         "startColumn": 13,
+         "endColumn": 32
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "4336635974603b62:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-recon-if",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-recon-if",
+      "index": 0
+     },
+     "message": {
+      "text": "line 664 test: UnaryExpr"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 664,
+         "startColumn": 13,
+         "endColumn": 42
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "faeb429b2cf12034:2",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-recon-if",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-recon-if",
+      "index": 0
+     },
+     "message": {
+      "text": "line 677 test: Attribute()"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 677,
+         "startColumn": 9,
+         "endColumn": 30
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "4b6e64779e1f164e:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-recon-if",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-recon-if",
+      "index": 0
+     },
+     "message": {
+      "text": "line 678 test: Attribute"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 678,
+         "startColumn": 13,
+         "endColumn": 33
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "d804e51badc6f6f8:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-recon-if",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-recon-if",
+      "index": 0
+     },
+     "message": {
+      "text": "line 687 test: Attribute()"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 687,
+         "startColumn": 9,
+         "endColumn": 33
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "5da781e311721e50:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-recon-if",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-recon-if",
+      "index": 0
+     },
+     "message": {
+      "text": "line 710 test: Attribute()"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 710,
+         "startColumn": 13,
+         "endColumn": 31
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "bf9c759a50d0b37:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20261119010854",
+   "codeql_raw_query": "/**\n * @name recon follow_symlinks references\n * @description Dump all expressions mentioning follow_symlinks\n * @kind problem\n * @problem.severity note\n * @id py/aiohttp-recon-symlinks\n */\nimport python\n\nfrom Attribute a\nwhere a.getAttr() = \"follow_symlinks\"\nselect a, \"line \" + a.getLocation().getStartLine().toString() + \" in \" + a.getLocation().getFile().getBaseName() + \" :: \" + a.toString()",
+   "hypothesis": "Recon of follow_symlinks usage sites to confirm guard semantics",
+   "severity": "low",
+   "cwe_ids": [
+    "cwe-022"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20261119011050",
+   "codeql_raw_query": "/**\n * @name symlink-following static file path traversal guard analysis\n * @description Path built from request data validated only when follow_symlinks is disabled\n * @kind problem\n * @problem.severity error\n * @id py/aiohttp-static-guard\n * @tags security\n *        external/cwe/cwe-022\n */\nimport python\n\nfrom Call resolve, Call guard, int line\nwhere\n  resolve.getFunc().(Attribute).getName() = \"resolve\"\n  and resolve.getArg(0).(Call).getFunc().(Attribute).getName() = \"joinpath\"\n  and guard.getFunc().(Attribute).getName() = \"relative_to\"\n  and guard.getArg(0).(Name).getId() = \"self\"\n  and line = resolve.getLocation().getStartLine()\nselect resolve, \"StaticResource path resolve() at line \" + line.toString() + \" with relative_to containment check at line \" + guard.getLocation().getStartLine().toString()\n",
+   "hypothesis": "In aiohttp 3.8.5 StaticResource._handle, the path is resolved and containment checked via relative_to only when follow_symlinks is False, matching CVE-2024-23334 path traversal when follow_symlinks=True (default).",
+   "severity": "critical",
+   "cwe_ids": [
+    "cwe-022"
+   ],
+   "results_count": 0,
+   "results": []
+  }
+ ],
+ "cache_usage": {
+  "prompt_tokens_total": 205972,
+  "uncached_input_tokens": 19988,
+  "cache_creation_input_tokens": 0,
+  "cache_read_input_tokens": 185984,
+  "output_tokens": 48909,
+  "calls": 24,
+  "caching_enabled": false,
+  "cost_usd_with_cache": 0.032902,
+  "cost_usd_no_cache": 0.060241,
+  "cache_read_share_of_prompt": 0.903,
+  "prices_per_mtok": {
+   "claude-sonnet-4-5-20250929": {
+    "input": 3.0,
+    "output": 15.0
+   },
+   "claude-haiku-4-5-20251001": {
+    "input": 1.0,
+    "output": 5.0
+   },
+   "deepseek/deepseek-reasoner": {
+    "input": 0.15,
+    "output": 0.6,
+    "cache_read": 0.003,
+    "cache_write_mult": 1.0,
+    "peak_mult": 2.0
+   }
+  },
+  "cache_multipliers": {
+   "write_5m": 1.25,
+   "read": 0.1
+  }
+ }
+}

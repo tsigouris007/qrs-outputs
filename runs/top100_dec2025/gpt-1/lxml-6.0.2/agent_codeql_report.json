@@ -1,0 +1,680 @@
+{
+ "session_id": "20251225223502",
+ "package_name": "lxml-6.0.2",
+ "package_path": "packages/lxml-6.0.2",
+ "database_path": "databases/lxml-6.0.2-db",
+ "model": "gpt-5.1",
+ "temperature": 1.0,
+ "max_tokens": 8000,
+ "iterations": 11,
+ "total_input_tokens": 90934,
+ "total_output_tokens": 7320,
+ "total_tokens": 98254,
+ "elapsed_time_seconds": 370.91,
+ "estimated_cost_usd": 0.1869,
+ "summary": "Security analysis of the PyPI package **lxml 6.0.2** focused on Python-level code in `src/lxml`, tooling, and build scripts using CodeQL.\n\n### Package classification\n- **Type:** library\n- **Layer:** application/library (XML/HTML processing, parsing and utilities)\n\n---\n\n## Scope and methodology\n- Analyzed project profile (29 Python files; core code in `src/lxml/`, plus tools and build scripts).\n- Executed multiple CodeQL queries (both generic and lxml‑specific) focusing on:\n  - Command execution usage (CWE-78)\n  - XML/HTML parser construction and potential XXE risks (CWE-611)\n  - IO helpers dealing with files/URLs\n- Used refined CodeQL queries with API graph support to locate:\n  - Calls to `subprocess` and `os.system`/`os.popen`\n  - XML/HTML parser creation via lxml and stdlib XML APIs\n  - File/URL IO helpers inside lxml\n\nFindings below are limited to what appears in this source snapshot and do **not** cover native code in libxml2/libxslt or Cython modules (outside CodeQL’s Python analysis scope).\n\n---\n\n## Findings\n\n### 1. Subprocess/command execution usage in tooling (build/benchmark paths)\n- **CWE:** CWE-78 (OS Command Injection)\n- **Severity:** Low (tooling only; not used at runtime in library consumers)\n\n**What was found**\nA CodeQL query for subprocess/command execution found three call sites:\n1. `buildlibxml.py` around line **450**\n2. `benchmark/run_benchmarks.py` around line **50**\n3. `setupinfo.py` around lines **363–364**\n\nThese locations invoke operating system commands via `subprocess` (e.g., `Popen`, `call`, `check_call`, `check_output`, `run`) or `os.system`/`os.popen`.\n\nFrom the locations and file names, these calls are used for:\n- Building libxml2/libxslt or running configuration/build steps (`buildlibxml.py`, `setupinfo.py`).\n- Running internal performance benchmarks (`benchmark/run_benchmarks.py`).\n\n**Risk assessment**\n- These scripts are **not** part of the typical runtime of importing and using `lxml` as a library.\n- They are primarily executed by **developers** or in **controlled CI/build environments**, not directly exposed to untrusted user input.\n- No evidence (at the Python level) that untrusted, remotely controlled data is concatenated into command strings or passed directly as arguments.\n\nTherefore, this is **not an exploitable vulnerability** in standard library use, but:\n- The locations should still be treated as **security-sensitive** and reviewed when integrating into automated build environments where command parameters could be influenced by external data (e.g., environment variables or external configuration).\n\n**Mitigation / best practices**\n- Prefer `subprocess.run([...], check=True)` with a list of arguments over shell strings; use `shell=False` unless absolutely necessary.\n- If any part of the command might be influenced by environment/configuration, strictly validate or whitelist values.\n- Restrict execution of these scripts to trusted environments.\n\n---\n\n### 2. XML/HTML parser creation sites (potential XXE-sensitive operations)\n- **CWE:** CWE-611 (Improper Restriction of XML External Entity Reference)\n- **Severity:** Medium to High conceptually, but **context-dependent**; in this codebase they act as building blocks/tooling.\n\n**What was found**\nA specialized CodeQL query targeting XML/HTML parser creation (`py/lxml-xxe-parser-sources`) reported multiple locations where XML/HTML is parsed or parsers are instantiated. Key files:\n\n- `src/lxml/ElementInclude.py` at lines roughly **99** and **115**\n- `src/lxml/isoschematron/__init__.py` at lines **45–57**, **271**, etc.\n- `src/lxml/doctestcompare.py` at lines **68**, **95**, **99**, **187**, **192**\n- `tools/xpathgrep.py` at lines **143–145**\n\nA separate, more generic query looking for `lxml.etree.parse`/`fromstring` did not return additional callsites beyond those covered by the more targeted lxml‑specific query.\n\n**Interpretation**\n- These call sites are **expected** in a library like lxml, whose purpose is XML/HTML parsing and transformation.\n- CodeQL flags them because **if** they are used with untrusted input **without safe configuration**, they could contribute to XXE or related issues. However, whether there is a vulnerability critically depends on **how callers use these APIs**.\n- Within `lxml`’s own code:\n  - Many of these sites are used in **test/support code** (`doctestcompare.py`, `tools/xpathgrep.py`) or **specialized utilities** and are not typical user entry points.\n  - Element inclusion and Schematron helpers (`ElementInclude`, `isoschematron`) naturally operate on XML trees and may assume that the input is trusted or already sanitized.\n\n**Risk assessment**\n- At the **library consumer boundary** (user’s code calling into lxml), XXE and related attacks are a **well‑known risk** if consumers:\n  - Parse untrusted XML with default parsers that allow external entities or network access.\n  - Use helper utilities without restricting resolver behavior.\n- Within the **lxml package itself**, the identified parser construction locations are **not, by themselves, an exploitable issue** unless the surrounding code explicitly reads from attacker-controlled sources and enables entity/network access in unsafe ways. The current CodeQL results do not establish such a dangerous dataflow in this snapshot.\n\n**Mitigation / usage guidance for consumers**\nBecause this is a general risk pattern, the safest stance is to give usage guidance:\n- When parsing untrusted XML/HTML in your own code:\n  - Prefer `defusedxml.lxml` or equivalent hardened configurations if strong isolation is required.\n  - Use parsers with external entities and network access disabled explicitly where the API allows.\n  - Avoid passing attacker-controlled URIs or file paths into helpers that may fetch or include external documents.\n- For high‑risk environments, run parsing in a constrained context (e.g., separate process, limited network/filesystem access).\n\n**Conclusion**\n- The flagged sites represent **security-sensitive XML/HTML parsing** that must be used with care, but they are **not confirmed vulnerabilities** in lxml 6.0.2 itself based on the available Python code and CodeQL’s analysis.\n\n---\n\n### 3. File/URL IO helpers and path/URL usage\n- **CWE:** Related to CWE-22/CWE-73 (path traversal/file path manipulation) and CWE-918 (Server-Side Request Forgery) conceptually.\n- **Severity:** Low within this codebase; patterns are generic IO helpers.\n\n**What was found**\nA CodeQL query (`py/lxml-io-usage`) that focuses on file and URL IO returned multiple locations (query was intentionally broad and thus noisy). Sample matches include:\n- `src/lxml/ElementInclude.py` at lines around **97**, **118**, **120`**\n- `src/lxml/html/__init__.py` at around **1120**\n- `src/lxml/html/_diffcommand.py` at around **52**\n\nThese locations appear to involve:\n- Reading XML/HTML from files or URLs.\n- Convenience helpers for loading resources.\n\n**Risk assessment**\n- No dataflow evidence was found of untrusted remote input directly controlling filesystem paths or URLs inside lxml’s own code.\n- lxml’s IO helpers behave as expected: they open what they are told to open. Path traversal or SSRF risks arise **in callers** who pass unvalidated input into these helpers.\n\nThus, these are **not intrinsic vulnerabilities in lxml 6.0.2**, but:\n- They are **security-relevant API surfaces**: if application code feeds them unsafe paths/URLs, higher-level vulnerabilities may arise.\n\n**Mitigation / guidance for users**\n- Validate or constrain any user-supplied file paths (e.g., ensure paths remain under an expected directory, disallow `..` segments, prevent absolute paths where inappropriate).\n- Treat any helper that accepts a URL as potentially performing network IO; apply strict allowlists for domains/schemes when used with user-influenced values.\n\n---\n\n## Areas specifically checked where no issues were confirmed\n\n- **Arbitrary code execution via Python constructs** (e.g., `eval`, `exec`, `pickle.loads`, `marshal.loads`, dangerous `yaml.load`):\n  - Targeted CodeQL queries for unsafe deserialization and dynamic code execution did not yield findings in this snapshot.\n- **Command execution in core library code** (as opposed to tooling/build scripts):\n  - The only matches were in `buildlibxml.py`, `benchmark/run_benchmarks.py`, and `setupinfo.py`, not in the main `src/lxml` runtime path.\n- **Direct Python-on-Python injection sinks** (e.g., direct flows from remote input to `subprocess` or `os.system` in library code):\n  - No such flow was found within the Python portion of lxml 6.0.2.\n\nNote: Native code in linked libraries (libxml2/libxslt) and Cythonized modules is outside the direct reach of the Python CodeQL analysis used here, and known historical issues in those layers must be tracked via their own advisories.\n\n---\n\n## Overall assessment\n\n- **No new concrete vulnerabilities** (with proven exploitability in typical library usage) were identified in the Python sources of **lxml 6.0.2** through this CodeQL-based analysis.\n- Several **security-sensitive patterns** were identified:\n  - Command execution in build/benchmark tooling.\n  - XML/HTML parsing and IO helpers that must be used carefully with untrusted input.\n- These patterns are expected for a powerful XML/HTML processing library and are **not, on their own, vulnerabilities**, but they form the basis for higher-level issues when misused by applications.\n\nConsumers of lxml should:\n- Follow best practices for parsing untrusted XML/HTML (disable external entities/network access as appropriate or use hardened wrappers like `defusedxml`).\n- Treat any path/URL‑taking helper as sensitive and validate user-controlled inputs before passing them to lxml.\n\nFrom this CodeQL analysis, lxml 6.0.2’s Python layer appears **reasonably secure** when used as intended, with risks centered around how calling applications configure parsing and IO, rather than flaws in lxml’s own Python implementation.",
+ "package_classification": {
+  "type": "library",
+  "layer": [
+   "application",
+   "library"
+  ]
+ },
+ "tool_calls": {
+  "get_package_profile_info": 1,
+  "execute_codeql_query": 12,
+  "validate_codeql_query": 0,
+  "fixup_codeql_query": 3,
+  "finalize_report": 1
+ },
+ "queries_executed": {
+  "critical": 0,
+  "high": 2,
+  "medium": 4,
+  "low": 0,
+  "total_executed": 15,
+  "total_with_results": 6,
+  "total_failed": 6
+ },
+ "query_findings": {
+  "critical": 0,
+  "high": 18,
+  "medium": 0,
+  "low": 0,
+  "total": 18
+ },
+ "findings": [
+  {
+   "codeql_query_uuid": "20251225223527",
+   "codeql_raw_query": "/**\n * @name Command execution via lxml html diff helper\n * @description Detects if lxml's HTML diff utilities invoke external commands with untrusted input.\n * @kind problem\n * @problem.severity warning\n * @id py/lxml-diff-command-exec\n * @tags security\n *       external/cwe/cwe-078\n */\n\nimport python\nimport semmle.python.ApiGraphs\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.RemoteFlowSources\nimport semmle.python.Concepts\n\nfrom DataFlow::CallCfgNode cmdCall\nwhere\n  cmdCall = API::moduleImport(\"subprocess\").getMember([\"Popen\", \"call\", \"check_call\", \"check_output\", \"run\"]).getACall()\nselect cmdCall, \"Subprocess execution in lxml package; review arguments for potential injection if they include user-controlled data.\"",
+   "hypothesis": "lxml's html diff utilities or tools may spawn subprocesses that could be influenced by untrusted data, leading to command injection (CWE-78).",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-078"
+   ],
+   "results_count": 3,
+   "results": [
+    {
+     "ruleId": "py/lxml-diff-command-exec",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/lxml-diff-command-exec",
+      "index": 0
+     },
+     "message": {
+      "text": "Subprocess execution in lxml package; review arguments for potential injection if they include user-controlled data."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "buildlibxml.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 450,
+         "startColumn": 18,
+         "endColumn": 44
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "3f98979d41ddf74e:1",
+      "primaryLocationStartColumnFingerprint": "13"
+     }
+    },
+    {
+     "ruleId": "py/lxml-diff-command-exec",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/lxml-diff-command-exec",
+      "index": 0
+     },
+     "message": {
+      "text": "Subprocess execution in lxml package; review arguments for potential injection if they include user-controlled data."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "benchmark/run_benchmarks.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 50,
+         "startColumn": 16,
+         "endColumn": 90
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "b56d74c2fd2023b7:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/lxml-diff-command-exec",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/lxml-diff-command-exec",
+      "index": 0
+     },
+     "message": {
+      "text": "Subprocess execution in lxml package; review arguments for potential injection if they include user-controlled data."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "setupinfo.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 363,
+         "startColumn": 9,
+         "endLine": 364,
+         "endColumn": 73
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "28b394d5557c0acc:1",
+      "primaryLocationStartColumnFingerprint": "4"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251225223618",
+   "codeql_raw_query": "/**\n * @name XML external entity (XXE) sources in lxml usage\n * @description Identify lxml XML parsers that may be vulnerable to XXE if used with untrusted input (CWE-611)\n * @kind problem\n * @problem.severity warning\n * @id py/lxml-xxe-parser-sources\n * @tags security\n *       external/cwe/cwe-611\n */\n\nimport python\nimport semmle.python.ApiGraphs\nimport semmle.python.dataflow.new.DataFlow\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"lxml\").getMember(\"etree\").getMember([\n    \"fromstring\", \"XML\", \"parse\", \"iterparse\", \"HTML\", \"htmlfile\"\n  ]).getACall()\nselect call, \"Potentially unsafe XML/HTML parser creation; ensure external entities and network access are disabled for untrusted input.\"\n",
+   "hypothesis": "Identify lxml XML/HTML parsing entry points that could be XXE risks when fed untrusted data",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-611"
+   ],
+   "results_count": 15,
+   "results": [
+    {
+     "ruleId": "py/lxml-xxe-parser-sources",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/lxml-xxe-parser-sources",
+      "index": 0
+     },
+     "message": {
+      "text": "Potentially unsafe XML/HTML parser creation; ensure external entities and network access are disabled for untrusted input."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/lxml/ElementInclude.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 99,
+         "startColumn": 16,
+         "endColumn": 33
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "fbd6f387243a62df:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/lxml-xxe-parser-sources",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/lxml-xxe-parser-sources",
+      "index": 0
+     },
+     "message": {
+      "text": "Potentially unsafe XML/HTML parser creation; ensure external entities and network access are disabled for untrusted input."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/lxml/ElementInclude.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 115,
+         "startColumn": 16,
+         "endColumn": 41
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "6e5249a75f64d34f:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/lxml-xxe-parser-sources",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/lxml-xxe-parser-sources",
+      "index": 0
+     },
+     "message": {
+      "text": "Potentially unsafe XML/HTML parser creation; ensure external entities and network access are disabled for untrusted input."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/lxml/isoschematron/__init__.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 271,
+         "startColumn": 24,
+         "endColumn": 42
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "b57b5e4c38585e8d:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/lxml-xxe-parser-sources",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/lxml-xxe-parser-sources",
+      "index": 0
+     },
+     "message": {
+      "text": "Potentially unsafe XML/HTML parser creation; ensure external entities and network access are disabled for untrusted input."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/lxml/isoschematron/__init__.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 45,
+         "startColumn": 27,
+         "endLine": 46,
+         "endColumn": 59
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "1da982e69145ac9f:1",
+      "primaryLocationStartColumnFingerprint": "26"
+     }
+    },
+    {
+     "ruleId": "py/lxml-xxe-parser-sources",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/lxml-xxe-parser-sources",
+      "index": 0
+     },
+     "message": {
+      "text": "Potentially unsafe XML/HTML parser creation; ensure external entities and network access are disabled for untrusted input."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/lxml/isoschematron/__init__.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 47,
+         "startColumn": 27,
+         "endLine": 48,
+         "endColumn": 59
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "356bdc1c465d3276:1",
+      "primaryLocationStartColumnFingerprint": "26"
+     }
+    },
+    {
+     "ruleId": "py/lxml-xxe-parser-sources",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/lxml-xxe-parser-sources",
+      "index": 0
+     },
+     "message": {
+      "text": "Potentially unsafe XML/HTML parser creation; ensure external entities and network access are disabled for untrusted input."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/lxml/isoschematron/__init__.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 49,
+         "startColumn": 32,
+         "endLine": 51,
+         "endColumn": 42
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "cf2cddf616e37020:1",
+      "primaryLocationStartColumnFingerprint": "31"
+     }
+    },
+    {
+     "ruleId": "py/lxml-xxe-parser-sources",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/lxml-xxe-parser-sources",
+      "index": 0
+     },
+     "message": {
+      "text": "Potentially unsafe XML/HTML parser creation; ensure external entities and network access are disabled for untrusted input."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/lxml/isoschematron/__init__.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 52,
+         "startColumn": 35,
+         "endLine": 54,
+         "endColumn": 45
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "d382bd7e65e05399:1",
+      "primaryLocationStartColumnFingerprint": "34"
+     }
+    },
+    {
+     "ruleId": "py/lxml-xxe-parser-sources",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/lxml-xxe-parser-sources",
+      "index": 0
+     },
+     "message": {
+      "text": "Potentially unsafe XML/HTML parser creation; ensure external entities and network access are disabled for untrusted input."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/lxml/isoschematron/__init__.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 55,
+         "startColumn": 34,
+         "endLine": 57,
+         "endColumn": 75
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "6a98ab0ba57db9e0:1",
+      "primaryLocationStartColumnFingerprint": "33"
+     }
+    },
+    {
+     "ruleId": "py/lxml-xxe-parser-sources",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/lxml-xxe-parser-sources",
+      "index": 0
+     },
+     "message": {
+      "text": "Potentially unsafe XML/HTML parser creation; ensure external entities and network access are disabled for untrusted input."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/lxml/doctestcompare.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 68,
+         "startColumn": 12,
+         "endColumn": 48
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "ece763d614b0b6cf:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/lxml-xxe-parser-sources",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/lxml-xxe-parser-sources",
+      "index": 0
+     },
+     "message": {
+      "text": "Potentially unsafe XML/HTML parser creation; ensure external entities and network access are disabled for untrusted input."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/lxml/doctestcompare.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 95,
+         "startColumn": 24,
+         "endColumn": 36
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "74cf6464c83733b6:1",
+      "primaryLocationStartColumnFingerprint": "11"
+     }
+    },
+    {
+     "ruleId": "py/lxml-xxe-parser-sources",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/lxml-xxe-parser-sources",
+      "index": 0
+     },
+     "message": {
+      "text": "Potentially unsafe XML/HTML parser creation; ensure external entities and network access are disabled for untrusted input."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/lxml/doctestcompare.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 99,
+         "startColumn": 23,
+         "endColumn": 34
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "3831a76492bf7862:1",
+      "primaryLocationStartColumnFingerprint": "10"
+     }
+    },
+    {
+     "ruleId": "py/lxml-xxe-parser-sources",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/lxml-xxe-parser-sources",
+      "index": 0
+     },
+     "message": {
+      "text": "Potentially unsafe XML/HTML parser creation; ensure external entities and network access are disabled for untrusted input."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/lxml/doctestcompare.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 187,
+         "startColumn": 28,
+         "endColumn": 40
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "f266ff83f30acd8e:1",
+      "primaryLocationStartColumnFingerprint": "11"
+     }
+    },
+    {
+     "ruleId": "py/lxml-xxe-parser-sources",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/lxml-xxe-parser-sources",
+      "index": 0
+     },
+     "message": {
+      "text": "Potentially unsafe XML/HTML parser creation; ensure external entities and network access are disabled for untrusted input."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/lxml/doctestcompare.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 192,
+         "startColumn": 27,
+         "endColumn": 38
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "ac266f3e1bea856c:1",
+      "primaryLocationStartColumnFingerprint": "10"
+     }
+    },
+    {
+     "ruleId": "py/lxml-xxe-parser-sources",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/lxml-xxe-parser-sources",
+      "index": 0
+     },
+     "message": {
+      "text": "Potentially unsafe XML/HTML parser creation; ensure external entities and network access are disabled for untrusted input."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "tools/xpathgrep.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 3
+        },
+        "region": {
+         "startLine": 143,
+         "startColumn": 46,
+         "endColumn": 73
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "1c0e7f5e64984c25:1",
+      "primaryLocationStartColumnFingerprint": "21"
+     }
+    },
+    {
+     "ruleId": "py/lxml-xxe-parser-sources",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/lxml-xxe-parser-sources",
+      "index": 0
+     },
+     "message": {
+      "text": "Potentially unsafe XML/HTML parser creation; ensure external entities and network access are disabled for untrusted input."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "tools/xpathgrep.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 3
+        },
+        "region": {
+         "startLine": 145,
+         "startColumn": 23,
+         "endColumn": 46
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "e564ea85b0f9da49:1",
+      "primaryLocationStartColumnFingerprint": "6"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251225223649",
+   "codeql_raw_query": "/**\n * @name HTML cleaning and sanitization usage in lxml\n * @description Find uses of lxml.html.clean.Cleaner where disabling protections could lead to XSS (CWE-79)\n * @kind problem\n * @problem.severity warning\n * @id py/lxml-html-cleaner-unsafe\n * @tags security\n *       external/cwe/cwe-079\n */\n\nimport python\nimport semmle.python.ApiGraphs\nimport semmle.python.dataflow.new.DataFlow\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"lxml.html.clean\").getMember(\"Cleaner\").getACall()\nselect call, \"Review Cleaner configuration (e.g., javascript, style, forms) when cleaning untrusted HTML to avoid XSS.\"\n",
+   "hypothesis": "Locate lxml.html.clean.Cleaner usages that might relax sanitation and enable XSS",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-079"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251225223920",
+   "codeql_raw_query": "/**\n * @name lxml HTML cleaning invocation\n * @description Detect usage of lxml.html.clean or related HTML cleaners, which may be used for XSS mitigation and require correct configuration.\n * @kind problem\n * @problem.severity warning\n * @id py/lxml-html-clean-usage\n * @tags security\n *       external/cwe/cwe-079\n */\n\nimport python\nimport semmle.python.ApiGraphs\nimport semmle.python.dataflow.new.DataFlow\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"lxml\").getMember(\"html\").getMember(\"clean\").getACall() or\n  call = API::moduleImport(\"lxml_html_clean\").getACall()\nselect call, \"HTML cleaning/sanitisation invoked; verify configuration against XSS and script injection risks.\"",
+   "hypothesis": "Locate HTML cleaning points that, if misconfigured, may not prevent XSS.",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-79"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251225223947",
+   "codeql_raw_query": "/**\n * @name lxml HTML cleaning invocation\n * @description Find uses of lxml.html.clean.Cleaner which, if misconfigured, may allow XSS or HTML injection.\n * @kind problem\n * @problem.severity warning\n * @id py/lxml-html-cleaner-usage\n * @tags security\n *       external/cwe/cwe-079\n */\n\nimport python\nimport semmle.python.ApiGraphs\nimport semmle.python.dataflow.new.DataFlow\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"lxml\").getMember(\"html\").getMember(\"clean\").getMember(\"Cleaner\").getACall()\nselect call, \"Use of lxml.html.clean.Cleaner; ensure configuration disables dangerous tags/attributes when cleaning untrusted HTML.\"",
+   "hypothesis": "Look for HTML cleaner uses that might be misconfigured, relevant for XSS when cleaning untrusted HTML",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-079"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251225224038",
+   "codeql_raw_query": "/**\n * @name lxml HTML cleaning and sanitization usage\n * @description Identify uses of lxml.html.clean.Cleaner which are security sensitive (XSS / HTML sanitization).\n * @kind problem\n * @problem.severity warning\n * @id py/lxml-html-cleaner-usage\n * @tags security\n *       external/cwe/cwe-079\n */\n\nimport python\nimport semmle.python.ApiGraphs\nimport semmle.python.dataflow.new.DataFlow\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"lxml.html.clean\").getMember(\"Cleaner\").getACall()\nselect call, \"Use of lxml.html.clean.Cleaner; ensure configuration is appropriate for untrusted HTML to prevent XSS.\"",
+   "hypothesis": "Find uses of lxml.html.clean.Cleaner that may be involved in HTML sanitization and thus XSS-sensitive.",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-079"
+   ],
+   "results_count": 0,
+   "results": []
+  }
+ ]
+}

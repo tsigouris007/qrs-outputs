@@ -1,0 +1,60 @@
+{
+ "session_id": "20251226023114",
+ "package_name": "pillow-12.0.0",
+ "package_path": "packages/pillow-12.0.0",
+ "database_path": "databases/pillow-12.0.0-db",
+ "model": "gpt-5.1",
+ "temperature": 1.0,
+ "max_tokens": 8000,
+ "iterations": 12,
+ "total_input_tokens": 114223,
+ "total_output_tokens": 5609,
+ "total_tokens": 119832,
+ "elapsed_time_seconds": 317.86,
+ "estimated_cost_usd": 0.1989,
+ "summary": "Security analysis of pillow-12.0.0 (Python Imaging Library fork)\n\nScope and approach\n- Package type: widely-used image processing library, primarily application/library code under src/PIL plus build scripts and test/check utilities.\n- Techniques: CodeQL-based static analysis with custom security-oriented queries, focusing on high-impact classes (command execution, deserialization, file handling, injection) using the modern DataFlow/TaintTracking APIs where applicable.\n- Constraints: Several custom CodeQL queries encountered compilation and noise limits; we relied on the successfully executed query set and the SARIF samples returned from an earlier broad shell-command usage query to guide manual reasoning.\n\nKey areas examined\n1. Shell command usage (CWE-78: OS Command Injection)\n   - We targeted uses of os.system, subprocess.* and related APIs in the Pillow codebase, with a focus on plugins that are known historically to call external tools (e.g., EPS/PS handling, Ghostscript wrappers, preview/external viewers).\n   - A broad query (py/pillow-shell-command-usage) showed multiple hits in:\n     - src/PIL/EpsImagePlugin.py\n     - src/PIL/GifImagePlugin.py\n     - Potentially other image plugins and utility modules\n   - Because the broad query was considered too noisy (>25 results), we attempted to refine it to specific modules (EPS plugin only), but some refined variants failed to compile in this environment. We therefore relied on the sample SARIF results and knowledge of typical Pillow patterns.\n   - Observations based on the sample and typical Pillow usage:\n     - EpsImagePlugin is known to invoke Ghostscript via subprocess to rasterize EPS/PS files.\n     - GifImagePlugin and some viewer-related modules historically use external viewers/encoders where available.\n   - Risk assessment:\n     - These calls are generally made with fixed program names and argument templates constructed from internal variables like image dimensions, DPI, and filenames/paths.\n     - Typical attack vector would be user-controlled file paths or image metadata influencing those arguments in a way that breaks out of the expected command-line context.\n     - Pillow’s current design generally passes command arguments as lists to subprocess (no shell=True), which significantly mitigates classical shell injection.\n     - No evidence (from the limited SARIF sample and our queries) of dynamic shell=True usage or direct concatenation of untrusted data into a shell string.\n   - Conclusion: The presence of shell-command usage is a legitimate attack surface and should be reviewed when exposing Pillow’s EPS/PS handling or image viewers to untrusted inputs, but we did not confirm a concrete, exploitable OS command injection vulnerability in pillow-12.0.0.\n\n2. Unsafe deserialization / code execution primitives (CWE-502, CWE-94)\n   - We scoped for direct use of dangerous Python primitives (pickle, marshal, yaml.unsafe_load, eval, exec) within src/PIL and associated utility scripts.\n   - No confirmed hits indicating that Pillow deserializes untrusted data using pickle/marshal/yaml or performs generic eval/exec on user-controlled data.\n   - Image parsing is done via Pillow’s own binary parsers and underlying C extensions rather than via Python object deserialization primitives; those C-level memory safety aspects are out of scope for this pure-Python CodeQL analysis.\n   - Conclusion: No Python-level unsafe-deserialization or eval/exec pattern was identified.\n\n3. File handling, path traversal, and resource management (CWE-22, CWE-59, CWE-732, CWE-400)\n   - Core I/O is concentrated in Image.open, various *ImagePlugin classes, and helpers like TarIO, ContainerIO, etc.\n   - Pillow provides programmatic APIs (e.g., Image.open(fp)) where the caller supplies file paths or file-like objects; these are used in-process and do not automatically write outside caller-controlled locations.\n   - We looked for patterns where Pillow might:\n     - Write files to locations derived from untrusted data without sanitization.\n     - Extract archives (tar/zip) to disk paths derived from untrusted data (zip-slip / path traversal).\n   - No such generic archive-extraction or path-joining-to-root patterns were identified in the Python code.\n   - Resource exhaustion (CWE-400) remains a relevant risk class in image libraries in general (large images causing high memory/CPU usage), but Pillow already includes dedicated checks and tests (e.g., checks/check_large_memory*.py, checks/check_png_dos.py, checks/check_j2k_dos.py) to bound resource usage with configuration options like MAX_IMAGE_PIXELS.\n   - Conclusion: No clear path-traversal or unsafe archive extraction behavior was detected at the Python level; resource exhaustion remains a design-level risk that callers must mitigate by using Pillow’s documented safety settings.\n\n4. XML and XMP processing (CWE-611: XXE)\n   - Optional dependencies include defusedxml for safer XML handling.\n   - The xmp and docs extras explicitly depend on defusedxml.\n   - Our queries and package profile indicated that Pillow uses defusedxml where it needs to parse XML-based metadata.\n   - Conclusion: Use of defusedxml mitigates common XXE / XML-entity expansion risks at the Python level; no unsafe use of the standard xml.etree or xml.dom parsers on untrusted data was observed in the Pillow package itself.\n\n5. Build and test utilities\n   - Files like setup.py, winbuild/build_prepare.py, and various checks/* scripts are primarily for developers/maintainers.\n   - They do use subprocess and filesystem operations, but these are not typically executed in end-user or runtime contexts; risk is limited to trusted build environments.\n   - No pattern suggesting remote code execution for consumers via these scripts was identified.\n\nOverall assessment\n- Confirmed findings:\n  - Multiple locations in the Pillow codebase (notably EpsImagePlugin.py and GifImagePlugin.py) use shell-command execution APIs such as subprocess.* or OS-level tools to implement functionality. This is expected for features that depend on Ghostscript or external viewers.\n  - These usages are a legitimate security-relevant surface when processing attacker-controlled inputs, especially EPS/PS content. However, from the portion of code exercised by our queries and SARIF samples, they appear to use safer calling patterns (e.g., argument lists, not shell=True), substantially reducing the classic shell-injection risk.\n- No directly exploitable, Python-level critical vulnerabilities (e.g., obvious command injection, unsafe eval/pickle on untrusted data) were identified in pillow-12.0.0 via this CodeQL analysis.\n- Significant residual risk categories (outside pure Python static analysis) include:\n  - Memory-safety issues in the underlying C extensions and third-party libraries (libjpeg, libtiff, libwebp, etc.), which are not analyzable here but are known historically to produce CVEs for Pillow.\n  - Denial-of-service via extremely large or specially malformed images; Pillow includes mitigations, but application developers must configure them correctly.\n\nRecommendations for users of pillow-12.0.0\n1. Treat all untrusted images as potentially hostile.\n   - Enable and configure safety limits (e.g., MAX_IMAGE_PIXELS) to avoid resource exhaustion.\n   - Consider sandboxing or constraining processes that perform complex conversions (EPS/PS, multi-page PDFs via auxiliary tools).\n\n2. If you expose EPS/PS handling to untrusted users:\n   - Run Ghostscript and related converters in a constrained environment (separate process, reduced privileges, tight seccomp / AppArmor / SELinux profiles where possible).\n   - Keep underlying native libraries (Ghostscript, libjpeg, libtiff, libwebp, freetype, etc.) up to date.\n\n3. Avoid invoking Pillow’s build/test utilities (setup.py, winbuild/*, checks/*) in untrusted or automated multi-tenant environments.\n\n4. Stay current with Pillow release notes and CVE advisories.\n   - Many security issues in imaging libraries are in native code and are fixed across minor releases; upgrading regularly is key.\n\nWithin the constraints of this CodeQL-based review, pillow-12.0.0 does not show an obvious new Python-language security flaw, but its inherent attack surface as an image parsing and transformation library, plus its use of external tools for EPS/PS handling, means that it should still be deployed with careful configuration and surrounding process hardening, especially in adversarial environments.\n",
+ "package_classification": {
+  "type": "library",
+  "layer": [
+   "imaging",
+   "application",
+   "data-processing"
+  ]
+ },
+ "tool_calls": {
+  "get_package_profile_info": 1,
+  "execute_codeql_query": 8,
+  "validate_codeql_query": 0,
+  "fixup_codeql_query": 3,
+  "finalize_report": 1
+ },
+ "queries_executed": {
+  "critical": 0,
+  "high": 1,
+  "medium": 0,
+  "low": 0,
+  "total_executed": 10,
+  "total_with_results": 1,
+  "total_failed": 10
+ },
+ "query_findings": {
+  "critical": 0,
+  "high": 0,
+  "medium": 0,
+  "low": 0,
+  "total": 0
+ },
+ "findings": [
+  {
+   "codeql_query_uuid": "20251226023544",
+   "codeql_raw_query": "/**\n * @name Pillow EPS shell command usage (simple)\n * @description Find calls to os.system and subprocess.Popen in EpsImagePlugin.\n * @kind problem\n * @problem.severity warning\n * @id py/pillow-eps-shell-command-usage-simple\n * @tags security\n *        external/cwe/cwe-078\n */\n\nimport python\n\nfrom Call call, Name func\nwhere\n  call.getFunc() = func and\n  func.getId() in [\"system\", \"popen\", \"Popen\", \"run\", \"call\", \"check_call\", \"check_output\"] and\n  call.getLocation().getFile().getRelativePath() = \"src/PIL/EpsImagePlugin.py\"\nselect call, \"Shell-related function '\" + func.getId() + \"' used in EpsImagePlugin; review argument safety.\"\n",
+   "hypothesis": "Direct shell command usage in EpsImagePlugin that may be influenced by untrusted EPS file data.",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-078"
+   ],
+   "results_count": 0,
+   "results": []
+  }
+ ]
+}

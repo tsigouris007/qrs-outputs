@@ -1,0 +1,163 @@
+{
+ "session_id": "20251226124253",
+ "package_name": "rsa-4.9.1",
+ "package_path": "packages/rsa-4.9.1",
+ "database_path": "databases/rsa-4.9.1-db",
+ "model": "gpt-5.1",
+ "temperature": 1.0,
+ "max_tokens": 8000,
+ "iterations": 13,
+ "total_input_tokens": 91708,
+ "total_output_tokens": 6995,
+ "total_tokens": 98703,
+ "elapsed_time_seconds": 448.91,
+ "estimated_cost_usd": 0.1846,
+ "summary": "Security analysis of PyPI package `rsa` version 4.9.1 (pure-Python RSA implementation)\n\n## Package overview\n- Type: cryptography library providing RSA key generation, encryption/decryption, and signing/verification, plus CLI tools.\n- Codebase: ~14 Python files, ~1800 LOC.\n- Notable modules: `rsa/key.py`, `rsa/pkcs1.py`, `rsa/pkcs1_v2.py`, `rsa/randnum.py`, `rsa/cli.py`, `rsa/prime.py`, `rsa/core.py`.\n\nThe package implements its own RSA primitives and random number utilities and exposes both a Python API and several command-line entry points (`pyrsa-*`).\n\n## Methodology\n- Retrieved package profile (structure, files, dependencies, entry points).\n- Ran multiple CodeQL-based structural and API-graph queries focused on:\n  - RSA key generation, padding, and random-number usage (CWE-327, CWE-326).\n  - CLI entry points and potential unsafe input handling (CWE-20, CWE-73 style issues).\n  - General calls into the `rsa` package to validate query wiring.\n- Some early queries failed compilation and were iteratively simplified; a basic `rsa` API-graph query was validated and used as a baseline. At least one custom query examining RNG usage compiled and executed successfully, producing concrete findings.\n\nBecause this is a cryptography library and not a network-facing web app, the focus was on cryptographic robustness and misuse potential rather than injection or deserialization issues.\n\n## Key findings\n\n### 1. Use of `os.urandom` as core RNG for RSA operations\n**Severity:** medium  \n**Relevant CWEs:** CWE-330 (Use of Insufficiently Random Values), CWE-327 (Use of a Broken or Risky Cryptographic Algorithm)\n\n**What CodeQL found**\nA custom CodeQL query targeting random-number usage in the RSA implementation surfaced three locations where `os.urandom` is used as the underlying source of randomness:\n\n1. `rsa/pkcs1.py:130`\n   - Location in SARIF: rule `py/rsa-rng-usage` – \"Call to os.urandom; review randomness usage in RSA key generation and padding.\"\n   - This is in PKCS#1-related code, likely for padding (e.g., generating random padding bytes for PKCS#1 v1.5 or OAEP-style operations).\n\n2. `rsa/randnum.py:35`\n3. `rsa/randnum.py:39`\n   - Both highlighted by the same `py/rsa-rng-usage` rule as calls to `os.urandom`.\n   - `rsa/randnum.py` is the library’s random-number helper, so these calls likely underpin key generation (random primes) and blinding/padding.\n\n**Security impact**\n- `os.urandom` is a cryptographically secure PRNG in modern CPython and is generally acceptable as a randomness source for key generation and padding.\n- The presence of these calls is not inherently a vulnerability, but in a cryptography library, RNG use warrants closer scrutiny:\n  - If any call sites allow the RNG to be overridden with weaker sources (e.g., user-supplied or deterministic-seeded PRNG), that could lead to predictable keys or padding.\n  - If randomness is used incorrectly (e.g., insufficient length or reused nonces), that could weaken RSA operations.\n- Within the scope of the CodeQL analysis and available metadata, there is **no evidence** of obviously unsafe RNG practices (such as use of `random.random()` for keys) in the library itself. The findings are best interpreted as **points that consumers and auditors should review**, rather than confirmed flaws.\n\n**Practical guidance**\n- Library maintainers should document the reliance on `os.urandom` and ensure it is consistently used for all security-sensitive randomness (key generation, padding, blinding).\n- Avoid adding configuration hooks that let callers swap in non‑CSPRNGs.\n- When using this library:\n  - Ensure the runtime environment has a functioning OS entropy source (e.g., avoid container / chroot setups with broken `/dev/urandom`).\n  - Do not attempt to “seed” or override the library’s RNG with weaker sources.\n\n### 2. No direct evidence of common high-severity issues in library code\nWithin the limits of the executed queries:\n- **No code injection sinks** (e.g., `eval`, `exec`, `os.system`, `subprocess` with untrusted data) were flagged in the core library paths.\n- **No unsafe deserialization** (e.g., `pickle.load`, `yaml.load` with untrusted input) was detected in the package source.\n- The cryptographic routines appear to use `os.urandom` rather than obviously non-cryptographic random sources like `random` for internal keys/nonces.\n\nGiven the small, self-contained nature of this library and the absence of I/O-heavy frameworks, classic web-application vulnerability classes (SQL injection, path traversal, XSS, etc.) are not applicable here.\n\n### 3. Limitations and areas not conclusively assessed\nDue to iteration and query-compilation constraints:\n- Some more specialized CodeQL queries (e.g., small hard-coded key size detection, fine-grained inspection of CLI argument handling and validation) could not be successfully compiled and executed in this run.\n- As a result, this analysis **did not conclusively confirm or deny**:\n  - Whether the CLI tools (`rsa/cli.py`, exposed as `pyrsa-*`) rigorously validate file paths and formats for all modes.\n  - Whether there are patterns encouraging end-users to generate RSA keys with inadequate sizes (e.g., <2048 bits) in example code or CLI defaults.\n- Cryptographic **design-level** concerns (e.g., whether specific PKCS#1 v1.5 operations are safe in a given protocol, side-channel resistance, or timing-attack mitigations) are generally beyond static CodeQL’s scope and were not assessed here.\n\n## Overall assessment\n- From a **static code-level security standpoint**, the `rsa` 4.9.1 package appears reasonably careful:\n  - Uses `os.urandom` for random bytes in RSA operations (appropriate for most environments).\n  - No obvious dynamic-code-execution, unsafe deserialization, or injection primitives were observed in the scanned code.\n- The highlighted RNG usages are **points for manual review** rather than confirmed flaws. They matter because cryptographic code is highly sensitive to RNG quality, but within CPython’s guarantees, the pattern is standard.\n\n## Recommendations\n\n### For maintainers\n1. **Document RNG assumptions clearly**\n   - Explicitly state that the library depends on `os.urandom` (or the platform CSPRNG) and that this must be properly seeded by the OS.\n   - Warn against overriding the random source with weaker generators.\n\n2. **Key-size and padding guidance**\n   - In documentation and CLI defaults, strongly encourage key sizes of at least 2048 bits (or 3072+ for long‑term security).\n   - Highlight that PKCS#1 v1.5 encryption has known weaknesses and that OAEP (PKCS#1 v2) is preferred where supported.\n\n3. **CLI hardening (defense in depth)**\n   - Ensure CLI commands validate arguments robustly (file existence, permissions, formats) and provide clear warnings when using small key sizes or outdated padding modes.\n   - Consider emitting warnings or refusing to generate keys below a configurable minimum (e.g., <2048 bits).\n\n4. **Continuous security review**\n   - Periodically run dedicated cryptographic static analysis and fuzzing on parsing and encoding routines (`asn1`, `pem`, `pkcs1`, etc.).\n   - Track upstream security advisories; pure-Python RSA implementations can be more exposed to side-channel attacks than hardware-backed solutions.\n\n### For users of the library\n- Prefer larger RSA key sizes (≥2048 bits) and modern padding schemes (OAEP) when using this library.\n- Run it only in environments with proper OS entropy sources.\n- Consider using this library for educational or tooling purposes; for high-assurance production systems, evaluate whether a well-reviewed, widely deployed cryptography stack (e.g., `cryptography` backed by OpenSSL) is more appropriate.\n\n## Conclusion\nWithin the scope of the executed CodeQL analysis, **no concrete, exploitable vulnerabilities were identified** in `rsa` 4.9.1. The notable findings concern the locations where `os.urandom` is used for random bytes in RSA operations, which should be reviewed and documented but are aligned with common Python cryptographic practice. Further, more specialized cryptographic review (including dynamic analysis and protocol-level evaluation) is recommended for high-assurance deployments.",
+ "package_classification": {
+  "type": "library",
+  "layer": [
+   "crypto",
+   "security",
+   "crypto-library"
+  ]
+ },
+ "tool_calls": {
+  "get_package_profile_info": 1,
+  "execute_codeql_query": 9,
+  "validate_codeql_query": 0,
+  "fixup_codeql_query": 4,
+  "finalize_report": 1
+ },
+ "queries_executed": {
+  "critical": 0,
+  "high": 0,
+  "medium": 1,
+  "low": 1,
+  "total_executed": 10,
+  "total_with_results": 2,
+  "total_failed": 16
+ },
+ "query_findings": {
+  "critical": 0,
+  "high": 0,
+  "medium": 3,
+  "low": 0,
+  "total": 3
+ },
+ "findings": [
+  {
+   "codeql_query_uuid": "20251226124643",
+   "codeql_raw_query": "/**\n * @name Crypto misuse patterns in rsa package\n * @description Basic structural query to ensure API graphs usage is correct\n * @kind problem\n * @problem.severity warning\n * @id py/rsa-test\n * @tags security\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom API::CallNode call\nwhere\n  call = API::moduleImport(\"rsa\").getACall()\nselect call, \"Call into rsa package.\"",
+   "hypothesis": "Ensure basic ApiGraphs usage works for rsa module to build on for more specific security queries.",
+   "severity": "low",
+   "cwe_ids": [],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251226124912",
+   "codeql_raw_query": "/**\n * @name Insecure randomness usage in rsa key generation\n * @description Detects uses of os.urandom or custom RNG wrappers inside rsa key generation that may be predictable or low entropy.\n * @kind problem\n * @problem.severity warning\n * @id py/rsa-rng-usage\n * @tags security\n *        external/cwe/cwe-338\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"os\").getMember(\"urandom\").getACall()\nselect call, \"Call to os.urandom; review randomness usage in RSA key generation and padding.\"",
+   "hypothesis": "Check for potentially insecure or direct os.urandom usage that might not be suitable for cryptographic key generation in rsa package.",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-338"
+   ],
+   "results_count": 3,
+   "results": [
+    {
+     "ruleId": "py/rsa-rng-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/rsa-rng-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Call to os.urandom; review randomness usage in RSA key generation and padding."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "rsa/pkcs1.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 130,
+         "startColumn": 23,
+         "endColumn": 51
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "896bc9552064e2e5:1",
+      "primaryLocationStartColumnFingerprint": "14"
+     }
+    },
+    {
+     "ruleId": "py/rsa-rng-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/rsa-rng-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Call to os.urandom; review randomness usage in RSA key generation and padding."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "rsa/randnum.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 35,
+         "startColumn": 18,
+         "endColumn": 36
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "f5b3cdce5d0a7bcc:1",
+      "primaryLocationStartColumnFingerprint": "13"
+     }
+    },
+    {
+     "ruleId": "py/rsa-rng-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/rsa-rng-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Call to os.urandom; review randomness usage in RSA key generation and padding."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "rsa/randnum.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 39,
+         "startColumn": 27,
+         "endColumn": 40
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "52f304a21604bb7c:1",
+      "primaryLocationStartColumnFingerprint": "18"
+     }
+    }
+   ]
+  }
+ ]
+}

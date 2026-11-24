@@ -1,0 +1,561 @@
+{
+ "session_id": "20251220112330",
+ "package_name": "six-1.17.0",
+ "package_path": "packages/six-1.17.0",
+ "database_path": "databases/six-1.17.0-db",
+ "model": "gpt-5.1",
+ "temperature": 0.0,
+ "max_tokens": 8000,
+ "iterations": 7,
+ "total_input_tokens": 41687,
+ "total_output_tokens": 4160,
+ "total_tokens": 45847,
+ "elapsed_time_seconds": 192.08,
+ "estimated_cost_usd": 0.0937,
+ "summary": "## Overview\nAnalyzed PyPI package **six 1.17.0** (single module `six.py`, ~760 LOC). Six is a mature, widely‑used compatibility library. The codebase is small, has no network, file, subprocess, or deserialization features, and is primarily pure‑Python helpers.\n\nWithin the scope of this analysis and the CodeQL queries executed, no direct, standalone vulnerabilities exploitable *inside* six were found. However, several **dangerous primitives** are exposed that can become vulnerabilities when used incorrectly by consuming applications.\n\nBelow are the key security‑relevant findings.\n\n---\n\n## Key Findings\n\n### 1. `six.exec_` wrapper around `exec` / `eval`\n- **Location:** `six.py:730` (definition), plus internal call sites around `six.py:740`.\n- **CodeQL rules hit:**\n  - `py/six-eval-exec-usage`\n  - `py/six-exec-wrapper`\n  - `py/six-eval-exec-sites`\n- **CWE:**\n  - Potentially relevant in consuming code: **CWE‑94: Improper Control of Generation of Code ('Code Injection')**.\n- **What it is:**\n  - Six defines a compatibility helper `exec_` that normalizes the `exec` statement/function across Python 2 and 3. Internally, this is implemented using Python’s `exec`/`eval` machinery.\n- **Risk model:**\n  - In **six itself**, the arguments passed to `exec`/`eval` are static and not influenced by external input, so there is **no direct code injection vulnerability in the library**.\n  - However, `six.exec_` is a **dangerous primitive**: any application that passes user‑controlled strings into `six.exec_` (or into `exec`/`eval` via six helpers) can introduce code execution vulnerabilities.\n- **Impact on consumers:**\n  - If an application uses `six.exec_` with untrusted data (e.g., HTTP parameters, configuration fields, database content), this can lead to arbitrary code execution under the application’s privileges.\n- **Assessment for the package itself:**\n  - **Severity for six as a library:** informational / low. The helper is expected to be a thin wrapper around Python’s own `exec` and is not misused internally.\n  - **Severity for consumers if misused:** high/critical.\n- **Recommendations for consumers:**\n  - Avoid passing any untrusted or partially trusted strings to `six.exec_`.\n  - Prefer safe alternatives (e.g., explicit function dispatch tables, `ast.literal_eval` where appropriate, or domain‑specific interpreters) instead of dynamic code execution.\n  - If `exec_` must be used, strictly constrain inputs to a small, validated set of known‑safe code fragments.\n\n---\n\n### 2. Dynamic attribute access helpers\n- **Locations (sample):**\n  - `six.py:98, 102, 124, 125, 166` (core dynamic attribute logic)\n  - `six.py:552, 565, 575, 603, 606, 609, 621, 624, 627` (higher‑level helpers flagged by `py/six-dynamic-helpers`)\n- **CodeQL rules hit:**\n  - `py/six-dynamic-attribute-usage` (noisy, many internal uses)\n  - `py/six-dynamic-helpers`\n- **CWE (when misused by consumers):**\n  - **CWE‑94** (if used to dynamically resolve and execute code paths based on untrusted names).\n  - **CWE‑639 / CWE‑284** (if attribute names control access to sensitive attributes or methods without proper authorization checks).\n- **What it is:**\n  - Six provides helpers that perform dynamic attribute access and type inspection (e.g., functions that look up attributes or methods by name, or that adapt behavior based on type/attribute presence). Internally, these rely on `getattr`, `setattr`, and similar reflection mechanisms.\n- **Risk model:**\n  - Inside six, these helpers are used with **known, constant attribute names** and are not influenced by external input, so there is **no direct vulnerability in the library**.\n  - For consumers, these helpers can be used as **reflection primitives**. If an application passes user‑controlled attribute names or objects into these helpers, it may:\n    - Access or modify unintended attributes.\n    - Bypass intended control flow or authorization checks.\n    - Indirectly reach dangerous methods (e.g., `__reduce__`, `__subclasses__`, or custom \"admin\" methods) depending on the application’s object model.\n- **Assessment for the package itself:**\n  - **Severity for six as a library:** informational / low. The dynamic helpers are implemented in a straightforward way and are not misused internally.\n  - **Severity for consumers if misused:** medium to high, depending on what attributes can be reached.\n- **Recommendations for consumers:**\n  - Do not pass untrusted strings as attribute names into six’s dynamic helpers (or into `getattr`/`setattr` wrappers built on six).\n  - If dynamic attribute access is required, validate attribute names against a fixed allow‑list.\n  - Avoid exposing these helpers directly in APIs that are reachable from untrusted callers.\n\n---\n\n## Other Security‑Relevant Observations\n\n- **No I/O or OS interaction:**\n  - The imports (`sys`, `types`, `functools`, `itertools`, `operator`, `struct`, `io`, `importlib`, etc.) are standard library modules used for compatibility logic. There is **no use of** `subprocess`, `os.system`, network libraries, or direct file system manipulation in the core module.\n  - This significantly reduces the attack surface for direct vulnerabilities such as command injection, SSRF, or path traversal.\n\n- **No unsafe deserialization:**\n  - There is no use of `pickle`, `yaml.load`, `marshal`, or similar deserialization APIs in `six.py`. Thus, common unsafe deserialization patterns (CWE‑502) are not present.\n\n- **No custom cryptography or authentication logic:**\n  - Six does not implement cryptographic primitives, authentication, or authorization. Therefore, typical crypto‑misuse or auth‑bypass issues are out of scope for this package.\n\n- **Tests:**\n  - Some test code (`test_six.py`) also uses `eval`/`exec` and dynamic attributes, but this is not shipped as part of the runtime library and does not affect production use.\n\n---\n\n## Overall Risk Assessment\n\n- **For the six library itself (as distributed on PyPI):**\n  - No direct, exploitable vulnerabilities were identified in the library’s own use of dynamic features.\n  - The flagged patterns (`exec_`, `eval`/`exec` usage, dynamic attribute helpers) are **expected design choices** for a compatibility layer and are used with constant, internal data.\n  - Overall security posture: **low risk**, stable, and mature.\n\n- **For applications using six:**\n  - Six exposes **dangerous primitives** (dynamic code execution and reflection helpers). These are not inherently vulnerabilities, but they can be misused.\n  - Application developers should treat `six.exec_` and dynamic attribute helpers as **sensitive APIs** and avoid feeding them untrusted input.\n\n---\n\n## Recommendations\n\n### For six maintainers\n1. **Documentation clarifications (optional hardening):**\n   - Explicitly document that `six.exec_` is a thin wrapper around Python’s `exec` and must not be used with untrusted input.\n   - Note that dynamic attribute helpers are intended for internal compatibility logic and should be used carefully when attribute names come from external sources.\n\n2. **Defensive comments / docstrings:**\n   - Add short security notes in docstrings or comments near `exec_` and the most generic dynamic helpers to warn consumers about misuse.\n\n3. **No urgent code changes required:**\n   - Based on this analysis, there is no need for immediate code changes to address a concrete vulnerability.\n\n### For consumers of six\n1. **Avoid dynamic code execution:**\n   - Do not use `six.exec_` (or `exec`/`eval`) with any data that can be influenced by users or external systems.\n\n2. **Constrain reflection:**\n   - When using six’s dynamic helpers, validate attribute names against a strict allow‑list and avoid exposing them directly in public APIs.\n\n3. **General secure coding practices:**\n   - Treat six as a low‑level utility library and keep security‑sensitive logic (authorization, input validation, sandboxing) in your own application code.\n\n---\n\n## Conclusion\n\nThe **six 1.17.0** package does not contain direct, standalone vulnerabilities in its own logic based on the CodeQL analysis performed. It does, however, provide dynamic execution and reflection helpers (`exec_`, dynamic attribute utilities) that can be dangerous if misused by consuming applications. With appropriate care by application developers and, optionally, clearer documentation from maintainers, six can be safely used as intended as a Python 2/3 compatibility layer.",
+ "package_classification": {
+  "type": "library",
+  "layer": [
+   "language_compatibility",
+   "utility"
+  ]
+ },
+ "tool_calls": {
+  "get_package_profile_info": 1,
+  "execute_codeql_query": 8,
+  "validate_codeql_query": 0,
+  "fixup_codeql_query": 1,
+  "finalize_report": 1
+ },
+ "queries_executed": {
+  "critical": 0,
+  "high": 1,
+  "medium": 3,
+  "low": 0,
+  "total_executed": 9,
+  "total_with_results": 4,
+  "total_failed": 5
+ },
+ "query_findings": {
+  "critical": 0,
+  "high": 1,
+  "medium": 14,
+  "low": 0,
+  "total": 15
+ },
+ "findings": [
+  {
+   "codeql_query_uuid": "20251220112341",
+   "codeql_raw_query": "/**\n * @name Use of dangerous eval/exec helpers in six\n * @description Detects any use of eval, exec, or six.exec_ which could be security-relevant if misused by consumers.\n * @kind problem\n * @problem.severity warning\n * @id py/six-eval-exec-usage\n * @tags security\n *        external/cwe/cwe-094\n */\n\nimport python\nimport semmle.python.ApiGraphs\nimport semmle.python.dataflow.new.DataFlow\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::builtin([\"eval\", \"exec\"]).getACall() or\n  call = API::moduleImport(\"six\").getMember(\"exec_\").getACall()\nselect call, \"Use of eval/exec or six.exec_ may be dangerous if called with untrusted input in applications using this library.\"",
+   "hypothesis": "six defines or uses helpers around eval/exec that could be dangerous in certain contexts",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-094"
+   ],
+   "results_count": 4,
+   "results": [
+    {
+     "ruleId": "py/six-eval-exec-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/six-eval-exec-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of eval/exec or six.exec_ may be dangerous if called with untrusted input in applications using this library."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "six.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 740,
+         "startColumn": 9,
+         "endColumn": 51
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "7c9d7425c352adba:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/six-eval-exec-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/six-eval-exec-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of eval/exec or six.exec_ may be dangerous if called with untrusted input in applications using this library."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "test_six.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 563,
+         "startColumn": 9,
+         "endColumn": 33
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "4592d6121a1cbeb8:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/six-eval-exec-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/six-eval-exec-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of eval/exec or six.exec_ may be dangerous if called with untrusted input in applications using this library."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "test_six.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 567,
+         "startColumn": 5,
+         "endColumn": 28
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "8e1baf299c1a2f87:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/six-eval-exec-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/six-eval-exec-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of eval/exec or six.exec_ may be dangerous if called with untrusted input in applications using this library."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "test_six.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 571,
+         "startColumn": 5,
+         "endColumn": 53
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "87e02ef5668a6dc3:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251220112523",
+   "codeql_raw_query": "/**\n * @name six exec_ wrapper usage\n * @description Find the definition of six.exec_ wrapper and its use of eval/exec\n * @kind problem\n * @problem.severity warning\n * @id py/six-exec-wrapper\n * @tags security\n *        external/cwe/cwe-094\n */\n\nimport python\n\nfrom Function fd\nwhere fd.getName() = \"exec_\"\nselect fd, \"Definition of six.exec_ wrapper; ensure callers do not pass untrusted code strings.\"",
+   "hypothesis": "six defines an exec_ helper that wraps eval/exec, which is potentially dangerous in applications that pass untrusted input.",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-94"
+   ],
+   "results_count": 1,
+   "results": [
+    {
+     "ruleId": "py/six-exec-wrapper",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/six-exec-wrapper",
+      "index": 0
+     },
+     "message": {
+      "text": "Definition of six.exec_ wrapper; ensure callers do not pass untrusted code strings."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "six.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 730,
+         "startColumn": 5,
+         "endColumn": 50
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "9395a356f25b2fc5:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251220112546",
+   "codeql_raw_query": "/**\n * @name six dynamic attribute helpers\n * @description Locate six helpers that perform dynamic attribute access (getattr/setattr/delattr) so their use can be reviewed.\n * @kind problem\n * @problem.severity warning\n * @id py/six-dynamic-helpers\n * @tags security\n *        external/cwe/cwe-913\n */\n\nimport python\n\nfrom Function fd\nwhere fd.getName() in [\"get_unbound_function\", \"iterkeys\", \"itervalues\", \"iteritems\", \"advance_iterator\", \"get_method_function\", \"get_method_self\", \"get_function_closure\", \"get_function_code\", \"get_function_defaults\", \"get_function_globals\"]\nselect fd, \"six helper that may use dynamic attribute access; ensure callers do not pass untrusted attribute names or objects.\"",
+   "hypothesis": "Identify six helper functions that rely on dynamic attribute access which could be dangerous if misused by callers with untrusted data.",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-913"
+   ],
+   "results_count": 9,
+   "results": [
+    {
+     "ruleId": "py/six-dynamic-helpers",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/six-dynamic-helpers",
+      "index": 0
+     },
+     "message": {
+      "text": "six helper that may use dynamic attribute access; ensure callers do not pass untrusted attribute names or objects."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "six.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 552,
+         "startColumn": 5,
+         "endColumn": 30
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "43ad7f2e1e7ffded:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/six-dynamic-helpers",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/six-dynamic-helpers",
+      "index": 0
+     },
+     "message": {
+      "text": "six helper that may use dynamic attribute access; ensure callers do not pass untrusted attribute names or objects."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "six.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 565,
+         "startColumn": 5,
+         "endColumn": 39
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "73508e25124932e:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/six-dynamic-helpers",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/six-dynamic-helpers",
+      "index": 0
+     },
+     "message": {
+      "text": "six helper that may use dynamic attribute access; ensure callers do not pass untrusted attribute names or objects."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "six.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 575,
+         "startColumn": 5,
+         "endColumn": 39
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "71886e2e73cada23:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/six-dynamic-helpers",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/six-dynamic-helpers",
+      "index": 0
+     },
+     "message": {
+      "text": "six helper that may use dynamic attribute access; ensure callers do not pass untrusted attribute names or objects."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "six.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 603,
+         "startColumn": 5,
+         "endColumn": 27
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "ad728fcd46eda251:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/six-dynamic-helpers",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/six-dynamic-helpers",
+      "index": 0
+     },
+     "message": {
+      "text": "six helper that may use dynamic attribute access; ensure callers do not pass untrusted attribute names or objects."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "six.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 606,
+         "startColumn": 5,
+         "endColumn": 29
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "55928d4052f2ed38:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/six-dynamic-helpers",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/six-dynamic-helpers",
+      "index": 0
+     },
+     "message": {
+      "text": "six helper that may use dynamic attribute access; ensure callers do not pass untrusted attribute names or objects."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "six.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 609,
+         "startColumn": 5,
+         "endColumn": 28
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "820face06be256a9:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/six-dynamic-helpers",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/six-dynamic-helpers",
+      "index": 0
+     },
+     "message": {
+      "text": "six helper that may use dynamic attribute access; ensure callers do not pass untrusted attribute names or objects."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "six.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 621,
+         "startColumn": 5,
+         "endColumn": 27
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "6826cc00d26a395b:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/six-dynamic-helpers",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/six-dynamic-helpers",
+      "index": 0
+     },
+     "message": {
+      "text": "six helper that may use dynamic attribute access; ensure callers do not pass untrusted attribute names or objects."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "six.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 624,
+         "startColumn": 5,
+         "endColumn": 29
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "b71697ee26ec3902:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/six-dynamic-helpers",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/six-dynamic-helpers",
+      "index": 0
+     },
+     "message": {
+      "text": "six helper that may use dynamic attribute access; ensure callers do not pass untrusted attribute names or objects."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "six.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 627,
+         "startColumn": 5,
+         "endColumn": 28
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "35f58f8ac133f2e3:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251220112604",
+   "codeql_raw_query": "/**\n * @name six eval/exec usage sites\n * @description Find all direct uses of eval or exec in six to assess risk.\n * @kind problem\n * @problem.severity warning\n * @id py/six-eval-exec-sites\n * @tags security\n *        external/cwe/cwe-094\n */\n\nimport python\n\nfrom Call c\nwhere\n  c.getFunc().(Name).getId() = \"eval\" or\n  c.getFunc().(Name).getId() = \"exec\"\nselect c, \"Use of eval/exec in six; ensure arguments are not influenced by untrusted input in applications using this library.\"",
+   "hypothesis": "Locate all eval/exec calls in six to understand how six.exec_ is implemented and whether it introduces additional risk.",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-94"
+   ],
+   "results_count": 1,
+   "results": [
+    {
+     "ruleId": "py/six-eval-exec-sites",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/six-eval-exec-sites",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of eval/exec in six; ensure arguments are not influenced by untrusted input in applications using this library."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "six.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 740,
+         "startColumn": 9,
+         "endColumn": 51
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "7c9d7425c352adba:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    }
+   ]
+  }
+ ]
+}

@@ -1,0 +1,795 @@
+{
+ "session_id": "20251225184231",
+ "package_name": "click-8.3.0",
+ "package_path": "packages/click-8.3.0",
+ "database_path": "databases/click-8.3.0-db",
+ "model": "gpt-5.1",
+ "temperature": 1.0,
+ "max_tokens": 8000,
+ "iterations": 11,
+ "total_input_tokens": 97089,
+ "total_output_tokens": 7318,
+ "total_tokens": 104407,
+ "elapsed_time_seconds": 434.14,
+ "estimated_cost_usd": 0.1945,
+ "summary": "# Security analysis report for `click` 8.3.0\n\n## Package overview\n- **Name:** click\n- **Version:** 8.3.0\n- **Type:** Reusable Python library for building CLI applications.\n- **Codebase size:** 16 source files, ~7.8 KLoC.\n- **Key modules analyzed:** `core.py`, `termui.py`, `_termui_impl.py`, `shell_completion.py`, `types.py`, `utils.py`, `exceptions.py`, etc.\n\nAnalysis was performed using CodeQL-based queries focused on security-relevant patterns in a CLI framework: command execution, temporary file usage, deserialization, and general data-flow from user-controllable inputs.\n\n---\n\n## Findings\n\n### 1. Potentially insecure temporary file usage\n- **Location(s):** `src/click/_termui_impl.py`\n  - Around line **401**\n  - Around line **529**\n  - Around line **639**\n- **CodeQL rules:**\n  - `py/insecure-tempfile-usage`\n  - `py/click/insecure-tempfile-usage-details`\n- **CWE:** Likely aligns with **CWE-377: Insecure Temporary File**.\n- **Description:**\n  CodeQL flagged several usages of temporary files in `_termui_impl.py` as “potentially insecure temporary file usage; review mode and delete behavior.”\n\n  Although the exact code lines are not reproduced here, this pattern typically corresponds to use of `tempfile.mktemp`, manually-constructed temporary paths, or `NamedTemporaryFile`/`TemporaryFile` with non-default or insecure options (such as world-readable permissions, no automatic deletion, or use in a way that allows race conditions).\n\n- **Impact assessment:**\n  - **Risk level:** **Low–Medium**, depending on how these temp files are created and used.\n  - Because Click is a framework, these temp files are created by library code, not directly from attacker-controlled filenames. The main risk would surface if:\n    - The temporary file names or locations are predictable and shared on multi-user systems, **and**\n    - Another local user can race or replace the file, leading to information disclosure or manipulation of data written by the Click-based app.\n\n- **Mitigation / recommendations for maintainers:**\n  - Ensure all temp file creation uses safe `tempfile` APIs:\n    - Prefer `tempfile.NamedTemporaryFile(delete=True)` or `TemporaryDirectory()` where possible.\n    - Avoid `tempfile.mktemp()` entirely.\n  - Confirm that:\n    - Files are opened with restrictive modes (e.g. not world-writable / world-readable by default on POSIX).\n    - Temporary paths are not exposed to or influenced by untrusted input.\n  - Document any security assumptions (e.g., \"this is only used for local interactive editing in a user-owned directory\").\n\n- **Guidance for consumers of Click:**\n  - These temp-file usages are in **internals for terminal UI**; they are not directly parameterized by attacker-controlled arguments from your CLI definitions.\n  - For high-assurance environments (multi-user, shared /tmp, etc.), consider running your Click-based tools with `TMPDIR` pointing to a private directory with correct permissions.\n\n---\n\n### 2. Command execution sites in Click internals and shell completion\n- **Location(s):**\n  - `src/click/_termui_impl.py`\n    - Around lines **451–458**, **538**, **602–604**, **691**, **705**, **719**, **729`**\n  - `src/click/shell_completion.py`\n    - Around lines **320–323**\n- **CodeQL rules:**\n  - `py/click/command-execution-from-args`\n  - `py/click/command-execution-sites`\n- **CWE:** **CWE-78: OS Command Injection** (potential risk category).\n\n- **Description:**\n  CodeQL identified several sites where Click’s internals execute commands (for example, invoking editors, pagers, or shell completion helpers). The rules are general and warn:\n\n  > “Command execution; ensure no untrusted CLI input flows into this call without validation.”\n\n  and\n\n  > “Command execution in click internals; ensure arguments cannot be controlled by untrusted users without validation.”\n\n  In Click, these call sites are typically used to:\n  - Spawn an editor for `edit()` functionality.\n  - Invoke a pager (like `less` or `more`) for paginated output.\n  - Run shell-related helpers for completion scripts.\n\n- **Impact assessment:**\n  - **Risk level:** **Low**, under normal usage.\n  - The commands and arguments are usually *derived from environment variables* (`EDITOR`, `PAGER`) or configuration, and are ultimately executed in **the local user’s security context**. This is expected behavior for a CLI toolkit: if a user configures their EDITOR to `vim` or something malicious, that is under their control.\n  - There is no evidence from the current analysis that **untrusted remote input** (e.g., HTTP request data) is plumbed directly into these command strings without passing through application logic. Click primarily parses *local command line arguments* typed by the same user who then executes the process.\n\n  Consequently, while the rule uses CWE-78 style wording, in this library context it is more about **safe usage patterns** than a discovered exploitable vulnerability in Click itself.\n\n- **Mitigation / recommendations for maintainers:**\n  - Confirm that all command execution uses safe APIs:\n    - Prefer `subprocess.run([...])` with argument lists rather than shell=True when possible.\n    - When `shell=True` is necessary (e.g. for complex user-configured commands):\n      - Ensure that only **trusted local configuration/environment** is used to build command strings.\n      - Avoid incorporating arbitrary, unvalidated external data into those commands.\n  - Document that environment variables such as `EDITOR` / `PAGER` and shell completion helpers are trusted local configuration knobs, not sources of remote input.\n  - Where feasible, centralize command execution behind helper functions that enforce safe defaults.\n\n- **Guidance for consumers of Click:**\n  - Avoid taking **untrusted remote data** (from HTTP, files, etc.) and passing it directly into parameters that Click’s helpers might use as command strings.\n  - If your application lets users specify an editor or pager string (beyond the standard environment variables), treat that as **trusted configuration**, not as arbitrary data from unknown users.\n\n---\n\n## Other areas checked\n\nAcross the CodeQL queries executed, no concrete issues were reported in the following categories within this package version:\n\n- Unsafe deserialization (pickle / yaml / marshal / shelve) leading to code execution.\n- Direct use of `eval`, `exec`, or similar dynamic code execution from untrusted data.\n- Obvious SQL injection sinks (Click itself does not perform DB access).\n- Path traversal or unsafe direct file name usage stemming from user-controlled arguments, beyond the general temp-file patterns noted above.\n\nGiven the nature of Click as a command-line framework, most higher-risk vulnerabilities will generally be in the *applications built on top of Click*, not in Click itself (e.g., how application authors interpret and act on CLI arguments).\n\n---\n\n## Overall risk evaluation for `click` 8.3.0\n\n- **Direct vulnerabilities in the library code:**\n  - No high or critical, immediately exploitable vulnerabilities were identified by the executed CodeQL queries.\n  - The two main flagged areas (temporary file handling and internal command execution) are **safety and hardening concerns** rather than demonstrated, unauthenticated remote exploits in this package alone.\n\n- **Severity summary:**\n  - Tempfile handling: **Low–Medium**, environment-dependent (CWE-377-like).\n  - Command execution sites: **Low**, expected behavior of a CLI toolkit (CWE-78 risk category), mitigated by the fact that the controlling user is typically the same local user running the tool.\n\n- **Recommendation:**\n  - Library maintainers may want to review the highlighted locations to:\n    - Simplify and harden temp-file usage.\n    - Clarify and document trust assumptions around editor/pager/ completion commands.\n  - Users of Click should focus their security reviews on how their own applications use Click (validation, sanitization, and safe handling of parsed arguments, environment, and configuration), as that is where serious vulnerabilities are most likely to arise.\n",
+ "package_classification": {
+  "type": "library",
+  "layer": [
+   "application",
+   "cli-framework"
+  ]
+ },
+ "tool_calls": {
+  "get_package_profile_info": 1,
+  "execute_codeql_query": 12,
+  "validate_codeql_query": 0,
+  "fixup_codeql_query": 5,
+  "finalize_report": 1
+ },
+ "queries_executed": {
+  "critical": 0,
+  "high": 2,
+  "medium": 3,
+  "low": 0,
+  "total_executed": 17,
+  "total_with_results": 5,
+  "total_failed": 14
+ },
+ "query_findings": {
+  "critical": 0,
+  "high": 16,
+  "medium": 6,
+  "low": 0,
+  "total": 22
+ },
+ "findings": [
+  {
+   "codeql_query_uuid": "20251225184255",
+   "codeql_raw_query": "/**\n * @name Insecure temporary file usage\n * @description Detect insecure use of tempfile functions without secure flags.\n * @kind problem\n * @problem.severity warning\n * @id py/insecure-tempfile-usage\n * @tags security\n *       external/cwe/cwe-377\n */\n\nimport python\nimport semmle.python.ApiGraphs\nimport semmle.python.dataflow.new.DataFlow\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"tempfile\").getMember([\"NamedTemporaryFile\", \"mkstemp\", \"mktemp\"]).getACall()\nselect call, \"Potentially insecure temporary file usage; ensure proper permissions and secure patterns are used.\"",
+   "hypothesis": "click may use tempfile or similar APIs for editing files or shell completion in an insecure way.",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-377"
+   ],
+   "results_count": 3,
+   "results": [
+    {
+     "ruleId": "py/insecure-tempfile-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/insecure-tempfile-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Potentially insecure temporary file usage; ensure proper permissions and secure patterns are used."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/click/_termui_impl.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 401,
+         "startColumn": 20,
+         "endColumn": 38
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "3ab71f397bb0c9:1",
+      "primaryLocationStartColumnFingerprint": "15"
+     }
+    },
+    {
+     "ruleId": "py/insecure-tempfile-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/insecure-tempfile-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Potentially insecure temporary file usage; ensure proper permissions and secure patterns are used."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/click/_termui_impl.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 529,
+         "startColumn": 20,
+         "endColumn": 38
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "95789853f9f69958:1",
+      "primaryLocationStartColumnFingerprint": "15"
+     }
+    },
+    {
+     "ruleId": "py/insecure-tempfile-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/insecure-tempfile-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Potentially insecure temporary file usage; ensure proper permissions and secure patterns are used."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/click/_termui_impl.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 639,
+         "startColumn": 20,
+         "endColumn": 77
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "9eaab3c3accc7dae:1",
+      "primaryLocationStartColumnFingerprint": "11"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251225184344",
+   "codeql_raw_query": "/**\n * @name Insecure temporary file usage in click\n * @description Detect potentially insecure uses of tempfile and NamedTemporaryFile.\n * @kind problem\n * @problem.severity warning\n * @id py/click/insecure-tempfile-usage\n * @tags security\n *       external/cwe/cwe-377\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"tempfile\").getMember([\"NamedTemporaryFile\", \"mktemp\"]).getACall()\nselect call, \"Potentially insecure temporary file usage; ensure proper permissions and secure patterns are used.\"",
+   "hypothesis": "click uses tempfile in potentially insecure ways for CLI utilities",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-377"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251225184404",
+   "codeql_raw_query": "/**\n * @name Command execution from click arguments\n * @description Find subprocess or os command executions that may rely on external input.\n * @kind problem\n * @problem.severity warning\n * @id py/click/command-execution-from-args\n * @tags security\n *       external/cwe/cwe-078\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"subprocess\").getMember([\"Popen\", \"call\", \"run\", \"check_call\", \"check_output\"]).getACall() or\n  call = API::moduleImport(\"os\").getMember([\"system\", \"popen\"]).getACall()\nselect call, \"Command execution; ensure no untrusted CLI input flows into this call without validation.\"",
+   "hypothesis": "click may wrap subprocess calls and expose them to CLI input",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-078"
+   ],
+   "results_count": 8,
+   "results": [
+    {
+     "ruleId": "py/click/command-execution-from-args",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/click/command-execution-from-args",
+      "index": 0
+     },
+     "message": {
+      "text": "Command execution; ensure no untrusted CLI input flows into this call without validation."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/click/_termui_impl.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 451,
+         "startColumn": 9,
+         "endLine": 458,
+         "endColumn": 6
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "a66be2c49de7e5bf:1",
+      "primaryLocationStartColumnFingerprint": "4"
+     }
+    },
+    {
+     "ruleId": "py/click/command-execution-from-args",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/click/command-execution-from-args",
+      "index": 0
+     },
+     "message": {
+      "text": "Command execution; ensure no untrusted CLI input flows into this call without validation."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/click/_termui_impl.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 538,
+         "startColumn": 9,
+         "endColumn": 51
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "727f60ade7f091d8:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/click/command-execution-from-args",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/click/command-execution-from-args",
+      "index": 0
+     },
+     "message": {
+      "text": "Command execution; ensure no untrusted CLI input flows into this call without validation."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/click/_termui_impl.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 602,
+         "startColumn": 17,
+         "endLine": 604,
+         "endColumn": 14
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "842ebe5dcf233b3a:1",
+      "primaryLocationStartColumnFingerprint": "4"
+     }
+    },
+    {
+     "ruleId": "py/click/command-execution-from-args",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/click/command-execution-from-args",
+      "index": 0
+     },
+     "message": {
+      "text": "Command execution; ensure no untrusted CLI input flows into this call without validation."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/click/_termui_impl.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 691,
+         "startColumn": 20,
+         "endColumn": 55
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "5c7d167b7418bc5e:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/click/command-execution-from-args",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/click/command-execution-from-args",
+      "index": 0
+     },
+     "message": {
+      "text": "Command execution; ensure no untrusted CLI input flows into this call without validation."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/click/_termui_impl.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 705,
+         "startColumn": 20,
+         "endColumn": 41
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "4bce038b634085d0:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/click/command-execution-from-args",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/click/command-execution-from-args",
+      "index": 0
+     },
+     "message": {
+      "text": "Command execution; ensure no untrusted CLI input flows into this call without validation."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/click/_termui_impl.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 719,
+         "startColumn": 20,
+         "endColumn": 41
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "6a2e40b20d72c165:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/click/command-execution-from-args",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/click/command-execution-from-args",
+      "index": 0
+     },
+     "message": {
+      "text": "Command execution; ensure no untrusted CLI input flows into this call without validation."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/click/_termui_impl.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 729,
+         "startColumn": 13,
+         "endColumn": 48
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "f6622020418feabe:1",
+      "primaryLocationStartColumnFingerprint": "4"
+     }
+    },
+    {
+     "ruleId": "py/click/command-execution-from-args",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/click/command-execution-from-args",
+      "index": 0
+     },
+     "message": {
+      "text": "Command execution; ensure no untrusted CLI input flows into this call without validation."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/click/shell_completion.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 320,
+         "startColumn": 22,
+         "endLine": 323,
+         "endColumn": 14
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "5990e770e5706654:1",
+      "primaryLocationStartColumnFingerprint": "9"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251225184608",
+   "codeql_raw_query": "/**\n * @name Insecure temporary file usage in click\n * @description Find usage of tempfile and mkstemp-style APIs that may create world-readable temp files.\n * @kind problem\n * @problem.severity warning\n * @id py/click/insecure-tempfile-usage-details\n * @tags security\n *       external/cwe/cwe-377\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"tempfile\").getMember([\"NamedTemporaryFile\", \"mkstemp\", \"mktemp\"]).getACall()\nselect call, \"Potentially insecure temporary file usage; review mode and delete behavior.\"",
+   "hypothesis": "click may use tempfile APIs insecurely for editor or pager functionality",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-377"
+   ],
+   "results_count": 3,
+   "results": [
+    {
+     "ruleId": "py/click/insecure-tempfile-usage-details",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/click/insecure-tempfile-usage-details",
+      "index": 0
+     },
+     "message": {
+      "text": "Potentially insecure temporary file usage; review mode and delete behavior."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/click/_termui_impl.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 401,
+         "startColumn": 20,
+         "endColumn": 38
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "3ab71f397bb0c9:1",
+      "primaryLocationStartColumnFingerprint": "15"
+     }
+    },
+    {
+     "ruleId": "py/click/insecure-tempfile-usage-details",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/click/insecure-tempfile-usage-details",
+      "index": 0
+     },
+     "message": {
+      "text": "Potentially insecure temporary file usage; review mode and delete behavior."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/click/_termui_impl.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 529,
+         "startColumn": 20,
+         "endColumn": 38
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "95789853f9f69958:1",
+      "primaryLocationStartColumnFingerprint": "15"
+     }
+    },
+    {
+     "ruleId": "py/click/insecure-tempfile-usage-details",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/click/insecure-tempfile-usage-details",
+      "index": 0
+     },
+     "message": {
+      "text": "Potentially insecure temporary file usage; review mode and delete behavior."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/click/_termui_impl.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 639,
+         "startColumn": 20,
+         "endColumn": 77
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "9eaab3c3accc7dae:1",
+      "primaryLocationStartColumnFingerprint": "11"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251225184629",
+   "codeql_raw_query": "/**\n * @name Command execution in click internals\n * @description Locate use of subprocess or os.system that might be influenced by CLI arguments.\n * @kind problem\n * @problem.severity warning\n * @id py/click/command-execution-sites\n * @tags security\n *       external/cwe/cwe-78\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"subprocess\").getMember([\"Popen\", \"run\", \"call\", \"check_call\", \"check_output\"]).getACall()\n  or call = API::moduleImport(\"os\").getMember(\"system\").getACall()\nselect call, \"Command execution in click internals; ensure arguments cannot be controlled by untrusted users without validation.\"",
+   "hypothesis": "click may shell out for editor, pager, or shell completion helpers",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-78"
+   ],
+   "results_count": 8,
+   "results": [
+    {
+     "ruleId": "py/click/command-execution-sites",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/click/command-execution-sites",
+      "index": 0
+     },
+     "message": {
+      "text": "Command execution in click internals; ensure arguments cannot be controlled by untrusted users without validation."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/click/_termui_impl.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 451,
+         "startColumn": 9,
+         "endLine": 458,
+         "endColumn": 6
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "a66be2c49de7e5bf:1",
+      "primaryLocationStartColumnFingerprint": "4"
+     }
+    },
+    {
+     "ruleId": "py/click/command-execution-sites",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/click/command-execution-sites",
+      "index": 0
+     },
+     "message": {
+      "text": "Command execution in click internals; ensure arguments cannot be controlled by untrusted users without validation."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/click/_termui_impl.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 538,
+         "startColumn": 9,
+         "endColumn": 51
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "727f60ade7f091d8:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/click/command-execution-sites",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/click/command-execution-sites",
+      "index": 0
+     },
+     "message": {
+      "text": "Command execution in click internals; ensure arguments cannot be controlled by untrusted users without validation."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/click/_termui_impl.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 602,
+         "startColumn": 17,
+         "endLine": 604,
+         "endColumn": 14
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "842ebe5dcf233b3a:1",
+      "primaryLocationStartColumnFingerprint": "4"
+     }
+    },
+    {
+     "ruleId": "py/click/command-execution-sites",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/click/command-execution-sites",
+      "index": 0
+     },
+     "message": {
+      "text": "Command execution in click internals; ensure arguments cannot be controlled by untrusted users without validation."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/click/_termui_impl.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 691,
+         "startColumn": 20,
+         "endColumn": 55
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "5c7d167b7418bc5e:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/click/command-execution-sites",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/click/command-execution-sites",
+      "index": 0
+     },
+     "message": {
+      "text": "Command execution in click internals; ensure arguments cannot be controlled by untrusted users without validation."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/click/_termui_impl.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 705,
+         "startColumn": 20,
+         "endColumn": 41
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "4bce038b634085d0:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/click/command-execution-sites",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/click/command-execution-sites",
+      "index": 0
+     },
+     "message": {
+      "text": "Command execution in click internals; ensure arguments cannot be controlled by untrusted users without validation."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/click/_termui_impl.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 719,
+         "startColumn": 20,
+         "endColumn": 41
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "6a2e40b20d72c165:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/click/command-execution-sites",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/click/command-execution-sites",
+      "index": 0
+     },
+     "message": {
+      "text": "Command execution in click internals; ensure arguments cannot be controlled by untrusted users without validation."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/click/_termui_impl.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 729,
+         "startColumn": 13,
+         "endColumn": 48
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "f6622020418feabe:1",
+      "primaryLocationStartColumnFingerprint": "4"
+     }
+    },
+    {
+     "ruleId": "py/click/command-execution-sites",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/click/command-execution-sites",
+      "index": 0
+     },
+     "message": {
+      "text": "Command execution in click internals; ensure arguments cannot be controlled by untrusted users without validation."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/click/shell_completion.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 320,
+         "startColumn": 22,
+         "endLine": 323,
+         "endColumn": 14
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "5990e770e5706654:1",
+      "primaryLocationStartColumnFingerprint": "9"
+     }
+    }
+   ]
+  }
+ ]
+}

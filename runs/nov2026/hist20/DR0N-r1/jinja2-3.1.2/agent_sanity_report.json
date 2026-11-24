@@ -1,0 +1,955 @@
+{
+ "session_id": "20261119033811",
+ "original_report": "reports/_nov2026/hist20/DR0N-r1/jinja2-3.1.2/agent_codeql_report.json",
+ "package_name": "jinja2-3.1.2",
+ "package_path": "packages/jinja2-3.1.2",
+ "database_path": "databases/jinja2-3.1.2-db",
+ "package_classification": {
+  "type": [
+   "library",
+   "framework"
+  ],
+  "layer": [
+   "application",
+   "templating",
+   "web"
+  ]
+ },
+ "model": "deepseek/deepseek-reasoner",
+ "temperature": 0.0,
+ "max_tokens": 8000,
+ "iterations": 51,
+ "total_input_tokens": 484938,
+ "total_output_tokens": 74225,
+ "total_tokens": 559163,
+ "elapsed_time_seconds": 514.78,
+ "estimated_cost_usd": 0.167,
+ "total_findings_submitted": 20,
+ "manual_review": 1,
+ "review_groups": {
+  "high_often_medium": 1,
+  "medium_often_medium": 2,
+  "high_often_high": 3,
+  "high_undetermined_undetermined": 4,
+  "medium_undetermined_undetermined": 1,
+  "medium_undetermined_high": 1,
+  "high_sometimes_medium": 1
+ },
+ "tool_calls": {
+  "extract_code_snippet": 50,
+  "grep_search": 29,
+  "trace_dataflow_path": 0,
+  "submit_finding": 20,
+  "complete_review": 4
+ },
+ "true_positives": {
+  "critical": 0,
+  "high": 2,
+  "medium": 1,
+  "low": 0,
+  "total": 3
+ },
+ "false_positives": {
+  "critical": 0,
+  "high": 0,
+  "medium": 1,
+  "low": 14,
+  "total": 15
+ },
+ "findings": [
+  {
+   "codeql_query_uuids": [
+    "20261119032520"
+   ],
+   "finding_id": "914c9937-c07f-4b9c-9dc4-ceb136217f4b",
+   "verdict": "tp",
+   "confidence": 65,
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-502"
+   ],
+   "description": "Unsafe pickle.load deserialization of bytecode-cache file contents in Bucket.load_bytecode (Jinja2 template bytecode cache)",
+   "file_path": "src/jinja2/bccache.py",
+   "start_line": 71,
+   "end_line": 71,
+   "start_column": null,
+   "end_column": null,
+   "code_snippet": "    def load_bytecode(self, f: t.BinaryIO) -> None:\n        \"\"\"Loads bytecode from a file or file like object.\"\"\"\n        # make sure the magic header is correct\n        magic = f.read(len(bc_magic))\n        if magic != bc_magic:\n            self.reset()\n            return\n        # the source code of the file changed, we need to reload\n        checksum = pickle.load(f)",
+   "reasoning": "`Bucket.load_bytecode` accepts an arbitrary binary stream and immediately calls `pickle.load(f)` on data read from that stream (line 71). The only guards are:\n\n1. `magic != bc_magic` — `bc_magic` is a static, publicly-known constant (`b\"j2\" + pickle.dumps(5, 2) + pickle.dumps(ver, 2)`) that any attacker can trivially prepend. It provides no protection.\n2. The checksum comparison happens *after* `pickle.load(f)` has already executed arbitrary `__reduce__`/`__setstate__` gadget code. So even a checksum mismatch cannot prevent code execution.\n\nSink reachability (confirmed by tracing the callers):\n- `Bucket.bytecode_from_string()` (line 92) -> `load_bytecode(BytesIO(string))`, used by `MemcachedBytecodeCache.load_bytecode` (line 386) on bytes returned by `self.client.get(...)`. Bytes coming back from a memcached/redis backend are fully attacker-influenceable if that backend is shared, unauthenticated, reachable, or compromised — none of which is validated here.\n- `FileSystemBytecodeCache.load_bytecode` (line 262) -> `bucket.load_bytecode(f)` on `open(filename, \"rb\")`, where `filename = os.path.join(self.directory, self.pattern % bucket.key)`. `directory` and `pattern` are caller-supplied constructor arguments; if they point at a shared/world-writable or network-mounted location (very common for container/cache volumes, /tmp-based defaults on some platforms, NFS/S3 FUSE mounts, multi-tenant hosts), an attacker can plant a cache file and obtain arbitrary code execution in the victim process.\n\nThe `_get_default_cache_dir` hardening (uid check + `stat.S_IRWXU` mode check) only applies to the *default* directory and only defends against other local OS users; it provides no protection when a custom directory is supplied or when the memcached backend is the source. Jinja2's own API even documents a custom `load_bytecode` that just does `open(filename,'rb')` and `bucket.load_bytecode(f)`.\n\nThe `_unsafe_dir` check also only runs when the directory is created/first used, so a directory replaced after the check (TOCTOU on a shared mount) still results in attacker-controlled bytes being pickled.\n\nThis is a genuine CWE-502 unsafe deserialization: the data crossing into `pickle.load` is attacker-controlled and no safe loader (`pickletools`, restricted unpickler, HMAC/signature over the cache content) is used anywhere in the module. The only real mitigations today are deployment hygiene (trusted, non-shared cache dir) — which is exactly what a bytecode-cache API cannot guarantee for its users.",
+   "evidence": {
+    "code_context": "bc_magic = (b\"j2\" + pickle.dumps(bc_version, 2) + pickle.dumps((sys.version_info[0] << 24) | sys.version_info[1], 2))\n\ndef load_bytecode(self, f):\n    magic = f.read(len(bc_magic))\n    if magic != bc_magic:\n        self.reset(); return\n    checksum = pickle.load(f)          # <-- sink, line 71, executes gadgets before any validation\n    if self.checksum != checksum:\n        self.reset(); return\n    try:\n        self.code = marshal.load(f)    # <-- line 77\n    except (EOFError, ValueError, TypeError):\n        self.reset(); return\n\ndef bytecode_from_string(self, string): self.load_bytecode(BytesIO(string))",
+    "dataflow_analysis": "Source -> sink paths confirmed via grep of all load_bytecode callers:\n(a) MemcachedBytecodeCache.load_bytecode (line 386): code = self.client.get(self.prefix + bucket.key) -> bucket.bytecode_from_string(code) (line 92) -> Bucket.load_bytecode(BytesIO) -> pickle.load at line 71. No validation of the returned bytes.\n(b) FileSystemBytecodeCache.load_bytecode (line 262): open(self._get_cache_filename(bucket),'rb') -> with f: bucket.load_bytecode(f) (line 275) -> pickle.load at line 71. Directory only uid/mode-checked when defaulted, and only at creation time.\n(c) Public API Bucket.bytecode_from_string / documented subclass example (bccache.py docstring lines 110-125) encourage feeding arbitrary files/streams into load_bytecode.",
+    "notes": "bc_magic is a constant and therefore forgeable; it is a compatibility guard, not a trust boundary. Checksum verification occurs after pickle execution, so it cannot mitigate. The module imports `pickle` (unsafe) and `marshal` (unsafe) and has no safe-loader alternative or signature verification anywhere."
+   },
+   "dataflow_path": null,
+   "group": "high_often_medium",
+   "sanity_check": {
+    "verdict": "mr",
+    "confidence": 58,
+    "recommendation": "review",
+    "concerns": true,
+    "flags": [
+     {
+      "type": "EXPLOITABILITY",
+      "severity": "warning",
+      "message": "pickle.load sink is real, but exploitation requires attacker write access to the bytecode cache (filesystem cache directory or memcached), which is normally a trusted store written and read by Jinja2 itself. Not directly reachable from untrusted template/user input in standard deployments.",
+      "evidence": "load_bytecode is invoked on files Jinja2 writes under FileSystemBytecodeCache (open cache file) and on memcached values returned by the configured client; the application owns that store. The documented bytecode_from_string/public API could pass untrusted bytes, but that is caller responsibility."
+     },
+     {
+      "type": "NOVEL_FINDING",
+      "severity": "info",
+      "message": "Code is accurately described; no hallucination. The magic constant is forgeable and the checksum is validated after pickle.load, so the compatibility guard offers no deserialization protection. This matches a known unsafe-pickle pattern rather than a novel exploit.",
+      "evidence": "bc_magic = b\"j2\" + pickle.dumps(bc_version,2) + pickle.dumps((major<<24)|minor,2); checksum = pickle.load(f) then if self.checksum != checksum: self.reset()."
+     }
+    ],
+    "reasoning": "The finding accurately reflects the code: Bucket.load_bytecode calls pickle.load on an arbitrary binary stream at line 71, with only a forgeable magic header and post-deserialization checksum check. However, whether this is a genuine exploitable vulnerability depends on the deployment threat model—Jinja2 treats its bytecode cache as a trusted local store, so an attacker must already have write access to the cache directory/memcached, which is not reachable from untrusted template input in normal operation. This is a real unsafe-deserialization weakness worth manual review, but exploitability is context-dependent and not high-confidence enough to auto-accept."
+   }
+  },
+  {
+   "codeql_query_uuids": [
+    "20261119032520"
+   ],
+   "finding_id": "0851d5e8-bd5c-4dc3-bebc-7b5fb0c5b9a5",
+   "verdict": "mr",
+   "confidence": 50,
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-502",
+    "cwe-913"
+   ],
+   "description": "Unsafe marshal.load of code objects from bytecode-cache stream allows arbitrary code-object injection",
+   "file_path": "src/jinja2/bccache.py",
+   "start_line": 77,
+   "end_line": 77,
+   "start_column": null,
+   "end_column": null,
+   "code_snippet": "        # if marshal_load fails then we need to reload\n        try:\n            self.code = marshal.load(f)\n        except (EOFError, ValueError, TypeError):\n            self.reset()\n            return",
+   "reasoning": "Line 77 deserializes the remaining stream with `marshal.load(f)` and assigns the result to `self.code`, which is later used as the compiled template code object. `marshal` is explicitly documented as unable to handle malicious/malformed input safely, and it can materialize arbitrary Python code objects (constants, nested code objects, attacker-chosen opcodes). Once `self.code` is set it is executed/attached as the template's compiled module.\n\nThis sink is a downstream consequence of the same trust failure as line 71 (`pickle.load`): the only preconditions are (a) matching 5-byte `bc_magic`, trivially forgeable, and (b) `checksum == self.checksum`, which is `sha1(template source)` — computable by anyone who knows the template name/source. The exception handling catches only `EOFError/ValueError/TypeError`; it does not validate the resulting object at all.\n\nVerdict: manual-review rather than a separate true positive. It is reachable in exactly the same scenarios as the pickle sink, and in practice any attacker able to reach line 77 can already achieve RCE via the earlier `pickle.load` at line 71 — so it is the same root cause/secondary sink rather than an independently exploitable primitive. It would become independently critical if `pickle.load` were ever replaced with a safe loader while `marshal.load` was left in place (a realistic partial fix that would silently leave a code-object-injection hole). Also, malformed marshal data can crash the interpreter (segfault) rather than raise a catchable exception, making this a robustness/DoS concern as well.",
+   "evidence": {
+    "code_context": "checksum = pickle.load(f)\nif self.checksum != checksum:\n    self.reset(); return\ntry:\n    self.code = marshal.load(f)   # line 77\n\n# self.code is later written back out (write_bytecode) and used as the\n# compiled template code object by the Environment loader.",
+    "dataflow_analysis": "FileSystemBytecodeCache.load_bytecode (line 262) / MemcachedBytecodeCache.load_bytecode (line 386) -> Bucket.load_bytecode -> marshal.load(f) at line 77 -> self.code (CodeType) -> template execution.",
+    "notes": "marshal is not a safe deserializer; Python docs: 'Never unmarshal data received from an untrusted or unauthenticated source.' Guard conditions (magic constant + sha1 source checksum) are attacker-computable and do not constitute a trust boundary. Caught exceptions do not cover all malformed-input failure modes (potential interpreter crash)."
+   },
+   "dataflow_path": null,
+   "group": "high_often_medium",
+   "sanity_check": {
+    "verdict": "mr",
+    "confidence": 75,
+    "recommendation": "review",
+    "concerns": true,
+    "flags": [
+     {
+      "type": "EXPLOITABILITY",
+      "severity": "warning",
+      "message": "The unsafe deserialization sink is real, but exploitation requires attacker control over the bytecode cache file or cache backend. It is not remotely reachable by default.",
+      "evidence": "Bucket.load_bytecode reads from a local file or memcached cache; an attacker must be able to write cache entries and satisfy the magic value and checksum before marshal.load is reached."
+     },
+     {
+      "type": "NOVEL_FINDING",
+      "severity": "info",
+      "message": "No clear CVE match is apparent; this is a known unsafe-deserialization pattern whose severity depends on the cache trust boundary and deployment permissions.",
+      "evidence": "src/jinja2/bccache.py:77 uses marshal.load on cached data; Jinja2's cache directory/backend permissions determine whether untrusted writers are possible."
+     }
+    ],
+    "reasoning": "The code trace is accurate: Bucket.load_bytecode calls marshal.load and assigns the result to self.code, which can become executable template bytecode. However, this is not a default remote vulnerability because it requires control of the bytecode cache (filesystem or memcached) and is fundamentally a trust-boundary/design issue; manual review should determine whether the documented deployment permits untrusted cache writers and whether cache permissions or backend authentication mitigate it."
+   }
+  },
+  {
+   "codeql_query_uuids": [
+    "20261119032520"
+   ],
+   "finding_id": "d2f02856-a8f6-4668-8123-41dae6a83552",
+   "verdict": "tp",
+   "confidence": 75,
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-502",
+    "cwe-913"
+   ],
+   "description": "MemcachedBytecodeCache passes attacker-influenceable memcached value directly into Bucket.bytecode_from_string, which unpickles it (pickle.load) → remote code execution via cache poisoning.",
+   "file_path": "src/jinja2/bccache.py",
+   "start_line": 391,
+   "end_line": 392,
+   "start_column": null,
+   "end_column": null,
+   "code_snippet": "    def load_bytecode(self, bucket: Bucket) -> None:\n        try:\n            code = self.client.get(self.prefix + bucket.key)\n        except Exception:\n            if not self.ignore_memcache_errors:\n                raise\n        else:\n            bucket.bytecode_from_string(code)",
+   "reasoning": "MemcachedBytecodeCache.load_bytecode() reads a raw bytes value from a memcached server and hands it to bucket.bytecode_from_string(code) with no validation beyond the 6-byte \"j2...\" magic prefix check inside Bucket.load_bytecode. That method then calls pickle.load(f) at line 71. memcached is a network service frequently reachable by other tenants/hosts (default no auth, often bound to 0.0.0.0, or shared Redis/memcached instance), and the cache keys are fully predictable: prefix \"jinja2/bytecode/\" + sha1(template name [+ filename]). An attacker who can write to the memcached instance (unauth memcached, SSRF to memcached, or a shared instance) can plant a bucket value whose first bytes equal bc_magic (j2 + pickle.dumps(5,2) + pickle.dumps(python_version,2)) followed by a malicious pickle payload; the checksum comparison happens only AFTER the pickle has been executed, so no knowledge of the real checksum is needed for code execution. This is an additional sink beyond the two reported by CodeQL (which only cover the generic Bucket.load_bytecode), and it makes the deserialization reachable from an untrusted network source rather than only from the local cache directory.",
+   "evidence": {
+    "code_context": "Bucket.load_bytecode (lines 63-80): magic = f.read(len(bc_magic)); if magic != bc_magic: reset/return; checksum = pickle.load(f)  <-- unpickling BEFORE any integrity check.  bytecode_from_string (line 92) = self.load_bytecode(BytesIO(string)).\nMemcachedBytecodeCache.load_bytecode (386-392): code = self.client.get(self.prefix + bucket.key); bucket.bytecode_from_string(code).",
+    "dataflow_analysis": "memcached GET response (network, attacker writable) -> `code` (bytes) -> Bucket.bytecode_from_string(code) -> BytesIO -> Bucket.load_bytecode(f) -> f.read(len(bc_magic)) prefix check (bc_magic is deterministic/known) -> pickle.load(f) => arbitrary __reduce__ execution.",
+    "notes": "Exploitation requires write access to the memcached instance used by the application (common in multi-tenant/shared cache setups, unauthenticated memcached, or SSRF+gopher). Cache keys are predictable from template names/paths (sha1 hexdigest)."
+   },
+   "dataflow_path": null,
+   "group": "high_often_medium",
+   "sanity_check": {
+    "verdict": "tp",
+    "confidence": 80,
+    "recommendation": "review",
+    "concerns": true,
+    "flags": [
+     {
+      "type": "EXPLOITABILITY",
+      "severity": "warning",
+      "message": "Exploitation requires write access to the configured memcached service; if the cache is properly isolated or authenticated, this path is not reachable by an external attacker.",
+      "evidence": "MemcachedBytecodeCache.load_bytecode reads self.client.get(...) and passes the bytes directly to Bucket.bytecode_from_string; Bucket.load_bytecode then calls pickle.load after only a known magic-prefix check, so a poisoned cache entry can execute arbitrary code."
+     }
+    ],
+    "reasoning": "The code trace is accurate: a memcached GET result is fed into an unpickling path without authentication or integrity validation, so cache poisoning can lead to RCE. The practical risk is deployment-dependent because it requires attacker write access to the memcached instance, so this should be reviewed rather than unconditionally accepted."
+   }
+  },
+  {
+   "codeql_query_uuids": [
+    "20261119032606",
+    "20261119032915"
+   ],
+   "finding_id": "aa5eb789-ceef-4dea-a8ef-cac35301ce3b",
+   "verdict": "dup",
+   "confidence": 65,
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-502"
+   ],
+   "description": "Unsafe pickle deserialization of Jinja bytecode cache payload (Bucket.load_bytecode) allows code execution if cache storage is attacker-writable",
+   "file_path": "src/jinja2/bccache.py",
+   "start_line": 71,
+   "end_line": 71,
+   "start_column": null,
+   "end_column": null,
+   "code_snippet": "        # the source code of the file changed, we need to reload\n        checksum = pickle.load(f)\n        if self.checksum != checksum:\n            self.reset()\n            return",
+   "reasoning": "Bucket.load_bytecode reads a byte stream (from a filesystem cache file via FileSystemBytecodeCache.load_bytecode, or from an arbitrary memcache client via MemcachedBytecodeCache.load_bytecode/bytecode_from_string) and calls pickle.load(f) on it. The only gate before deserialization is a 9-byte magic header comparison (bc_magic = b\"j2\" + pickle.dumps(5,2) + pickle.dumps(version,2)), which any attacker who can write/poison the cache can trivially reproduce. The checksum comparison happens only AFTER pickle.load has already executed, so it provides no protection. pickle.load on untrusted data is arbitrary code execution via __reduce__/__setstate__ gadgets. The filesystem implementation does harden the default temp directory (0700 + ownership/lstat checks), but a caller-supplied directory, a cache directory on shared/NFS storage, or a shared/multi-tenant memcached instance (MemcachedBytecodeCache accepts any client and uses only client.get(prefix+key)) collapses that hardening. This is the genuine deserialization sink the query flags; impact is RCE in the application process at template-load time.",
+   "evidence": {
+    "code_context": "def load_bytecode(self, f: t.BinaryIO) -> None:\n    magic = f.read(len(bc_magic))\n    if magic != bc_magic:\n        self.reset(); return\n    checksum = pickle.load(f)   # <-- sink, line 71\n    if self.checksum != checksum:\n        self.reset(); return\n    try:\n        self.code = marshal.load(f)  # line 77\n    except (EOFError, ValueError, TypeError):\n        self.reset(); return",
+    "dataflow_analysis": "Source: bytes from cache storage.\n  FileSystemBytecodeCache.load_bytecode -> open(filename,'rb') -> f -> bucket.load_bytecode(f)\n  MemcachedBytecodeCache.load_bytecode -> self.client.get(self.prefix+bucket.key) -> bucket.bytecode_from_string(code) -> BytesIO(code) -> load_bytecode\nSink: pickle.load(f) at bccache.py:71 (magic-bytes gate only, checksum verified after deserialization).\nReached from BaseLoader.get_template -> bcc.get_bucket(...) -> self.load_bytecode(bucket) (loaders.py:135).",
+    "notes": "bc_magic is public/constant and reproducible; the SHA1 source checksum check occurs after the pickle.load, so it cannot prevent gadget execution. Suggested fix: replace pickle with a non-executing format (e.g., read a fixed-length bytes/integer checksum, or use hmac+struct)."
+   },
+   "dataflow_path": null,
+   "group": "medium_often_medium"
+  },
+  {
+   "codeql_query_uuids": [
+    "20261119032915"
+   ],
+   "finding_id": "857fba2c-0759-414e-b2f4-328f2e6d00f7",
+   "verdict": "tp",
+   "confidence": 55,
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-502"
+   ],
+   "description": "marshal.load on attacker-writable bytecode cache content in Bucket.load_bytecode (unsafe deserialization / code object injection)",
+   "file_path": "src/jinja2/bccache.py",
+   "start_line": 77,
+   "end_line": 82,
+   "start_column": null,
+   "end_column": null,
+   "code_snippet": "        # if marshal_load fails then we need to reload\n        try:\n            self.code = marshal.load(f)\n        except (EOFError, ValueError, TypeError):\n            self.reset()\n            return",
+   "reasoning": "The code object stored in the cache is read with marshal.load and then returned to BaseLoader.get_template as `code`, which is executed via Template.from_code -> exec(code, namespace) (environment.py:1222). marshal is explicitly documented as not a secure deserialization format; crafted data can produce arbitrary code objects (arbitrary bytecode -> arbitrary Python execution) in the interpreter process. As with the sibling pickle.load at line 71, the only precondition is matching the 9-byte bc_magic header, which is public and trivially reproducible, and the checksum is only checked after the pickle payload is loaded. Attacker who can place a cache file (custom/shared cache directory or poisoned memcache entry) can therefore inject a code object that Jinja will execute as the compiled template. Same trust boundary as the pickle finding but a distinct sink requiring a separate fix (e.g. signing the whole cache payload).",
+   "evidence": {
+    "code_context": "self.code = marshal.load(f) -> bucket.code returned by get_bucket() -> loaders.py:136 code = bucket.code -> environment.template_class.from_code(environment, code, globals, uptodate) -> exec(code, namespace) (environment.py:1219-1222)",
+    "dataflow_analysis": "cache bytes -> Bucket.load_bytecode(f) -> marshal.load(f) -> Bucket.code -> FileSystemLoader.get_template (loaders.py:135-136) -> Template.from_code -> exec(code, namespace)",
+    "notes": "Exception handling only catches EOFError/ValueError/TypeError, which does not prevent a well-formed malicious marshal payload from loading."
+   },
+   "dataflow_path": null,
+   "group": "medium_often_medium",
+   "sanity_check": {
+    "verdict": "mr",
+    "confidence": 58,
+    "recommendation": "review",
+    "concerns": true,
+    "flags": [
+     {
+      "type": "EXPLOITABILITY",
+      "severity": "warning",
+      "message": "Exploitability depends on the application configuring the bytecode cache directory to a location writable by an attacker. This is a caller/infrastructure responsibility; in the standard deployment model the cache is trusted, application-controlled storage.",
+      "evidence": "FileSystemLoader is configured by the application with a cache directory. An attacker able to write the cache file could already plant/modify template source files or Python modules; marshal.load adds limited marginal attack surface."
+     },
+     {
+      "type": "CONTEXT_MISMATCH",
+      "severity": "info",
+      "message": "The data deserialized is internal application-written cache state, not externally-supplied untrusted input. CWE-502's 'untrusted data' precondition is only met if cache directory permissions are insecure, which is a deployment concern rather than a library defect.",
+      "evidence": "Bytecode cache is written by the same process via write_bytecode (marshal.dump) and is not populated from HTTP/external input in the normal flow."
+     }
+    ],
+    "reasoning": "The code trace is accurate: marshal.load feeds Bucket.code into Template.from_code -> exec, and marshal/pickle are indeed unsafe formats, so the finding is not a hallucination. However, this bytecode cache is a trusted, application-controlled storage path; exploiting it requires the attacker to already be able to write to the cache directory (equivalent filesystem access already grants template/module replacement). This is a caller responsibility / defense-in-depth concern rather than a clear library vulnerability, so it warrants human judgment about the deployment's cache trust boundaries rather than an automatic accept or reject."
+   }
+  },
+  {
+   "codeql_query_uuids": [
+    "20261119032915"
+   ],
+   "finding_id": "fb9932a1-a1c1-462f-b2fc-515147b59316",
+   "verdict": "fp",
+   "confidence": 90,
+   "severity": "low",
+   "cwe_ids": [
+    "cwe-502"
+   ],
+   "description": "pickle.dump in Bucket.write_bytecode is a serialization sink, not a deserialization of untrusted data",
+   "file_path": "src/jinja2/bccache.py",
+   "start_line": 87,
+   "end_line": 88,
+   "start_column": null,
+   "end_column": null,
+   "code_snippet": "        f.write(bc_magic)\n        pickle.dump(self.checksum, f, 2)\n        marshal.dump(self.code, f)",
+   "reasoning": "Lines 87-88 only serialize the checksum (a sha1 hex string) and the code object when writing the cache. There is no attacker-controlled deserialization here; the data written is generated internally by Jinja. No taint from untrusted input reaches this sink in an exploitable way.",
+   "evidence": {},
+   "dataflow_path": null,
+   "group": "medium_often_medium",
+   "sanity_check": {
+    "verdict": "fp",
+    "confidence": 95,
+    "recommendation": "reject",
+    "concerns": false,
+    "flags": [
+     {
+      "type": "EXPLOITABILITY",
+      "severity": "info",
+      "message": "The reported line uses pickle.dump, which is a serialization sink, not a deserialization sink. It does not process untrusted input at this point.",
+      "evidence": "write_bytecode() serializes self.checksum (a SHA1 checksum string) and self.code (a code object) into a cache file. No attacker-controlled data is deserialized here."
+     }
+    ],
+    "reasoning": "The finding correctly identifies that pickle.dump in Bucket.write_bytecode is only a serialization operation. CWE-502 concerns deserialization of untrusted data, and this line does not perform deserialization, so the reported vulnerability is a false positive."
+   }
+  },
+  {
+   "codeql_query_uuids": [
+    "20261119032915"
+   ],
+   "finding_id": "d4841b19-9c98-4aff-a2c8-089642e4c913",
+   "verdict": "fp",
+   "confidence": 95,
+   "severity": "low",
+   "cwe_ids": [
+    "cwe-502"
+   ],
+   "description": "bc_magic built with pickle.dumps of constant integers - not a vulnerability",
+   "file_path": "src/jinja2/bccache.py",
+   "start_line": 36,
+   "end_line": 41,
+   "start_column": null,
+   "end_column": null,
+   "code_snippet": "bc_magic = (\n    b\"j2\"\n    + pickle.dumps(bc_version, 2)\n    + pickle.dumps((sys.version_info[0] << 24) | sys.version_info[1], 2)\n)",
+   "reasoning": "Module-level constant construction; pickle.dumps is called on trusted integers only. No deserialization of untrusted data occurs. The bytecode magic is compared against file content as a sanity check, which does not provide integrity protection, but the sink itself is benign.",
+   "evidence": {},
+   "dataflow_path": null,
+   "group": "medium_often_medium",
+   "sanity_check": {
+    "verdict": "fp",
+    "confidence": 96,
+    "recommendation": "reject",
+    "concerns": false,
+    "flags": [
+     {
+      "type": "EXPLOITABILITY",
+      "severity": "warning",
+      "message": "pickle.dumps is serialization, not deserialization; no CWE-502 sink exists at this location",
+      "evidence": "bc_magic is constructed at module import from constant integers (bc_version=5 and sys.version_info); pickle.dumps serializes trusted constants and no attacker-controlled data reaches a deserialization sink in this snippet."
+     },
+     {
+      "type": "HALLUCINATION",
+      "severity": "info",
+      "message": "CWE-502 applies to deserialization of untrusted data; the flagged code only serializes constants",
+      "evidence": "The snippet uses pickle.dumps on constant integers to build magic bytes. There is no pickle.loads / unpickling of external input at this line."
+     }
+    ],
+    "reasoning": "The flagged code constructs a module-level bytecode magic constant by pickling trusted integer values (bc_version and sys.version_info). CWE-502 concerns deserialization of untrusted data, but here there is no deserialization and no untrusted input; the pickle usage is benign serialization. The finding is a false positive."
+   }
+  },
+  {
+   "codeql_query_uuids": [
+    "20261119032915"
+   ],
+   "finding_id": "0181c8e3-3f16-4a1a-8cb5-6ee47038b3d4",
+   "verdict": "fp",
+   "confidence": 90,
+   "severity": "low",
+   "cwe_ids": [
+    "cwe-94"
+   ],
+   "description": "compile/exec in jinja2/debug.py operates on internally generated code, not attacker input",
+   "file_path": "src/jinja2/debug.py",
+   "start_line": 105,
+   "end_line": 145,
+   "start_column": null,
+   "end_column": null,
+   "code_snippet": "    code: CodeType = compile(\n        \"\\n\" * (lineno - 1) + \"raise __jinja_exception__\", filename, \"exec\"\n    )\n    ...\n    try:\n        exec(code, globals, locals)\n    except BaseException:\n        return sys.exc_info()[2].tb_next  # type: ignore",
+   "reasoning": "The source string compiled is a fixed literal (\"raise __jinja_exception__\") prefixed with newlines; only the filename and the line offset come from the traceback, and neither is interpolated into executable statements. The exec runs that same generated code. No attacker-controlled data reaches eval/exec here — this is Jinja's traceback rewriting helper used when propagate_exceptions/debug is enabled.",
+   "evidence": {},
+   "dataflow_path": null,
+   "group": "medium_often_medium",
+   "sanity_check": {
+    "verdict": "fp",
+    "confidence": 95,
+    "recommendation": "reject",
+    "concerns": false,
+    "flags": [
+     {
+      "type": "EXPLOITABILITY",
+      "severity": "info",
+      "message": "The compile/exec operates on a fixed literal source string, not attacker input, so there is no code injection vector.",
+      "evidence": "Source is \"\\n\" * (lineno - 1) + \"raise __jinja_exception__\" where lineno is an integer and the statement is a constant literal. filename only sets co_filename/__file__ metadata and is not concatenated into the executed statement. The exec runs this same internally generated code solely to obtain a rewritten traceback."
+     }
+    ],
+    "reasoning": "The snippet matches the described code and there is no hallucination; however, the compiled/executed source is an internally constructed constant that raises a pre-bound exception, with only filename metadata and an integer line offset derived from the traceback. No attacker-controlled data reaches compile/exec in any executable position, making this a false positive (CWE-94 does not apply). The finding's own verdict (fp) is correct and confidence should remain high."
+   }
+  },
+  {
+   "codeql_query_uuids": [
+    "20261119032915"
+   ],
+   "finding_id": "692b88bd-2365-444e-a659-d504c5659dc4",
+   "verdict": "fp",
+   "confidence": 80,
+   "severity": "low",
+   "cwe_ids": [
+    "cwe-94"
+   ],
+   "description": "Environment._compile / Template.from_code compile and exec template code as part of documented Jinja design",
+   "file_path": "src/jinja2/environment.py",
+   "start_line": 1341,
+   "end_line": null,
+   "start_column": null,
+   "end_column": null,
+   "code_snippet": "                use_id,\\n                (\"root\", code_generator...)\\n            ...\\n        return compile(source, filename, \"exec\")",
+   "reasoning": "Compiling Jinja template source into Python code and exec'ing the resulting code object is the core, documented mechanism of the templating engine (sandboxing is provided by SandboxedEnvironment, not by avoiding compile). The template source is supplied by the application developer via loaders; rendering untrusted templates is a documented non-goal/unsafe usage. Not a vulnerability in itself; the reported environment.py:704 compile and 1222 exec are by-design primitives.",
+   "evidence": {},
+   "dataflow_path": null,
+   "group": "medium_often_medium",
+   "sanity_check": {
+    "verdict": "fp",
+    "confidence": 95,
+    "recommendation": "reject",
+    "concerns": false,
+    "flags": [
+     {
+      "type": "EXPLOITABILITY",
+      "severity": "info",
+      "message": "Compiling and exec'ing template source is Jinja2's documented, by-design mechanism; any security boundary is provided by SandboxedEnvironment, not by avoiding compile/exec.",
+      "evidence": "Snippet shows `return compile(source, filename, \"exec\")` inside Environment._compile, which is the core templating engine primitive. Template source is supplied by the application/developer via loaders, not untrusted external input in normal usage."
+     },
+     {
+      "type": "CONTEXT_MISMATCH",
+      "severity": "info",
+      "message": "Finding flags standard library behavior as cwe-94 without demonstrating untrusted input reaching compile/exec, which is a caller responsibility in this context.",
+      "evidence": "Package context is a library/framework (templating layer); rendering untrusted templates is documented as unsafe usage, and sandboxing is delegated to SandboxedEnvironment."
+     }
+    ],
+    "reasoning": "The compile/exec call in jinja2/environment.py is the documented core of the templating engine and does not constitute a vulnerability by itself. It is only exploitable if the application renders untrusted templates without sandboxing, which is a caller-side misuse rather than a library vulnerability, so the finding is a false positive."
+   }
+  },
+  {
+   "codeql_query_uuids": [
+    "20261119032915"
+   ],
+   "finding_id": "ed36804f-3bb3-415a-b2c8-f24027bd810c",
+   "verdict": "fp",
+   "confidence": 85,
+   "severity": "low",
+   "cwe_ids": [
+    "cwe-94"
+   ],
+   "description": "ModuleLoader __import__ uses a sha1-derived module name, not attacker-controlled import path",
+   "file_path": "src/jinja2/loaders.py",
+   "start_line": 648,
+   "end_line": null,
+   "start_column": null,
+   "end_column": null,
+   "code_snippet": "        key = self.get_template_key(name)\n        module = f\"{self.package_name}.{key}\"\n        ...\n                mod = __import__(module, None, None, [\"root\"])",
+   "reasoning": "The imported module name is the prefix package_name (developer-supplied) plus \"tmpl_\" + sha1(template name).hexdigest(), so the dynamic part is a hex digest that cannot contain dots or traversal characters. Importing an arbitrary module is not possible through the template name.",
+   "evidence": {},
+   "dataflow_path": null,
+   "group": "medium_often_medium",
+   "sanity_check": {
+    "verdict": "fp",
+    "confidence": 96,
+    "recommendation": "reject",
+    "concerns": true,
+    "flags": [
+     {
+      "type": "EXPLOITABILITY",
+      "severity": "warning",
+      "message": "The dynamic import path is derived from an internal package name and a SHA-1 hex digest of the template name, which prevents attacker-controlled module path injection.",
+      "evidence": "module = f\"{self.package_name}.{key}\"; key comes from get_template_key(name), which hashes the template name. The digest is hexadecimal and cannot contain dots or traversal characters."
+     },
+     {
+      "type": "CODE_SMELL",
+      "severity": "info",
+      "message": "Dynamic __import__ can resemble an injection sink, but in this context the module name is safely constructed from a fixed package prefix and a hash digest.",
+      "evidence": "The imported module is a generated fake package submodule, and failed imports are converted to TemplateNotFound."
+     }
+    ],
+    "reasoning": "The finding correctly notes the presence of __import__, but incorrectly treats the sha1-derived module name as attacker-controlled import path. In Jinja2's ModuleLoader, the template name is hashed into a hexadecimal key and prefixed by an internally generated package name, so arbitrary module import via template name is not feasible. This is not a real CWE-94 vulnerability in the library context."
+   }
+  },
+  {
+   "codeql_query_uuids": [
+    "20261119032915"
+   ],
+   "finding_id": "dca3429b-9da6-47a4-9d49-6a9477323b48",
+   "verdict": "fp",
+   "confidence": 80,
+   "severity": "low",
+   "cwe_ids": [
+    "cwe-94"
+   ],
+   "description": "import_string __import__ is fed by developer-configured extension/loader names, not end-user input",
+   "file_path": "src/jinja2/utils.py",
+   "start_line": 146,
+   "end_line": 149,
+   "start_column": null,
+   "end_column": null,
+   "code_snippet": "        if \":\" in import_name:\n            module, obj = import_name.split(\":\", 1)\n        elif \".\" in import_name:\n            module, _, obj = import_name.rpartition(\".\")\n        else:\n            return __import__(import_name)\n        return getattr(__import__(module, None, None, [obj]), obj)",
+   "reasoning": "import_string is called from Environment.__init__ (extensions list) and ext.py:808 — both take class-path strings from application configuration, not from request data. Importing a module by name is also not equivalent to code execution unless the app lets untrusted users choose extensions, which would be an application-level mistake. Not exploitable within Jinja itself.",
+   "evidence": {},
+   "dataflow_path": null,
+   "group": "medium_often_medium",
+   "sanity_check": {
+    "verdict": "fp",
+    "confidence": 95,
+    "recommendation": "reject",
+    "concerns": true,
+    "flags": [
+     {
+      "type": "EXPLOITABILITY",
+      "severity": "warning",
+      "message": "import_string is a utility that dynamically imports developer-supplied module paths; it is not reachable by untrusted input within Jinja itself.",
+      "evidence": "The function accepts import_name and calls __import__, but callers such as Environment.__init__ and ext.py pass application configuration values, not request data."
+     },
+     {
+      "type": "CODE_SMELL",
+      "severity": "info",
+      "message": "Dynamic importing based on a string is an intended feature and only becomes dangerous if an application misuses import_string with user-controlled input.",
+      "evidence": "jinja2.utils.import_string is a public helper; the risk is caller responsibility, not a library vulnerability."
+     },
+     {
+      "type": "CONTEXT_MISMATCH",
+      "severity": "info",
+      "message": "CWE-94 code injection is not appropriately mapped here because module import by name is not equivalent to arbitrary code execution in this context.",
+      "evidence": "The code uses __import__ and getattr to load configured classes/extensions; no eval/exec or attacker-controlled path is present in Jinja runtime."
+     }
+    ],
+    "reasoning": "The snippet does contain dynamic import logic, but it is fed by developer/application configuration rather than end-user input. In a templating library context this is expected functionality, and any exploit would require a caller to pass untrusted data to import_string, which is an application-level misuse. Therefore the finding is a false positive."
+   }
+  },
+  {
+   "codeql_query_uuids": [
+    "20261119032940"
+   ],
+   "finding_id": "e4862ea3-c36d-4fb9-838b-b2bf77d289a6",
+   "verdict": "fp",
+   "confidence": 92,
+   "severity": "low",
+   "cwe_ids": [
+    "cwe-022"
+   ],
+   "description": "bccache open() flagged as path traversal, but filename is built from a SHA-1 hexdigest cache key under a developer-configured directory/pattern, not attacker-controlled path data",
+   "file_path": "src/jinja2/bccache.py",
+   "start_line": 268,
+   "end_line": 268,
+   "start_column": null,
+   "end_column": null,
+   "code_snippet": "    def load_bytecode(self, bucket: Bucket) -> None:\n        filename = self._get_cache_filename(bucket)\n\n        # Don't test for existence before opening the file, since the\n        # file could disappear after the test before the open.\n        try:\n            f = open(filename, \"rb\")",
+   "reasoning": "`_get_cache_filename` returns `os.path.join(self.directory, self.pattern % (bucket.key,))`. `bucket.key` is produced by `get_cache_key()` as `sha1(name.encode(\"utf-8\"))` hexdigest (bccache.py:150-158), which is 40 hex characters with no path separators or `..` segments, so template names cannot escape the cache root. `self.directory` and `self.pattern` come from the application developer (BytecodeCache configuration), not from an untrusted request, so an attacker cannot influence the path. Additionally, `_get_default_cache_dir()` hardens the default location with lstat ownership/mode checks on POSIX. No traversal is reachable here.",
+   "evidence": {
+    "code_context": "_get_cache_filename: os.path.join(self.directory, self.pattern % (bucket.key,)); get_cache_key: sha1(name.encode('utf-8')) hexdigest (40 hex chars, no separators)",
+    "dataflow_analysis": "template name -> sha1 hexdigest (irreversible, separator-free) -> pattern substitution -> join with developer-supplied directory. No untrusted path component reaches open().",
+    "notes": "The pattern/directory are trusted configuration values, equivalent to an administrator-specified cache path. Same directory is validated by lstat uid/mode checks in _get_default_cache_dir."
+   },
+   "dataflow_path": null,
+   "group": "medium_undetermined_undetermined",
+   "sanity_check": {
+    "verdict": "fp",
+    "confidence": 96,
+    "recommendation": "reject",
+    "concerns": false,
+    "flags": [
+     {
+      "type": "EXPLOITABILITY",
+      "severity": "warning",
+      "message": "No attacker-controlled path component reaches open(); the cache filename uses a SHA-1 hexdigest and developer-configured directory/pattern.",
+      "evidence": "_get_cache_filename returns os.path.join(self.directory, self.pattern % (bucket.key,)); bucket.key is a SHA-1 hexdigest of the template name, containing only 40 hex characters with no '/' or '..'. self.directory and self.pattern are BytecodeCache configuration values, not untrusted request input."
+     }
+    ],
+    "reasoning": "The code snippet exists and matches the finding, but the alleged path traversal is not exploitable. The only dynamic filename component is an irreversible SHA-1 hexdigest, while the cache root and pattern are trusted developer configuration, so this is a false positive rather than a CWE-22 vulnerability."
+   }
+  },
+  {
+   "codeql_query_uuids": [
+    "20261119032940"
+   ],
+   "finding_id": "fbc30198-e9c9-458d-8513-96ffd79aad04",
+   "verdict": "fp",
+   "confidence": 96,
+   "severity": "low",
+   "cwe_ids": [
+    "cwe-022"
+   ],
+   "description": "split_template_path() flagged at its own call site in FileSystemLoader.get_source — this function IS the path traversal sanitizer, not a sink",
+   "file_path": "src/jinja2/loaders.py",
+   "start_line": 195,
+   "end_line": 195,
+   "start_column": null,
+   "end_column": null,
+   "code_snippet": "    def get_source(\n        self, environment: \"Environment\", template: str\n    ) -> t.Tuple[str, str, t.Callable[[], bool]]:\n        pieces = split_template_path(template)\n        for searchpath in self.searchpath:\n            # Use posixpath even on Windows to avoid \"drive:\" or UNC\n            # segments breaking out of the search directory.\n            filename = posixpath.join(searchpath, *pieces)",
+   "reasoning": "The reported line is the call to `split_template_path(template)`, which is the traversal guard itself (defined at loaders.py:25-38). It raises `TemplateNotFound` for any segment containing `os.path.sep`, `os.path.altsep`, or equal to `os.path.pardir` ('..'), and drops empty/'.' segments. The remaining segments therefore cannot contain path separators or traversal elements, so the subsequent `posixpath.join(searchpath, *pieces)` cannot escape the search directory. Being flagged at the sanitizer means the query did not model the guard; there is no vulnerability at this location.",
+   "evidence": {
+    "code_context": "def split_template_path(template):\n    pieces = []\n    for piece in template.split('/'):\n        if (os.path.sep in piece or (os.path.altsep and os.path.altsep in piece) or piece == os.path.pardir):\n            raise TemplateNotFound(template)\n        elif piece and piece != '.':\n            pieces.append(piece)\n    return pieces",
+    "dataflow_analysis": "untrusted template name -> split_template_path() (raises on '..' / separators) -> clean segment list -> posixpath.join(searchpath, *pieces)",
+    "notes": "Unit tests confirm the guard: tests/test_loader.py:117 expects TemplateNotFound for '../foo'. This is the intended security boundary of Jinja's FileSystemLoader."
+   },
+   "dataflow_path": null,
+   "group": "medium_undetermined_undetermined",
+   "sanity_check": {
+    "verdict": "fp",
+    "confidence": 95,
+    "recommendation": "reject",
+    "concerns": false,
+    "flags": [
+     {
+      "type": "CODE_SMELL",
+      "severity": "info",
+      "message": "The flagged line is the path-traversal sanitizer itself, not a sink; it is the intended security boundary of Jinja's FileSystemLoader.",
+      "evidence": "split_template_path() (loaders.py:25-38) raises TemplateNotFound for any segment containing os.path.sep/altsep or equal to '..', so posixpath.join(searchpath, *pieces) cannot escape the search directory."
+     }
+    ],
+    "reasoning": "The reported call site is exactly the guard function that prevents directory traversal; the code snippet matches the finding's description with no hallucination. Since the sanitizer ensures the joined path stays within the search directory, this is a false positive rather than a real cwe-022 vulnerability."
+   }
+  },
+  {
+   "codeql_query_uuids": [
+    "20261119032940"
+   ],
+   "finding_id": "89eb3a1c-6427-490e-95de-30be62796c35",
+   "verdict": "fp",
+   "confidence": 85,
+   "severity": "low",
+   "cwe_ids": [
+    "cwe-22"
+   ],
+   "description": "PackageLoader path construction uses split_template_path() which rejects '..' and path separators, preventing traversal",
+   "file_path": "src/jinja2/loaders.py",
+   "start_line": 337,
+   "end_line": 338,
+   "start_column": null,
+   "end_column": null,
+   "code_snippet": "        p = os.path.normpath(\n            posixpath.join(self._template_root, *split_template_path(template))\n        )",
+   "reasoning": "The template name is passed through split_template_path(), which iterates over the '/'-separated segments and raises TemplateNotFound(template) if any segment contains os.path.sep, os.altsep, or equals os.path.pardir ('..'). Empty segments and '.' are dropped. Therefore no '..' or separator can reach the posixpath.join() call, so the joined path cannot escape _template_root. The os.path.normpath() applied afterwards operates on an already-validated relative path and cannot introduce traversal. This is the intended, documented sanitizer for this loader — the query simply follows the taint into the join without modeling the guard. Not exploitable.",
+   "evidence": {
+    "code_context": "def split_template_path(template: str) -> t.List[str]:\n    pieces = []\n    for piece in template.split(\"/\"):\n        if (\n            os.path.sep in piece\n            or (os.path.altsep and os.path.altsep in piece)\n            or piece == os.path.pardir\n        ):\n            raise TemplateNotFound(template)\n        elif piece and piece != \".\":\n            pieces.append(piece)\n    return pieces\n\n# PackageLoader.get_source\np = os.path.normpath(\n    posixpath.join(self._template_root, *split_template_path(template))\n)",
+    "dataflow_analysis": "Source: template name supplied to get_source(). Sink: posixpath.join() at loaders.py:337 feeding open(p) at line 346. The dataflow passes through split_template_path(), which raises TemplateNotFound for any '..' segment or embedded separator, so tainted traversal segments never reach the join.",
+    "notes": "Unit test exists: tests/test_loader.py:117 asserts pytest.raises(TemplateNotFound, split_template_path, '../foo'). The comment in the code also documents the intent: 'Use posixpath even on Windows to avoid \"drive:\" or UNC segments breaking out of the search directory.'"
+   },
+   "dataflow_path": null,
+   "group": "medium_undetermined_undetermined",
+   "sanity_check": {
+    "verdict": "fp",
+    "confidence": 93,
+    "recommendation": "reject",
+    "concerns": false,
+    "flags": [],
+    "reasoning": "The claimed traversal is genuinely mitigated: split_template_path() splits the template on '/', rejects any segment containing os.path.sep/os.path.altsep or equal to '..', and drops empty/'.' segments before the posixpath.join() call. Consequently no traversal segment or separator can reach the join, making the subsequent os.path.normpath() operate on an already-validated relative path. The finding itself even describes the mitigation, confirming this is a false positive rather than a real vulnerability."
+   }
+  },
+  {
+   "codeql_query_uuids": [
+    "20261119032940"
+   ],
+   "finding_id": "3a57fc77-7c6c-48af-ac15-f750b8e432ae",
+   "verdict": "fp",
+   "confidence": 85,
+   "severity": "low",
+   "cwe_ids": [
+    "cwe-22"
+   ],
+   "description": "PackageLoader open() sink operates on a path already validated by split_template_path(), so no traversal is possible",
+   "file_path": "src/jinja2/loaders.py",
+   "start_line": 346,
+   "end_line": 347,
+   "start_column": null,
+   "end_column": null,
+   "code_snippet": "            with open(p, \"rb\") as f:\n                source = f.read()",
+   "reasoning": "Line 346 is the open() sink reached from the path built at line 337. Because the sole input to that path is split_template_path(template), which raises TemplateNotFound on any '..' segment or embedded path separator, the value of p is guaranteed to remain inside self._template_root. In addition, the code checks os.path.isfile(p) and raises TemplateNotFound(template) if it is not a regular file before opening. There is no attacker-controlled traversal reaching this open(). False positive.",
+   "evidence": {
+    "code_context": "if self._archive is None:\n    # Package is a directory.\n    if not os.path.isfile(p):\n        raise TemplateNotFound(template)\n\n    with open(p, \"rb\") as f:\n        source = f.read()",
+    "dataflow_analysis": "Taint source: template name. Path: template -> split_template_path() (raises on '..'/separators, drops '' and '.') -> posixpath.join(self._template_root, *pieces) -> os.path.normpath -> open(p). The guard intercepts traversal segments before the join.",
+    "notes": "Same sanitizer chain as loaders.py:337; both locations belong to the same PackageLoader.get_source path and are non-exploitable."
+   },
+   "dataflow_path": null,
+   "group": "medium_undetermined_undetermined",
+   "sanity_check": {
+    "verdict": "fp",
+    "confidence": 95,
+    "recommendation": "reject",
+    "concerns": false,
+    "flags": [],
+    "reasoning": "The open() sink receives a path built from split_template_path(template), which rejects '..' segments and embedded path separators before joining and normalizing the path. The additional isfile() check further confirms the target is a regular file inside the configured template root. There is no attacker-controlled path traversal reaching this open() call."
+   }
+  },
+  {
+   "codeql_query_uuids": [],
+   "finding_id": "d49371e1-1542-425f-b603-7124c5c2c5fb",
+   "verdict": "fp",
+   "confidence": 90,
+   "severity": "low",
+   "cwe_ids": [
+    "cwe-022"
+   ],
+   "description": "open_if_exists() opens a path built from a template loader search path; not a traversal vulnerability — path segments are validated by split_template_path() before reaching this helper",
+   "file_path": "src/jinja2/utils.py",
+   "start_line": 162,
+   "end_line": 162,
+   "start_column": null,
+   "end_column": null,
+   "code_snippet": "def open_if_exists(filename: str, mode: str = \"rb\") -> t.Optional[t.IO]:\n    \"\"\"Returns a file descriptor for the filename if that file exists,\n    otherwise ``None``.\n    \"\"\"\n    if not os.path.isfile(filename):\n        return None\n\n    return open(filename, mode)",
+   "reasoning": "utils.py:162 is the `open(filename, mode)` inside the generic helper `open_if_exists()`. It performs no path construction itself — it simply opens whatever filename its caller supplies. Its only in-tree caller relevant to this query is `FileSystemLoader.get_source()` (loaders.py:196), which builds `filename = posixpath.join(searchpath, *pieces)` where `pieces` comes from `split_template_path(template)`.\n\nThat helper (loaders.py:25-38) is an explicit path-traversal guard: it splits the template name on \"/\" and raises `TemplateNotFound` if any segment contains `os.path.sep`, `os.path.altsep`, or equals `os.path.pardir` (\"..\"). It also drops empty and \".\" segments. Consequently, on both POSIX and Windows, \"..\", \"../\", \"..\\\\\", \"C:\\\\\", and UNC-style segments are all rejected before any join occurs, so the joined path cannot escape `searchpath`.\n\nAdditional mitigating context: Jinja's own documented threat model places template source names under application control — the `Environment`/loader API is explicitly not a sandbox, and untrusted template *names* are out of scope for security fixes by design (untrusted template *content* is the concern). There is also a unit test asserting the guard behavior (tests/test_loader.py:114-117: `pytest.raises(TemplateNotFound, split_template_path, \"../foo\")`), confirming intent.\n\nBecause `open_if_exists()` receives only pre-validated, separator-free, non-\"..\" segments, CodeQL's taint model is flagging the helper at its sink boundary without accounting for the interprocedural sanitizer in `split_template_path()`. This is a false positive.",
+   "evidence": {
+    "code_context": "utils.py:155-162 -> def open_if_exists(filename, mode='rb'): if not os.path.isfile(filename): return None; return open(filename, mode)\n\nloaders.py:193-197 (caller) -> pieces = split_template_path(template); for searchpath in self.searchpath: filename = posixpath.join(searchpath, *pieces); f = open_if_exists(filename)\n\nloaders.py:25-38 (sanitizer) -> for piece in template.split('/'): if os.path.sep in piece or (os.path.altsep and os.path.altsep in piece) or piece == os.path.pardir: raise TemplateNotFound(template); elif piece and piece != '.': pieces.append(piece)",
+    "dataflow_analysis": "Source: template name string passed to FileSystemLoader.get_source(). Sink: open() at utils.py:162. Path: template -> split_template_path() [RAISES TemplateNotFound on '..', os.sep, os.altsep] -> pieces (guaranteed single-segment, traversal-free) -> posixpath.join(searchpath, *pieces) -> open_if_exists() -> open(). The sanitizer is strictly validating and sits on every path between source and sink; note os.path.sep covers '/' on POSIX and '\\\\' on Windows while altsep is checked too, so neither separator style nor '..' survives.",
+    "notes": "No in-tree caller passes an unvalidated name to open_if_exists. The helper is a generic low-level utility; the vulnerability-shaped behavior would require a caller that skips split_template_path, which does not exist in this package. Also confirmed via grep that split_template_path is only called at loaders.py:195 and loaders.py:337, both of which feed joins rooted at a configured template root. Consistent verdict with the other four locations in this group."
+   },
+   "dataflow_path": null,
+   "group": "medium_undetermined_undetermined",
+   "sanity_check": {
+    "verdict": "fp",
+    "confidence": 95,
+    "recommendation": "reject",
+    "concerns": false,
+    "flags": [
+     {
+      "type": "EXPLOITABILITY",
+      "severity": "info",
+      "message": "The sink is a generic open() helper and receives only a caller-constructed filename; in the relevant caller, template path pieces are sanitized by split_template_path before joining.",
+      "evidence": "loaders.py:193-197 joins searchpath with pieces from split_template_path(template); loaders.py:25-38 rejects '..', os.sep, and os.altsep. open_if_exists() itself performs no path construction."
+     }
+    ],
+    "reasoning": "The code at src/jinja2/utils.py:162 is a generic file-opening utility and does not itself introduce path traversal. The only relevant in-tree caller sanitizes template path components via split_template_path, which explicitly blocks '..' and path separators, so uncontrolled input cannot reach open() through the described flow."
+   }
+  },
+  {
+   "codeql_query_uuids": [
+    "20261119033534"
+   ],
+   "finding_id": "9cb5da54-f25e-453e-b6bc-b5ca6ab2fec8",
+   "verdict": "fp",
+   "confidence": 88,
+   "severity": "low",
+   "cwe_ids": [
+    "cwe-22"
+   ],
+   "description": "Path-traversal hypothesis on split_template_path: sanitizer rejects '..' and OS separators, so traversal is not possible (false positive)",
+   "file_path": "src/jinja2/loaders.py",
+   "start_line": 25,
+   "end_line": 38,
+   "start_column": null,
+   "end_column": null,
+   "code_snippet": "def split_template_path(template: str) -> t.List[str]:\n    \"\"\"Split a path into segments and perform a sanity check.  If it detects\n    '..' in the path it will raise a `TemplateNotFound` error.\n    \"\"\"\n    pieces = []\n    for piece in template.split(\"/\"):\n        if (\n            os.path.sep in piece\n            or (os.path.altsep and os.path.altsep in piece)\n            or piece == os.path.pardir\n        ):\n            raise TemplateNotFound(template)\n        elif piece and piece != \".\":\n            pieces.append(piece)\n    return pieces",
+   "reasoning": "The query hypothesizes that split_template_path may fail to block traversal sequences. Reviewing the implementation (jinja2 3.1.2) shows the opposite: the name is split on '/', and each resulting segment is rejected if it contains os.path.sep, contains os.path.altsep (when defined, e.g. '/' on Windows), or is exactly os.path.pardir ('..'). Because the split already removes '/', the only way to escape the search directory is a '..' segment, which is explicitly blocked. Segments such as '....', '..;' or '.' are literal directory names, not traversal primitives, and there is no percent-decoding or normalization step that could turn them into '..'. Both consumers of the sanitizer use safe joins: FileSystemLoader uses posixpath.join(searchpath, *pieces) (explicitly to avoid drive/UNC escapes on Windows) and PackageLoader uses os.path.normpath(posixpath.join(self._template_root, *split_template_path(template))) where normpath cannot reintroduce traversal since no '..' segment survives. Therefore the constraint is enforced before any filesystem access and the CodeQL finding does not represent an exploitable directory traversal.",
+   "evidence": {
+    "code_context": "split_template_path() blocks segments containing os.path.sep, os.path.altsep, or equal to os.path.pardir; callers: FileSystemLoader.get_source (line 195, posixpath.join(searchpath, *pieces)) and PackageLoader.get_source (line 337, os.path.normpath(posixpath.join(self._template_root, *split_template_path(template)))).",
+    "dataflow_analysis": "No attacker-controlled template name can reach an unvalidated filesystem join/open: every '..' or separator-containing segment raises TemplateNotFound before open_if_exists/os.path.isfile is called.",
+    "notes": "Version = 3.1.2 (current upstream release). No decoding/normalization bypass present in the loaders module."
+   },
+   "dataflow_path": null,
+   "group": "medium_undetermined_high",
+   "sanity_check": {
+    "verdict": "fp",
+    "confidence": 97,
+    "recommendation": "reject",
+    "concerns": false,
+    "flags": [
+     {
+      "type": "EXPLOITABILITY",
+      "severity": "info",
+      "message": "split_template_path explicitly rejects '..' segments and any segment containing platform path separators, so attacker-controlled template names cannot escape the configured search path through this helper.",
+      "evidence": "The function splits on '/', rejects os.path.sep, os.path.altsep, and os.path.pardir, and callers pass only sanitized pieces into posixpath.join/open_if_exists. No decode/normalize bypass appears in the loaders module."
+     }
+    ],
+    "reasoning": "The code snippet matches the described implementation and contains no path-traversal flaw: split_template_path blocks '..' and separator-containing segments before any filesystem join/open. The candidate finding is a false positive, not a real CWE-22 vulnerability."
+   }
+  },
+  {
+   "codeql_query_uuids": [
+    "20261119033534"
+   ],
+   "finding_id": "d804c9fe-c7dd-440c-ab87-4cdead7172f9",
+   "verdict": "fp",
+   "confidence": 85,
+   "severity": "low",
+   "cwe_ids": [
+    "cwe-22"
+   ],
+   "description": "Flagged RuntimeError/type/TemplateNotFound raises are abstract BaseLoader API guards, not path-traversal sinks",
+   "file_path": "src/jinja2/loaders.py",
+   "start_line": 96,
+   "end_line": 99,
+   "start_column": null,
+   "end_column": null,
+   "code_snippet": "        if not self.has_source_access:\n            raise RuntimeError(\n                f\"{type(self).__name__} cannot provide access to the source\"\n            )\n        raise TemplateNotFound(template)",
+   "reasoning": "These lines are the default (abstract) implementation of BaseLoader.get_source. They perform no filesystem access and no path construction; they only raise RuntimeError when a subclass declares has_source_access = False (e.g. ModuleLoader) and otherwise raise TemplateNotFound. No template name is joined to a path or opened here, so there is no directory-traversal sink. The CodeQL result is an artifact of the query matching the TemplateNotFound/type/RuntimeError calls inside the loader API rather than an actual vulnerable operation.",
+   "evidence": {
+    "code_context": "BaseLoader.get_source() is overridden by all concrete loaders; the base implementation only raises. Only concrete loader (e.g. FileSystemLoader) touches the filesystem, and it sanitizes via split_template_path + posixpath.join.",
+    "dataflow_analysis": "template -> TemplateNotFound(template) exception message only; never reaches open()/os.path.join.",
+    "notes": "Dead-end sink for traversal purposes."
+   },
+   "dataflow_path": null,
+   "group": "medium_undetermined_high",
+   "sanity_check": {
+    "verdict": "fp",
+    "confidence": 93,
+    "recommendation": "reject",
+    "concerns": false,
+    "flags": [
+     {
+      "type": "EXPLOITABILITY",
+      "severity": "warning",
+      "message": "The flagged code is the abstract BaseLoader.get_source default implementation; it performs no filesystem access or path construction, so CWE-22 cannot be triggered here.",
+      "evidence": "Snippet only contains `raise RuntimeError(...)` and `raise TemplateNotFound(template)`. The template value flows only into the exception message, never into open()/os.path.join()/posixpath.join()."
+     },
+     {
+      "type": "CONTEXT_MISMATCH",
+      "severity": "info",
+      "message": "CodeQL matched exception-raising API guard code rather than an actual path-traversal sink.",
+      "evidence": "All concrete loaders (e.g. FileSystemLoader) override get_source and sanitize via split_template_path + posixpath.join; the base method is a dead-end for traversal."
+     }
+    ],
+    "reasoning": "The flagged lines are Jinja2's abstract BaseLoader.get_source implementation, which only raises RuntimeError/TemplateNotFound and performs no path construction or file access. There is no dataflow from the template name to a filesystem sink, so this is a false positive for CWE-22; the concrete loaders that do touch the filesystem sanitize paths separately."
+   }
+  },
+  {
+   "codeql_query_uuids": [
+    "20261119033534"
+   ],
+   "finding_id": "6dd1af73-4737-4920-850b-d814e4c45698",
+   "verdict": "fp",
+   "confidence": 85,
+   "severity": "low",
+   "cwe_ids": [
+    "cwe-22"
+   ],
+   "description": "BaseLoader.list_templates raising TypeError is unrelated to path traversal (false positive)",
+   "file_path": "src/jinja2/loaders.py",
+   "start_line": 105,
+   "end_line": 105,
+   "start_column": null,
+   "end_column": null,
+   "code_snippet": "        raise TypeError(\"this loader cannot iterate over all templates\")",
+   "reasoning": "Line 105 is the default list_templates() implementation that signals 'iteration not supported' via TypeError. It takes no template-name input, performs no path joining and no file access, so it cannot be a directory-traversal sink. This result is noise from the query matching exception-raising calls in the loaders module.",
+   "evidence": {
+    "code_context": "def list_templates(self) -> t.List[str]: ... raise TypeError(\"this loader cannot iterate over all templates\")",
+    "dataflow_analysis": "No data flow from user-controlled template names to this statement; it is a constant-message raise.",
+    "notes": "Unreachable as a filesystem operation."
+   },
+   "dataflow_path": null,
+   "group": "medium_undetermined_high",
+   "sanity_check": {
+    "verdict": "fp",
+    "confidence": 98,
+    "recommendation": "reject",
+    "concerns": true,
+    "flags": [
+     {
+      "type": "CONTEXT_MISMATCH",
+      "severity": "warning",
+      "message": "CWE-22 path traversal does not match this code: the method raises a constant TypeError and performs no path construction or file access.",
+      "evidence": "BaseLoader.list_templates() contains only `raise TypeError(\"this loader cannot iterate over all templates\")`; it accepts no template-name input and has no filesystem sink."
+     },
+     {
+      "type": "EXPLOITABILITY",
+      "severity": "info",
+      "message": "The statement is not reachable as a directory-traversal sink and has no user-controlled data flow.",
+      "evidence": "No data flow analysis path connects user-controlled template names to this raise; it is a constant-message exception used to signal unsupported iteration."
+     }
+    ],
+    "reasoning": "The finding is a false positive: the cited line is an intentional exception raise in Jinja2's BaseLoader implementation, not a path traversal operation. The code contains no path joining, no file access, and no user-controlled input reaching the statement, so CWE-22 is not applicable."
+   }
+  },
+  {
+   "codeql_query_uuids": [
+    "20261119033534"
+   ],
+   "finding_id": "92de27df-f57e-4d7c-b078-e974cba26ebf",
+   "verdict": "fp",
+   "confidence": 92,
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-22"
+   ],
+   "description": "CodeQL flags TemplateNotFound raise in BaseLoader.get_source as a potential directory traversal path check; not a vulnerability (safe template-not-found error path, no path construction from user input)",
+   "file_path": "src/jinja2/loaders.py",
+   "start_line": 99,
+   "end_line": 99,
+   "start_column": null,
+   "end_column": null,
+   "code_snippet": "        if not self.has_source_access:\n            raise RuntimeError(\n                f\"{type(self).__name__} cannot provide access to the source\"\n            )\n        raise TemplateNotFound(template)",
+   "reasoning": "Line 99 is the terminal `raise TemplateNotFound(template)` of the abstract `BaseLoader.get_source` implementation. It never touches the filesystem and performs no path joining, so it cannot introduce or bypass a traversal check. The real sanitization for all filesystem loaders lives in `split_template_path` (lines 25-38), which rejects any path segment containing `os.sep`, `os.altsep`, or equal to `os.path.pardir` (`..`), and also uses `posixpath.join` (in FileSystemLoader/PackageLoader) precisely to avoid Windows drive/UNC escape. This query result is a heuristic artifact of the rule matching exception-raise sites inside the base loader class rather than an exploitable traversal. Note: Jinja2's own documentation has always stated that template names are trusted input; applications mapping untrusted user input to template names must do their own validation. No exploitable path traversal exists here.",
+   "evidence": {
+    "code_context": "base loader get_source raises TemplateNotFound; no filesystem access performed",
+    "dataflow_analysis": "No source-to-sink flow: `template` is only used in the exception message. Filesystem sinks (open_if_exists/getmtime in FileSystemLoader line ~195-207, os.path.isfile/open in PackageLoader line ~337-345) are all preceded by split_template_path() which raises on '..', os.sep and os.altsep. posixpath.join is used specifically to prevent 'drive:'/'\\\\' escapes on Windows.",
+    "notes": "Jinja2 3.1.2 src/jinja2/loaders.py lines 25-38 contain the traversal check; the flagged lines 96-105 are abstract-class raise statements only."
+   },
+   "dataflow_path": null,
+   "group": "medium_undetermined_high",
+   "sanity_check": {
+    "verdict": "fp",
+    "confidence": 99,
+    "recommendation": "reject",
+    "concerns": true,
+    "flags": [
+     {
+      "type": "EXPLOITABILITY",
+      "severity": "warning",
+      "message": "The flagged line is only an exception path and performs no filesystem access or path construction, so it cannot be a directory traversal vulnerability.",
+      "evidence": "BaseLoader.get_source raises TemplateNotFound(template); the actual filesystem loaders use split_template_path(), which rejects '..', os.sep, and os.altsep before path joins/open operations."
+     }
+    ],
+    "reasoning": "The finding describes CodeQL flagging the terminal raise TemplateNotFound in BaseLoader.get_source, but that code neither constructs a path nor accesses the filesystem. The real traversal protection is in split_template_path for filesystem-backed loaders, so this is a false positive rather than a CWE-22 vulnerability."
+   }
+  }
+ ],
+ "sanity_check_metadata": {
+  "session_id": "20261119034646",
+  "model": "deepseek/deepseek-reasoner",
+  "temperature": 0.0,
+  "max_tokens": 8000,
+  "total_input_tokens": 26919,
+  "total_output_tokens": 30823,
+  "total_tokens": 57742,
+  "estimated_cost_usd": 0.0205,
+  "total_findings_validated": 20,
+  "findings_with_flags": 0,
+  "elapsed_time_seconds": 257.82
+ },
+ "cache_usage": {
+  "prompt_tokens_total": 26919,
+  "uncached_input_tokens": 26919,
+  "cache_creation_input_tokens": 0,
+  "cache_read_input_tokens": 0,
+  "output_tokens": 30823,
+  "calls": 19,
+  "caching_enabled": false,
+  "cost_usd_with_cache": 0.045063,
+  "cost_usd_no_cache": 0.045063,
+  "cache_read_share_of_prompt": 0.0,
+  "prices_per_mtok": {
+   "claude-sonnet-4-5-20250929": {
+    "input": 3.0,
+    "output": 15.0
+   },
+   "claude-haiku-4-5-20251001": {
+    "input": 1.0,
+    "output": 5.0
+   },
+   "deepseek/deepseek-reasoner": {
+    "input": 0.15,
+    "output": 0.6,
+    "cache_read": 0.003,
+    "cache_write_mult": 1.0,
+    "peak_mult": 2.0
+   }
+  },
+  "cache_multipliers": {
+   "write_5m": 1.25,
+   "read": 0.1
+  }
+ }
+}

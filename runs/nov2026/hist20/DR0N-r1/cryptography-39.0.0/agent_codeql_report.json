@@ -1,0 +1,2071 @@
+{
+ "session_id": "20261119013626",
+ "package_name": "cryptography-39.0.0",
+ "package_path": "packages/cryptography-39.0.0",
+ "database_path": "databases/cryptography-39.0.0-db",
+ "model": "deepseek/deepseek-reasoner",
+ "temperature": 0.0,
+ "max_tokens": 8000,
+ "iterations": 18,
+ "total_input_tokens": 236264,
+ "total_output_tokens": 28444,
+ "total_tokens": 264708,
+ "elapsed_time_seconds": 640.2,
+ "estimated_cost_usd": 0.0781,
+ "summary": "## Security Analysis: `cryptography` 39.0.0\n\n### Primary Finding — HIGH — CVE-2023-23931: Memory corruption via `Cipher.update_into` on non-writable buffers (CWE-787)\n\nThe package is `cryptography` **39.0.0**, which is the exact version affected by the publicly disclosed **CVE-2023-23931** (fixed in 39.0.1). CodeQL analysis confirmed the vulnerability is present in the analyzed source:\n\n- `src/cryptography/hazmat/backends/openssl/ciphers.py`, `_CipherContext.update_into` (lines ~148–177) passes the **caller-supplied output buffer** directly into `ffi.from_buffer(<buf>)` (line 159) and `ffi.from_buffer(<buf>, require_writable=...)`-style writes (line 160), and hands the resulting pointer to `EVP_CipherUpdate` as the *output* buffer.\n- `src/cryptography/hazmat/primitives/ciphers/base.py`, `CipherContext.update_into` (line 32) and `_CipherContext.update_into` (line 178) / `_AEADCipherContext.update_into` (line 220) forward the user buffer without validation.\n- A package-wide search for any writability guard (`readonly` / `writable` / `require_writable`) returned **zero results**. The only validation performed in `update_into` is a length check (\"buffer must be at least {{}} bytes for this payload\").\n\n**Impact:** Although the C API accepts const-typed inputs, OpenSSL writes decrypted/encrypted output through the pointer obtained from `ffi.from_buffer`. Because immutability of the Python object was never checked, callers can pass an immutable `bytes` object, causing writes into a non-writable allocation → **memory corruption / potential use-after-free / crash**. This is a local integrity/availability issue reachable through the normal public `Cipher` API (and via `update_into` in AEAD contexts).\n\n### Secondary / Informational Observations\n\n1. **17 `ffi.from_buffer` call sites lack `isinstance`/buffer-protocol validation** (`aead.py`, `backend.py`, `ciphers.py`, `hashes.py`, `hmac.py`, `poly1305.py`). Most receive `bytes` (immutable, safe in read context), but the *output-buffer* paths are exactly where this becomes dangerous (see primary finding). Hardening gap for the whole buffer-handling layer.\n2. **`setup.py` (lines 105–111) invokes a subprocess** during build (`setuptools_rust`/build machinery). Build-time only; arguments are not derived from untrusted input, so no practical injection vector — low/no risk.\n3. **`src/cryptography/x509/extensions.py` (line 70)** references a legacy digest constant; consistent with intentional backwards-compatibility for parsing legacy certificates, not an exploitable weakness.\n4. **`_cffi_src/utils.py` (lines 17, 42)** contains dynamic `exec`/eval of generated CFFI bindings — **build-time code generation only**, not reachable at runtime by an attacker. Benign.\n5. **`verify`-named methods** (`hmac.py:70`, `poly1305.py:48,60`, `cmac.py:59`, `fernet.py:133`) flagged by a TLS-verification heuristic are false positives — they are constant-time MAC verification routines, not TLS peer-verification toggles.\n6. `_AEADCipherContext.update_into` performs length assertions before delegating, but still lacks the writability guard; same root cause as the primary finding.\n\n### Recommendation\nUpgrade to **`cryptography >= 39.0.1`**, where `update_into` rejects non-readable/non-writable buffers. Long term: enforce `ffi.from_buffer(..., require_writable=True)` on all output-buffer paths and add explicit buffer-protocol validation at the `hazmat` public API boundary.",
+ "package_classification": {
+  "type": [
+   "library",
+   "framework"
+  ],
+  "layer": [
+   "cryptography",
+   "security",
+   "cffi-bindings",
+   "runtime"
+  ]
+ },
+ "tool_calls": {
+  "get_package_profile_info": 1,
+  "execute_codeql_query": 25,
+  "validate_codeql_query": 0,
+  "fixup_codeql_query": 2,
+  "finalize_report": 1
+ },
+ "queries_executed": {
+  "critical": 1,
+  "high": 7,
+  "medium": 4,
+  "low": 0,
+  "total_executed": 26,
+  "total_with_results": 12,
+  "total_failed": 16
+ },
+ "query_findings": {
+  "critical": 2,
+  "high": 48,
+  "medium": 9,
+  "low": 0,
+  "total": 59
+ },
+ "findings": [
+  {
+   "codeql_query_uuid": "20261119013649",
+   "codeql_raw_query": "/**\n * @name Command execution with shell / shell-like invocation\n * @description Find subprocess/os shell invocations that may allow command injection\n * @kind problem\n * @problem.severity warning\n * @id py/shell-invocation-sweep\n */\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call, string what\nwhere\n  (\n    call = API::moduleImport(\"subprocess\").getMember([\"call\",\"run\",\"Popen\",\"check_output\",\"check_call\",\"getoutput\",\"getstatusoutput\"]).getACall()\n    and what = \"subprocess call\"\n    or\n    call = API::moduleImport(\"os\").getMember([\"system\",\"popen\",\"spawnl\",\"spawnv\",\"execv\",\"execl\"]).getACall()\n    and what = \"os process spawn\"\n  )\nselect call, \"Process spawning via \" + what + \" - review arguments for injection.\"\n",
+   "hypothesis": "The package spawns processes (setup.py, _cffi_src/utils.py) and may pass shell commands built from data.",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-78"
+   ],
+   "results_count": 1,
+   "results": [
+    {
+     "ruleId": "py/shell-invocation-sweep",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/shell-invocation-sweep",
+      "index": 0
+     },
+     "message": {
+      "text": "Process spawning via subprocess call - review arguments for injection."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "setup.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 105,
+         "startColumn": 28,
+         "endLine": 111,
+         "endColumn": 14
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "4b1211c3e13fe0e4:1",
+      "primaryLocationStartColumnFingerprint": "15"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20261119013705",
+   "codeql_raw_query": "/**\n * @name Weak hash / insecure randomness usage\n * @description Detect use of md5/sha1 for security purposes and non-cryptographic RNG\n * @kind problem\n * @problem.severity warning\n * @id py/weak-crypto-sweep\n */\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call, string msg\nwhere\n  (\n    call = API::moduleImport(\"hashlib\").getMember([\"md5\",\"sha1\",\"new\"]).getACall() and msg = \"Weak/insecure hash usage\"\n    or\n    call = API::moduleImport(\"random\").getMember([\"random\",\"randint\",\"choice\",\"choices\",\"getrandbits\",\"sample\",\"randrange\",\"uniform\"]).getACall() and msg = \"Non-cryptographic RNG\"\n    or\n    call = API::moduleImport(\"uuid\").getMember(\"uuid1\").getACall() and msg = \"uuid1 uses predictable data\"\n  )\nselect call, msg\n",
+   "hypothesis": "Insecure primitives used inside the crypto library or its test helpers.",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-327",
+    "cwe-338"
+   ],
+   "results_count": 1,
+   "results": [
+    {
+     "ruleId": "py/weak-crypto-sweep",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/weak-crypto-sweep",
+      "index": 0
+     },
+     "message": {
+      "text": "Weak/insecure hash usage"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/cryptography/x509/extensions.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 70,
+         "startColumn": 12,
+         "endColumn": 30
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "3178f041781f3959:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20261119013755",
+   "codeql_raw_query": "/**\n * @name Unvalidated writable buffer passed to ffi.from_buffer\n * @description CFFI from_buffer accepts immutable bytes; writing to them can corrupt memory\n * @kind problem\n * @problem.severity warning\n * @id py/unvalidated-from-buffer\n * @tags security\n *        external/cwe/cwe-787\n */\nimport python\n\nfrom Function f, Call c\nwhere\n  f.contains(c) and\n  c.getFunc().(Attribute).getAttr() = \"from_buffer\" and\n  c.getArg(0) instanceof Name and\n  not exists(Call chk |\n    chk.getFunc().(Name).getId() = \"isinstance\" and\n    f.contains(chk)\n  )\nselect c, \"ffi.from_buffer in function \" + f.getName() + \" without isinstance validation of the buffer argument\"\n",
+   "hypothesis": "Crypto operations write into a caller-supplied buffer without verifying it is mutable (bytes vs bytearray), enabling memory corruption (CVE-2023-23931 class).",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-787",
+    "cwe-119"
+   ],
+   "results_count": 17,
+   "results": [
+    {
+     "ruleId": "py/unvalidated-from-buffer",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/unvalidated-from-buffer",
+      "index": 0
+     },
+     "message": {
+      "text": "ffi.from_buffer in function _aead_create_ctx without isinstance validation of the buffer argument"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/cryptography/hazmat/backends/openssl/aead.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 75,
+         "startColumn": 15,
+         "endColumn": 44
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "7c7e64b0c41c1ab1:1",
+      "primaryLocationStartColumnFingerprint": "10"
+     }
+    },
+    {
+     "ruleId": "py/unvalidated-from-buffer",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/unvalidated-from-buffer",
+      "index": 0
+     },
+     "message": {
+      "text": "ffi.from_buffer in function _aead_setup without isinstance validation of the buffer argument"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/cryptography/hazmat/backends/openssl/aead.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 126,
+         "startColumn": 17,
+         "endColumn": 48
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "39a813251677584:1",
+      "primaryLocationStartColumnFingerprint": "12"
+     }
+    },
+    {
+     "ruleId": "py/unvalidated-from-buffer",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/unvalidated-from-buffer",
+      "index": 0
+     },
+     "message": {
+      "text": "ffi.from_buffer in function _aead_setup without isinstance validation of the buffer argument"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/cryptography/hazmat/backends/openssl/aead.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 127,
+         "startColumn": 15,
+         "endColumn": 44
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "821d0f8e093aebb1:1",
+      "primaryLocationStartColumnFingerprint": "10"
+     }
+    },
+    {
+     "ruleId": "py/unvalidated-from-buffer",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/unvalidated-from-buffer",
+      "index": 0
+     },
+     "message": {
+      "text": "ffi.from_buffer in function _set_nonce_operation without isinstance validation of the buffer argument"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/cryptography/hazmat/backends/openssl/aead.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 148,
+         "startColumn": 17,
+         "endColumn": 48
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "55c7270959e33eb4:1",
+      "primaryLocationStartColumnFingerprint": "12"
+     }
+    },
+    {
+     "ruleId": "py/unvalidated-from-buffer",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/unvalidated-from-buffer",
+      "index": 0
+     },
+     "message": {
+      "text": "ffi.from_buffer in function derive_pbkdf2_hmac without isinstance validation of the buffer argument"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/cryptography/hazmat/backends/openssl/backend.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 472,
+         "startColumn": 28,
+         "endColumn": 63
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "afd8403c9a9ef82f:1",
+      "primaryLocationStartColumnFingerprint": "19"
+     }
+    },
+    {
+     "ruleId": "py/unvalidated-from-buffer",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/unvalidated-from-buffer",
+      "index": 0
+     },
+     "message": {
+      "text": "ffi.from_buffer in function _bytes_to_bio without isinstance validation of the buffer argument"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/cryptography/hazmat/backends/openssl/backend.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 630,
+         "startColumn": 20,
+         "endColumn": 47
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "ba5d5db830bc4f47:1",
+      "primaryLocationStartColumnFingerprint": "11"
+     }
+    },
+    {
+     "ruleId": "py/unvalidated-from-buffer",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/unvalidated-from-buffer",
+      "index": 0
+     },
+     "message": {
+      "text": "ffi.from_buffer in function _load_key without isinstance validation of the buffer argument"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/cryptography/hazmat/backends/openssl/backend.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 1174,
+         "startColumn": 28,
+         "endColumn": 59
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "cd88d21942c1477b:1",
+      "primaryLocationStartColumnFingerprint": "15"
+     }
+    },
+    {
+     "ruleId": "py/unvalidated-from-buffer",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/unvalidated-from-buffer",
+      "index": 0
+     },
+     "message": {
+      "text": "ffi.from_buffer in function x448_load_private_bytes without isinstance validation of the buffer argument"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/cryptography/hazmat/backends/openssl/backend.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 1978,
+         "startColumn": 20,
+         "endColumn": 47
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "b03482c955638f3:1",
+      "primaryLocationStartColumnFingerprint": "11"
+     }
+    },
+    {
+     "ruleId": "py/unvalidated-from-buffer",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/unvalidated-from-buffer",
+      "index": 0
+     },
+     "message": {
+      "text": "ffi.from_buffer in function ed25519_load_private_bytes without isinstance validation of the buffer argument"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/cryptography/hazmat/backends/openssl/backend.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 2026,
+         "startColumn": 20,
+         "endColumn": 47
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "b03482c955638f3:2",
+      "primaryLocationStartColumnFingerprint": "11"
+     }
+    },
+    {
+     "ruleId": "py/unvalidated-from-buffer",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/unvalidated-from-buffer",
+      "index": 0
+     },
+     "message": {
+      "text": "ffi.from_buffer in function ed448_load_private_bytes without isinstance validation of the buffer argument"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/cryptography/hazmat/backends/openssl/backend.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 2065,
+         "startColumn": 20,
+         "endColumn": 47
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "b03482c955638f3:3",
+      "primaryLocationStartColumnFingerprint": "11"
+     }
+    },
+    {
+     "ruleId": "py/unvalidated-from-buffer",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/unvalidated-from-buffer",
+      "index": 0
+     },
+     "message": {
+      "text": "ffi.from_buffer in function derive_scrypt without isinstance validation of the buffer argument"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/cryptography/hazmat/backends/openssl/backend.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 2088,
+         "startColumn": 28,
+         "endColumn": 63
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "c5760db10b75a838:1",
+      "primaryLocationStartColumnFingerprint": "19"
+     }
+    },
+    {
+     "ruleId": "py/unvalidated-from-buffer",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/unvalidated-from-buffer",
+      "index": 0
+     },
+     "message": {
+      "text": "ffi.from_buffer in function authenticate_additional_data without isinstance validation of the buffer argument"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/cryptography/hazmat/backends/openssl/ciphers.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 274,
+         "startColumn": 13,
+         "endColumn": 49
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "d63e422c7b7f384a:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/unvalidated-from-buffer",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/unvalidated-from-buffer",
+      "index": 0
+     },
+     "message": {
+      "text": "ffi.from_buffer in function update without isinstance validation of the buffer argument"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/cryptography/hazmat/backends/openssl/hashes.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 3
+        },
+        "region": {
+         "startLine": 56,
+         "startColumn": 20,
+         "endColumn": 56
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "64cf02a2d68ca913:1",
+      "primaryLocationStartColumnFingerprint": "11"
+     }
+    },
+    {
+     "ruleId": "py/unvalidated-from-buffer",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/unvalidated-from-buffer",
+      "index": 0
+     },
+     "message": {
+      "text": "ffi.from_buffer in function __init__ without isinstance validation of the buffer argument"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/cryptography/hazmat/backends/openssl/hmac.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 4
+        },
+        "region": {
+         "startLine": 41,
+         "startColumn": 23,
+         "endColumn": 58
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "9d987baa31832aee:1",
+      "primaryLocationStartColumnFingerprint": "10"
+     }
+    },
+    {
+     "ruleId": "py/unvalidated-from-buffer",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/unvalidated-from-buffer",
+      "index": 0
+     },
+     "message": {
+      "text": "ffi.from_buffer in function update without isinstance validation of the buffer argument"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/cryptography/hazmat/backends/openssl/hmac.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 4
+        },
+        "region": {
+         "startLine": 67,
+         "startColumn": 20,
+         "endColumn": 56
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "9e2b995f5cedde95:1",
+      "primaryLocationStartColumnFingerprint": "11"
+     }
+    },
+    {
+     "ruleId": "py/unvalidated-from-buffer",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/unvalidated-from-buffer",
+      "index": 0
+     },
+     "message": {
+      "text": "ffi.from_buffer in function __init__ without isinstance validation of the buffer argument"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/cryptography/hazmat/backends/openssl/poly1305.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 5
+        },
+        "region": {
+         "startLine": 22,
+         "startColumn": 19,
+         "endColumn": 54
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "eb10735d0d3d2f7c:1",
+      "primaryLocationStartColumnFingerprint": "10"
+     }
+    },
+    {
+     "ruleId": "py/unvalidated-from-buffer",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/unvalidated-from-buffer",
+      "index": 0
+     },
+     "message": {
+      "text": "ffi.from_buffer in function update without isinstance validation of the buffer argument"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/cryptography/hazmat/backends/openssl/poly1305.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 5
+        },
+        "region": {
+         "startLine": 50,
+         "startColumn": 20,
+         "endColumn": 56
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "565f617820179747:1",
+      "primaryLocationStartColumnFingerprint": "11"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20261119013812",
+   "codeql_raw_query": "/**\n * @name Dangerous dynamic evaluation / deserialization\n * @description eval/exec/pickle/marshal/yaml.load usage\n * @kind problem\n * @problem.severity error\n * @id py/dynamic-eval-deser\n * @tags security\n *        external/cwe/cwe-502\n *        external/cwe/cwe-094\n */\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::builtin([\"eval\", \"exec\", \"__import__\"]).getACall()\n  or\n  call = API::moduleImport([\"pickle\", \"cPickle\", \"marshal\", \"_pickle\"]).getMember([\"load\", \"loads\", \"Unpickler\"]).getACall()\n  or\n  call = API::moduleImport(\"yaml\").getMember([\"load\", \"unsafe_load\", \"full_load\"]).getACall()\n  or\n  call.getFunction().(DataFlow::Node).asExpr().(Attribute).getAttr() = \"loads\" and\n  call.getFunction().(DataFlow::Node).asExpr().(Attribute).getObject().(Name).getId() = \"pickle\"\nselect call, \"Dynamic evaluation or unsafe deserialization reachable here.\"\n",
+   "hypothesis": "The package may deserialize untrusted data or eval strings (e.g. in serialization helpers or setup scripts).",
+   "severity": "critical",
+   "cwe_ids": [
+    "cwe-502",
+    "cwe-094"
+   ],
+   "results_count": 2,
+   "results": [
+    {
+     "ruleId": "py/dynamic-eval-deser",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/dynamic-eval-deser",
+      "index": 0
+     },
+     "message": {
+      "text": "Dynamic evaluation or unsafe deserialization reachable here."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/_cffi_src/utils.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 42,
+         "startColumn": 9,
+         "endColumn": 41
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "d2de9406cbec5623:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/dynamic-eval-deser",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/dynamic-eval-deser",
+      "index": 0
+     },
+     "message": {
+      "text": "Dynamic evaluation or unsafe deserialization reachable here."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/_cffi_src/utils.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 17,
+         "startColumn": 5,
+         "endColumn": 26
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "1e83e77bd09711a5:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20261119013837",
+   "codeql_raw_query": "/**\n * @name Disabled TLS certificate verification\n * @description Setting verify_mode to CERT_NONE or check_hostname to False disables TLS authentication\n * @kind problem\n * @problem.severity error\n * @id py/tls-verification-disabled\n * @tags security\n *        external/cwe/cwe-295\n */\nimport python\n\nfrom Attribute a\nwhere\n  a.getAttr() in [\"verify_mode\", \"check_hostname\", \"CERT_NONE\", \"verify\"]\nselect a, \"TLS verification related attribute set/read: \" + a.getAttr()\n",
+   "hypothesis": "Package code may disable certificate/hostname verification when acting as a TLS client or server.",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-295"
+   ],
+   "results_count": 5,
+   "results": [
+    {
+     "ruleId": "py/tls-verification-disabled",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/tls-verification-disabled",
+      "index": 0
+     },
+     "message": {
+      "text": "TLS verification related attribute set/read: verify"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/cryptography/hazmat/primitives/cmac.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 59,
+         "startColumn": 9,
+         "endColumn": 19
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "15e54bf048fea5e5:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/tls-verification-disabled",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/tls-verification-disabled",
+      "index": 0
+     },
+     "message": {
+      "text": "TLS verification related attribute set/read: verify"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/cryptography/fernet.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 133,
+         "startColumn": 13,
+         "endColumn": 21
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "6ebe80d5976e1e77:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/tls-verification-disabled",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/tls-verification-disabled",
+      "index": 0
+     },
+     "message": {
+      "text": "TLS verification related attribute set/read: verify"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/cryptography/hazmat/primitives/hmac.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 70,
+         "startColumn": 9,
+         "endColumn": 19
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "8be66980fc7929fe:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/tls-verification-disabled",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/tls-verification-disabled",
+      "index": 0
+     },
+     "message": {
+      "text": "TLS verification related attribute set/read: verify"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/cryptography/hazmat/primitives/poly1305.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 3
+        },
+        "region": {
+         "startLine": 48,
+         "startColumn": 9,
+         "endColumn": 19
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "275118a4c69e9d00:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/tls-verification-disabled",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/tls-verification-disabled",
+      "index": 0
+     },
+     "message": {
+      "text": "TLS verification related attribute set/read: verify"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/cryptography/hazmat/primitives/poly1305.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 3
+        },
+        "region": {
+         "startLine": 60,
+         "startColumn": 9,
+         "endColumn": 17
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "344848971d6d98c5:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20261119013935",
+   "codeql_raw_query": "/**\n * @name writability validation in buffer-consuming functions\n * @description Find buffer-writing functions and whether they validate that the output buffer is a writable bytes-like type\n * @kind problem\n * @problem.severity warning\n * @id py/buffer-writability-check\n */\n\nimport python\n\nfrom Function f\nwhere\n  f.getName() in [\"update_into\", \"_aead_create_ctx\", \"encrypt_at_time\"]\nselect f, \"buffer writing function \" + f.getQualifiedName()",
+   "hypothesis": "Locate all functions that write into caller-provided buffers for writability review",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-787"
+   ],
+   "results_count": 7,
+   "results": [
+    {
+     "ruleId": "py/buffer-writability-check",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/buffer-writability-check",
+      "index": 0
+     },
+     "message": {
+      "text": "buffer writing function _aead_create_ctx"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/cryptography/hazmat/backends/openssl/aead.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 65,
+         "endLine": 69,
+         "endColumn": 3
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "f79b5dbd133d740a:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/buffer-writability-check",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/buffer-writability-check",
+      "index": 0
+     },
+     "message": {
+      "text": "buffer writing function CipherContext.update_into"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/cryptography/hazmat/primitives/ciphers/base.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 32,
+         "startColumn": 5,
+         "endColumn": 59
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "3b06fb86404e3f79:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/buffer-writability-check",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/buffer-writability-check",
+      "index": 0
+     },
+     "message": {
+      "text": "buffer writing function _CipherContext.update_into"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/cryptography/hazmat/primitives/ciphers/base.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 178,
+         "startColumn": 5,
+         "endColumn": 59
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "20fc760927f3309c:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/buffer-writability-check",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/buffer-writability-check",
+      "index": 0
+     },
+     "message": {
+      "text": "buffer writing function _AEADCipherContext.update_into"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/cryptography/hazmat/primitives/ciphers/base.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 220,
+         "startColumn": 5,
+         "endColumn": 59
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "5070b31efab98f2c:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/buffer-writability-check",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/buffer-writability-check",
+      "index": 0
+     },
+     "message": {
+      "text": "buffer writing function _CipherContext.update_into"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/cryptography/hazmat/backends/openssl/ciphers.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 148,
+         "startColumn": 5,
+         "endColumn": 59
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "db1e6d98c23fffab:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/buffer-writability-check",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/buffer-writability-check",
+      "index": 0
+     },
+     "message": {
+      "text": "buffer writing function Fernet.encrypt_at_time"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/cryptography/fernet.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 3
+        },
+        "region": {
+         "startLine": 53,
+         "startColumn": 5,
+         "endColumn": 72
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "446479a7b9fae099:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/buffer-writability-check",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/buffer-writability-check",
+      "index": 0
+     },
+     "message": {
+      "text": "buffer writing function MultiFernet.encrypt_at_time"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/cryptography/fernet.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 3
+        },
+        "region": {
+         "startLine": 185,
+         "startColumn": 5,
+         "endColumn": 71
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "d3c44a9b963a7461:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20261119014406",
+   "codeql_raw_query": "/**\n * @name Calls inside update_into implementations\n * @description Lists calls inside update_into to check for missing buffer writability validation (CVE-2023-23931).\n * @kind problem\n * @problem.severity warning\n * @id py/custom/update-into-calls\n */\n\nimport python\n\nfrom Function f, Call c\nwhere f.getName() = \"update_into\"\n  and c.getScope() = f\nselect c, \"call inside update_into in \" + f.getQualifiedName()",
+   "hypothesis": "CVE-2023-23931: Cipher.update_into writes into caller-provided buffers without checking writability; enumerate calls inside update_into implementations to confirm missing readonly check.",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-787",
+    "cwe-123"
+   ],
+   "results_count": 19,
+   "results": [
+    {
+     "ruleId": "py/custom/update-into-calls",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/custom/update-into-calls",
+      "index": 0
+     },
+     "message": {
+      "text": "call inside update_into in _CipherContext.update_into"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/cryptography/hazmat/primitives/ciphers/base.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 180,
+         "startColumn": 19,
+         "endColumn": 69
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "64fb84c258d0710a:1",
+      "primaryLocationStartColumnFingerprint": "6"
+     }
+    },
+    {
+     "ruleId": "py/custom/update-into-calls",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/custom/update-into-calls",
+      "index": 0
+     },
+     "message": {
+      "text": "call inside update_into in _CipherContext.update_into"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/cryptography/hazmat/primitives/ciphers/base.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 181,
+         "startColumn": 16,
+         "endColumn": 48
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "b04f32321194c1c7:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/custom/update-into-calls",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/custom/update-into-calls",
+      "index": 0
+     },
+     "message": {
+      "text": "call inside update_into in _AEADCipherContext.update_into"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/cryptography/hazmat/primitives/ciphers/base.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 221,
+         "startColumn": 9,
+         "endColumn": 37
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "c3c34d5e407be3e2:2",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/custom/update-into-calls",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/custom/update-into-calls",
+      "index": 0
+     },
+     "message": {
+      "text": "call inside update_into in _AEADCipherContext.update_into"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/cryptography/hazmat/primitives/ciphers/base.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 221,
+         "startColumn": 27,
+         "endColumn": 36
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "c3c34d5e407be3e2:2",
+      "primaryLocationStartColumnFingerprint": "18"
+     }
+    },
+    {
+     "ruleId": "py/custom/update-into-calls",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/custom/update-into-calls",
+      "index": 0
+     },
+     "message": {
+      "text": "call inside update_into in _AEADCipherContext.update_into"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/cryptography/hazmat/primitives/ciphers/base.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 224,
+         "startColumn": 16,
+         "endColumn": 48
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "b04f32321194c1c7:2",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/custom/update-into-calls",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/custom/update-into-calls",
+      "index": 0
+     },
+     "message": {
+      "text": "call inside update_into in _CipherContext.update_into"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/cryptography/hazmat/backends/openssl/ciphers.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 149,
+         "startColumn": 26,
+         "endColumn": 35
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "33bf615e61a2a63:1",
+      "primaryLocationStartColumnFingerprint": "17"
+     }
+    },
+    {
+     "ruleId": "py/custom/update-into-calls",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/custom/update-into-calls",
+      "index": 0
+     },
+     "message": {
+      "text": "call inside update_into in _CipherContext.update_into"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/cryptography/hazmat/backends/openssl/ciphers.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 150,
+         "startColumn": 12,
+         "endColumn": 20
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "4b6281b4cf0c1b22:1",
+      "primaryLocationStartColumnFingerprint": "3"
+     }
+    },
+    {
+     "ruleId": "py/custom/update-into-calls",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/custom/update-into-calls",
+      "index": 0
+     },
+     "message": {
+      "text": "call inside update_into in _CipherContext.update_into"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/cryptography/hazmat/backends/openssl/ciphers.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 151,
+         "startColumn": 19,
+         "endLine": 154,
+         "endColumn": 14
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "8227a517f656c191:1",
+      "primaryLocationStartColumnFingerprint": "6"
+     }
+    },
+    {
+     "ruleId": "py/custom/update-into-calls",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/custom/update-into-calls",
+      "index": 0
+     },
+     "message": {
+      "text": "call inside update_into in _CipherContext.update_into"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/cryptography/hazmat/backends/openssl/ciphers.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 152,
+         "startColumn": 17,
+         "endLine": 153,
+         "endColumn": 73
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "7fcd00ad18c70b44:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/custom/update-into-calls",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/custom/update-into-calls",
+      "index": 0
+     },
+     "message": {
+      "text": "call inside update_into in _CipherContext.update_into"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/cryptography/hazmat/backends/openssl/ciphers.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 153,
+         "startColumn": 34,
+         "endColumn": 43
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "5bc6d72d39a71606:1",
+      "primaryLocationStartColumnFingerprint": "17"
+     }
+    },
+    {
+     "ruleId": "py/custom/update-into-calls",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/custom/update-into-calls",
+      "index": 0
+     },
+     "message": {
+      "text": "call inside update_into in _CipherContext.update_into"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/cryptography/hazmat/backends/openssl/ciphers.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 158,
+         "startColumn": 18,
+         "endColumn": 49
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "e2db6da19848294a:1",
+      "primaryLocationStartColumnFingerprint": "9"
+     }
+    },
+    {
+     "ruleId": "py/custom/update-into-calls",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/custom/update-into-calls",
+      "index": 0
+     },
+     "message": {
+      "text": "call inside update_into in _CipherContext.update_into"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/cryptography/hazmat/backends/openssl/ciphers.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 159,
+         "startColumn": 22,
+         "endColumn": 57
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "49a43dd2f150a1ad:1",
+      "primaryLocationStartColumnFingerprint": "13"
+     }
+    },
+    {
+     "ruleId": "py/custom/update-into-calls",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/custom/update-into-calls",
+      "index": 0
+     },
+     "message": {
+      "text": "call inside update_into in _CipherContext.update_into"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/cryptography/hazmat/backends/openssl/ciphers.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 160,
+         "startColumn": 21,
+         "endColumn": 57
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "46227e57b615a691:1",
+      "primaryLocationStartColumnFingerprint": "12"
+     }
+    },
+    {
+     "ruleId": "py/custom/update-into-calls",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/custom/update-into-calls",
+      "index": 0
+     },
+     "message": {
+      "text": "call inside update_into in _CipherContext.update_into"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/cryptography/hazmat/backends/openssl/ciphers.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 165,
+         "startColumn": 21,
+         "endColumn": 79
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "44f918d38221567:1",
+      "primaryLocationStartColumnFingerprint": "8"
+     }
+    },
+    {
+     "ruleId": "py/custom/update-into-calls",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/custom/update-into-calls",
+      "index": 0
+     },
+     "message": {
+      "text": "call inside update_into in _CipherContext.update_into"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/cryptography/hazmat/backends/openssl/ciphers.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 167,
+         "startColumn": 19,
+         "endLine": 169,
+         "endColumn": 14
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "ca6ce0032af2fbe2:1",
+      "primaryLocationStartColumnFingerprint": "6"
+     }
+    },
+    {
+     "ruleId": "py/custom/update-into-calls",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/custom/update-into-calls",
+      "index": 0
+     },
+     "message": {
+      "text": "call inside update_into in _CipherContext.update_into"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/cryptography/hazmat/backends/openssl/ciphers.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 170,
+         "startColumn": 29,
+         "endColumn": 62
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "ce35572e489a5c37:1",
+      "primaryLocationStartColumnFingerprint": "16"
+     }
+    },
+    {
+     "ruleId": "py/custom/update-into-calls",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/custom/update-into-calls",
+      "index": 0
+     },
+     "message": {
+      "text": "call inside update_into in _CipherContext.update_into"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/cryptography/hazmat/backends/openssl/ciphers.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 171,
+         "startColumn": 17,
+         "endColumn": 48
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "6b4100022d278ee2:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/custom/update-into-calls",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/custom/update-into-calls",
+      "index": 0
+     },
+     "message": {
+      "text": "call inside update_into in _CipherContext.update_into"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/cryptography/hazmat/backends/openssl/ciphers.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 172,
+         "startColumn": 23,
+         "endLine": 175,
+         "endColumn": 18
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "45900d1e53a468f7:1",
+      "primaryLocationStartColumnFingerprint": "6"
+     }
+    },
+    {
+     "ruleId": "py/custom/update-into-calls",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/custom/update-into-calls",
+      "index": 0
+     },
+     "message": {
+      "text": "call inside update_into in _CipherContext.update_into"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/cryptography/hazmat/backends/openssl/ciphers.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 177,
+         "startColumn": 17,
+         "endColumn": 55
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "d0d0c3db52da9034:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20261119014432",
+   "codeql_raw_query": "/**\n * @name string literals inside update_into\n * @kind problem\n * @problem.severity note\n * @id py/custom/update-into-literals\n */\n\nimport python\n\nfrom Function f, Str s\nwhere\n  f.getName() = \"update_into\" and\n  s.getScope+() = f\nselect s, f.getQualifiedName() + \" :: \" + s.getText()",
+   "hypothesis": "Examine literals inside update_into to determine whether a buffer-writability ('readonly'/'writable') check is present in the OpenSSL backend implementation (CVE-2023-23931).",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-787",
+    "cwe-1286"
+   ],
+   "results_count": 5,
+   "results": [
+    {
+     "ruleId": "py/custom/update-into-literals",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/custom/update-into-literals",
+      "index": 0
+     },
+     "message": {
+      "text": "CipherContext.update_into :: \n        Processes the provided bytes and writes the resulting data into the\n        provided buffer. Returns the number of bytes written.\n        "
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/cryptography/hazmat/primitives/ciphers/base.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 33,
+         "startColumn": 9,
+         "endLine": 36,
+         "endColumn": 12
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "601a6728cd35da70:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/custom/update-into-literals",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/custom/update-into-literals",
+      "index": 0
+     },
+     "message": {
+      "text": "_CipherContext.update_into :: Context was already finalized."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/cryptography/hazmat/primitives/ciphers/base.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 180,
+         "startColumn": 36,
+         "endColumn": 68
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "64fb84c258d0710a:1",
+      "primaryLocationStartColumnFingerprint": "23"
+     }
+    },
+    {
+     "ruleId": "py/custom/update-into-literals",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/custom/update-into-literals",
+      "index": 0
+     },
+     "message": {
+      "text": "_CipherContext.update_into :: buffer must be at least {{}} bytes for this payload"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/cryptography/hazmat/backends/openssl/ciphers.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 152,
+         "startColumn": 17,
+         "endLine": 153,
+         "endColumn": 26
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "7fcd00ad18c70b44:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/custom/update-into-literals",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/custom/update-into-literals",
+      "index": 0
+     },
+     "message": {
+      "text": "_CipherContext.update_into :: int *"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/cryptography/hazmat/backends/openssl/ciphers.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 158,
+         "startColumn": 41,
+         "endColumn": 48
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "e2db6da19848294a:1",
+      "primaryLocationStartColumnFingerprint": "32"
+     }
+    },
+    {
+     "ruleId": "py/custom/update-into-literals",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/custom/update-into-literals",
+      "index": 0
+     },
+     "message": {
+      "text": "_CipherContext.update_into :: In XTS mode you must supply at least a full block in the first update call. For AES this is 16 bytes."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/cryptography/hazmat/backends/openssl/ciphers.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 173,
+         "startColumn": 21,
+         "endLine": 174,
+         "endColumn": 67
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "85adfcfb5302bbf7:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20261119014452",
+   "codeql_raw_query": "/**\n * @name writability check literals\n * @kind problem\n * @problem.severity note\n * @id py/custom/writability-literals\n */\n\nimport python\n\nfrom Str s\nwhere s.getText().regexpMatch(\"(?i).*(readonly|writable|immutable).*\")\nselect s, s.getText()",
+   "hypothesis": "Locate all writability/immutability validation strings to determine which buffer-writing entry points validate the destination buffer.",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-787"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20261119014519",
+   "codeql_raw_query": "/**\n * @name readonly attribute access\n * @kind problem\n * @problem.severity note\n * @id py/custom/readonly-attr\n */\nimport python\n\nfrom Attribute a\nwhere a.getAttr() = \"readonly\"\nselect a, \"readonly attribute access in \" + a.getScope().toString()",
+   "hypothesis": "CVE-2023-23931 fix requires checking buffer writability via memoryview.readonly; if absent anywhere in the package, 39.0.0 is vulnerable to memory corruption via Cipher.update_into on immutable buffers.",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-787",
+    "cwe-416"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20261119014539",
+   "codeql_raw_query": "/**\n * @name writable-related string literals\n * @kind problem\n * @problem.severity note\n * @id py/custom/writable-literals\n */\nimport python\n\nfrom StrConst s\nwhere s.getText().toLowerCase().matches(\"%writab%\")\nselect s, \"literal: \" + s.getText()",
+   "hypothesis": "Check whether any code path raises an error about buffers needing to be writable (the CVE-2023-23931 mitigation).",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-787"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20261119014607",
+   "codeql_raw_query": "/**\n * @name from_buffer target in update_into\n * @description In cryptography 39.0.0 Cipher.update_into passes the caller-supplied buffer straight to\n *              ffi.from_buffer without verifying writability, allowing writes into immutable objects\n *              (CVE-2023-23931).\n * @kind problem\n * @problem.severity error\n * @id py/custom/cve-2023-23931\n * @tags security\n *        external/cwe/cwe-787\n */\n\nimport python\n\nfrom Function f, Call c, Attribute a, Name n\nwhere\n  f.getName() = \"update_into\" and\n  c.getScope+() = f and\n  c.getFunc() = a and\n  a.getAttr() = \"from_buffer\" and\n  n = c.getAnArg() and\n  n.getId() in [\"buf\", \"buffer\", \"data\"]\nselect c, \"ffi.from_buffer writes into caller-supplied '\" + n.getId() + \"' in \" + f.getQualifiedName() + \" without a writability check\"",
+   "hypothesis": "CVE-2023-23931: Cipher.update_into in cryptography 39.0.0 writes into a caller-supplied buffer via ffi.from_buffer without checking that the buffer is writable, permitting memory corruption via immutable objects (bytes/str).",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-787",
+    "cwe-119"
+   ],
+   "results_count": 2,
+   "results": [
+    {
+     "ruleId": "py/custom/cve-2023-23931",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/custom/cve-2023-23931",
+      "index": 0
+     },
+     "message": {
+      "text": "ffi.from_buffer writes into caller-supplied 'buf' in _CipherContext.update_into without a writability check"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/cryptography/hazmat/backends/openssl/ciphers.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 159,
+         "startColumn": 22,
+         "endColumn": 57
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "49a43dd2f150a1ad:1",
+      "primaryLocationStartColumnFingerprint": "13"
+     }
+    },
+    {
+     "ruleId": "py/custom/cve-2023-23931",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/custom/cve-2023-23931",
+      "index": 0
+     },
+     "message": {
+      "text": "ffi.from_buffer writes into caller-supplied 'data' in _CipherContext.update_into without a writability check"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/cryptography/hazmat/backends/openssl/ciphers.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 160,
+         "startColumn": 21,
+         "endColumn": 57
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "46227e57b615a691:1",
+      "primaryLocationStartColumnFingerprint": "12"
+     }
+    }
+   ]
+  }
+ ],
+ "cache_usage": {
+  "prompt_tokens_total": 236264,
+  "uncached_input_tokens": 18408,
+  "cache_creation_input_tokens": 0,
+  "cache_read_input_tokens": 217856,
+  "output_tokens": 28444,
+  "calls": 21,
+  "caching_enabled": false,
+  "cost_usd_with_cache": 0.020481,
+  "cost_usd_no_cache": 0.052506,
+  "cache_read_share_of_prompt": 0.9221,
+  "prices_per_mtok": {
+   "claude-sonnet-4-5-20250929": {
+    "input": 3.0,
+    "output": 15.0
+   },
+   "claude-haiku-4-5-20251001": {
+    "input": 1.0,
+    "output": 5.0
+   },
+   "deepseek/deepseek-reasoner": {
+    "input": 0.15,
+    "output": 0.6,
+    "cache_read": 0.003,
+    "cache_write_mult": 1.0,
+    "peak_mult": 2.0
+   }
+  },
+  "cache_multipliers": {
+   "write_5m": 1.25,
+   "read": 0.1
+  }
+ }
+}

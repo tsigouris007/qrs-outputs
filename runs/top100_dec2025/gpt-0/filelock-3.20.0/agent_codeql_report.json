@@ -1,0 +1,347 @@
+{
+ "session_id": "20251207232426",
+ "package_name": "filelock-3.20.0",
+ "package_path": "packages/filelock-3.20.0",
+ "database_path": "databases/filelock-3.20.0-db",
+ "model": "gpt-5.1",
+ "temperature": 0.0,
+ "max_tokens": 8000,
+ "iterations": 14,
+ "total_input_tokens": 103000,
+ "total_output_tokens": 8435,
+ "total_tokens": 111435,
+ "elapsed_time_seconds": 360.27,
+ "estimated_cost_usd": 0.2131,
+ "summary": "## Overview\n\nPackage: **filelock 3.20.0**  \nType: Python library providing cross-platform file locking  \nScope analyzed: `src/filelock/*.py` (~847 LOC, 9 files) using CodeQL (Python) with custom security queries.\n\nThe library is relatively small and focused on filesystem-based locking. No networking, deserialization, subprocess, or dynamic code execution primitives are present, which significantly limits the attack surface.\n\n---\n\n## Key Security Finding\n\n### 1. Potentially insecure lock file / directory creation (CWE-377)\n\n**CWE:** [CWE-377: Insecure Temporary File](https://cwe.mitre.org/data/definitions/377.html)  \n**Severity (for this library):** Low–Medium (depends heavily on how and where it is used)  \n**CodeQL rule ID:** `py/filelock/insecure-tempfile`\n\n**Locations flagged by CodeQL:**\n- `src/filelock/_soft.py:27`\n- `src/filelock/_unix.py:44`\n- `src/filelock/_windows.py:28`\n\n**What the query looked for**  \nA custom CodeQL query was used to detect calls to low-level file/directory creation APIs that are typically used for lock files:\n\n```ql\n/**\n * @name Insecure temporary file or directory usage in filelock\n * @description Detects potentially insecure creation of lock files/directories that may be vulnerable to race conditions or permission issues.\n * @kind problem\n * @problem.severity warning\n * @id py/filelock/insecure-tempfile\n * @tags security\n *       external/cwe/cwe-377\n */\n\nimport python\nimport semmle.python.ApiGraphs\nimport semmle.python.dataflow.new.DataFlow\n\nfrom DataFlow::CallCfgNode call, DataFlow::ExprNode pathArg\nwhere\n  call = API::moduleImport(\"os\").getMember([\"open\", \"mkdir\"]).getACall() and\n  pathArg = call.getArg(0)\nselect call, \"Check that this file or directory creation is safe when used for locking (permissions, race conditions).\"\n```\n\nThis query finds uses of `os.open` and `os.mkdir` (or equivalent) that are likely involved in creating lock files or lock directories.\n\n**Risk explanation**\n\nFile-based locking can be vulnerable in multi-user or adversarial environments if:\n\n1. **Predictable / attacker-influenced paths**  \n   - If lock files are placed in directories writable by untrusted users (e.g., `/tmp` or other shared locations) and the path is predictable, an attacker may:\n     - Pre-create the lock file or directory.\n     - Replace it with a symlink or another file.\n     - Interfere with lock acquisition or release.\n\n2. **Non-atomic creation or missing safety flags**  \n   - On Unix, safe lock file creation typically uses `os.open` with `O_CREAT | O_EXCL` to ensure atomic creation and avoid race conditions.\n   - If `O_EXCL` or equivalent semantics are not used, there is a window where another process can interfere.\n\n3. **Overly permissive permissions**  \n   - If lock files/directories are created with world-readable or world-writable permissions, other users on the same system may tamper with them.\n\n**What we can and cannot conclude from the automated analysis**\n\n- The CodeQL result **confirms** that `filelock` uses low-level file/directory creation primitives for locking at the above locations.\n- The result **does not by itself prove** an exploitable vulnerability. It is a **warning that these call sites must be reviewed** for:\n  - Use of atomic creation flags (`O_CREAT | O_EXCL` on Unix, appropriate flags on Windows).\n  - Safe default permissions (e.g., `0o600` for lock files on Unix).\n  - Avoidance of world-writable or attacker-controlled directories for lock placement.\n\nGiven the library’s purpose, these calls are expected. Whether they are *insecure* depends on:\n- How the application chooses the lock path (user-controlled vs. trusted configuration).\n- The environment (single-user vs. multi-user, container vs. shared host).\n\n**Practical guidance for users of `filelock`**\n\n- Treat `filelock` as a **synchronization primitive**, not a security boundary.\n- Prefer lock paths in directories not writable by untrusted users (e.g., per-user config/cache directories, application-specific directories with restricted permissions).\n- Avoid using lock files in `/tmp` or other world-writable directories for security-sensitive coordination unless you have:\n  - Reviewed the underlying implementation for atomic creation and safe permissions.\n  - Considered the threat model (e.g., untrusted local users).\n\n---\n\n## Other Vulnerability Classes Checked\n\nMultiple additional CodeQL queries were executed (some generic, some custom) to look for common high-impact issues. No findings were reported for these classes:\n\n- **Code execution / injection**\n  - No uses of `eval`, `exec`, or dynamic code loading patterns were detected.\n  - No subprocess or shell command execution APIs were found.\n\n- **Unsafe deserialization**\n  - No use of `pickle`, `yaml.load`, `marshal`, or similar unsafe deserialization APIs.\n\n- **SQL injection / command injection sinks**\n  - No database or shell execution APIs present.\n\n- **Remote input handling**\n  - The library does not expose network listeners or HTTP endpoints; it operates purely on local filesystem and concurrency primitives.\n\n- **Path traversal / arbitrary file access from untrusted input**\n  - No evidence of the library itself accepting remote or untrusted input and using it directly as file paths. Paths are provided by the caller; the library does not attempt to sanitize or validate them, which is expected for a low-level locking primitive.\n\nGiven the limited scope and the absence of high-risk primitives, no critical or high-severity vulnerabilities were identified by the automated analysis.\n\n---\n\n## Overall Security Assessment\n\n- **Primary concern:** Correctness and safety of lock file/directory creation semantics (CWE-377) at three specific locations. These are **design/usage concerns** rather than a clear-cut exploit.\n- **No evidence** (from CodeQL analysis) of:\n  - Arbitrary code execution vulnerabilities.\n  - Deserialization vulnerabilities.\n  - Injection vulnerabilities (SQL, command, or code).\n  - Network-exposed attack surface.\n\n**Risk rating for typical use:**\n- For single-user or containerized environments where all processes are trusted, the residual risk is low.\n- In multi-user environments with untrusted local users, security-sensitive applications should:\n  - Carefully choose lock directories.\n  - Review the exact flags and permissions used at the flagged call sites.\n\n---\n\n## Recommendations\n\n### For library maintainers\n\n1. **Document security considerations explicitly**\n   - Clarify in the README or docs that `filelock` is not a security boundary and that lock paths should not be placed in world-writable directories for security-sensitive use cases.\n\n2. **Review and, if needed, harden lock creation**\n   - Ensure that on Unix, lock files are created with `O_CREAT | O_EXCL` and restrictive permissions (e.g., `0o600`).\n   - On Windows, ensure appropriate flags/sharing modes are used to prevent other processes from hijacking the lock.\n\n3. **Consider safer defaults**\n   - If the library provides any default lock locations, prefer per-user or application-specific directories with restricted permissions rather than shared temp directories.\n\n### For library users\n\n1. **Choose safe lock locations**\n   - Use directories that are not writable by untrusted users.\n   - Avoid `/tmp` or similar world-writable locations for security-sensitive coordination.\n\n2. **Do not rely on `filelock` for access control**\n   - Use OS-level permissions and other security mechanisms to enforce access control; use `filelock` only for synchronization.\n\n---\n\n## Conclusion\n\nThe CodeQL-based security review of **filelock 3.20.0** found **no critical or high-severity vulnerabilities**. The main identified issue is a **CWE-377-style concern** around how lock files/directories are created, which is inherent to file-based locking and must be evaluated in the context of the deployment environment and how callers choose lock paths.\n\nWith appropriate usage (non-world-writable directories, trusted local environment), `filelock` appears reasonable from a security perspective based on the automated analysis performed.",
+ "package_classification": {
+  "type": "library",
+  "layer": [
+   "application",
+   "filesystem",
+   "concurrency"
+  ]
+ },
+ "tool_calls": {
+  "get_package_profile_info": 1,
+  "execute_codeql_query": 13,
+  "validate_codeql_query": 0,
+  "fixup_codeql_query": 4,
+  "finalize_report": 1
+ },
+ "queries_executed": {
+  "critical": 0,
+  "high": 8,
+  "medium": 2,
+  "low": 0,
+  "total_executed": 15,
+  "total_with_results": 10,
+  "total_failed": 10
+ },
+ "query_findings": {
+  "critical": 0,
+  "high": 0,
+  "medium": 6,
+  "low": 0,
+  "total": 6
+ },
+ "findings": [
+  {
+   "codeql_query_uuid": "20251207232433",
+   "codeql_raw_query": "/**\n * @name Insecure temporary file or directory usage\n * @description Detects use of tempfile-like patterns that may create race conditions or insecure permissions\n * @kind problem\n * @problem.severity warning\n * @id py/filelock/insecure-tempfile\n * @tags security\n *       external/cwe/cwe-377\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"os\").getMember([\"open\", \"fdopen\"]).getACall() or\n  call = API::moduleImport(\"os\").getMember(\"mkfifo\").getACall() or\n  call = API::moduleImport(\"os\").getMember(\"mkdir\").getACall()\nselect call, \"Check that this file or directory creation is safe when used for locking (permissions, race conditions).\"",
+   "hypothesis": "Insecure temporary file or directory usage for lock files",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-377"
+   ],
+   "results_count": 3,
+   "results": [
+    {
+     "ruleId": "py/filelock/insecure-tempfile",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/filelock/insecure-tempfile",
+      "index": 0
+     },
+     "message": {
+      "text": "Check that this file or directory creation is safe when used for locking (permissions, race conditions)."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/filelock/_soft.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 27,
+         "startColumn": 28,
+         "endColumn": 78
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "e0cf0771037e84c:1",
+      "primaryLocationStartColumnFingerprint": "15"
+     }
+    },
+    {
+     "ruleId": "py/filelock/insecure-tempfile",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/filelock/insecure-tempfile",
+      "index": 0
+     },
+     "message": {
+      "text": "Check that this file or directory creation is safe when used for locking (permissions, race conditions)."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/filelock/_unix.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 44,
+         "startColumn": 18,
+         "endColumn": 73
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "d118c77731a1d2b9:1",
+      "primaryLocationStartColumnFingerprint": "5"
+     }
+    },
+    {
+     "ruleId": "py/filelock/insecure-tempfile",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/filelock/insecure-tempfile",
+      "index": 0
+     },
+     "message": {
+      "text": "Check that this file or directory creation is safe when used for locking (permissions, race conditions)."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/filelock/_windows.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 28,
+         "startColumn": 22,
+         "endColumn": 72
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "9a4bb758ad4769f1:1",
+      "primaryLocationStartColumnFingerprint": "5"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251207232546",
+   "codeql_raw_query": "/**\n * @name filelock: unsafe deserialization usage\n * @description Detects use of pickle, marshal, yaml.load, or shelve which can lead to unsafe deserialization.\n * @kind problem\n * @problem.severity warning\n * @id py/filelock/unsafe-deserialization\n * @tags security\n *       external/cwe/cwe-502\n */\n\nimport python\nimport semmle.python.ApiGraphs\nimport semmle.python.dataflow.new.DataFlow\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"pickle\").getMember([\"load\", \"loads\", \"Unpickler\"]).getACall() or\n  call = API::moduleImport(\"yaml\").getMember([\"load\", \"unsafe_load\"]).getACall() or\n  call = API::moduleImport(\"marshal\").getMember([\"load\", \"loads\"]).getACall() or\n  call = API::moduleImport(\"shelve\").getMember(\"open\").getACall()\nselect call, \"Potentially unsafe deserialization operation that could execute arbitrary code.\"",
+   "hypothesis": "Check for unsafe deserialization primitives that could be used on untrusted data",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-502"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251207232707",
+   "codeql_raw_query": "/**\n * @name Use of eval/exec or dynamic code execution\n * @description Detects use of eval, exec, or compile which could lead to code injection if used with untrusted input.\n * @kind problem\n * @problem.severity warning\n * @id py/filelock/dynamic-code-execution\n * @tags security\n *       external/cwe/cwe-094\n */\n\nimport python\nimport semmle.python.ApiGraphs\nimport semmle.python.dataflow.new.DataFlow\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::builtin([\"eval\", \"exec\", \"compile\"]).getACall()\nselect call, \"Dynamic code execution detected; ensure arguments are not influenced by untrusted input.\"",
+   "hypothesis": "Check for dangerous dynamic code execution primitives that could enable code injection.",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-094"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251207232727",
+   "codeql_raw_query": "/**\n * @name Use of eval/exec or dynamic code execution\n * @description Flags any use of eval, exec, or compile which could lead to code injection if fed untrusted data.\n * @kind problem\n * @problem.severity warning\n * @id py/filelock/dynamic-code-execution\n * @tags security\n *       external/cwe/cwe-094\n */\n\nimport python\nimport semmle.python.ApiGraphs\nimport semmle.python.dataflow.new.DataFlow\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::builtin([\"eval\", \"exec\", \"compile\"]).getACall()\nselect call, \"Dynamic code execution detected; ensure inputs are trusted.\"",
+   "hypothesis": "Check for dangerous dynamic code execution primitives in filelock.",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-094"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251207232742",
+   "codeql_raw_query": "/**\n * @name Unsafe deserialization in filelock\n * @description Detects use of pickle, yaml.load, marshal, or shelve which can lead to code execution on untrusted data.\n * @kind problem\n * @problem.severity warning\n * @id py/filelock/unsafe-deserialization\n * @tags security\n *       external/cwe/cwe-502\n */\n\nimport python\nimport semmle.python.ApiGraphs\nimport semmle.python.dataflow.new.DataFlow\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"pickle\").getMember([\"load\", \"loads\", \"Unpickler\"]).getACall() or\n  call = API::moduleImport(\"yaml\").getMember([\"load\", \"unsafe_load\"]).getACall() or\n  call = API::moduleImport(\"marshal\").getMember([\"load\", \"loads\"]).getACall() or\n  call = API::moduleImport(\"shelve\").getMember(\"open\").getACall()\nselect call, \"Potentially unsafe deserialization operation that could execute arbitrary code if given untrusted data.\"",
+   "hypothesis": "Look for unsafe deserialization primitives in filelock.",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-502"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251207232804",
+   "codeql_raw_query": "/**\n * @name Use of eval/exec or dynamic code execution\n * @description Flags any use of eval, exec, or compile which could enable code injection if fed untrusted data.\n * @kind problem\n * @problem.severity warning\n * @id py/filelock/dynamic-code-execution\n * @tags security\n *       external/cwe/cwe-094\n */\n\nimport python\nimport semmle.python.ApiGraphs\nimport semmle.python.dataflow.new.DataFlow\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::builtin([\"eval\", \"exec\", \"compile\"]).getACall()\nselect call, \"Dynamic code execution is used; ensure inputs are trusted.\"",
+   "hypothesis": "Check for any use of eval/exec/compile that could lead to code injection.",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-094"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251207232823",
+   "codeql_raw_query": "/**\n * @name Insecure use of os.system / subprocess shell=True\n * @description Detects shell command execution that could be influenced by untrusted input.\n * @kind problem\n * @problem.severity warning\n * @id py/filelock/command-execution\n * @tags security\n *       external/cwe/cwe-078\n */\n\nimport python\nimport semmle.python.ApiGraphs\nimport semmle.python.dataflow.new.DataFlow\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"os\").getMember(\"system\").getACall() or\n  call = API::moduleImport(\"subprocess\").getMember([\"run\", \"Popen\", \"call\", \"check_call\", \"check_output\"]).getACall()\nselect call, \"Shell command execution is used; ensure no untrusted input reaches the shell.\"",
+   "hypothesis": "Look for any shell command execution that might be a sink for injection.",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-078"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251207232848",
+   "codeql_raw_query": "/**\n * @name Use of eval/exec or dynamic code execution\n * @description Flags any use of eval, exec, or compile which could lead to code injection if fed untrusted data.\n * @kind problem\n * @problem.severity warning\n * @id py/filelock/dynamic-code-execution\n * @tags security\n *       external/cwe/cwe-094\n */\n\nimport python\nimport semmle.python.ApiGraphs\nimport semmle.python.dataflow.new.DataFlow\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::builtin([\"eval\", \"exec\", \"compile\"]).getACall()\nselect call, \"Dynamic code execution is used; ensure inputs are trusted.\"",
+   "hypothesis": "Check for dangerous dynamic code execution primitives in filelock",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-094"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251207232901",
+   "codeql_raw_query": "/**\n * @name Dangerous subprocess or shell command execution\n * @description Detects use of subprocess or os.system that could be used for command injection.\n * @kind problem\n * @problem.severity warning\n * @id py/filelock/command-execution\n * @tags security\n *       external/cwe/cwe-078\n */\n\nimport python\nimport semmle.python.ApiGraphs\nimport semmle.python.dataflow.new.DataFlow\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"os\").getMember(\"system\").getACall() or\n  call = API::moduleImport(\"subprocess\").getMember([\"run\", \"Popen\", \"call\", \"check_call\", \"check_output\"]).getACall()\nselect call, \"Command execution is used; ensure no untrusted input reaches this call.\"",
+   "hypothesis": "Check for command execution primitives that could be injection sinks",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-078"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251207232926",
+   "codeql_raw_query": "/**\n * @name Insecure temporary file or directory usage in filelock\n * @description Detects potentially insecure creation of lock files/directories that may be vulnerable to race conditions or permission issues.\n * @kind problem\n * @problem.severity warning\n * @id py/filelock/insecure-tempfile\n * @tags security\n *       external/cwe/cwe-377\n */\n\nimport python\nimport semmle.python.ApiGraphs\nimport semmle.python.dataflow.new.DataFlow\n\nfrom DataFlow::CallCfgNode call, DataFlow::ExprNode pathArg\nwhere\n  call = API::moduleImport(\"os\").getMember([\"open\", \"mkdir\"]).getACall() and\n  pathArg = call.getArg(0)\nselect call, \"Check that this file or directory creation is safe when used for locking (permissions, race conditions).\"",
+   "hypothesis": "Re-run insecure tempfile query to confirm all locations and ensure no missed instances.",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-377"
+   ],
+   "results_count": 3,
+   "results": [
+    {
+     "ruleId": "py/filelock/insecure-tempfile",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/filelock/insecure-tempfile",
+      "index": 0
+     },
+     "message": {
+      "text": "Check that this file or directory creation is safe when used for locking (permissions, race conditions)."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/filelock/_soft.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 27,
+         "startColumn": 28,
+         "endColumn": 78
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "e0cf0771037e84c:1",
+      "primaryLocationStartColumnFingerprint": "15"
+     }
+    },
+    {
+     "ruleId": "py/filelock/insecure-tempfile",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/filelock/insecure-tempfile",
+      "index": 0
+     },
+     "message": {
+      "text": "Check that this file or directory creation is safe when used for locking (permissions, race conditions)."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/filelock/_unix.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 44,
+         "startColumn": 18,
+         "endColumn": 73
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "d118c77731a1d2b9:1",
+      "primaryLocationStartColumnFingerprint": "5"
+     }
+    },
+    {
+     "ruleId": "py/filelock/insecure-tempfile",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/filelock/insecure-tempfile",
+      "index": 0
+     },
+     "message": {
+      "text": "Check that this file or directory creation is safe when used for locking (permissions, race conditions)."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/filelock/_windows.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 28,
+         "startColumn": 22,
+         "endColumn": 72
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "9a4bb758ad4769f1:1",
+      "primaryLocationStartColumnFingerprint": "5"
+     }
+    }
+   ]
+  }
+ ]
+}

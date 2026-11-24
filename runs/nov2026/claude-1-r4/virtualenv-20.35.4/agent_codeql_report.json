@@ -1,0 +1,1717 @@
+{
+ "session_id": "20261117223129",
+ "package_name": "virtualenv-20.35.4",
+ "package_path": "packages/virtualenv-20.35.4",
+ "database_path": "databases/virtualenv-20.35.4-db",
+ "model": "claude-sonnet-4-5-20250929",
+ "temperature": 1.0,
+ "max_tokens": 8000,
+ "iterations": 19,
+ "total_input_tokens": 281283,
+ "total_output_tokens": 11074,
+ "total_tokens": 292357,
+ "elapsed_time_seconds": 578.61,
+ "estimated_cost_usd": 1.01,
+ "summary": "## Security Analysis Summary - virtualenv 20.35.4\n\nI completed a comprehensive security analysis of the virtualenv package (version 20.35.4), a popular Python virtual environment builder. The analysis executed 15 CodeQL queries across critical vulnerability categories and discovered **10 distinct security findings**.\n\n### Findings Overview\n\n#### HIGH SEVERITY (8 findings)\n\n**1. Path Traversal Vulnerabilities (CWE-22)** - 6 instances\n- **Location**: `src/virtualenv/discovery/builtin.py` (lines 181, 183)\n- **Location**: `src/virtualenv/config/ini.py` (lines 36, 41, 52)\n- **Location**: `tasks/make_zipapp.py` (line 52)\n- **Description**: User-controlled input flows into file system operations without proper validation, allowing potential path traversal attacks. Attackers could potentially read/write files outside intended directories.\n- **Impact**: Unauthorized file access, potential data exposure or file overwrite\n\n**2. Insecure SSL/TLS Configuration (CWE-295)** - 2 instances\n- **Location**: `src/virtualenv/seed/wheels/periodic_update.py` (lines 336, 353)\n- **Description**: SSL/TLS connections may be configured insecurely, potentially allowing man-in-the-middle attacks during wheel downloads/updates.\n- **Impact**: Package integrity compromise, potential malicious code injection through MITM attacks\n\n#### MEDIUM SEVERITY (1 finding)\n\n**3. Insecure URL Request (CWE-918/CWE-319)** - 1 instance\n- **Location**: `src/virtualenv/seed/wheels/periodic_update.py` (line 353)\n- **Description**: URL requests that may be vulnerable to SSRF or use insecure connections for downloading package wheels.\n- **Impact**: Potential SSRF exploitation or insecure data transmission\n\n### Security Strengths\n\nThe package shows good security practices in several areas:\n- No command injection vulnerabilities detected in subprocess calls\n- No unsafe deserialization (pickle/yaml) usage found\n- No code injection via exec/eval with user input\n- No hardcoded credentials detected\n- No insecure temporary file usage patterns\n\n### Recommendations\n\n1. **Path Traversal**: Implement strict path validation and sanitization for all user-provided paths. Use `os.path.realpath()` and verify paths are within expected boundaries.\n2. **SSL/TLS**: Ensure certificate verification is enabled for all HTTPS connections. Use secure SSL contexts with proper certificate validation.\n3. **URL Requests**: Validate and restrict URLs for wheel downloads to trusted package repositories only.\n\n### Package Classification\n\nThe virtualenv package is a production-ready CLI tool and library for creating isolated Python environments, widely used in Python development workflows.",
+ "package_classification": {
+  "type": [
+   "cli_tool",
+   "library"
+  ],
+  "layer": [
+   "application",
+   "infrastructure"
+  ]
+ },
+ "tool_calls": {
+  "get_package_profile_info": 1,
+  "execute_codeql_query": 13,
+  "validate_codeql_query": 0,
+  "fixup_codeql_query": 3,
+  "finalize_report": 1
+ },
+ "queries_executed": {
+  "critical": 1,
+  "high": 5,
+  "medium": 4,
+  "low": 0,
+  "total_executed": 15,
+  "total_with_results": 10,
+  "total_failed": 6
+ },
+ "query_findings": {
+  "critical": 0,
+  "high": 8,
+  "medium": 1,
+  "low": 0,
+  "total": 9
+ },
+ "findings": [
+  {
+   "codeql_query_uuid": "20261117223304",
+   "codeql_raw_query": "/**\n * @name Command injection via subprocess\n * @description Using subprocess with untrusted input can lead to command injection\n * @kind problem\n * @problem.severity error\n * @id py/command-injection\n * @tags security\n *        external/cwe/cwe-078\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  (\n    // subprocess.call/run/Popen with shell=True\n    call = API::moduleImport(\"subprocess\").getMember([\"call\", \"run\", \"Popen\", \"check_call\", \"check_output\"]).getACall() and\n    exists(DataFlow::Node shell_arg |\n      shell_arg = call.getArgByName(\"shell\") and\n      shell_arg.asExpr().(BooleanLiteral).booleanValue() = true\n    )\n  )\n  or\n  (\n    // os.system, os.popen\n    call = API::moduleImport(\"os\").getMember([\"system\", \"popen\", \"popen2\", \"popen3\", \"popen4\"]).getACall()\n  )\nselect call, \"Potentially unsafe command execution that could be vulnerable to injection.\"\n",
+   "hypothesis": "Looking for subprocess calls with shell=True or os.system/popen calls that could be vulnerable to command injection",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-078"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20261117223337",
+   "codeql_raw_query": "/**\n * @name Path traversal in file operations\n * @description Using user-controlled paths without validation can lead to path traversal\n * @kind path-problem\n * @problem.severity error\n * @id py/path-injection\n * @tags security\n *        external/cwe/cwe-022\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.Concepts\nimport semmle.python.ApiGraphs\n\nmodule PathTraversalConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    // CLI arguments\n    exists(DataFlow::CallCfgNode call |\n      call = API::moduleImport(\"argparse\").getMember(\"ArgumentParser\").getReturn().getMember(\"parse_args\").getACall() and\n      source = call\n    )\n    or\n    // Environment variables\n    exists(DataFlow::CallCfgNode call |\n      call = API::moduleImport(\"os\").getMember(\"environ\").getMember(\"get\").getACall() and\n      source = call\n    )\n    or\n    exists(DataFlow::CallCfgNode call |\n      call = API::moduleImport(\"os\").getMember(\"getenv\").getACall() and\n      source = call\n    )\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(FileSystemAccess fsa |\n      sink = fsa.getAPathArgument()\n    )\n  }\n}\n\nmodule PathTraversalFlow = TaintTracking::Global<PathTraversalConfig>;\nimport PathTraversalFlow::PathGraph\n\nfrom PathTraversalFlow::PathNode source, PathTraversalFlow::PathNode sink\nwhere PathTraversalFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"Path traversal from $@.\", source.getNode(), \"user input\"",
+   "hypothesis": "User-controlled paths from CLI arguments or environment variables flowing to file system operations without proper validation could allow path traversal attacks",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-022"
+   ],
+   "results_count": 6,
+   "results": [
+    {
+     "ruleId": "py/path-injection",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/path-injection",
+      "index": 0
+     },
+     "message": {
+      "text": "Path traversal from [user input](1)."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/virtualenv/discovery/builtin.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 181,
+         "startColumn": 26,
+         "endColumn": 45
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "757e40cdbec850e5:1",
+      "primaryLocationStartColumnFingerprint": "17"
+     },
+     "codeFlows": [
+      {
+       "threadFlows": [
+        {
+         "locations": [
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/virtualenv/discovery/builtin.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 180,
+              "startColumn": 25,
+              "endColumn": 59
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for Attribute()"
+            }
+           },
+           "taxa": [
+            {
+             "index": 0,
+             "toolComponent": {
+              "index": 1
+             },
+             "properties": {
+              "CodeQL/DataflowRole": "source"
+             }
+            }
+           ]
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/virtualenv/discovery/builtin.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 180,
+              "startColumn": 8,
+              "endColumn": 21
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for uv_python_dir"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/virtualenv/discovery/builtin.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 181,
+              "startColumn": 26,
+              "endColumn": 45
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for Path()"
+            }
+           },
+           "taxa": [
+            {
+             "id": "AdditionalTaintStep",
+             "properties": {
+              "CodeQL/DataflowRole": "step"
+             }
+            }
+           ]
+          }
+         ]
+        }
+       ]
+      }
+     ],
+     "relatedLocations": [
+      {
+       "id": 1,
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/virtualenv/discovery/builtin.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 180,
+         "startColumn": 25,
+         "endColumn": 59
+        }
+       },
+       "message": {
+        "text": "user input"
+       }
+      },
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/virtualenv/discovery/builtin.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 180,
+         "startColumn": 25,
+         "endColumn": 59
+        }
+       }
+      }
+     ]
+    },
+    {
+     "ruleId": "py/path-injection",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/path-injection",
+      "index": 0
+     },
+     "message": {
+      "text": "Path traversal from [user input](1)."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/virtualenv/discovery/builtin.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 183,
+         "startColumn": 26,
+         "endColumn": 45
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "3b0efdeb1da004b:1",
+      "primaryLocationStartColumnFingerprint": "17"
+     },
+     "codeFlows": [
+      {
+       "threadFlows": [
+        {
+         "locations": [
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/virtualenv/discovery/builtin.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 182,
+              "startColumn": 27,
+              "endColumn": 53
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for Attribute()"
+            }
+           },
+           "taxa": [
+            {
+             "index": 0,
+             "toolComponent": {
+              "index": 1
+             },
+             "properties": {
+              "CodeQL/DataflowRole": "source"
+             }
+            }
+           ]
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/virtualenv/discovery/builtin.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 182,
+              "startColumn": 10,
+              "endColumn": 23
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for xdg_data_home"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/virtualenv/discovery/builtin.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 183,
+              "startColumn": 26,
+              "endColumn": 45
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for Path()"
+            }
+           },
+           "taxa": [
+            {
+             "id": "AdditionalTaintStep",
+             "properties": {
+              "CodeQL/DataflowRole": "step"
+             }
+            }
+           ]
+          }
+         ]
+        }
+       ]
+      }
+     ],
+     "relatedLocations": [
+      {
+       "id": 1,
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/virtualenv/discovery/builtin.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 182,
+         "startColumn": 27,
+         "endColumn": 53
+        }
+       },
+       "message": {
+        "text": "user input"
+       }
+      },
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/virtualenv/discovery/builtin.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 182,
+         "startColumn": 27,
+         "endColumn": 53
+        }
+       }
+      }
+     ]
+    },
+    {
+     "ruleId": "py/path-injection",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/path-injection",
+      "index": 0
+     },
+     "message": {
+      "text": "Path traversal from [user input](1)."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/virtualenv/config/ini.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 36,
+         "startColumn": 36,
+         "endColumn": 52
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "e418d487d9142713:1",
+      "primaryLocationStartColumnFingerprint": "23"
+     },
+     "codeFlows": [
+      {
+       "threadFlows": [
+        {
+         "locations": [
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/virtualenv/config/ini.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 1
+             },
+             "region": {
+              "startLine": 24,
+              "startColumn": 23,
+              "endColumn": 73
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for Attribute()"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/virtualenv/config/ini.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 1
+             },
+             "region": {
+              "startLine": 24,
+              "startColumn": 9,
+              "endColumn": 20
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for config_file"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/virtualenv/config/ini.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 1
+             },
+             "region": {
+              "startLine": 29,
+              "startColumn": 13,
+              "endColumn": 24
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for config_file"
+            }
+           },
+           "taxa": [
+            {
+             "id": "AdditionalTaintStep",
+             "properties": {
+              "CodeQL/DataflowRole": "step"
+             }
+            }
+           ]
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/virtualenv/config/ini.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 1
+             },
+             "region": {
+              "startLine": 30,
+              "startColumn": 28,
+              "endColumn": 39
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for config_file"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/virtualenv/config/ini.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 1
+             },
+             "region": {
+              "startLine": 30,
+              "startColumn": 9,
+              "endColumn": 13
+             }
+            },
+            "message": {
+             "text": "[post] ControlFlowNode for self [Attribute config_file]"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/virtualenv/config/ini.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 1
+             },
+             "region": {
+              "startLine": 31,
+              "startColumn": 9,
+              "endColumn": 13
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for self [Attribute config_file]"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/virtualenv/config/ini.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 1
+             },
+             "region": {
+              "startLine": 34,
+              "startColumn": 9,
+              "endColumn": 13
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for self [Attribute config_file]"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/virtualenv/config/ini.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 1
+             },
+             "region": {
+              "startLine": 36,
+              "startColumn": 36,
+              "endColumn": 40
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for self [Attribute config_file]"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/virtualenv/config/ini.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 1
+             },
+             "region": {
+              "startLine": 36,
+              "startColumn": 36,
+              "endColumn": 52
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for Attribute"
+            }
+           }
+          }
+         ]
+        }
+       ]
+      }
+     ],
+     "relatedLocations": [
+      {
+       "id": 1,
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/virtualenv/config/ini.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 24,
+         "startColumn": 23,
+         "endColumn": 73
+        }
+       },
+       "message": {
+        "text": "user input"
+       }
+      },
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/virtualenv/config/ini.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 24,
+         "startColumn": 23,
+         "endColumn": 73
+        }
+       }
+      }
+     ]
+    },
+    {
+     "ruleId": "py/path-injection",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/path-injection",
+      "index": 0
+     },
+     "message": {
+      "text": "Path traversal from [user input](1)."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/virtualenv/config/ini.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 41,
+         "startColumn": 36,
+         "endColumn": 52
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "9722cf499beb3598:1",
+      "primaryLocationStartColumnFingerprint": "19"
+     },
+     "codeFlows": [
+      {
+       "threadFlows": [
+        {
+         "locations": [
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/virtualenv/config/ini.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 1
+             },
+             "region": {
+              "startLine": 24,
+              "startColumn": 23,
+              "endColumn": 73
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for Attribute()"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/virtualenv/config/ini.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 1
+             },
+             "region": {
+              "startLine": 24,
+              "startColumn": 9,
+              "endColumn": 20
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for config_file"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/virtualenv/config/ini.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 1
+             },
+             "region": {
+              "startLine": 29,
+              "startColumn": 13,
+              "endColumn": 24
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for config_file"
+            }
+           },
+           "taxa": [
+            {
+             "id": "AdditionalTaintStep",
+             "properties": {
+              "CodeQL/DataflowRole": "step"
+             }
+            }
+           ]
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/virtualenv/config/ini.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 1
+             },
+             "region": {
+              "startLine": 30,
+              "startColumn": 28,
+              "endColumn": 39
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for config_file"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/virtualenv/config/ini.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 1
+             },
+             "region": {
+              "startLine": 30,
+              "startColumn": 9,
+              "endColumn": 13
+             }
+            },
+            "message": {
+             "text": "[post] ControlFlowNode for self [Attribute config_file]"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/virtualenv/config/ini.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 1
+             },
+             "region": {
+              "startLine": 31,
+              "startColumn": 9,
+              "endColumn": 13
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for self [Attribute config_file]"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/virtualenv/config/ini.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 1
+             },
+             "region": {
+              "startLine": 34,
+              "startColumn": 9,
+              "endColumn": 13
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for self [Attribute config_file]"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/virtualenv/config/ini.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 1
+             },
+             "region": {
+              "startLine": 36,
+              "startColumn": 13,
+              "endColumn": 17
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for self [Attribute config_file]"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/virtualenv/config/ini.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 1
+             },
+             "region": {
+              "startLine": 41,
+              "startColumn": 36,
+              "endColumn": 40
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for self [Attribute config_file]"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/virtualenv/config/ini.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 1
+             },
+             "region": {
+              "startLine": 41,
+              "startColumn": 36,
+              "endColumn": 52
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for Attribute"
+            }
+           }
+          }
+         ]
+        }
+       ]
+      }
+     ],
+     "relatedLocations": [
+      {
+       "id": 1,
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/virtualenv/config/ini.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 24,
+         "startColumn": 23,
+         "endColumn": 73
+        }
+       },
+       "message": {
+        "text": "user input"
+       }
+      },
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/virtualenv/config/ini.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 24,
+         "startColumn": 23,
+         "endColumn": 73
+        }
+       }
+      }
+     ]
+    },
+    {
+     "ruleId": "py/path-injection",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/path-injection",
+      "index": 0
+     },
+     "message": {
+      "text": "Path traversal from [user input](1)."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/virtualenv/config/ini.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 52,
+         "startColumn": 14,
+         "endColumn": 30
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "3459905e0bc7faa6:1",
+      "primaryLocationStartColumnFingerprint": "5"
+     },
+     "codeFlows": [
+      {
+       "threadFlows": [
+        {
+         "locations": [
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/virtualenv/config/ini.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 1
+             },
+             "region": {
+              "startLine": 24,
+              "startColumn": 23,
+              "endColumn": 73
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for Attribute()"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/virtualenv/config/ini.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 1
+             },
+             "region": {
+              "startLine": 24,
+              "startColumn": 9,
+              "endColumn": 20
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for config_file"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/virtualenv/config/ini.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 1
+             },
+             "region": {
+              "startLine": 29,
+              "startColumn": 13,
+              "endColumn": 24
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for config_file"
+            }
+           },
+           "taxa": [
+            {
+             "id": "AdditionalTaintStep",
+             "properties": {
+              "CodeQL/DataflowRole": "step"
+             }
+            }
+           ]
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/virtualenv/config/ini.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 1
+             },
+             "region": {
+              "startLine": 30,
+              "startColumn": 28,
+              "endColumn": 39
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for config_file"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/virtualenv/config/ini.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 1
+             },
+             "region": {
+              "startLine": 30,
+              "startColumn": 9,
+              "endColumn": 13
+             }
+            },
+            "message": {
+             "text": "[post] ControlFlowNode for self [Attribute config_file]"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/virtualenv/config/ini.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 1
+             },
+             "region": {
+              "startLine": 31,
+              "startColumn": 9,
+              "endColumn": 13
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for self [Attribute config_file]"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/virtualenv/config/ini.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 1
+             },
+             "region": {
+              "startLine": 34,
+              "startColumn": 9,
+              "endColumn": 13
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for self [Attribute config_file]"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/virtualenv/config/ini.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 1
+             },
+             "region": {
+              "startLine": 36,
+              "startColumn": 13,
+              "endColumn": 17
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for self [Attribute config_file]"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/virtualenv/config/ini.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 1
+             },
+             "region": {
+              "startLine": 41,
+              "startColumn": 36,
+              "endColumn": 40
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for self [Attribute config_file]"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/virtualenv/config/ini.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 1
+             },
+             "region": {
+              "startLine": 41,
+              "startColumn": 36,
+              "endColumn": 52
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for Attribute"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/virtualenv/config/ini.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 1
+             },
+             "region": {
+              "startLine": 41,
+              "startColumn": 36,
+              "endColumn": 62
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for Attribute()"
+            }
+           },
+           "taxa": [
+            {
+             "id": "AdditionalTaintStep",
+             "properties": {
+              "CodeQL/DataflowRole": "step"
+             }
+            }
+           ]
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/virtualenv/config/ini.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 1
+             },
+             "region": {
+              "startLine": 41,
+              "startColumn": 17,
+              "endColumn": 21
+             }
+            },
+            "message": {
+             "text": "[post] ControlFlowNode for self [Attribute config_file]"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/virtualenv/config/ini.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 1
+             },
+             "region": {
+              "startLine": 42,
+              "startColumn": 17,
+              "endColumn": 21
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for self [Attribute config_file]"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/virtualenv/config/ini.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 1
+             },
+             "region": {
+              "startLine": 44,
+              "startColumn": 21,
+              "endColumn": 25
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for self [Attribute config_file]"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/virtualenv/config/ini.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 1
+             },
+             "region": {
+              "startLine": 51,
+              "startColumn": 15,
+              "endColumn": 19
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for self [Attribute config_file]"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/virtualenv/config/ini.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 1
+             },
+             "region": {
+              "startLine": 52,
+              "startColumn": 14,
+              "endColumn": 18
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for self [Attribute config_file]"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/virtualenv/config/ini.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 1
+             },
+             "region": {
+              "startLine": 52,
+              "startColumn": 14,
+              "endColumn": 30
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for Attribute"
+            }
+           }
+          }
+         ]
+        }
+       ]
+      }
+     ],
+     "relatedLocations": [
+      {
+       "id": 1,
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/virtualenv/config/ini.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 24,
+         "startColumn": 23,
+         "endColumn": 73
+        }
+       },
+       "message": {
+        "text": "user input"
+       }
+      },
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/virtualenv/config/ini.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 24,
+         "startColumn": 23,
+         "endColumn": 73
+        }
+       }
+      }
+     ]
+    },
+    {
+     "ruleId": "py/path-injection",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/path-injection",
+      "index": 0
+     },
+     "message": {
+      "text": "Path traversal from [user input](1)."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "tasks/make_zipapp.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 52,
+         "startColumn": 65,
+         "endColumn": 69
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "df551e34e6a2dfa0:1",
+      "primaryLocationStartColumnFingerprint": "60"
+     },
+     "codeFlows": [
+      {
+       "threadFlows": [
+        {
+         "locations": [
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "tasks/make_zipapp.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 2
+             },
+             "region": {
+              "startLine": 32,
+              "startColumn": 12,
+              "endColumn": 31
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for Attribute()"
+            }
+           },
+           "taxa": [
+            {
+             "index": 1,
+             "toolComponent": {
+              "index": 1
+             },
+             "properties": {
+              "CodeQL/DataflowRole": "source"
+             }
+            }
+           ]
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "tasks/make_zipapp.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 2
+             },
+             "region": {
+              "startLine": 32,
+              "startColumn": 5,
+              "endColumn": 9
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for args"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "tasks/make_zipapp.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 2
+             },
+             "region": {
+              "startLine": 35,
+              "startColumn": 23,
+              "endColumn": 49
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for Attribute()"
+            }
+           },
+           "taxa": [
+            {
+             "id": "AdditionalTaintStep",
+             "properties": {
+              "CodeQL/DataflowRole": "step"
+             }
+            }
+           ]
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "tasks/make_zipapp.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 2
+             },
+             "region": {
+              "startLine": 38,
+              "startColumn": 19,
+              "endColumn": 23
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for dest"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "tasks/make_zipapp.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 2
+             },
+             "region": {
+              "startLine": 52,
+              "startColumn": 65,
+              "endColumn": 69
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for dest"
+            }
+           }
+          }
+         ]
+        }
+       ]
+      }
+     ],
+     "relatedLocations": [
+      {
+       "id": 1,
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "tasks/make_zipapp.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 32,
+         "startColumn": 12,
+         "endColumn": 31
+        }
+       },
+       "message": {
+        "text": "user input"
+       }
+      },
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "tasks/make_zipapp.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 32,
+         "startColumn": 12,
+         "endColumn": 31
+        }
+       }
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20261117223430",
+   "codeql_raw_query": "/**\n * @name Unsafe file write operations\n * @description Writing to file paths derived from user input without validation can lead to arbitrary file writes\n * @kind path-problem\n * @problem.severity error\n * @id py/unsafe-file-write\n * @tags security\n *        external/cwe/cwe-059\n *        external/cwe/cwe-073\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.ApiGraphs\n\nmodule UnsafeFileWriteConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    exists(DataFlow::CallCfgNode call |\n      // sys.argv\n      call = API::moduleImport(\"sys\").getMember(\"argv\").getACall() and\n      source = call\n      or\n      // Environment variables\n      call = API::moduleImport(\"os\").getMember(\"environ\").getMember(\"get\").getACall() and\n      source = call\n      or\n      // Command line args\n      call = API::moduleImport(\"argparse\").getMember(\"ArgumentParser\").getReturn().getMember(\"parse_args\").getACall() and\n      source = call\n    )\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(DataFlow::CallCfgNode call |\n      // File open for write\n      call = API::builtin(\"open\").getACall() and\n      sink = call.getArg(0)\n      or\n      // shutil operations\n      call = API::moduleImport(\"shutil\").getMember([\"copy\", \"copy2\", \"copyfile\", \"copytree\", \"move\"]).getACall() and\n      (sink = call.getArg(0) or sink = call.getArg(1))\n      or\n      // os.symlink\n      call = API::moduleImport(\"os\").getMember([\"symlink\", \"link\", \"rename\", \"makedirs\"]).getACall() and\n      sink = call.getArg(0)\n    )\n  }\n}\n\nmodule UnsafeFileWriteFlow = TaintTracking::Global<UnsafeFileWriteConfig>;\nimport UnsafeFileWriteFlow::PathGraph\n\nfrom UnsafeFileWriteFlow::PathNode source, UnsafeFileWriteFlow::PathNode sink\nwhere UnsafeFileWriteFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"Unsafe file write from $@.\", source.getNode(), \"user input\"",
+   "hypothesis": "Check for unsafe file writes that could lead to arbitrary file overwrite or symlink attacks",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-59",
+    "cwe-73"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20261117223509",
+   "codeql_raw_query": "/**\n * @name Insecure temporary file usage\n * @description Using predictable temporary file names can lead to race conditions and security vulnerabilities\n * @kind problem\n * @problem.severity warning\n * @id py/insecure-temp-file\n * @tags security\n *        external/cwe/cwe-377\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  (\n    call = API::moduleImport(\"tempfile\").getMember([\"mktemp\"]).getACall() or\n    call = API::moduleImport(\"os\").getMember([\"tmpnam\", \"tempnam\"]).getACall()\n  )\nselect call, \"Insecure temporary file creation that may be vulnerable to race conditions.\"\n",
+   "hypothesis": "Detecting insecure temporary file creation using deprecated functions like mktemp, tmpnam, or tempnam",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-377"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20261117223543",
+   "codeql_raw_query": "/**\n * @name Unsafe deserialization\n * @description Deserializing untrusted data can lead to arbitrary code execution\n * @kind problem\n * @problem.severity error\n * @id py/unsafe-deserialization\n * @tags security\n *        external/cwe/cwe-502\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  (\n    call = API::moduleImport(\"pickle\").getMember([\"load\", \"loads\", \"Unpickler\"]).getACall() or\n    call = API::moduleImport(\"yaml\").getMember([\"load\", \"unsafe_load\"]).getACall() or\n    call = API::moduleImport(\"marshal\").getMember([\"load\", \"loads\"]).getACall() or\n    call = API::moduleImport(\"shelve\").getMember(\"open\").getACall()\n  )\nselect call, \"Potentially unsafe deserialization operation that could execute arbitrary code.\"",
+   "hypothesis": "Looking for unsafe deserialization functions like pickle.load, yaml.load, marshal.load that could lead to arbitrary code execution",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-502"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20261117223712",
+   "codeql_raw_query": "/**\n * @name Code injection via exec/eval\n * @description Using exec or eval with user input can lead to arbitrary code execution\n * @kind path-problem\n * @problem.severity error\n * @id py/code-injection-exec\n * @tags security\n *        external/cwe/cwe-094\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.Concepts\nimport semmle.python.ApiGraphs\n\nmodule CodeInjectionConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    exists(DataFlow::CallCfgNode call |\n      call = API::moduleImport(\"argparse\").getMember(\"ArgumentParser\").getReturn().getMember(\"parse_args\").getACall() and\n      source = call\n    )\n    or\n    exists(DataFlow::CallCfgNode call |\n      call = API::moduleImport(\"os\").getMember(\"environ\").getMember(\"get\").getACall() and\n      source = call\n    )\n    or\n    exists(DataFlow::CallCfgNode call |\n      call = API::moduleImport(\"configparser\").getMember(\"ConfigParser\").getReturn().getMember(\"get\").getACall() and\n      source = call\n    )\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(CodeExecution ce | sink = ce.getCode())\n  }\n}\n\nmodule CodeInjectionFlow = TaintTracking::Global<CodeInjectionConfig>;\nimport CodeInjectionFlow::PathGraph\n\nfrom CodeInjectionFlow::PathNode source, CodeInjectionFlow::PathNode sink\nwhere CodeInjectionFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"Code injection from $@.\", source.getNode(), \"user input\"",
+   "hypothesis": "Code injection through exec/eval with user-controlled input from CLI args, environment variables, or config files",
+   "severity": "critical",
+   "cwe_ids": [
+    "cwe-094"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20261117223756",
+   "codeql_raw_query": "/**\n * @name Insecure URL request\n * @description Making HTTP requests without SSL verification or to user-controlled URLs\n * @kind problem\n * @problem.severity warning\n * @id py/insecure-url-request\n * @tags security\n *        external/cwe/cwe-918\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  (\n    // urllib.request calls\n    call = API::moduleImport(\"urllib\").getMember(\"request\").getMember([\"urlopen\", \"urlretrieve\"]).getACall() or\n    call = API::moduleImport(\"urllib\").getMember(\"request\").getMember(\"Request\").getACall()\n  )\nselect call, \"URL request that may be vulnerable to SSRF or insecure connections.\"\n",
+   "hypothesis": "Looking for insecure URL requests that could be vulnerable to SSRF or lack SSL verification",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-918",
+    "cwe-295"
+   ],
+   "results_count": 1,
+   "results": [
+    {
+     "ruleId": "py/insecure-url-request",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/insecure-url-request",
+      "index": 0
+     },
+     "message": {
+      "text": "URL request that may be vulnerable to SSRF or insecure connections."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/virtualenv/seed/wheels/periodic_update.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 353,
+         "startColumn": 22,
+         "endColumn": 51
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "7925b476f3762538:1",
+      "primaryLocationStartColumnFingerprint": "5"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20261117223834",
+   "codeql_raw_query": "/**\n * @name Time-of-check Time-of-use race condition\n * @description Checking file existence followed by file operation can lead to race conditions\n * @kind problem\n * @problem.severity warning\n * @id py/toctou-file-operation\n * @tags security\n *        external/cwe/cwe-367\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode check, DataFlow::CallCfgNode op, DataFlow::Node path1, DataFlow::Node path2\nwhere\n  (\n    check = API::moduleImport(\"os\").getMember(\"path\").getMember([\"exists\", \"isfile\", \"isdir\"]).getACall() or\n    check = API::moduleImport(\"pathlib\").getMember(\"Path\").getReturn().getMember([\"exists\", \"is_file\", \"is_dir\"]).getACall()\n  ) and\n  (\n    op = API::builtin([\"open\"]).getACall() or\n    op = API::moduleImport(\"os\").getMember([\"remove\", \"unlink\", \"rmdir\", \"mkdir\"]).getACall() or\n    op = API::moduleImport(\"shutil\").getMember([\"rmtree\", \"copy\", \"copy2\", \"move\"]).getACall()\n  ) and\n  path1 = check.getArg(0) and\n  path2 = op.getArg(0) and\n  DataFlow::localFlow(path1, path2)\nselect check, \"Potential TOCTOU race condition: file check followed by operation on the same path.\"\n",
+   "hypothesis": "Time-of-check Time-of-use race conditions where file existence checks are followed by operations on the same file path",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-367"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20261117223956",
+   "codeql_raw_query": "/**\n * @name Hardcoded secrets\n * @description Hardcoded passwords or API keys in source code\n * @kind problem\n * @problem.severity warning\n * @id py/hardcoded-credentials\n * @tags security\n *        external/cwe/cwe-798\n */\n\nimport python\n\nfrom StrConst str\nwhere\n  (\n    str.getText().regexpMatch(\"(?i).*(password|passwd|pwd|secret|api[_-]?key|token|auth).*=.*\") or\n    str.getText().regexpMatch(\"(?i)(password|passwd|secret|api[_-]?key)\\\\s*[:=]\\\\s*['\\\"]\\\\w+['\\\"]\")\n  ) and\n  not str.getLocation().getFile().getRelativePath().matches(\"%test%\")\nselect str, \"Potential hardcoded credential found in string literal.\"\n",
+   "hypothesis": "Looking for hardcoded credentials, API keys, or secrets in the codebase",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-798"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20261117224024",
+   "codeql_raw_query": "/**\n * @name Insecure SSL/TLS configuration\n * @description Disabling SSL certificate verification can allow man-in-the-middle attacks\n * @kind problem\n * @problem.severity error\n * @id py/insecure-ssl-config\n * @tags security\n *        external/cwe/cwe-295\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  (\n    // urllib.request with context that doesn't verify\n    call = API::moduleImport(\"urllib\").getMember(\"request\").getMember([\"urlopen\", \"Request\"]).getACall() or\n    // requests with verify=False\n    call = API::moduleImport(\"requests\").getMember([\"get\", \"post\", \"request\", \"put\", \"delete\", \"patch\"]).getACall() or\n    // SSL context with CERT_NONE\n    call = API::moduleImport(\"ssl\").getMember(\"_create_unverified_context\").getACall()\n  )\nselect call, \"Potentially insecure SSL/TLS configuration that may allow man-in-the-middle attacks.\"\n",
+   "hypothesis": "Detecting insecure SSL/TLS configurations that disable certificate verification",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-295"
+   ],
+   "results_count": 2,
+   "results": [
+    {
+     "ruleId": "py/insecure-ssl-config",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/insecure-ssl-config",
+      "index": 0
+     },
+     "message": {
+      "text": "Potentially insecure SSL/TLS configuration that may allow man-in-the-middle attacks."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/virtualenv/seed/wheels/periodic_update.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 336,
+         "startColumn": 11,
+         "endColumn": 43
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "b927bf6cef7bc9f6:1",
+      "primaryLocationStartColumnFingerprint": "6"
+     }
+    },
+    {
+     "ruleId": "py/insecure-ssl-config",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/insecure-ssl-config",
+      "index": 0
+     },
+     "message": {
+      "text": "Potentially insecure SSL/TLS configuration that may allow man-in-the-middle attacks."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/virtualenv/seed/wheels/periodic_update.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 353,
+         "startColumn": 22,
+         "endColumn": 51
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "7925b476f3762538:1",
+      "primaryLocationStartColumnFingerprint": "5"
+     }
+    }
+   ]
+  }
+ ],
+ "cache_usage": {
+  "prompt_tokens_total": 281283,
+  "uncached_input_tokens": 126,
+  "cache_creation_input_tokens": 26703,
+  "cache_read_input_tokens": 254454,
+  "output_tokens": 11074,
+  "calls": 22,
+  "caching_enabled": true,
+  "cost_usd_with_cache": 0.34296,
+  "cost_usd_no_cache": 1.009959,
+  "cache_read_share_of_prompt": 0.9046,
+  "prices_per_mtok": {
+   "claude-sonnet-4-5-20250929": {
+    "input": 3.0,
+    "output": 15.0
+   },
+   "claude-haiku-4-5-20251001": {
+    "input": 1.0,
+    "output": 5.0
+   }
+  },
+  "cache_multipliers": {
+   "write_5m": 1.25,
+   "read": 0.1
+  }
+ }
+}

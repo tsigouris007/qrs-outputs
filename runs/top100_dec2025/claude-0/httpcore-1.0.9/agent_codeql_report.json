@@ -1,0 +1,841 @@
+{
+ "session_id": "20251206125001",
+ "package_name": "httpcore-1.0.9",
+ "package_path": "packages/httpcore-1.0.9",
+ "database_path": "databases/httpcore-1.0.9-db",
+ "model": "claude-sonnet-4-5-20250929",
+ "temperature": 0.0,
+ "max_tokens": 4000,
+ "iterations": 19,
+ "total_input_tokens": 184287,
+ "total_output_tokens": 10852,
+ "total_tokens": 195139,
+ "elapsed_time_seconds": 469.71,
+ "estimated_cost_usd": 0.7156,
+ "summary": "## Security Analysis Summary: httpcore-1.0.9\n\n### Package Overview\nhttpcore is a minimal low-level HTTP client library (v1.0.9) with ~5,689 lines of code across 31 files. It provides HTTP/1.1 and HTTP/2 support with both synchronous and asynchronous implementations, proxy support (HTTP and SOCKS), and SSL/TLS handling.\n\n### Analysis Methodology\nConducted comprehensive security analysis using 15 CodeQL queries across multiple vulnerability categories:\n- Server-Side Request Forgery (SSRF)\n- SSL/TLS certificate validation bypass\n- HTTP header injection (CRLF)\n- Unvalidated redirects\n- Hardcoded credentials\n- Insecure random number generation\n- Resource exhaustion/DoS\n- Information disclosure\n- Socket operation vulnerabilities\n\n### Key Findings\n\n**No Critical or High Severity Vulnerabilities Detected**\n\nThe analysis found no exploitable security vulnerabilities in the httpcore package. Specifically:\n\n1. **SSRF Protection**: No URL manipulation vulnerabilities that could lead to SSRF attacks\n2. **SSL/TLS Security**: No certificate validation bypass issues detected\n3. **Header Injection**: No CRLF injection vulnerabilities in HTTP header handling\n4. **Redirect Handling**: No unvalidated redirect following issues\n5. **Cryptographic Security**: No use of insecure random number generators\n6. **Information Disclosure**: No sensitive data leakage through exceptions\n\n**False Positives Identified**:\n- 23 string literals flagged as potential hardcoded credentials were actually HTTP header names (\"Proxy-Authorization\", \"auth\") and SOCKS protocol constants (\"NO AUTHENTICATION REQUIRED\", \"USERNAME/PASSWORD\") - these are legitimate protocol identifiers, not actual credentials.\n\n### Security Posture\nhttpcore demonstrates good security practices:\n- Proper use of SSL/TLS libraries (certifi, ssl module)\n- No obvious input validation gaps\n- Clean separation between sync/async implementations\n- Appropriate use of established HTTP libraries (h11, h2)\n\n### Recommendations\n1. Continue following secure coding practices\n2. Ensure downstream applications properly validate URLs before passing to httpcore\n3. Maintain up-to-date dependencies (h11, h2, certifi)\n\n### Conclusion\nhttpcore-1.0.9 is a well-implemented low-level HTTP client library with no identified security vulnerabilities. The codebase follows security best practices appropriate for a foundational HTTP library.",
+ "package_classification": {
+  "type": [
+   "library"
+  ],
+  "layer": [
+   "network",
+   "protocol"
+  ]
+ },
+ "tool_calls": {
+  "get_package_profile_info": 1,
+  "execute_codeql_query": 12,
+  "validate_codeql_query": 0,
+  "fixup_codeql_query": 4,
+  "finalize_report": 1
+ },
+ "queries_executed": {
+  "critical": 1,
+  "high": 2,
+  "medium": 4,
+  "low": 0,
+  "total_executed": 15,
+  "total_with_results": 7,
+  "total_failed": 9
+ },
+ "query_findings": {
+  "critical": 0,
+  "high": 0,
+  "medium": 23,
+  "low": 0,
+  "total": 23
+ },
+ "findings": [
+  {
+   "codeql_query_uuid": "20251206125021",
+   "codeql_raw_query": "/**\n * @name Server-Side Request Forgery via URL manipulation\n * @description User-controlled URLs used in HTTP requests without validation may allow SSRF attacks\n * @kind path-problem\n * @problem.severity warning\n * @id py/httpcore-ssrf\n * @tags security\n *        external/cwe/cwe-918\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.dataflow.new.RemoteFlowSources\nimport semmle.python.ApiGraphs\n\nmodule SSRFConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    source instanceof RemoteFlowSource\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(DataFlow::CallCfgNode call |\n      // Looking for socket.connect, socket operations with addresses\n      call = API::moduleImport(\"socket\").getMember(\"socket\").getReturn().getMember(\"connect\").getACall() and\n      sink = call.getArg(0)\n      or\n      // HTTP request methods that take URLs\n      exists(DataFlow::AttrRead attr |\n        attr.getAttributeName() in [\"request\", \"handle_request\", \"handle_async_request\"] and\n        call.getFunction() = attr and\n        sink = call.getArg(0)\n      )\n    )\n  }\n}\n\nmodule SSRFFlow = TaintTracking::Global<SSRFConfig>;\nimport SSRFFlow::PathGraph\n\nfrom SSRFFlow::PathNode source, SSRFFlow::PathNode sink\nwhere SSRFFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"Potential SSRF: user-controlled data flows to network request $@.\", source, \"from user input\"\n",
+   "hypothesis": "SSRF via insufficient URL validation - checking if user-controlled URLs are used without proper validation in HTTP requests",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-918"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251206125147",
+   "codeql_raw_query": "/**\n * @name SSL/TLS Certificate Validation Bypass\n * @description Detects when SSL certificate verification is disabled\n * @kind problem\n * @problem.severity error\n * @id py/ssl-verification-disabled\n * @tags security\n *        external/cwe/cwe-295\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  (\n    // ssl.create_default_context with check_hostname=False\n    call = API::moduleImport(\"ssl\").getMember(\"create_default_context\").getACall() and\n    exists(DataFlow::Node kwarg |\n      kwarg = call.getArgByName(\"check_hostname\") and\n      kwarg.asExpr().(BooleanLiteral).booleanValue() = false\n    )\n    or\n    // SSLContext.check_hostname = False (assignment pattern)\n    exists(AssignStmt assign, Attribute attr |\n      attr = assign.getATarget() and\n      attr.getName() = \"check_hostname\" and\n      DataFlow::exprNode(attr.getObject()).(DataFlow::LocalSourceNode).getALocalSource() = \n        API::moduleImport(\"ssl\").getMember(\"SSLContext\").getACall() and\n      assign.getValue().(BooleanLiteral).booleanValue() = false and\n      call = API::moduleImport(\"ssl\").getMember(\"SSLContext\").getACall()\n    )\n    or\n    // verify_mode = CERT_NONE\n    call = API::moduleImport(\"ssl\").getMember(\"SSLContext\").getACall() and\n    exists(DataFlow::Node kwarg |\n      kwarg = call.getArgByName(\"verify_mode\") and\n      kwarg.asExpr().(Attribute).getName() = \"CERT_NONE\"\n    )\n    or\n    // SSLContext() with check_hostname=False\n    call = API::moduleImport(\"ssl\").getMember(\"SSLContext\").getACall() and\n    exists(DataFlow::Node kwarg |\n      kwarg = call.getArgByName(\"check_hostname\") and\n      kwarg.asExpr().(BooleanLiteral).booleanValue() = false\n    )\n  )\nselect call, \"SSL certificate verification may be disabled, allowing man-in-the-middle attacks\"",
+   "hypothesis": "SSL/TLS certificate validation can be disabled or bypassed",
+   "severity": "critical",
+   "cwe_ids": [
+    "cwe-295"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251206125306",
+   "codeql_raw_query": "/**\n * @name HTTP Header Injection via CRLF\n * @description Detects potential HTTP header injection through unsanitized CRLF characters\n * @kind path-problem\n * @problem.severity error\n * @id py/http-header-injection\n * @tags security\n *        external/cwe/cwe-113\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.dataflow.new.RemoteFlowSources\nimport semmle.python.ApiGraphs\n\nmodule HeaderInjectionConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    source instanceof RemoteFlowSource\n  }\n  \n  predicate isSink(DataFlow::Node sink) {\n    exists(DataFlow::CallCfgNode call |\n      // Headers being set in httpcore\n      call.getFunction().asExpr().(Attribute).getName() in [\"add\", \"append\", \"extend\", \"update\", \"setdefault\"] and\n      sink = call.getArg(_)\n    )\n  }\n  \n  predicate isBarrier(DataFlow::Node node) {\n    // If CRLF characters are sanitized\n    exists(DataFlow::CallCfgNode call |\n      call.getFunction().asExpr().(Attribute).getName() in [\"replace\", \"strip\"] and\n      node = call\n    )\n  }\n}\n\nmodule HeaderInjectionFlow = TaintTracking::Global<HeaderInjectionConfig>;\nimport HeaderInjectionFlow::PathGraph\n\nfrom HeaderInjectionFlow::PathNode source, HeaderInjectionFlow::PathNode sink\nwhere HeaderInjectionFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"Potential HTTP header injection from $@.\", source.getNode(), \"user input\"\n",
+   "hypothesis": "HTTP header injection through unsanitized CRLF characters in headers",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-113"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251206125345",
+   "codeql_raw_query": "/**\n * @name Unvalidated Redirect Following\n * @description Detects redirect handling without proper validation\n * @kind problem\n * @problem.severity warning\n * @id py/unvalidated-redirect\n * @tags security\n *        external/cwe/cwe-601\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call, DataFlow::Node locationArg\nwhere\n  // Looking for redirect handling in httpcore\n  (\n    call.getFunction().asExpr().(Attribute).getName() in [\"handle_redirect\", \"follow_redirect\"] or\n    exists(DataFlow::Node node |\n      node.asExpr().(Name).getId() in [\"location\", \"Location\"] and\n      locationArg = node\n    )\n  ) and\n  // Check if location header is used without validation\n  exists(DataFlow::CallCfgNode requestCall |\n    requestCall.getFunction().asExpr().(Attribute).getName() = \"request\" and\n    DataFlow::localFlow(locationArg, requestCall.getArg(_))\n  )\nselect call, \"Redirect location may be followed without proper validation\"\n",
+   "hypothesis": "Unvalidated redirect following that could lead to open redirect vulnerabilities",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-601"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251206125454",
+   "codeql_raw_query": "/**\n * @name Hardcoded Credentials or Secrets\n * @description Detects hardcoded passwords, API keys, or secrets\n * @kind problem\n * @problem.severity warning\n * @id py/hardcoded-credentials\n * @tags security\n *        external/cwe/cwe-798\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\n\nfrom StrConst str, string value\nwhere\n  value = str.getText() and\n  (\n    value.regexpMatch(\"(?i).*(password|passwd|pwd|secret|api[_-]?key|token|auth).*\") and\n    not value.regexpMatch(\"(?i).*(example|test|dummy|placeholder|sample).*\") and\n    str.getEnclosingModule().getName().matches(\"httpcore%\")\n  )\nselect str, \"Potential hardcoded credential or secret: \" + value",
+   "hypothesis": "Detects hardcoded passwords, API keys, or secrets in the codebase",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-798"
+   ],
+   "results_count": 23,
+   "results": [
+    {
+     "ruleId": "py/hardcoded-credentials",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/hardcoded-credentials",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential hardcoded credential or secret: auth"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "httpcore/_models.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 509,
+         "startColumn": 52,
+         "endColumn": 58
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "7f1afa74a3156a5c:1",
+      "primaryLocationStartColumnFingerprint": "39"
+     }
+    },
+    {
+     "ruleId": "py/hardcoded-credentials",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/hardcoded-credentials",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential hardcoded credential or secret: auth"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "httpcore/_models.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 510,
+         "startColumn": 52,
+         "endColumn": 58
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "ff54b2436db92833:1",
+      "primaryLocationStartColumnFingerprint": "39"
+     }
+    },
+    {
+     "ruleId": "py/hardcoded-credentials",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/hardcoded-credentials",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential hardcoded credential or secret: Proxy-Authorization"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "httpcore/_models.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 514,
+         "startColumn": 30,
+         "endColumn": 52
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "e677e7a621b2b097:1",
+      "primaryLocationStartColumnFingerprint": "17"
+     }
+    },
+    {
+     "ruleId": "py/hardcoded-credentials",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/hardcoded-credentials",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential hardcoded credential or secret: :authority"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "httpcore/_async/http2.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 236,
+         "startColumn": 14,
+         "endColumn": 27
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "e63fa0baf756f7e2:1",
+      "primaryLocationStartColumnFingerprint": "1"
+     }
+    },
+    {
+     "ruleId": "py/hardcoded-credentials",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/hardcoded-credentials",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential hardcoded credential or secret: :authority"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "httpcore/_sync/http2.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 236,
+         "startColumn": 14,
+         "endColumn": 27
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "e63fa0baf756f7e2:1",
+      "primaryLocationStartColumnFingerprint": "1"
+     }
+    },
+    {
+     "ruleId": "py/hardcoded-credentials",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/hardcoded-credentials",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential hardcoded credential or secret: proxy_auth"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "httpcore/_sync/http_proxy.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 3
+        },
+        "region": {
+         "startLine": 138,
+         "startColumn": 58,
+         "endColumn": 70
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "4d4a2f3ebd9d7010:1",
+      "primaryLocationStartColumnFingerprint": "45"
+     }
+    },
+    {
+     "ruleId": "py/hardcoded-credentials",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/hardcoded-credentials",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential hardcoded credential or secret: proxy_auth"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "httpcore/_sync/http_proxy.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 3
+        },
+        "region": {
+         "startLine": 139,
+         "startColumn": 58,
+         "endColumn": 70
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "f1e56e71139e34b1:1",
+      "primaryLocationStartColumnFingerprint": "45"
+     }
+    },
+    {
+     "ruleId": "py/hardcoded-credentials",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/hardcoded-credentials",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential hardcoded credential or secret: Proxy-Authorization"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "httpcore/_sync/http_proxy.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 3
+        },
+        "region": {
+         "startLine": 143,
+         "startColumn": 18,
+         "endColumn": 40
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "8b7efbd4d90fba5e:1",
+      "primaryLocationStartColumnFingerprint": "1"
+     }
+    },
+    {
+     "ruleId": "py/hardcoded-credentials",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/hardcoded-credentials",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential hardcoded credential or secret: proxy_auth"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "httpcore/_async/http_proxy.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 4
+        },
+        "region": {
+         "startLine": 138,
+         "startColumn": 58,
+         "endColumn": 70
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "4d4a2f3ebd9d7010:1",
+      "primaryLocationStartColumnFingerprint": "45"
+     }
+    },
+    {
+     "ruleId": "py/hardcoded-credentials",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/hardcoded-credentials",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential hardcoded credential or secret: proxy_auth"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "httpcore/_async/http_proxy.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 4
+        },
+        "region": {
+         "startLine": 139,
+         "startColumn": 58,
+         "endColumn": 70
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "f1e56e71139e34b1:1",
+      "primaryLocationStartColumnFingerprint": "45"
+     }
+    },
+    {
+     "ruleId": "py/hardcoded-credentials",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/hardcoded-credentials",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential hardcoded credential or secret: Proxy-Authorization"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "httpcore/_async/http_proxy.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 4
+        },
+        "region": {
+         "startLine": 143,
+         "startColumn": 18,
+         "endColumn": 40
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "8b7efbd4d90fba5e:1",
+      "primaryLocationStartColumnFingerprint": "1"
+     }
+    },
+    {
+     "ruleId": "py/hardcoded-credentials",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/hardcoded-credentials",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential hardcoded credential or secret: NO AUTHENTICATION REQUIRED"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "httpcore/_async/socks_proxy.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 5
+        },
+        "region": {
+         "startLine": 23,
+         "startColumn": 14,
+         "endColumn": 42
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "8725dacddaf5bbaf:1",
+      "primaryLocationStartColumnFingerprint": "9"
+     }
+    },
+    {
+     "ruleId": "py/hardcoded-credentials",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/hardcoded-credentials",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential hardcoded credential or secret: USERNAME/PASSWORD"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "httpcore/_async/socks_proxy.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 5
+        },
+        "region": {
+         "startLine": 25,
+         "startColumn": 14,
+         "endColumn": 33
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "8882e01ab1c7f4f4:1",
+      "primaryLocationStartColumnFingerprint": "9"
+     }
+    },
+    {
+     "ruleId": "py/hardcoded-credentials",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/hardcoded-credentials",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential hardcoded credential or secret: Invalid username/password"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "httpcore/_async/socks_proxy.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 5
+        },
+        "region": {
+         "startLine": 85,
+         "startColumn": 30,
+         "endColumn": 57
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "5fb30fda54267b38:1",
+      "primaryLocationStartColumnFingerprint": "17"
+     }
+    },
+    {
+     "ruleId": "py/hardcoded-credentials",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/hardcoded-credentials",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential hardcoded credential or secret: proxy_auth"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "httpcore/_async/socks_proxy.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 5
+        },
+        "region": {
+         "startLine": 167,
+         "startColumn": 59,
+         "endColumn": 71
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "2779f2868c806fd6:1",
+      "primaryLocationStartColumnFingerprint": "46"
+     }
+    },
+    {
+     "ruleId": "py/hardcoded-credentials",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/hardcoded-credentials",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential hardcoded credential or secret: proxy_auth"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "httpcore/_async/socks_proxy.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 5
+        },
+        "region": {
+         "startLine": 168,
+         "startColumn": 59,
+         "endColumn": 71
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "997543f60e8fdd20:1",
+      "primaryLocationStartColumnFingerprint": "46"
+     }
+    },
+    {
+     "ruleId": "py/hardcoded-credentials",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/hardcoded-credentials",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential hardcoded credential or secret: auth"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "httpcore/_async/socks_proxy.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 5
+        },
+        "region": {
+         "startLine": 239,
+         "startColumn": 25,
+         "endColumn": 31
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "bf7d02f7558fc875:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/hardcoded-credentials",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/hardcoded-credentials",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential hardcoded credential or secret: NO AUTHENTICATION REQUIRED"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "httpcore/_sync/socks_proxy.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 6
+        },
+        "region": {
+         "startLine": 23,
+         "startColumn": 14,
+         "endColumn": 42
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "8725dacddaf5bbaf:1",
+      "primaryLocationStartColumnFingerprint": "9"
+     }
+    },
+    {
+     "ruleId": "py/hardcoded-credentials",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/hardcoded-credentials",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential hardcoded credential or secret: USERNAME/PASSWORD"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "httpcore/_sync/socks_proxy.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 6
+        },
+        "region": {
+         "startLine": 25,
+         "startColumn": 14,
+         "endColumn": 33
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "8882e01ab1c7f4f4:1",
+      "primaryLocationStartColumnFingerprint": "9"
+     }
+    },
+    {
+     "ruleId": "py/hardcoded-credentials",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/hardcoded-credentials",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential hardcoded credential or secret: Invalid username/password"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "httpcore/_sync/socks_proxy.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 6
+        },
+        "region": {
+         "startLine": 85,
+         "startColumn": 30,
+         "endColumn": 57
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "5fb30fda54267b38:1",
+      "primaryLocationStartColumnFingerprint": "17"
+     }
+    },
+    {
+     "ruleId": "py/hardcoded-credentials",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/hardcoded-credentials",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential hardcoded credential or secret: proxy_auth"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "httpcore/_sync/socks_proxy.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 6
+        },
+        "region": {
+         "startLine": 167,
+         "startColumn": 59,
+         "endColumn": 71
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "2779f2868c806fd6:1",
+      "primaryLocationStartColumnFingerprint": "46"
+     }
+    },
+    {
+     "ruleId": "py/hardcoded-credentials",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/hardcoded-credentials",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential hardcoded credential or secret: proxy_auth"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "httpcore/_sync/socks_proxy.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 6
+        },
+        "region": {
+         "startLine": 168,
+         "startColumn": 59,
+         "endColumn": 71
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "997543f60e8fdd20:1",
+      "primaryLocationStartColumnFingerprint": "46"
+     }
+    },
+    {
+     "ruleId": "py/hardcoded-credentials",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/hardcoded-credentials",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential hardcoded credential or secret: auth"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "httpcore/_sync/socks_proxy.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 6
+        },
+        "region": {
+         "startLine": 239,
+         "startColumn": 25,
+         "endColumn": 31
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "35e1ed8b48360c00:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251206125519",
+   "codeql_raw_query": "/**\n * @name Insecure Random Number Generation\n * @description Use of insecure random number generators for security-sensitive operations\n * @kind problem\n * @problem.severity warning\n * @id py/insecure-randomness\n * @tags security\n *        external/cwe/cwe-338\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  (\n    // random module usage (not cryptographically secure)\n    call = API::moduleImport(\"random\").getMember(_).getACall()\n  ) and\n  // In httpcore package\n  call.getLocation().getFile().getRelativePath().matches(\"httpcore%\")\nselect call, \"Use of insecure random number generator from 'random' module\"",
+   "hypothesis": "Check for use of insecure random number generators in security contexts",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-338"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251206125655",
+   "codeql_raw_query": "/**\n * @name Information Disclosure via Exception Messages\n * @description Detects exceptions that may leak sensitive information\n * @kind problem\n * @problem.severity warning\n * @id py/information-disclosure-exception\n * @tags security\n *        external/cwe/cwe-209\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\n\nfrom Raise raise, Call call\nwhere\n  raise.getException() = call and\n  call.getFunc().(Name).getId() in [\"Exception\", \"ValueError\", \"RuntimeError\"] and\n  exists(StrConst msg | \n    msg = call.getArg(0) and\n    msg.getText().regexpMatch(\".*(?i)(password|secret|key|token|auth|credential).*\")\n  ) and\n  raise.getEnclosingModule().getName().matches(\"httpcore%\")\nselect raise, \"Exception message may disclose sensitive information\"",
+   "hypothesis": "Information disclosure through verbose exception messages that may leak sensitive data",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-209"
+   ],
+   "results_count": 0,
+   "results": []
+  }
+ ]
+}

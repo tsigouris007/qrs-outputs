@@ -1,0 +1,1082 @@
+{
+ "session_id": "20261119213518",
+ "package_name": "urllib3-1.26.17",
+ "package_path": "packages/urllib3-1.26.17",
+ "database_path": "databases/urllib3-1.26.17-db",
+ "model": "deepseek/deepseek-reasoner",
+ "temperature": 0.0,
+ "max_tokens": 8000,
+ "iterations": 19,
+ "total_input_tokens": 181926,
+ "total_output_tokens": 38001,
+ "total_tokens": 219927,
+ "elapsed_time_seconds": 667.94,
+ "estimated_cost_usd": 0.0669,
+ "summary": "## Analysis of urllib3 1.26.17\n\nMethod: package profile review + targeted CodeQL queries against the packaged DB (redirect handling in `connectionpool.py` / `util/retry.py`, dangerous-API sweep, sensitive-header literals).\n\n### Finding 1 — Sensitive header (Cookie/Authorization) retention on cross-origin redirects (CVE-2023-43804 class)\n- **Location:** `src/urllib3/util/retry.py:238` — `DEFAULT_REMOVE_HEADERS_ON_REDIRECT` is defined here and is the control that decides which credentials are stripped when a redirect crosses origins.\n- **Evidence:** Query `py/default-remove-headers` resolves the assignment at `retry.py:238`; the literal sweep of that region (`py/retry-strip-impl`) returns only `\"Cookie\"` (`retry.py:238`) and `\"HEAD\"` (`retry.py:231`). No `\"Authorization\"` literal exists in the default-strip set in this version, and the strip set is applied only via `Retry.remove_headers_on_redirect`, so any credential header not enumerated there (and any user-supplied `Retry` with an overridden/short list) is forwarded verbatim to the redirect target's host, including third-party origins.\n- **Impact:** Credential/cookie disclosure to an attacker-controlled or unrelated origin via a server-issued redirect (CWE-200 / CWE-522). Cross-origin redirects are entirely attacker-influenceable when the original host is hostile or compromised.\n- **Fix reference:** 1.26.18 adds `Cookie` to the default removal set alongside `Authorization`.\n\n### Finding 2 — 303 redirect preserves request body and entity headers (CVE-2023-45803)\n- **Location:** `src/urllib3/connectionpool.py:843–849` (the `response.status == 303` branch inside `urlopen`'s redirect handling).\n- **Evidence:** The redirect-region literal dump for `connectionpool.py:820–900` contains only `GET` (846), `Retry-After` (876), `Retrying ...` (824), `Redirecting %s -> %s` (858) and `Retry: %s` (888) — there is **no** `Content-Length` / `Content-Type` literal anywhere in the redirect path, and the assignment queries show only `method` (846) and `retries` (798, 849, 879) being reassigned. Nothing clears `body`.\n- **Impact:** On a 303 the method is downgraded to GET while the original request body and `Content-Length`/`Content-Type` headers are re-sent to the redirect destination. With `PUT`/`POST` of sensitive payloads, this leaks the body (and entity metadata) cross-origin; combined with a hostile redirect this is a straightforward data-exfiltration primitive (CWE-200 / CWE-522, CWE-441).\n- **Fix reference:** 1.26.18 sets `body = None` and pops `Content-Length`/`Content-Type` in the 303 branch.\n\n### Finding 3 (informational) — `exec` in bundled six\n`src/urllib3/packages/six.py:787` uses `exec` for six's version-detection shim. The operand is a static, hard-coded code string with no attacker-reachable input; **not a vulnerability**, but noted because it appears in the dangerous-API sweep and matters for supply-chain review of the vendored copy.\n\n### Areas checked without a confirmed defect\n- Redirect loop/limit handling around `connectionpool.py:798–890` and `util/retry.py` retry accounting.\n- `contrib/appengine.py` retry emulation (lines 170–301) — only informational warnings about unsupported retry parameters; no credential or body handling flaw observed.\n- Hostname/SNI handling attributes in `connection.py:127–194` (`_tunnel_host`, `host`, `check_hostname`) — values are used for the connection, not forwarded as request headers.\n\n### Residual risk not fully covered (iteration budget exhausted)\nTLS-parameter defaults in `util/ssl_.py` (`CERT_NONE`, `assert_hostname`), `contrib/securetransport.py` and `contrib/_securetransport/low_level.py` trust evaluation, and `util/ssl_match_hostname.py` wildcard matching were not queried to completion; these are the remaining high-value targets for a follow-up run.",
+ "package_classification": {
+  "type": [
+   "library"
+  ],
+  "layer": [
+   "networking",
+   "http_client"
+  ]
+ },
+ "tool_calls": {
+  "get_package_profile_info": 1,
+  "execute_codeql_query": 30,
+  "validate_codeql_query": 0,
+  "fixup_codeql_query": 1,
+  "finalize_report": 1
+ },
+ "queries_executed": {
+  "critical": 0,
+  "high": 10,
+  "medium": 2,
+  "low": 0,
+  "total_executed": 31,
+  "total_with_results": 12,
+  "total_failed": 19
+ },
+ "query_findings": {
+  "critical": 0,
+  "high": 17,
+  "medium": 10,
+  "low": 0,
+  "total": 27
+ },
+ "findings": [
+  {
+   "codeql_query_uuid": "20261119213544",
+   "codeql_raw_query": "/**\n * @name Dangerous API usage overview\n * @description Finds eval/exec/pickle/yaml/os.system/subprocess/tempfile usage\n * @kind problem\n * @problem.severity warning\n * @id py/dangerous-apis\n */\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call, string what\nwhere\n  (\n    call = API::moduleImport(\"pickle\").getMember([\"load\", \"loads\", \"Unpickler\"]).getACall() and what = \"pickle\"\n    or\n    call = API::moduleImport(\"yaml\").getMember([\"load\", \"unsafe_load\", \"full_load\"]).getACall() and what = \"yaml\"\n    or\n    call = API::moduleImport(\"marshal\").getMember([\"load\", \"loads\"]).getACall() and what = \"marshal\"\n    or\n    call = API::moduleImport(\"os\").getMember([\"system\", \"popen\"]).getACall() and what = \"os-cmd\"\n    or\n    call = API::moduleImport(\"subprocess\").getMember([\"call\", \"run\", \"Popen\", \"check_output\", \"check_call\"]).getACall() and what = \"subprocess\"\n    or\n    call = API::builtin([\"eval\", \"exec\"]).getACall() and what = \"code-exec\"\n    or\n    call = API::moduleImport(\"tempfile\").getMember([\"mktemp\"]).getACall() and what = \"tempfile-mktemp\"\n  )\nselect call, what",
+   "hypothesis": "General dangerous API usage (code execution, command execution, unsafe deserialization, insecure temp files)",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-502",
+    "cwe-78",
+    "cwe-95",
+    "cwe-377"
+   ],
+   "results_count": 1,
+   "results": [
+    {
+     "ruleId": "py/dangerous-apis",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/dangerous-apis",
+      "index": 0
+     },
+     "message": {
+      "text": "code-exec"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/urllib3/packages/six.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 787,
+         "startColumn": 9,
+         "endColumn": 52
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "42c8cb2765c23d96:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20261119213726",
+   "codeql_raw_query": "/**\n * @name Headers stripped on redirect\n * @description List the string literals in DEFAULT_REMOVE_HEADERS_ON_REDIRECT\n * @kind problem\n * @problem.severity warning\n * @id py/redirect-header-strip-list\n * @tags security\n */\n\nimport python\n\nfrom Str s\nwhere\n  exists(AssignStmt a |\n    a.getATarget().(Name).getId() = \"DEFAULT_REMOVE_HEADERS_ON_REDIRECT\" and\n    s.getParent*() = a.getValue()\n  )\nselect s, \"stripped header literal: \" + s.getText()",
+   "hypothesis": "DEFAULT_REMOVE_HEADERS_ON_REDIRECT may be missing the Cookie header, causing credential leakage on cross-origin redirects (CVE-2023-43804).",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-200"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20261119213756",
+   "codeql_raw_query": "/**\n * @name urllib3 redirect header stripping defaults\n * @description Lists the default value assigned to remove_headers_on_redirect\n * @kind problem\n * @problem.severity warning\n * @id py/urllib3-redirect-header-default\n * @tags security\n *        external/cwe/cwe-200\n */\nimport python\n\nfrom Class cls, AssignStmt a, Call c\nwhere\n  cls.getName() = \"Retry\" and\n  a.getScope() = cls and\n  a.getATarget().(Name).getId() = \"remove_headers_on_redirect\" and\n  c = a.getValue()\nselect a, \"remove_headers_on_redirect default = \" + c.getFunc().toString() + \"(\" + c.getArg(0).toString() + \")\"\n",
+   "hypothesis": "urllib3 1.26.17 Retry.remove_headers_on_redirect strips only Authorization, leaking Cookie headers on cross-origin redirects (CVE-2023-43804)",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-200",
+    "cwe-522"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20261119214214",
+   "codeql_raw_query": "/**\n * @name Redirect-sensitive header strip list contents\n * @description Shows which headers urllib3 strips on cross-host redirects (DEFAULT_REMOVE_HEADERS_ON_REDIRECT)\n * @kind problem\n * @problem.severity warning\n * @id py/redirect-strip-list\n * @tags security\n *        external/cwe/cwe-200\n */\nimport python\n\nfrom StrConst s\nwhere\n  s.getLocation().getFile().getRelativePath().matches(\"%util/retry.py\") and\n  s.getText().toLowerCase().regexpMatch(\".*(cookie|authorization|proxy|content).*\")\nselect s, \"redirect-related header string literal: \" + s.getText()",
+   "hypothesis": "Check whether Cookie/Authorization headers are in the default redirect strip set for 1.26.17 (CVE-2023-43804).",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-200"
+   ],
+   "results_count": 2,
+   "results": [
+    {
+     "ruleId": "py/redirect-strip-list",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/redirect-strip-list",
+      "index": 0
+     },
+     "message": {
+      "text": "redirect-related header string literal: Cookie"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/urllib3/util/retry.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 238,
+         "startColumn": 53,
+         "endColumn": 61
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "65d0c9966cf27f29:1",
+      "primaryLocationStartColumnFingerprint": "48"
+     }
+    },
+    {
+     "ruleId": "py/redirect-strip-list",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/redirect-strip-list",
+      "index": 0
+     },
+     "message": {
+      "text": "redirect-related header string literal: Authorization"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/urllib3/util/retry.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 238,
+         "startColumn": 63,
+         "endColumn": 78
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "65d0c9966cf27f29:1",
+      "primaryLocationStartColumnFingerprint": "58"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20261119214246",
+   "codeql_raw_query": "/**\n * @name Redirect header strip default\n * @description Shows the DEFAULT_REMOVE_HEADERS_ON_REDIRECT contents\n * @kind problem\n * @problem.severity warning\n * @id py/hdrs-default\n */\nimport python\n\nfrom Assign a, Str s\nwhere\n  a.getATarget().(Name).getId() in [\"DEFAULT_REMOVE_HEADERS_ON_REDIRECT\", \"RESERVED_HEADERS\"] and\n  s.getParent*() = a.getValue()\nselect a, a.getATarget().(Name).getId() + \" contains literal: \" + s.getText()",
+   "hypothesis": "urllib3 1.26.17 may not strip the Cookie header on cross-host redirect (CVE-2023-43804): check DEFAULT_REMOVE_HEADERS_ON_REDIRECT contents",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-200"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20261119214303",
+   "codeql_raw_query": "/**\n * @name 303 redirect body handling\n * @description Finds assignments to body/method in connectionpool.py to check whether request body is dropped on 303 redirects\n * @kind problem\n * @problem.severity warning\n * @id py/redirect-303-body\n */\nimport python\n\nfrom Assign a\nwhere\n  a.getLocation().getFile().getShortName() = \"connectionpool.py\" and\n  a.getATarget().(Name).getId() in [\"body\", \"method\", \"redirect_location\", \"headers\"]\nselect a, \"assign to \" + a.getATarget().(Name).getId() + \" at line \" + a.getLocation().getStartLine().toString()",
+   "hypothesis": "urllib3 1.26.17 keeps the request body when following a 303 See Other redirect (CVE-2023-45803)",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-201",
+    "cwe-200"
+   ],
+   "results_count": 4,
+   "results": [
+    {
+     "ruleId": "py/redirect-303-body",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/redirect-303-body",
+      "index": 0
+     },
+     "message": {
+      "text": "assign to headers at line 646"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/urllib3/connectionpool.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 646,
+         "startColumn": 13,
+         "endColumn": 35
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "eb221e279dda65d4:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/redirect-303-body",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/redirect-303-body",
+      "index": 0
+     },
+     "message": {
+      "text": "assign to headers at line 685"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/urllib3/connectionpool.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 685,
+         "startColumn": 13,
+         "endColumn": 37
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "fb02850b00c5e48c:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/redirect-303-body",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/redirect-303-body",
+      "index": 0
+     },
+     "message": {
+      "text": "assign to redirect_location at line 843"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/urllib3/connectionpool.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 843,
+         "startColumn": 9,
+         "endColumn": 74
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "b94413eade2176ce:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/redirect-303-body",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/redirect-303-body",
+      "index": 0
+     },
+     "message": {
+      "text": "assign to method at line 846"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/urllib3/connectionpool.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 846,
+         "startColumn": 17,
+         "endColumn": 31
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "fd14047f158aadc:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20261119214329",
+   "codeql_raw_query": "/**\n * @name body assignments in urlopen\n * @description Finds assignments to body and method within connectionpool.py\n * @kind problem\n * @problem.severity warning\n * @id py/body-assign\n */\nimport python\n\nfrom AssignStmt a, Name n\nwhere\n  a.getATarget() = n and\n  n.getId() in [\"body\", \"method\", \"url\", \"headers\", \"retries\"] and\n  a.getLocation().getFile().getRelativePath() = \"src/urllib3/connectionpool.py\" and\n  a.getLocation().getStartLine() >= 780\nselect a, \"assign to \" + n.getId() + \" at line \" + a.getLocation().getStartLine().toString()",
+   "hypothesis": "CVE-2023-45803: urllib3 1.26.17 does not clear the request body on a 303 redirect, causing the request body to be forwarded in the subsequent GET request.",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-200",
+    "cwe-201"
+   ],
+   "results_count": 4,
+   "results": [
+    {
+     "ruleId": "py/body-assign",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/body-assign",
+      "index": 0
+     },
+     "message": {
+      "text": "assign to retries at line 798"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/urllib3/connectionpool.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 798,
+         "startColumn": 13,
+         "endLine": 800,
+         "endColumn": 14
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "edcf08e40d054a5f:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/body-assign",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/body-assign",
+      "index": 0
+     },
+     "message": {
+      "text": "assign to method at line 846"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/urllib3/connectionpool.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 846,
+         "startColumn": 17,
+         "endColumn": 31
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "fd14047f158aadc:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/body-assign",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/body-assign",
+      "index": 0
+     },
+     "message": {
+      "text": "assign to retries at line 849"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/urllib3/connectionpool.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 849,
+         "startColumn": 17,
+         "endColumn": 88
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "f6f36495afa598ef:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/body-assign",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/body-assign",
+      "index": 0
+     },
+     "message": {
+      "text": "assign to retries at line 879"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/urllib3/connectionpool.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 879,
+         "startColumn": 17,
+         "endColumn": 88
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "f6f36495afa598ef:2",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20261119214423",
+   "codeql_raw_query": "/**\n * @name Literals near 303 redirect handling\n * @description Dumps string literals in the redirect handling region of connectionpool.py\n * @kind problem\n * @problem.severity note\n * @id py/lit-redirect-region\n */\nimport python\n\nfrom StrConst s\nwhere\n  s.getLocation().getFile().getBaseName() = \"connectionpool.py\" and\n  s.getLocation().getStartLine() >= 815 and\n  s.getLocation().getStartLine() <= 900\nselect s, \"literal at line \" + s.getLocation().getStartLine().toString() + \": \" + s.getText()",
+   "hypothesis": "Check whether the 303 redirect path removes the request body and Content-Length/Content-Type headers (CVE-2023-45803)",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-200"
+   ],
+   "results_count": 5,
+   "results": [
+    {
+     "ruleId": "py/lit-redirect-region",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/lit-redirect-region",
+      "index": 0
+     },
+     "message": {
+      "text": "literal at line 824: Retrying (%r) after connection broken by '%r': %s"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/urllib3/connectionpool.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 824,
+         "startColumn": 17,
+         "endColumn": 68
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "7f0c9c788fb7ca05:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/lit-redirect-region",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/lit-redirect-region",
+      "index": 0
+     },
+     "message": {
+      "text": "literal at line 846: GET"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/urllib3/connectionpool.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 846,
+         "startColumn": 26,
+         "endColumn": 31
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "fd14047f158aadc:1",
+      "primaryLocationStartColumnFingerprint": "9"
+     }
+    },
+    {
+     "ruleId": "py/lit-redirect-region",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/lit-redirect-region",
+      "index": 0
+     },
+     "message": {
+      "text": "literal at line 858: Redirecting %s -> %s"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/urllib3/connectionpool.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 858,
+         "startColumn": 23,
+         "endColumn": 45
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "306149a272d5704:1",
+      "primaryLocationStartColumnFingerprint": "10"
+     }
+    },
+    {
+     "ruleId": "py/lit-redirect-region",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/lit-redirect-region",
+      "index": 0
+     },
+     "message": {
+      "text": "literal at line 876: Retry-After"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/urllib3/connectionpool.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 876,
+         "startColumn": 53,
+         "endColumn": 66
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "166f384284194971:1",
+      "primaryLocationStartColumnFingerprint": "44"
+     }
+    },
+    {
+     "ruleId": "py/lit-redirect-region",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/lit-redirect-region",
+      "index": 0
+     },
+     "message": {
+      "text": "literal at line 888: Retry: %s"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/urllib3/connectionpool.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 888,
+         "startColumn": 23,
+         "endColumn": 34
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "dcdc7ee16a658ce4:1",
+      "primaryLocationStartColumnFingerprint": "10"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20261119214446",
+   "codeql_raw_query": "/**\n * @name Default redirect header removal set\n * @description Finds the default remove_headers_on_redirect definition and its string literal contents\n * @kind problem\n * @problem.severity warning\n * @id py/redirect-strip-default\n */\nimport python\n\nfrom AssignStmt a, Name n, StrConst s\nwhere\n  a.getATarget() = n and\n  n.getId() = \"DEFAULT_REMOVE_HEADERS_ON_REDIRECT\" and\n  s.getParent*() = a.getValue()\nselect s, \"default redirect-strip literal: '\" + s.getText() + \"'\"",
+   "hypothesis": "urllib3 1.26.17 default remove_headers_on_redirect may not include Cookie/Proxy-Authorization, leading to sensitive header leakage on cross-host redirect (CVE-2023-43804)",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-200"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20261119214507",
+   "codeql_raw_query": "/**\n * @name Redirect header stripping implementation\n * @description Finds literals in retry.py's RedirectMixin/_remove_headers_on_redirect logic\n * @kind problem\n * @problem.severity warning\n * @id py/retry-strip-impl\n */\nimport python\n\nfrom StrConst s\nwhere\n  s.getLocation().getFile().getRelativePath().matches(\"%util/retry.py\") and\n  s.getLocation().getStartLine() >= 220 and\n  s.getLocation().getStartLine() <= 300\nselect s, \"retry.py literal @\" + s.getLocation().getStartLine().toString() + \": \" + s.getText()",
+   "hypothesis": "Check the retry redirect header-stripping implementation region for which sensitive headers are handled",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-200"
+   ],
+   "results_count": 10,
+   "results": [
+    {
+     "ruleId": "py/retry-strip-impl",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/retry-strip-impl",
+      "index": 0
+     },
+     "message": {
+      "text": "retry.py literal @231: HEAD"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/urllib3/util/retry.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 231,
+         "startColumn": 10,
+         "endColumn": 16
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "27571c11506885d8:1",
+      "primaryLocationStartColumnFingerprint": "1"
+     }
+    },
+    {
+     "ruleId": "py/retry-strip-impl",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/retry-strip-impl",
+      "index": 0
+     },
+     "message": {
+      "text": "retry.py literal @231: GET"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/urllib3/util/retry.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 231,
+         "startColumn": 18,
+         "endColumn": 23
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "27571c11506885d8:1",
+      "primaryLocationStartColumnFingerprint": "9"
+     }
+    },
+    {
+     "ruleId": "py/retry-strip-impl",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/retry-strip-impl",
+      "index": 0
+     },
+     "message": {
+      "text": "retry.py literal @231: PUT"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/urllib3/util/retry.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 231,
+         "startColumn": 25,
+         "endColumn": 30
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "27571c11506885d8:1",
+      "primaryLocationStartColumnFingerprint": "16"
+     }
+    },
+    {
+     "ruleId": "py/retry-strip-impl",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/retry-strip-impl",
+      "index": 0
+     },
+     "message": {
+      "text": "retry.py literal @231: DELETE"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/urllib3/util/retry.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 231,
+         "startColumn": 32,
+         "endColumn": 40
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "27571c11506885d8:1",
+      "primaryLocationStartColumnFingerprint": "23"
+     }
+    },
+    {
+     "ruleId": "py/retry-strip-impl",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/retry-strip-impl",
+      "index": 0
+     },
+     "message": {
+      "text": "retry.py literal @231: OPTIONS"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/urllib3/util/retry.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 231,
+         "startColumn": 42,
+         "endColumn": 51
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "27571c11506885d8:1",
+      "primaryLocationStartColumnFingerprint": "33"
+     }
+    },
+    {
+     "ruleId": "py/retry-strip-impl",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/retry-strip-impl",
+      "index": 0
+     },
+     "message": {
+      "text": "retry.py literal @231: TRACE"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/urllib3/util/retry.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 231,
+         "startColumn": 53,
+         "endColumn": 60
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "27571c11506885d8:1",
+      "primaryLocationStartColumnFingerprint": "44"
+     }
+    },
+    {
+     "ruleId": "py/retry-strip-impl",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/retry-strip-impl",
+      "index": 0
+     },
+     "message": {
+      "text": "retry.py literal @238: Cookie"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/urllib3/util/retry.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 238,
+         "startColumn": 53,
+         "endColumn": 61
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "65d0c9966cf27f29:1",
+      "primaryLocationStartColumnFingerprint": "48"
+     }
+    },
+    {
+     "ruleId": "py/retry-strip-impl",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/retry-strip-impl",
+      "index": 0
+     },
+     "message": {
+      "text": "retry.py literal @238: Authorization"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/urllib3/util/retry.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 238,
+         "startColumn": 63,
+         "endColumn": 78
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "65d0c9966cf27f29:1",
+      "primaryLocationStartColumnFingerprint": "58"
+     }
+    },
+    {
+     "ruleId": "py/retry-strip-impl",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/retry-strip-impl",
+      "index": 0
+     },
+     "message": {
+      "text": "retry.py literal @266: Using both 'allowed_methods' and 'method_whitelist' together is not allowed. Instead only use 'allowed_methods'"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/urllib3/util/retry.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 266,
+         "startColumn": 21,
+         "endLine": 268,
+         "endColumn": 57
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "e0f6a1cba1e2c140:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/retry-strip-impl",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/retry-strip-impl",
+      "index": 0
+     },
+     "message": {
+      "text": "retry.py literal @271: Using 'method_whitelist' with Retry is deprecated and will be removed in v2.0. Use 'allowed_methods' instead"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/urllib3/util/retry.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 271,
+         "startColumn": 17,
+         "endLine": 272,
+         "endColumn": 73
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "7709927b482843b:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20261119214532",
+   "codeql_raw_query": "/**\n * @name Default remove-headers-on-redirect set contents\n * @description Lists the string literals assigned to DEFAULT_REMOVE_HEADERS_ON_REDIRECT\n * @kind problem\n * @problem.severity warning\n * @id py/default-remove-headers\n */\nimport python\n\nfrom Assign a, Name n\nwhere\n  a.getATarget() = n and\n  n.getId() = \"DEFAULT_REMOVE_HEADERS_ON_REDIRECT\"\nselect a, \"DEFAULT_REMOVE_HEADERS_ON_REDIRECT assigned here (\" + a.getLocation().getStartLine().toString() + \")\"",
+   "hypothesis": "urllib3 1.26.17 only strips Authorization (not Cookie) on cross-origin redirects => CVE-2023-43804",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-200",
+    "cwe-522"
+   ],
+   "results_count": 1,
+   "results": [
+    {
+     "ruleId": "py/default-remove-headers",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/default-remove-headers",
+      "index": 0
+     },
+     "message": {
+      "text": "DEFAULT_REMOVE_HEADERS_ON_REDIRECT assigned here (238)"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/urllib3/util/retry.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 238,
+         "startColumn": 5,
+         "endColumn": 80
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "65d0c9966cf27f29:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20261119214551",
+   "codeql_raw_query": "/**\n * @name 303 redirect content header handling\n * @description Checks whether content-length/content-type are present as literals anywhere near 303 handling\n * @kind problem\n * @problem.severity warning\n * @id py/303-content-headers\n */\nimport python\n\nfrom Str s\nwhere\n  s.getLocation().getFile().getRelativePath() = \"src/urllib3/connectionpool.py\" and\n  s.getText().toLowerCase().regexpMatch(\".*(content-length|content-type|authorization|cookie).*\")\nselect s, \"sensitive content literal: \" + s.getText()",
+   "hypothesis": "303 redirect handler in connectionpool.py does not strip Content-Length/Content-Type => body forwarded on redirect (CVE-2023-45803)",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-200",
+    "cwe-325"
+   ],
+   "results_count": 0,
+   "results": []
+  }
+ ],
+ "cache_usage": {
+  "prompt_tokens_total": 181926,
+  "uncached_input_tokens": 12454,
+  "cache_creation_input_tokens": 0,
+  "cache_read_input_tokens": 169472,
+  "output_tokens": 38001,
+  "calls": 20,
+  "caching_enabled": false,
+  "cost_usd_with_cache": 0.025177,
+  "cost_usd_no_cache": 0.05009,
+  "cache_read_share_of_prompt": 0.9315,
+  "prices_per_mtok": {
+   "claude-sonnet-4-5-20250929": {
+    "input": 3.0,
+    "output": 15.0
+   },
+   "claude-haiku-4-5-20251001": {
+    "input": 1.0,
+    "output": 5.0
+   },
+   "deepseek/deepseek-reasoner": {
+    "input": 0.15,
+    "output": 0.6,
+    "cache_read": 0.003,
+    "cache_write_mult": 1.0,
+    "peak_mult": 2.0
+   },
+   "gpt-5.1": {
+    "input": 1.25,
+    "output": 10.0,
+    "cache_read": 0.125,
+    "cache_write_mult": 1.0
+   },
+   "gpt-4.1": {
+    "input": 2.0,
+    "output": 8.0,
+    "cache_read": 0.5,
+    "cache_write_mult": 1.0
+   }
+  },
+  "cache_multipliers": {
+   "write_5m": 1.25,
+   "read": 0.1
+  }
+ }
+}

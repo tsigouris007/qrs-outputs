@@ -1,0 +1,1388 @@
+{
+ "session_id": "20261122222713",
+ "package_name": "numpy-2.3.4",
+ "package_path": "packages/numpy-2.3.4",
+ "database_path": "databases/numpy-2.3.4-db",
+ "model": "gemini/gemini-4-carbon",
+ "temperature": null,
+ "max_tokens": 16000,
+ "iterations": 19,
+ "total_input_tokens": 565609,
+ "total_output_tokens": 10897,
+ "total_tokens": 576506,
+ "elapsed_time_seconds": 623.66,
+ "estimated_cost_usd": 0.0,
+ "summary": "# Security Analysis Report: numpy-2.3.4\n\n## Package Overview\n`numpy` (v2.3.4) is the fundamental package for scientific and array computing in Python. In addition to its core runtime library (`numpy._core`, `numpy.lib`, `numpy.linalg`, `numpy.fft`, `numpy.random`, etc.), the source distribution includes the `f2py` Fortran-to-Python interface generator CLI/module, legacy `numpy.distutils`, and `vendored-meson` build tooling.\n\n## Key Security Findings\n\n### 1. Unsafe `eval()` on Parsed Fortran/Signature Expressions in `numpy.f2py` (CWE-95 / CWE-94) — Medium/High (Context-Dependent)\n- **Locations**:\n  - `numpy/f2py/crackfortran.py` (lines 1329, 2271, 2559, 2637, 2646, 2914, 2985, 3016, 3468)\n  - `numpy/f2py/capi_maps.py` (lines 159, 296, 449)\n  - `numpy/f2py/auxfuncs.py` (lines 632, 640)\n- **Details**: During parsing of Fortran source files and `.pyf` signature files, `f2py` evaluates extracted dimension/parameter/initialization expressions directly using Python's built-in `eval()`. If an application or CI service runs `f2py` on untrusted Fortran or `.pyf` files, crafted expressions can achieve arbitrary Python code execution.\n- **Remediation**: Replace `eval()` calls on parsed Fortran expressions with `ast.literal_eval()` or a dedicated safe arithmetic expression evaluator.\n\n### 2. Optional `pickle` Deserialization in Array Loading & Build Scripts (CWE-502) — Low/Informational\n- **Locations**:\n  - `numpy/lib/_format_impl.py` (line 838)\n  - `numpy/lib/_npyio_impl.py` (line 494)\n  - `vendored-meson/meson/mesonbuild/` (`cleantrees.py:29`, `depscan.py:73`, `meson_exe.py:107`, `ninjabackend.py:1141`, `regen_checker.py:42,45`, `universal.py:2353`)\n- **Details**: `numpy.load()` guards `pickle.load()` behind `allow_pickle=False` by default, mitigating unsafe deserialization unless a caller explicitly opts in with `allow_pickle=True` on untrusted `.npy`/`.npz` files. Build-time helper scripts in `vendored-meson` use `pickle.load()` to read local build metadata files.\n- **Remediation**: Ensure callers never pass `allow_pickle=True` when loading untrusted files.\n\n### 3. URL Fetching (SSRF) and Cache Path Construction in `numpy.lib._datasource` (CWE-918 / CWE-22) — Low/Medium (Context-Dependent)\n- **Locations**:\n  - `numpy/lib/_datasource.py` (`urllib.request.urlopen` at lines 333, 475; `os.path.join` with URL `netloc` and `path` at lines 411, 584)\n- **Details**: `numpy.lib.npyio.DataSource` fetches remote URLs via `urllib.request.urlopen` (which supports `http://`, `https://`, `ftp://`, and `file://` schemes) and maps URL components into a local cache path via `os.path.join`. If an application passes unvalidated user-supplied URLs to `DataSource`, it may be exposed to SSRF, arbitrary `file://` reads, or relative path traversal when resolving destination paths.\n- **Remediation**: Validate URL schemes and canonicalize resolved destination paths using `os.path.commonpath` against `self._destpath`.\n\n### 4. Build/Benchmark Utility Observations (CWE-94 / CWE-78) — Informational\n- `numpy/_build_utils/tempita/_tempita.py` (lines 321, 336, 1106) uses `eval`/`exec` as part of its internal build-time templating engine.\n- `numpy/_core/src/npysort/x86-simd-sort/run-bench.py` (lines 56, 61, 63) invokes `subprocess` with `shell=True` in a non-installed benchmark utility script.\n\n## Negative Checks Performed\n- **Insecure Temporary Files (CWE-377)**: No uses of `tempfile.mktemp` found.\n- **TLS Verification Bypass (CWE-295)**: No disabled SSL certificate verification contexts found.\n- **Hardcoded Credentials (CWE-798)**: None detected.",
+ "package_classification": {
+  "type": [
+   "library",
+   "scientific-computing",
+   "cli-tool"
+  ],
+  "layer": [
+   "data-processing",
+   "application",
+   "build-system"
+  ]
+ },
+ "tool_calls": {
+  "get_package_profile_info": 1,
+  "execute_codeql_query": 7,
+  "validate_codeql_query": 0,
+  "fixup_codeql_query": 1,
+  "finalize_report": 1
+ },
+ "queries_executed": {
+  "critical": 1,
+  "high": 2,
+  "medium": 3,
+  "low": 0,
+  "total_executed": 8,
+  "total_with_results": 6,
+  "total_failed": 1
+ },
+ "query_findings": {
+  "critical": 19,
+  "high": 12,
+  "medium": 6,
+  "low": 0,
+  "total": 37
+ },
+ "findings": [
+  {
+   "codeql_query_uuid": "20261122222740",
+   "codeql_raw_query": "/**\n * @name Dynamic code execution via eval or exec\n * @description Finds calls to eval or exec with non-constant arguments in numpy\n * @kind problem\n * @problem.severity error\n * @id py/dynamic-eval-exec\n * @tags security\n *       external/cwe/cwe-094\n *       external/cwe/cwe-095\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call, DataFlow::Node codeArg, File f\nwhere\n  call = API::builtin([\"eval\", \"exec\"]).getACall() and\n  codeArg = call.getArg(0) and\n  not codeArg.asExpr() instanceof StringLiteral and\n  f = call.getLocation().getFile() and\n  f.getRelativePath().regexpMatch(\"^numpy/.*\")\nselect call, \"Dynamic code execution with argument: \" + codeArg.asExpr().toString() + \" in \" + f.getRelativePath()\n",
+   "hypothesis": "Check for dynamic code execution using eval() or exec() with non-literal arguments inside the numpy package modules (e.g., f2py, lib, distutils, _core).",
+   "severity": "critical",
+   "cwe_ids": [
+    "cwe-94",
+    "cwe-95"
+   ],
+   "results_count": 19,
+   "results": [
+    {
+     "ruleId": "py/dynamic-eval-exec",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/dynamic-eval-exec",
+      "index": 0
+     },
+     "message": {
+      "text": "Dynamic code execution with argument: code in numpy/_build_utils/tempita/_tempita.py"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "numpy/_build_utils/tempita/_tempita.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 321,
+         "startColumn": 25,
+         "endColumn": 63
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "f6e936849758cd96:1",
+      "primaryLocationStartColumnFingerprint": "8"
+     }
+    },
+    {
+     "ruleId": "py/dynamic-eval-exec",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/dynamic-eval-exec",
+      "index": 0
+     },
+     "message": {
+      "text": "Dynamic code execution with argument: code in numpy/_build_utils/tempita/_tempita.py"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "numpy/_build_utils/tempita/_tempita.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 336,
+         "startColumn": 13,
+         "endColumn": 51
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "7277ca250f5eb045:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/dynamic-eval-exec",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/dynamic-eval-exec",
+      "index": 0
+     },
+     "message": {
+      "text": "Dynamic code execution with argument: value in numpy/_build_utils/tempita/_tempita.py"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "numpy/_build_utils/tempita/_tempita.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 1106,
+         "startColumn": 21,
+         "endColumn": 32
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "bf5f20c33a3bdbdb:1",
+      "primaryLocationStartColumnFingerprint": "8"
+     }
+    },
+    {
+     "ruleId": "py/dynamic-eval-exec",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/dynamic-eval-exec",
+      "index": 0
+     },
+     "message": {
+      "text": "Dynamic code execution with argument: Fstring in numpy/f2py/auxfuncs.py"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "numpy/f2py/auxfuncs.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 632,
+         "startColumn": 12,
+         "endColumn": 44
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "ab4daf0678c20aa7:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/dynamic-eval-exec",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/dynamic-eval-exec",
+      "index": 0
+     },
+     "message": {
+      "text": "Dynamic code execution with argument: Fstring in numpy/f2py/auxfuncs.py"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "numpy/f2py/auxfuncs.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 640,
+         "startColumn": 12,
+         "endColumn": 43
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "2f1c5470988a8e2c:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/dynamic-eval-exec",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/dynamic-eval-exec",
+      "index": 0
+     },
+     "message": {
+      "text": "Dynamic code execution with argument: Attribute() in numpy/f2py/capi_maps.py"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "numpy/f2py/capi_maps.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 159,
+         "startColumn": 17,
+         "endColumn": 47
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "6813f2f5c88c86ca:1",
+      "primaryLocationStartColumnFingerprint": "4"
+     }
+    },
+    {
+     "ruleId": "py/dynamic-eval-exec",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/dynamic-eval-exec",
+      "index": 0
+     },
+     "message": {
+      "text": "Dynamic code execution with argument: Subscript in numpy/f2py/capi_maps.py"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "numpy/f2py/capi_maps.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 296,
+         "startColumn": 32,
+         "endColumn": 49
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "6c1ee5386f3445be:1",
+      "primaryLocationStartColumnFingerprint": "19"
+     }
+    },
+    {
+     "ruleId": "py/dynamic-eval-exec",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/dynamic-eval-exec",
+      "index": 0
+     },
+     "message": {
+      "text": "Dynamic code execution with argument: v in numpy/f2py/capi_maps.py"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "numpy/f2py/capi_maps.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 449,
+         "startColumn": 25,
+         "endColumn": 40
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "2cdd14f16efef951:1",
+      "primaryLocationStartColumnFingerprint": "4"
+     }
+    },
+    {
+     "ruleId": "py/dynamic-eval-exec",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/dynamic-eval-exec",
+      "index": 0
+     },
+     "message": {
+      "text": "Dynamic code execution with argument: initexpr in numpy/f2py/crackfortran.py"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "numpy/f2py/crackfortran.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 3
+        },
+        "region": {
+         "startLine": 1329,
+         "startColumn": 21,
+         "endColumn": 47
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "80a1005230b2ac69:1",
+      "primaryLocationStartColumnFingerprint": "4"
+     }
+    },
+    {
+     "ruleId": "py/dynamic-eval-exec",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/dynamic-eval-exec",
+      "index": 0
+     },
+     "message": {
+      "text": "Dynamic code execution with argument: e in numpy/f2py/crackfortran.py"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "numpy/f2py/crackfortran.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 3
+        },
+        "region": {
+         "startLine": 2271,
+         "startColumn": 9,
+         "endColumn": 22
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "c16c2868ff7a421c:1",
+      "primaryLocationStartColumnFingerprint": "4"
+     }
+    },
+    {
+     "ruleId": "py/dynamic-eval-exec",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/dynamic-eval-exec",
+      "index": 0
+     },
+     "message": {
+      "text": "Dynamic code execution with argument: value in numpy/f2py/crackfortran.py"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "numpy/f2py/crackfortran.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 3
+        },
+        "region": {
+         "startLine": 2559,
+         "startColumn": 17,
+         "endColumn": 40
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "fc92e322ac8d2366:1",
+      "primaryLocationStartColumnFingerprint": "8"
+     }
+    },
+    {
+     "ruleId": "py/dynamic-eval-exec",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/dynamic-eval-exec",
+      "index": 0
+     },
+     "message": {
+      "text": "Dynamic code execution with argument: l in numpy/f2py/crackfortran.py"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "numpy/f2py/crackfortran.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 3
+        },
+        "region": {
+         "startLine": 2637,
+         "startColumn": 29,
+         "endColumn": 48
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "f8068295a3a23b45:1",
+      "primaryLocationStartColumnFingerprint": "8"
+     }
+    },
+    {
+     "ruleId": "py/dynamic-eval-exec",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/dynamic-eval-exec",
+      "index": 0
+     },
+     "message": {
+      "text": "Dynamic code execution with argument: l in numpy/f2py/crackfortran.py"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "numpy/f2py/crackfortran.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 3
+        },
+        "region": {
+         "startLine": 2646,
+         "startColumn": 29,
+         "endColumn": 48
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "a6a5255d405f5d73:1",
+      "primaryLocationStartColumnFingerprint": "8"
+     }
+    },
+    {
+     "ruleId": "py/dynamic-eval-exec",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/dynamic-eval-exec",
+      "index": 0
+     },
+     "message": {
+      "text": "Dynamic code execution with argument: Subscript in numpy/f2py/crackfortran.py"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "numpy/f2py/crackfortran.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 3
+        },
+        "region": {
+         "startLine": 2914,
+         "startColumn": 58,
+         "endLine": 2915,
+         "endColumn": 72
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "69d320308c2a8f22:1",
+      "primaryLocationStartColumnFingerprint": "21"
+     }
+    },
+    {
+     "ruleId": "py/dynamic-eval-exec",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/dynamic-eval-exec",
+      "index": 0
+     },
+     "message": {
+      "text": "Dynamic code execution with argument: v in numpy/f2py/crackfortran.py"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "numpy/f2py/crackfortran.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 3
+        },
+        "region": {
+         "startLine": 2985,
+         "startColumn": 17,
+         "endColumn": 42
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "6ccee1d20d721d04:1",
+      "primaryLocationStartColumnFingerprint": "4"
+     }
+    },
+    {
+     "ruleId": "py/dynamic-eval-exec",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/dynamic-eval-exec",
+      "index": 0
+     },
+     "message": {
+      "text": "Dynamic code execution with argument: item in numpy/f2py/crackfortran.py"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "numpy/f2py/crackfortran.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 3
+        },
+        "region": {
+         "startLine": 3016,
+         "startColumn": 20,
+         "endColumn": 48
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "bf35b86074fa883a:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/dynamic-eval-exec",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/dynamic-eval-exec",
+      "index": 0
+     },
+     "message": {
+      "text": "Dynamic code execution with argument: v in numpy/f2py/crackfortran.py"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "numpy/f2py/crackfortran.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 3
+        },
+        "region": {
+         "startLine": 3468,
+         "startColumn": 25,
+         "endColumn": 32
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "bbb60e5f0caecb93:1",
+      "primaryLocationStartColumnFingerprint": "4"
+     }
+    },
+    {
+     "ruleId": "py/dynamic-eval-exec",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/dynamic-eval-exec",
+      "index": 0
+     },
+     "message": {
+      "text": "Dynamic code execution with argument: astr in numpy/testing/_private/utils.py"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "numpy/testing/_private/utils.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 4
+        },
+        "region": {
+         "startLine": 1297,
+         "startColumn": 5,
+         "endColumn": 21
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "e8f8475fbcbc2120:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/dynamic-eval-exec",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/dynamic-eval-exec",
+      "index": 0
+     },
+     "message": {
+      "text": "Dynamic code execution with argument: code in numpy/testing/_private/utils.py"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "numpy/testing/_private/utils.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 4
+        },
+        "region": {
+         "startLine": 1583,
+         "startColumn": 9,
+         "endColumn": 32
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "3920136c8dd0df69:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20261122222856",
+   "codeql_raw_query": "/**\n * @name Unsafe deserialization in numpy\n * @description Deserializing untrusted data using pickle or marshal can lead to arbitrary code execution\n * @kind problem\n * @problem.severity error\n * @id py/unsafe-deserialization-numpy\n * @tags security\n *        external/cwe/cwe-502\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call, File f\nwhere\n  (\n    call = API::moduleImport(\"pickle\").getMember([\"load\", \"loads\", \"Unpickler\"]).getACall() or\n    call = API::moduleImport(\"_pickle\").getMember([\"load\", \"loads\", \"Unpickler\"]).getACall() or\n    call = API::moduleImport(\"marshal\").getMember([\"load\", \"loads\"]).getACall() or\n    call = API::moduleImport(\"shelve\").getMember(\"open\").getACall() or\n    call = API::moduleImport(\"yaml\").getMember([\"load\", \"unsafe_load\"]).getACall()\n  ) and\n  f = call.getLocation().getFile() and\n  not f.getRelativePath().matches(\"%test%\")\nselect call, \"Deserialization call in \" + f.getRelativePath() + \":\" + call.getLocation().getStartLine().toString()\n",
+   "hypothesis": "Check all uses of pickle, marshal, shelve, or yaml deserialization in numpy and vendored code to ensure allow_pickle=False or safe guards are enforced",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-502"
+   ],
+   "results_count": 9,
+   "results": [
+    {
+     "ruleId": "py/unsafe-deserialization-numpy",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/unsafe-deserialization-numpy",
+      "index": 0
+     },
+     "message": {
+      "text": "Deserialization call in numpy/lib/_format_impl.py:838"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "numpy/lib/_format_impl.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 838,
+         "startColumn": 21,
+         "endColumn": 53
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "8a7da932a94a62c:1",
+      "primaryLocationStartColumnFingerprint": "8"
+     }
+    },
+    {
+     "ruleId": "py/unsafe-deserialization-numpy",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/unsafe-deserialization-numpy",
+      "index": 0
+     },
+     "message": {
+      "text": "Deserialization call in numpy/lib/_npyio_impl.py:494"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "numpy/lib/_npyio_impl.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 494,
+         "startColumn": 24,
+         "endColumn": 57
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "9a3f52714cf73b00:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/unsafe-deserialization-numpy",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/unsafe-deserialization-numpy",
+      "index": 0
+     },
+     "message": {
+      "text": "Deserialization call in vendored-meson/meson/mesonbuild/scripts/cleantrees.py:29"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "vendored-meson/meson/mesonbuild/scripts/cleantrees.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 29,
+         "startColumn": 16,
+         "endColumn": 30
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "5fa65136685c8767:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/unsafe-deserialization-numpy",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/unsafe-deserialization-numpy",
+      "index": 0
+     },
+     "message": {
+      "text": "Deserialization call in vendored-meson/meson/mesonbuild/scripts/depscan.py:73"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "vendored-meson/meson/mesonbuild/scripts/depscan.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 3
+        },
+        "region": {
+         "startLine": 73,
+         "startColumn": 61,
+         "endColumn": 76
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "e9edd82bf8ad73e2:1",
+      "primaryLocationStartColumnFingerprint": "48"
+     }
+    },
+    {
+     "ruleId": "py/unsafe-deserialization-numpy",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/unsafe-deserialization-numpy",
+      "index": 0
+     },
+     "message": {
+      "text": "Deserialization call in vendored-meson/meson/mesonbuild/scripts/meson_exe.py:107"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "vendored-meson/meson/mesonbuild/scripts/meson_exe.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 4
+        },
+        "region": {
+         "startLine": 107,
+         "startColumn": 19,
+         "endColumn": 33
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "e17fc7a75aba0a1e:1",
+      "primaryLocationStartColumnFingerprint": "6"
+     }
+    },
+    {
+     "ruleId": "py/unsafe-deserialization-numpy",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/unsafe-deserialization-numpy",
+      "index": 0
+     },
+     "message": {
+      "text": "Deserialization call in vendored-meson/meson/mesonbuild/backend/ninjabackend.py:1141"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "vendored-meson/meson/mesonbuild/backend/ninjabackend.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 5
+        },
+        "region": {
+         "startLine": 1141,
+         "startColumn": 23,
+         "endColumn": 37
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "bc9bafcdb6649d95:1",
+      "primaryLocationStartColumnFingerprint": "6"
+     }
+    },
+    {
+     "ruleId": "py/unsafe-deserialization-numpy",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/unsafe-deserialization-numpy",
+      "index": 0
+     },
+     "message": {
+      "text": "Deserialization call in vendored-meson/meson/mesonbuild/scripts/regen_checker.py:42"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "vendored-meson/meson/mesonbuild/scripts/regen_checker.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 6
+        },
+        "region": {
+         "startLine": 42,
+         "startColumn": 21,
+         "endColumn": 35
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "6feeb2ef6ead03bf:1",
+      "primaryLocationStartColumnFingerprint": "12"
+     }
+    },
+    {
+     "ruleId": "py/unsafe-deserialization-numpy",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/unsafe-deserialization-numpy",
+      "index": 0
+     },
+     "message": {
+      "text": "Deserialization call in vendored-meson/meson/mesonbuild/scripts/regen_checker.py:45"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "vendored-meson/meson/mesonbuild/scripts/regen_checker.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 6
+        },
+        "region": {
+         "startLine": 45,
+         "startColumn": 20,
+         "endColumn": 34
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "b65ae9883ab85a3d:1",
+      "primaryLocationStartColumnFingerprint": "11"
+     }
+    },
+    {
+     "ruleId": "py/unsafe-deserialization-numpy",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/unsafe-deserialization-numpy",
+      "index": 0
+     },
+     "message": {
+      "text": "Deserialization call in vendored-meson/meson/mesonbuild/utils/universal.py:2353"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "vendored-meson/meson/mesonbuild/utils/universal.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 7
+        },
+        "region": {
+         "startLine": 2353,
+         "startColumn": 19,
+         "endColumn": 33
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "58c84d250cc231bd:1",
+      "primaryLocationStartColumnFingerprint": "6"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20261122223015",
+   "codeql_raw_query": "/**\n * @name Command execution with shell=True or os.system\n * @description Executing commands through a shell can lead to command injection\n * @kind problem\n * @problem.severity error\n * @id py/command-shell-exec\n * @tags security\n *        external/cwe/cwe-078\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call, File f\nwhere\n  f = call.getLocation().getFile() and\n  not f.getRelativePath().matches(\"tools/%\") and\n  not f.getRelativePath().matches(\"vendored-meson/%\") and\n  (\n    call = API::moduleImport(\"os\").getMember([\"system\", \"popen\"]).getACall()\n    or\n    (\n      call = API::moduleImport(\"subprocess\").getMember([\"Popen\", \"call\", \"check_call\", \"check_output\", \"run\"]).getACall() and\n      exists(DataFlow::Node shellArg |\n        shellArg = call.getArgByName(\"shell\") and\n        shellArg.asExpr().(ImmutableLiteral).booleanValue() = true\n      )\n    )\n  )\nselect call, \"Shell command execution in \" + f.getRelativePath() + \":\" + call.getLocation().getStartLine().toString()\n",
+   "hypothesis": "Check for OS command execution via os.system, os.popen, or subprocess with shell=True in numpy runtime and CLI tools.",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-78",
+    "cwe-77"
+   ],
+   "results_count": 3,
+   "results": [
+    {
+     "ruleId": "py/command-shell-exec",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/command-shell-exec",
+      "index": 0
+     },
+     "message": {
+      "text": "Shell command execution in numpy/_core/src/npysort/x86-simd-sort/run-bench.py:56"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "numpy/_core/src/npysort/x86-simd-sort/run-bench.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 56,
+         "startColumn": 10,
+         "endColumn": 123
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "633e5b7ea729cd76:1",
+      "primaryLocationStartColumnFingerprint": "5"
+     }
+    },
+    {
+     "ruleId": "py/command-shell-exec",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/command-shell-exec",
+      "index": 0
+     },
+     "message": {
+      "text": "Shell command execution in numpy/_core/src/npysort/x86-simd-sort/run-bench.py:61"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "numpy/_core/src/npysort/x86-simd-sort/run-bench.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 61,
+         "startColumn": 14,
+         "endColumn": 110
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "c40f1e1044db0d8c:1",
+      "primaryLocationStartColumnFingerprint": "5"
+     }
+    },
+    {
+     "ruleId": "py/command-shell-exec",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/command-shell-exec",
+      "index": 0
+     },
+     "message": {
+      "text": "Shell command execution in numpy/_core/src/npysort/x86-simd-sort/run-bench.py:63"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "numpy/_core/src/npysort/x86-simd-sort/run-bench.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 63,
+         "startColumn": 14,
+         "endColumn": 128
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "ae15297fdaba0189:1",
+      "primaryLocationStartColumnFingerprint": "5"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20261122223427",
+   "codeql_raw_query": "/**\n * @name Network and Archive Operations in Core NumPy\n * @description Audit URL fetching and archive/file operations in core numpy (e.g., DataSource) for SSRF, arbitrary file overwrite, or path traversal\n * @kind problem\n * @problem.severity warning\n * @id py/core-network-archive-ops\n * @tags security\n *       external/cwe/cwe-918\n *       external/cwe/cwe-022\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call, string mod, string func, string path\nwhere\n  mod in [\"urllib\", \"tarfile\", \"zipfile\", \"gzip\", \"bz2\", \"lzma\"] and\n  func in [\"urlopen\", \"urlretrieve\", \"open\", \"ZipFile\", \"TarFile\"] and\n  (\n    call = API::moduleImport(mod).getMember(func).getACall() or\n    call = API::moduleImport(mod).getMember(\"request\").getMember(func).getACall()\n  ) and\n  path = call.getLocation().getFile().getRelativePath() and\n  path.matches(\"numpy/%\") and\n  not path.matches(\"numpy/distutils/%\") and\n  not path.matches(\"numpy/testing/%\")\nselect call, mod + \".\" + func + \" called in \" + path + \":\" + call.getLocation().getStartLine().toString()\n",
+   "hypothesis": "Check URL fetching (urlopen/urlretrieve) and archive handling in core numpy (such as numpy.lib._datasource) for SSRF or path traversal",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-918",
+    "cwe-22"
+   ],
+   "results_count": 4,
+   "results": [
+    {
+     "ruleId": "py/core-network-archive-ops",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/core-network-archive-ops",
+      "index": 0
+     },
+     "message": {
+      "text": "urllib.urlopen called in numpy/lib/_datasource.py:333"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "numpy/lib/_datasource.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 333,
+         "startColumn": 18,
+         "endColumn": 31
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "79937120385c349c:1",
+      "primaryLocationStartColumnFingerprint": "5"
+     }
+    },
+    {
+     "ruleId": "py/core-network-archive-ops",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/core-network-archive-ops",
+      "index": 0
+     },
+     "message": {
+      "text": "urllib.urlopen called in numpy/lib/_datasource.py:475"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "numpy/lib/_datasource.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 475,
+         "startColumn": 27,
+         "endColumn": 40
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "ce1336d033e851b3:1",
+      "primaryLocationStartColumnFingerprint": "10"
+     }
+    },
+    {
+     "ruleId": "py/core-network-archive-ops",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/core-network-archive-ops",
+      "index": 0
+     },
+     "message": {
+      "text": "zipfile.ZipFile called in numpy/lib/_npyio_impl.py:112"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "numpy/lib/_npyio_impl.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 112,
+         "startColumn": 12,
+         "endColumn": 50
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "1dd69b8377e4d18b:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/core-network-archive-ops",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/core-network-archive-ops",
+      "index": 0
+     },
+     "message": {
+      "text": "urllib.urlretrieve called in numpy/_core/src/common/pythoncapi-compat/upgrade_pythoncapi.py:668"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "numpy/_core/src/common/pythoncapi-compat/upgrade_pythoncapi.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 668,
+         "startColumn": 9,
+         "endColumn": 66
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "8dd02119559d7143:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20261122223525",
+   "codeql_raw_query": "/**\n * @name Insecure temporary file or path handling in DataSource\n * @description Checks for insecure tempfile usage (mktemp) and path manipulation in _datasource.py\n * @kind problem\n * @problem.severity warning\n * @id py/datasource-path-and-tempfile\n * @tags security\n *       external/cwe/cwe-022\n *       external/cwe/cwe-377\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call, string msg\nwhere\n  (\n    call = API::moduleImport(\"tempfile\").getMember(\"mktemp\").getACall() and\n    msg = \"Insecure tempfile.mktemp() call\"\n  )\n  or\n  (\n    call.getLocation().getFile().getRelativePath() = \"numpy/lib/_datasource.py\" and\n    call = API::builtin(\"open\").getACall() and\n    msg = \"File open in _datasource.py with arg: \" + call.getArg(0).asExpr().toString()\n  )\nselect call, msg + \" at \" + call.getLocation().getFile().getRelativePath() + \":\" + call.getLocation().getStartLine().toString()\n",
+   "hypothesis": "Check for insecure tempfile.mktemp usage across the package and file open sinks in numpy/lib/_datasource.py for potential path traversal",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-22",
+    "cwe-377"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20261122223628",
+   "codeql_raw_query": "/**\n * @name Insecure temporary file or path handling in datasource and f2py\n * @description Check usage of tempfile.mktemp or path joining in _datasource.py\n * @kind problem\n * @problem.severity warning\n * @id py/insecure-tempfile-and-datasource\n * @tags security\n *       external/cwe/cwe-377\n *       external/cwe/cwe-022\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call, string msg\nwhere\n  (\n    call = API::moduleImport(\"tempfile\").getMember(\"mktemp\").getACall() and\n    msg = \"Insecure tempfile.mktemp in \" + call.getLocation().getFile().getRelativePath() + \":\" + call.getLocation().getStartLine().toString()\n  )\n  or\n  (\n    call.getLocation().getFile().getRelativePath() = \"numpy/lib/_datasource.py\" and\n    call = API::moduleImport(\"os\").getMember(\"path\").getMember(\"join\").getACall() and\n    msg = \"os.path.join in _datasource.py:\" + call.getLocation().getStartLine().toString() + \" args: \" + call.getArg(0).asExpr().toString() + \", \" + call.getArg(1).asExpr().toString()\n  )\nselect call, msg\n",
+   "hypothesis": "Check for insecure tempfile.mktemp usage across the codebase and path join operations in numpy.lib._datasource (CVE-2019-6446 / path traversal history check).",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-377",
+    "cwe-22"
+   ],
+   "results_count": 2,
+   "results": [
+    {
+     "ruleId": "py/insecure-tempfile-and-datasource",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/insecure-tempfile-and-datasource",
+      "index": 0
+     },
+     "message": {
+      "text": "os.path.join in _datasource.py:411 args: Attribute, netloc"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "numpy/lib/_datasource.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 411,
+         "startColumn": 16,
+         "endColumn": 59
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "aea01e9eb32e386a:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/insecure-tempfile-and-datasource",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/insecure-tempfile-and-datasource",
+      "index": 0
+     },
+     "message": {
+      "text": "os.path.join in _datasource.py:584 args: Attribute, path"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "numpy/lib/_datasource.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 584,
+         "startColumn": 22,
+         "endColumn": 55
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "a7e1d40528b3546:1",
+      "primaryLocationStartColumnFingerprint": "9"
+     }
+    }
+   ]
+  }
+ ],
+ "cache_usage": {
+  "prompt_tokens_total": 565609,
+  "uncached_input_tokens": 563754,
+  "cache_creation_input_tokens": 0,
+  "cache_read_input_tokens": 1855,
+  "output_tokens": 10897,
+  "calls": 19,
+  "caching_enabled": false,
+  "cost_usd_with_cache": 1.236664,
+  "cost_usd_no_cache": 1.240188,
+  "cache_read_share_of_prompt": 0.0033,
+  "prices_per_mtok": {
+   "claude-sonnet-4-5-20250929": {
+    "input": 3.0,
+    "output": 15.0
+   },
+   "claude-haiku-4-5-20251001": {
+    "input": 1.0,
+    "output": 5.0
+   },
+   "deepseek/deepseek-reasoner": {
+    "input": 0.15,
+    "output": 0.6,
+    "cache_read": 0.003,
+    "cache_write_mult": 1.0,
+    "peak_mult": 2.0
+   },
+   "gpt-5.1": {
+    "input": 1.25,
+    "output": 10.0,
+    "cache_read": 0.125,
+    "cache_write_mult": 1.0
+   },
+   "gpt-4.1": {
+    "input": 2.0,
+    "output": 8.0,
+    "cache_read": 0.5,
+    "cache_write_mult": 1.0
+   },
+   "deepseek/deepseek-v4-pro": {
+    "input": 0.66,
+    "output": 1.98,
+    "cache_read": 0.022,
+    "cache_write_mult": 1.0,
+    "peak_mult": 2.0
+   },
+   "deepseek/deepseek-flash": {
+    "input": 0.15,
+    "output": 0.6,
+    "cache_read": 0.003,
+    "cache_write_mult": 1.0,
+    "peak_mult": 2.0
+   },
+   "gemini/gemini-4-carbon": {
+    "input": 2.0,
+    "output": 10.0,
+    "cache_read": 0.1,
+    "cache_write_mult": 1.0
+   },
+   "gemini/gemini-3.8-flash": {
+    "input": 0.75,
+    "output": 3.75,
+    "cache_read": 0.075,
+    "cache_write_mult": 1.0
+   },
+   "openai/gpt-6.2-sol": {
+    "input": 2.0,
+    "output": 10.0,
+    "cache_read": 0.1,
+    "cache_write_mult": 1.0,
+    "long_threshold": 272000,
+    "long": {
+     "input": 4.0,
+     "output": 15.0,
+     "cache_read": 0.2
+    }
+   },
+   "openai/gpt-6-luna": {
+    "input": 0.1,
+    "output": 0.5,
+    "cache_read": 0.01,
+    "cache_write_mult": 1.0,
+    "long_threshold": 272000,
+    "long": {
+     "input": 0.2,
+     "output": 0.75,
+     "cache_read": 0.02
+    }
+   },
+   "claude-sonnet-5-5": {
+    "input": 2.0,
+    "output": 10.0,
+    "cache_read": 0.1
+   },
+   "claude-haiku-5-5": {
+    "input": 0.1,
+    "output": 0.5,
+    "cache_read": 0.01,
+    "long_threshold": 100000,
+    "long": {
+     "input": 0.5,
+     "output": 2.5,
+     "cache_read": 0.05
+    }
+   }
+  },
+  "cache_multipliers": {
+   "write_5m": 1.25,
+   "read": 0.1
+  }
+ }
+}

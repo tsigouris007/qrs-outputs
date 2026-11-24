@@ -1,0 +1,259 @@
+{
+ "session_id": "20251225164042",
+ "package_name": "pyyaml-6.0.3",
+ "package_path": "packages/pyyaml-6.0.3",
+ "database_path": "databases/pyyaml-6.0.3-db",
+ "model": "gpt-5.1",
+ "temperature": 1.0,
+ "max_tokens": 8000,
+ "iterations": 11,
+ "total_input_tokens": 70624,
+ "total_output_tokens": 6013,
+ "total_tokens": 76637,
+ "elapsed_time_seconds": 479.89,
+ "estimated_cost_usd": 0.1484,
+ "summary": "## Overview\n\nPackage analyzed: **PyYAML 6.0.3**  \nType: Python YAML parser/emitter library  \nScope: All Python sources in the distribution (`lib/yaml`, `_yaml`, packaging helpers).\n\nThe library is security‑sensitive by design because it can deserialize arbitrary Python objects from YAML. The analysis focused on object construction, loader/constructor behavior, and any obviously unsafe usage patterns inside the package itself (as opposed to how third‑party consumers call the API).\n\n---\n\n## Key Security‑Relevant Behaviors & Findings\n\n### 1. Presence of unsafe YAML loading APIs (expected, but security‑critical)\n\n**Finding:** The package exposes high‑risk loading functions and loaders that can construct arbitrary Python objects from YAML tags, e.g. `!!python/object/new`, `!!python/object/apply`, etc. These are part of PyYAML’s documented API and not an implementation mistake, but they are **dangerous when used on untrusted input**.\n\n**Evidence (CodeQL custom query `py/unsafe-yaml-load`):**\n- A call site in the project’s own packaging/test helper code:\n  - `packaging/build/smoketest.py:14` — uses `yaml.load` / `yaml.full_load`.\n\n**Risk:**\n- When applications use `yaml.load`, `yaml.full_load`, or loaders like `FullLoader`/`UnsafeLoader` on untrusted data, attackers can leverage Python‑specific tags to achieve **arbitrary code execution**.\n- This is a well‑known class of unsafe deserialization issues.\n\n**CWE classification:**\n- **CWE‑502 – Deserialization of Untrusted Data**\n\n**Status within this package:**\n- The unsafe APIs are **intentional** and required for full YAML/Python feature support.\n- The internal use we observed is in build/smoke‑test code, *not* production runtime of the library itself.\n- Security impact materializes primarily in **downstream consumers** that call these APIs on untrusted YAML.\n\n**Guidance for consumers:**\n- Use **`safe_load` / `safe_load_all`** or `SafeLoader` when processing untrusted YAML.\n- Avoid `yaml.load`, `yaml.full_load`, `UnsafeLoader`, or custom constructors that materialize arbitrary objects unless the input is fully trusted.\n\n---\n\n### 2. Custom representer APIs that can emit Python‑specific tags\n\n**Finding:** PyYAML exposes and internally defines **custom representer registration functions** that allow mapping Python types to YAML tags. Misuse of these APIs by downstream projects can increase the attack surface of deserialization.\n\n**Evidence (CodeQL custom query `py/pyyaml-unsafe-representer`):**\nMatches on functions whose names contain `representer`:\n\n1. `lib/yaml/__init__.py`\n   - Line ~329: `add_representer(...)`\n   - Line ~338: `add_multi_representer(...)`\n2. `lib/yaml/representer.py`\n   - Line ~66: method `add_representer(...)`\n   - Line ~72: method `add_multi_representer(...)`\n\nThese are part of the public API to extend YAML serialization.\n\n**Risk:**\n- By themselves, these functions are not a vulnerability.\n- If a consumer registers representers that emit Python‑specific tags (e.g., `!!python/object/new`), then using unsafe loading APIs on such YAML may lead to arbitrary code execution.\n- This is again part of the **deserialization attack surface**.\n\n**CWE classification:**\n- **CWE‑502 – Deserialization of Untrusted Data** (supporting surface)\n\n**Status within this package:**\n- The identified representer methods are general‑purpose extension points.\n- They are correctly implemented for their purpose; the security risk is conditional on how applications configure them and which loaders they pair them with.\n\n**Guidance for consumers:**\n- Avoid emitting Python‑specific execution‑capable tags for data that might be later parsed with unsafe loaders.\n- Prefer simple, schema‑like YAML without Python‑specific tags when data crosses trust boundaries.\n\n---\n\n### 3. Constructor/Resolver infrastructure (no direct bug found, but high‑risk by design)\n\n**Finding:** PyYAML’s internal modules (`yaml.constructor`, `yaml.resolver`, etc.) implement the logic that maps YAML tags to Python objects and performs object construction. These are inherently security‑sensitive but were not found to contain an obvious logic bug via the automated queries run.\n\n**Evidence (CodeQL custom query `py/pyyaml-arbitrary-object-construction`):**\n- Queried for calls to `yaml.constructor.Constructor`, `FullConstructor`, `UnsafeConstructor` via the API graph. No direct additional risky call patterns surfaced beyond the known design.\n\n**Evidence (CodeQL custom query `py/pyyaml-implicit-python-tag-resolver`):**\n- Queried for calls registering implicit resolvers via `yaml.resolver.BaseResolver.add_implicit_resolver`.\n- No additional unexpected patterns or configuration anomalies were flagged by the query in this package.\n\n**Risk:**\n- The **existence** of constructors capable of building arbitrary objects (e.g., from `!!python` tags) is an intentional feature.\n- When combined with untrusted YAML input and unsafe loaders, this results in classic unsafe deserialization / RCE scenarios.\n\n**CWE classification:**\n- **CWE‑502 – Deserialization of Untrusted Data**\n\n**Status within this package:**\n- No specific implementation flaw was detected via static analysis in this run; the risk is inherent to the feature set.\n\n---\n\n## Non‑Findings (Areas Analyzed With No Issues Detected)\n\nWithin the scope of the Python sources and the conducted CodeQL queries:\n\n- No additional high‑impact vulnerabilities such as:\n  - Direct command injection sinks tied to external input.\n  - Obvious path traversal sinks (file operations based on untrusted data) inside the library core.\n  - Unsafe deserialization using **other** formats (pickle, marshal, json) beyond the expected YAML behavior.\n- The C extension (`_yaml`) and low‑level parsing logic were not deeply inspected for memory‑safety issues in this session (those require C/C++ analysis rather than Python CodeQL).\n\n---\n\n## Overall Security Assessment\n\n- **Primary risk profile:** PyYAML 6.0.3 is a powerful serialization framework that inherently supports **arbitrary Python object construction from YAML**, which is dangerous on untrusted input.\n- The static analysis confirms the presence and use of known high‑risk APIs (e.g., `yaml.load`) in internal testing/build scripts and shows the extensibility hooks (representers, constructors, resolvers) that, when misconfigured, can exacerbate unsafe deserialization risks.\n- No new or previously unknown implementation bugs were surfaced in this run; the risks align with long‑documented PyYAML behavior.\n\n**For library maintainers:**\n- Continue emphasizing in documentation that users should default to **safe loaders** for untrusted data.\n- Consider ensuring that internal helper/test scripts do not provide confusing examples using `yaml.load` without clear safety warnings.\n\n**For downstream users:**\n- Treat PyYAML as a deserialization framework with RCE capabilities when misused.\n- **NEVER** call `yaml.load`/`yaml.full_load`/`UnsafeLoader` on untrusted input.\n- Use `safe_load` and a well‑defined schema for any untrusted or cross‑boundary data.\n\nThis concludes the automated CodeQL‑based security review of **PyYAML 6.0.3**.\n",
+ "package_classification": {
+  "type": "library",
+  "layer": [
+   "serialization",
+   "data_format",
+   "config"
+  ]
+ },
+ "tool_calls": {
+  "get_package_profile_info": 1,
+  "execute_codeql_query": 10,
+  "validate_codeql_query": 0,
+  "fixup_codeql_query": 5,
+  "finalize_report": 1
+ },
+ "queries_executed": {
+  "critical": 0,
+  "high": 1,
+  "medium": 4,
+  "low": 0,
+  "total_executed": 14,
+  "total_with_results": 5,
+  "total_failed": 9
+ },
+ "query_findings": {
+  "critical": 0,
+  "high": 1,
+  "medium": 4,
+  "low": 0,
+  "total": 5
+ },
+ "findings": [
+  {
+   "codeql_query_uuid": "20251225164107",
+   "codeql_raw_query": "/**\n * @name Arbitrary object construction via yaml.FullLoader/UnsafeLoader\n * @description Detects registrations of constructors for arbitrary Python object creation which, when combined with unsafe loading, can lead to code execution.\n * @kind problem\n * @problem.severity warning\n * @id py/pyyaml-arbitrary-object-constructor\n * @tags security\n *       external/cwe/cwe-502\n */\n\nimport python\n\nfrom Call call, Name func\nwhere\n  func = call.getFunc() and\n  func.getId() = \"add_constructor\" and\n  call.getArg(0).toString().regexpMatch(\"!python/object.*\")\nselect call, \"YAML constructor for arbitrary Python object types is registered here. When used with unsafe loaders on untrusted data, this may enable arbitrary object creation or code execution.\"",
+   "hypothesis": "PyYAML defines constructors for arbitrary Python object deserialization which could be dangerous with unsafe loading.",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-502"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251225164202",
+   "codeql_raw_query": "/**\n * @name Unsafe YAML load usage\n * @description Detect use of yaml.load and FullLoader/UnsafeLoader which can lead to code execution when used on untrusted input.\n * @kind problem\n * @problem.severity error\n * @id py/unsafe-yaml-load\n * @tags security\n *       external/cwe/cwe-502\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"yaml\").getMember([\"load\", \"full_load\"]).getACall()\nselect call, \"Potentially unsafe use of yaml.load or yaml.full_load, which may execute arbitrary code for untrusted input.\"",
+   "hypothesis": "The package may expose unsafe yaml.load or full_load usages internally that could encourage insecure patterns or be reachable in certain contexts.",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-502"
+   ],
+   "results_count": 1,
+   "results": [
+    {
+     "ruleId": "py/unsafe-yaml-load",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/unsafe-yaml-load",
+      "index": 0
+     },
+     "message": {
+      "text": "Potentially unsafe use of yaml.load or yaml.full_load, which may execute arbitrary code for untrusted input."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "packaging/build/smoketest.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 14,
+         "startColumn": 18,
+         "endColumn": 52
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "bc369fecfd4d7b56:1",
+      "primaryLocationStartColumnFingerprint": "9"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251225164458",
+   "codeql_raw_query": "/**\n * @name PyYAML arbitrary object construction sinks\n * @description Find call sites that end up invoking PyYAML's constructor for arbitrary Python objects (e.g., !!python/object/new) which is a core RCE sink.\n * @kind problem\n * @problem.severity warning\n * @id py/pyyaml-arbitrary-object-construction\n * @tags security\n *       external/cwe/cwe-502\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"yaml.constructor\").getMember([\"Constructor\", \"FullConstructor\", \"UnsafeConstructor\"]).getACall()\nselect call, \"Call into PyYAML Constructor classes that can materialize arbitrary Python objects from YAML tags (dangerous on untrusted input).\"",
+   "hypothesis": "Usage of internal Constructor classes that enable arbitrary object construction from YAML, relevant for understanding RCE risk surface.",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-502"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251225164718",
+   "codeql_raw_query": "/**\n * @name PyYAML unsafe representer usage\n * @description Detect custom representers that may serialize arbitrary Python objects with tags that trigger code execution on load.\n * @kind problem\n * @problem.severity warning\n * @id py/pyyaml-unsafe-representer\n * @tags security\n *       external/cwe/cwe-502\n */\n\nimport python\n\nfrom Function f\nwhere f.getName().regexpMatch(\".*representer.*\")\nselect f, \"Custom YAML representer '\" + f.getName() + \"' may produce unsafe YAML tags if used with arbitrary objects.\"",
+   "hypothesis": "PyYAML defines custom representers whose output, if used with untrusted consumers, could embed dangerous Python object construction tags.",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-502"
+   ],
+   "results_count": 4,
+   "results": [
+    {
+     "ruleId": "py/pyyaml-unsafe-representer",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pyyaml-unsafe-representer",
+      "index": 0
+     },
+     "message": {
+      "text": "Custom YAML representer 'add_representer' may produce unsafe YAML tags if used with arbitrary objects."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "lib/yaml/__init__.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 329,
+         "endColumn": 60
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "477091ee321224e6:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/pyyaml-unsafe-representer",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pyyaml-unsafe-representer",
+      "index": 0
+     },
+     "message": {
+      "text": "Custom YAML representer 'add_multi_representer' may produce unsafe YAML tags if used with arbitrary objects."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "lib/yaml/__init__.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 338,
+         "endColumn": 72
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "a828718563348a66:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/pyyaml-unsafe-representer",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pyyaml-unsafe-representer",
+      "index": 0
+     },
+     "message": {
+      "text": "Custom YAML representer 'add_representer' may produce unsafe YAML tags if used with arbitrary objects."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "lib/yaml/representer.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 66,
+         "startColumn": 5,
+         "endColumn": 54
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "83ecd759ac77bb87:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/pyyaml-unsafe-representer",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pyyaml-unsafe-representer",
+      "index": 0
+     },
+     "message": {
+      "text": "Custom YAML representer 'add_multi_representer' may produce unsafe YAML tags if used with arbitrary objects."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "lib/yaml/representer.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 72,
+         "startColumn": 5,
+         "endColumn": 60
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "8635db452172e34f:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251225164749",
+   "codeql_raw_query": "/**\n * @name PyYAML implicit resolver for Python object tags\n * @description Identify registrations of implicit resolvers for Python-specific tags like !!python/object/new which participate in unsafe deserialization.\n * @kind problem\n * @problem.severity warning\n * @id py/pyyaml-implicit-python-tag-resolver\n * @tags security\n *       external/cwe/cwe-502\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"yaml.resolver\").getMember(\"BaseResolver\").getMember(\"add_implicit_resolver\").getACall()\nselect call, \"Registration of implicit resolvers may enable automatic resolution of Python object construction tags (potentially unsafe).\"",
+   "hypothesis": "PyYAML registers implicit resolvers for Python-specific tags that help resolve dangerous object construction syntax automatically.",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-502"
+   ],
+   "results_count": 0,
+   "results": []
+  }
+ ]
+}

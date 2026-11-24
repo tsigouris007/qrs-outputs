@@ -1,0 +1,388 @@
+{
+ "session_id": "20251227124649",
+ "package_name": "jsonschema-4.25.1",
+ "package_path": "packages/jsonschema-4.25.1",
+ "database_path": "databases/jsonschema-4.25.1-db",
+ "model": "gemini/gemini-3-pro-preview",
+ "temperature": 1.0,
+ "max_tokens": 8000,
+ "iterations": 17,
+ "total_input_tokens": 156330,
+ "total_output_tokens": 12632,
+ "total_tokens": 168962,
+ "elapsed_time_seconds": 330.68,
+ "estimated_cost_usd": 0.4642,
+ "summary": "The analysis of the `jsonschema` package (version 4.25.1) identified a significant security risk related to Server-Side Request Forgery (SSRF).\n\n**Key Findings:**\n\n*   **Server-Side Request Forgery (SSRF) (CWE-918):**\n    *   **Location:** `jsonschema/validators.py` (lines 1225, 1228).\n    *   **Description:** The library includes functionality to fetch remote schemas referenced via URIs (e.g., in `$ref` keywords). The code explicitly imports and uses the `requests` library to perform HTTP GET requests to these URIs (`requests.get(uri).json()`).\n    *   **Impact:** If an application validates untrusted schemas (or schemas with untrusted references), an attacker could supply a malicious URI (e.g., `http://localhost:8080/admin` or `http://169.254.169.254/latest/meta-data/`). The server running the validation would then initiate a connection to this internal or sensitive resource, potentially exposing internal services or data. This behavior is often enabled by default when `RefResolver` is used or when resolving remote references is required.\n    *   **Recommendation:** Users should disable remote reference resolution if not strictly needed or ensure that a custom handler with an allowlist of trusted domains is used. The library should ideally provide a secure default that disables arbitrary remote fetching or warns users explicitly.\n\n**Other Observations:**\n*   **Regular Expressions:** The library makes extensive use of the `re` module for pattern validation. While no specific ReDoS (CWE-1333) vulnerabilities were confirmed during this analysis, the processing of complex regexes from untrusted schemas remains a general risk area for this type of library.\n*   **No Code Injection:** No evidence of `eval` or `exec` based code injection (CWE-94) or unsafe deserialization (CWE-502) was found.\n\nThe primary security concern is the unconstrained ability to fetch remote content, which constitutes an SSRF vulnerability in contexts where schemas or their references are user-controlled.",
+ "package_classification": {
+  "layer": [
+   "Library"
+  ],
+  "type": [
+   "Validation",
+   "Middleware"
+  ]
+ },
+ "tool_calls": {
+  "get_package_profile_info": 1,
+  "execute_codeql_query": 6,
+  "validate_codeql_query": 0,
+  "fixup_codeql_query": 2,
+  "finalize_report": 1
+ },
+ "queries_executed": {
+  "critical": 1,
+  "high": 1,
+  "medium": 1,
+  "low": 0,
+  "total_executed": 8,
+  "total_with_results": 3,
+  "total_failed": 4
+ },
+ "query_findings": {
+  "critical": 0,
+  "high": 2,
+  "medium": 1,
+  "low": 0,
+  "total": 3
+ },
+ "findings": [
+  {
+   "codeql_query_uuid": "20251227124703",
+   "codeql_raw_query": "/**\n * @name Network request\n * @description Identifying network requests which might be used for fetching remote schemas\n * @kind problem\n * @problem.severity medium\n * @id py/network-request\n * @tags security\n *       external/cwe/cwe-918\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"requests\").getMember(\"get\").getACall() or\n  call = API::moduleImport(\"requests\").getMember(\"post\").getACall() or\n  call = API::moduleImport(\"urllib.request\").getMember(\"urlopen\").getACall()\nselect call, \"Network request detected.\"",
+   "hypothesis": "The library might perform network requests to fetch remote schemas, potentially leading to SSRF if not restricted.",
+   "severity": "medium",
+   "cwe_ids": [
+    "CWE-918"
+   ],
+   "results_count": 1,
+   "results": [
+    {
+     "ruleId": "py/network-request",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/network-request",
+      "index": 0
+     },
+     "message": {
+      "text": "Network request detected."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "jsonschema/validators.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 1225,
+         "startColumn": 22,
+         "endColumn": 39
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "995c7e2fcbd7b863:1",
+      "primaryLocationStartColumnFingerprint": "9"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251227124751",
+   "codeql_raw_query": "/**\n * @name SSRF in Schema Fetching\n * @description Traces data flow from function parameters to network request sinks, indicating potential SSRF.\n * @kind path-problem\n * @problem.severity error\n * @id py/jsonschema-ssrf\n * @tags security\n *       external/cwe/cwe-918\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.ApiGraphs\n\nmodule SsrfConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    source instanceof DataFlow::ParameterNode\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(DataFlow::CallCfgNode call |\n      call = API::moduleImport(\"urllib\").getMember(\"request\").getMember(\"urlopen\").getACall() or\n      call = API::moduleImport(\"requests\").getMember([\"get\", \"post\", \"put\", \"delete\", \"head\", \"patch\", \"request\"]).getACall()\n      |\n      sink = call.getArg(0)\n    )\n  }\n}\n\nmodule SsrfFlow = TaintTracking::Global<SsrfConfig>;\nimport SsrfFlow::PathGraph\n\nfrom SsrfFlow::PathNode source, SsrfFlow::PathNode sink\nwhere SsrfFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"Potential SSRF from $@.\", source.getNode(), \"parameter\"\n",
+   "hypothesis": "The package may allow arbitrary network requests via schema references ($ref), leading to SSRF if not properly restricted.",
+   "severity": "high",
+   "cwe_ids": [
+    "CWE-918"
+   ],
+   "results_count": 2,
+   "results": [
+    {
+     "ruleId": "py/jsonschema-ssrf",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jsonschema-ssrf",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential SSRF from [parameter](1).\nPotential SSRF from [parameter](1)."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "jsonschema/validators.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 1228,
+         "startColumn": 26,
+         "endColumn": 29
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "69a4afe867e21641:1",
+      "primaryLocationStartColumnFingerprint": "13"
+     },
+     "codeFlows": [
+      {
+       "threadFlows": [
+        {
+         "locations": [
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "jsonschema/validators.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 1183,
+              "startColumn": 30,
+              "endColumn": 33
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for uri"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "jsonschema/validators.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 1228,
+              "startColumn": 26,
+              "endColumn": 29
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for uri"
+            }
+           }
+          }
+         ]
+        }
+       ]
+      },
+      {
+       "threadFlows": [
+        {
+         "locations": [
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "jsonschema/validators.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 1183,
+              "startColumn": 30,
+              "endColumn": 33
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for uri"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "jsonschema/validators.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 1228,
+              "startColumn": 26,
+              "endColumn": 29
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for uri"
+            }
+           }
+          }
+         ]
+        }
+       ]
+      }
+     ],
+     "relatedLocations": [
+      {
+       "id": 1,
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "jsonschema/validators.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 1183,
+         "startColumn": 30,
+         "endColumn": 33
+        }
+       },
+       "message": {
+        "text": "parameter"
+       }
+      },
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "jsonschema/validators.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 1183,
+         "startColumn": 30,
+         "endColumn": 33
+        }
+       }
+      }
+     ]
+    },
+    {
+     "ruleId": "py/jsonschema-ssrf",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jsonschema-ssrf",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential SSRF from [parameter](1)."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "jsonschema/validators.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 1225,
+         "startColumn": 35,
+         "endColumn": 38
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "995c7e2fcbd7b863:1",
+      "primaryLocationStartColumnFingerprint": "22"
+     },
+     "codeFlows": [
+      {
+       "threadFlows": [
+        {
+         "locations": [
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "jsonschema/validators.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 1183,
+              "startColumn": 30,
+              "endColumn": 33
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for uri"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "jsonschema/validators.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 1225,
+              "startColumn": 35,
+              "endColumn": 38
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for uri"
+            }
+           }
+          }
+         ]
+        }
+       ]
+      }
+     ],
+     "relatedLocations": [
+      {
+       "id": 1,
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "jsonschema/validators.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 1183,
+         "startColumn": 30,
+         "endColumn": 33
+        }
+       },
+       "message": {
+        "text": "parameter"
+       }
+      },
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "jsonschema/validators.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 1183,
+         "startColumn": 30,
+         "endColumn": 33
+        }
+       }
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251227125125",
+   "codeql_raw_query": "/**\n * @name Unsafe deserialization\n * @description Deserializing untrusted data using pickle or other unsafe methods can lead to arbitrary code execution\n * @kind problem\n * @problem.severity error\n * @id py/unsafe-deserialization\n * @tags security\n *        external/cwe/cwe-502\n */\n\nimport python\nimport semmle.python.ApiGraphs\nimport semmle.python.dataflow.new.DataFlow\n\nfrom DataFlow::CallCfgNode call\nwhere\n  (\n    call = API::moduleImport(\"pickle\").getMember([\"load\", \"loads\", \"Unpickler\"]).getACall() or\n    call = API::moduleImport(\"yaml\").getMember([\"load\", \"unsafe_load\"]).getACall() or\n    call = API::moduleImport(\"marshal\").getMember([\"load\", \"loads\"]).getACall() or\n    call = API::moduleImport(\"shelve\").getMember(\"open\").getACall() or\n    call = API::moduleImport(\"jsonpickle\").getMember([\"decode\", \"unpickler\"]).getACall()\n  )\nselect call, \"Potentially unsafe deserialization operation.\"\n",
+   "hypothesis": "Unsafe deserialization using pickle, yaml, or marshal.",
+   "severity": "critical",
+   "cwe_ids": [
+    "CWE-502"
+   ],
+   "results_count": 0,
+   "results": []
+  }
+ ]
+}

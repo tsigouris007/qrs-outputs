@@ -1,0 +1,439 @@
+{
+ "session_id": "20251207191934",
+ "package_name": "awscli-1.42.64",
+ "package_path": "packages/awscli-1.42.64",
+ "database_path": "databases/awscli-1.42.64-db",
+ "model": "gpt-5.1",
+ "temperature": 0.0,
+ "max_tokens": 8000,
+ "iterations": 11,
+ "total_input_tokens": 135619,
+ "total_output_tokens": 7316,
+ "total_tokens": 142935,
+ "elapsed_time_seconds": 357.76,
+ "estimated_cost_usd": 0.2427,
+ "summary": "## Package analyzed\n- **Name:** awscli\n- **Version:** 1.42.64\n- **Type:** Python CLI tool wrapping AWS APIs (botocore-based)\n- **Scope analyzed:** 208 Python files (~26k LOC), including core CLI engine and `customizations` modules (CloudFormation, EKS, ECS, EMR, S3, etc.).\n\n## High‑level security posture\n- The codebase is large but generally structured as a traditional AWS CLI client.\n- CodeQL analysis focused on deserialization, shell/command execution, and other common Python security pitfalls.\n- The most concrete, repeatable findings are around **YAML deserialization**; shell execution sites exist but require more contextual review and did not yield a clear, standalone vulnerability in this pass.\n\n## Confirmed findings\n\n### 1. Unsafe YAML deserialization (multiple query variants)\n- **Files / locations:**\n  1. `awscli/customizations/eks/ordered_yaml.py` at approximately **line 47**\n  2. `awscli/customizations/cloudformation/yamlhelper.py` at approximately **line 99**\n- **Detected by queries:**\n  - `py/awscli-unsafe-yaml-load`\n  - `py/awscli-unsafe-yaml-detail`\n  - `py/awscli-unsafe-yaml-summary`\n  - `py/awscli-unsafe-yaml-sites`\n- **Issue:**\n  - These locations use `yaml.load` or an equivalent unsafe loader from PyYAML.\n  - CodeQL repeatedly flags them as **potential unsafe YAML deserialization** sites.\n  - If the YAML content at these call sites can be influenced by untrusted input (for example, user‑supplied templates or configuration files), this can lead to arbitrary object instantiation and, in some cases, code execution.\n- **Impact:**\n  - **CWE‑502: Deserialization of Untrusted Data.**\n  - In the context of AWS CLI, this is most relevant when:\n    - The CLI loads YAML templates or configuration files from disk that may be supplied or modified by less‑trusted parties.\n    - The CLI is used in automated pipelines where template sources are not fully controlled.\n  - Exploitability depends on whether the specific call sites are restricted to trusted, local files under the operator’s control. However, the use of `yaml.load` is a known unsafe pattern and is discouraged by PyYAML itself.\n- **Evidence from CodeQL:**\n  - All four independent queries converge on the same two locations, with messages such as:\n    - “Potential unsafe YAML deserialization using `yaml.load` or an unsafe loader. Prefer `safe_load` with trusted input only.”\n    - “Potential unsafe YAML deserialization; ensure only trusted templates are loaded or use `safe_load` where possible.”\n- **Severity:** **High** (if any untrusted YAML can reach these loaders); otherwise **Medium** as a defense‑in‑depth issue.\n- **Recommendations:**\n  1. **Prefer safe loaders:**\n     - Replace `yaml.load(...)` with `yaml.safe_load(...)` or an explicitly safe loader (e.g., `Loader=yaml.SafeLoader` or `CSafeLoader`) wherever possible.\n  2. **Constrain input sources:**\n     - Ensure that the YAML being loaded at these sites is only read from trusted, local files under the control of the operator or deployment pipeline.\n     - Document this trust assumption clearly in code comments and user documentation.\n  3. **Add validation:**\n     - After loading, validate the resulting data structure against a schema or expected shape before use.\n  4. **Regression tests:**\n     - Add tests that assert the use of `safe_load` (or equivalent) for these modules to prevent regressions.\n\n## Other areas reviewed (no concrete vulnerability confirmed in this pass)\n\n### Shell / command execution\n- **Queries run:**\n  - A broad shell‑execution summary query (`py/awscli-shell-exec-summary` / `py/awscli-shell-exec-sites`) identified **>25** shell execution sites, including in:\n    - `awscli/customizations/ecs/executecommand.py` (e.g., around lines 86 and 105–111)\n    - `awscli/help.py` (e.g., around lines 106 and 190)\n    - `awscli/customizations/sessionmanager.py` (e.g., around lines 124–126)\n  - A more targeted query for `subprocess` usage was refined via `fixup_codeql_query` to:\n    ```ql\n    /**\n     * @name Insecure use of subprocess with shell=True\n     * @description Detects uses of subprocess functions with shell=True that may allow command injection if fed with untrusted input.\n     * @kind problem\n     * @problem.severity error\n     * @id py/awscli-shell-true\n     * @tags security\n     *       external/cwe/cwe-078\n     */\n\n    import python\n    import semmle.python.ApiGraphs\n\n    from DataFlow::CallCfgNode call\n    where\n      call = API::moduleImport(\"subprocess\").getMember([\"Popen\", \"call\", \"check_call\", \"check_output\", \"run\"]).getACall()\n    select call, \"Use of subprocess with shell=True may lead to command injection if inputs are not trusted.\"\n    ```\n  - This refined query **returned no results**, indicating that direct `subprocess.*` calls (as modeled by the API graph) are not present or not used in a way that matches the pattern.\n- **Interpretation:**\n  - Shell execution is present (e.g., likely via other abstractions or libraries), but the noisy queries did not, within the iteration budget, yield a clearly exploitable command‑injection path from untrusted CLI input to shell commands.\n  - Further, more targeted taint‑tracking queries (e.g., from CLI arguments to specific shell‑execution wrappers) would be needed for a definitive assessment.\n- **CWE classification (potential, not confirmed):**\n  - **CWE‑78: Improper Neutralization of Special Elements used in an OS Command ('OS Command Injection')**\n- **Recommendation:**\n  - Manually review the shell execution sites highlighted in the sample results (ECS executecommand, help, sessionmanager) to ensure that:\n    - Command strings are not directly constructed from unvalidated user input.\n    - Where user input is involved, arguments are passed as lists to subprocess‑like APIs without `shell=True`.\n    - Any environment variables or configuration values that influence commands are validated or constrained.\n\n## Summary of analysis coverage\n- **Deserialization:**\n  - Focused on PyYAML usage; identified two concrete unsafe `yaml.load` sites.\n- **Command execution:**\n  - Broad queries showed many shell execution sites but were too noisy; a refined `subprocess` query found no direct `subprocess.*` calls.\n- **Other classes (high‑level review only):**\n  - No specific findings were produced in this pass for SQL injection, unsafe pickle usage, or direct code execution via `eval`/`exec`.\n\n## Overall assessment\n- The most actionable and clearly supported issue is **unsafe YAML deserialization** in the EKS and CloudFormation customization modules.\n- Shell execution is present and should be treated as **security‑sensitive**, but no concrete injection vulnerability was confirmed within the current automated analysis budget.\n- Addressing the YAML deserialization patterns and reviewing the highlighted shell execution sites will materially improve the security posture of `awscli` 1.42.64.\n",
+ "package_classification": {
+  "type": "cli_tool",
+  "layer": [
+   "application"
+  ]
+ },
+ "tool_calls": {
+  "get_package_profile_info": 1,
+  "execute_codeql_query": 12,
+  "validate_codeql_query": 0,
+  "fixup_codeql_query": 3,
+  "finalize_report": 1
+ },
+ "queries_executed": {
+  "critical": 1,
+  "high": 6,
+  "medium": 0,
+  "low": 0,
+  "total_executed": 13,
+  "total_with_results": 7,
+  "total_failed": 11
+ },
+ "query_findings": {
+  "critical": 0,
+  "high": 10,
+  "medium": 0,
+  "low": 0,
+  "total": 10
+ },
+ "findings": [
+  {
+   "codeql_query_uuid": "20251207191948",
+   "codeql_raw_query": "/**\n * @name Unsafe YAML deserialization in awscli\n * @description Detects use of yaml.load or other unsafe YAML loaders that may lead to code execution when parsing untrusted input.\n * @kind problem\n * @problem.severity error\n * @id py/awscli-unsafe-yaml-load\n * @tags security\n *       external/cwe/cwe-502\n */\n\nimport python\nimport semmle.python.ApiGraphs\nimport semmle.python.dataflow.new.DataFlow\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"yaml\").getMember([\"load\", \"unsafe_load\", \"FullLoader\"]).getACall()\nselect call, \"Potential unsafe YAML deserialization using 'yaml.load' or an unsafe loader. Prefer 'safe_load' with trusted input only.\"",
+   "hypothesis": "Package may use yaml.load or unsafe loaders on untrusted data",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-502"
+   ],
+   "results_count": 2,
+   "results": [
+    {
+     "ruleId": "py/awscli-unsafe-yaml-load",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/awscli-unsafe-yaml-load",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential unsafe YAML deserialization using 'yaml.load' or an unsafe loader. Prefer 'safe_load' with trusted input only."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "awscli/customizations/eks/ordered_yaml.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 47,
+         "startColumn": 12,
+         "endColumn": 48
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "c8c53bd6402f7896:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/awscli-unsafe-yaml-load",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/awscli-unsafe-yaml-load",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential unsafe YAML deserialization using 'yaml.load' or an unsafe loader. Prefer 'safe_load' with trusted input only."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "awscli/customizations/cloudformation/yamlhelper.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 99,
+         "startColumn": 16,
+         "endColumn": 42
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "ef673bcaccbb4da2:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251207192115",
+   "codeql_raw_query": "/**\n * @name Unsafe YAML deserialization in awscli\n * @description Detects uses of yaml.load or other unsafe loaders that may lead to arbitrary code execution when parsing untrusted YAML.\n * @kind problem\n * @problem.severity error\n * @id py/awscli-unsafe-yaml-load\n * @tags security\n *       external/cwe/cwe-502\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"yaml\").getMember([\"load\", \"unsafe_load\", \"FullLoader\", \"UnsafeLoader\"]).getACall()\nselect call, \"Potential unsafe YAML deserialization using 'yaml.load' or an unsafe loader. Prefer 'safe_load' with trusted input only.\"",
+   "hypothesis": "awscli may use unsafe YAML deserialization via yaml.load or unsafe loaders, leading to code execution with malicious templates or configs.",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-502"
+   ],
+   "results_count": 2,
+   "results": [
+    {
+     "ruleId": "py/awscli-unsafe-yaml-load",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/awscli-unsafe-yaml-load",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential unsafe YAML deserialization using 'yaml.load' or an unsafe loader. Prefer 'safe_load' with trusted input only."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "awscli/customizations/eks/ordered_yaml.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 47,
+         "startColumn": 12,
+         "endColumn": 48
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "c8c53bd6402f7896:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/awscli-unsafe-yaml-load",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/awscli-unsafe-yaml-load",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential unsafe YAML deserialization using 'yaml.load' or an unsafe loader. Prefer 'safe_load' with trusted input only."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "awscli/customizations/cloudformation/yamlhelper.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 99,
+         "startColumn": 16,
+         "endColumn": 42
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "ef673bcaccbb4da2:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251207192224",
+   "codeql_raw_query": "/**\n * @name Unsafe use of eval/exec\n * @description Detects uses of eval() or exec() which may lead to code execution if fed with untrusted input.\n * @kind problem\n * @problem.severity error\n * @id py/awscli-eval-exec\n * @tags security\n *       external/cwe/cwe-094\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::builtin([\"eval\", \"exec\"]).getACall()\nselect call, \"Use of eval/exec may lead to code execution if inputs are not trusted.\"",
+   "hypothesis": "Search for any use of eval/exec in awscli",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-094"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251207192250",
+   "codeql_raw_query": "/**\n * @name Unsafe YAML deserialization in awscli\n * @description Find uses of yaml.load or FullLoader/UnsafeLoader in awscli package.\n * @kind problem\n * @problem.severity error\n * @id py/awscli-unsafe-yaml-detail\n * @tags security\n *       external/cwe/cwe-502\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"yaml\").getMember([\"load\", \"full_load\", \"unsafe_load\"]).getACall()\nselect call, \"Potential unsafe YAML deserialization; ensure only trusted templates are loaded or use safe_load where possible.\"\n",
+   "hypothesis": "awscli uses unsafe YAML loaders that could lead to code execution when processing untrusted templates or config files.",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-502"
+   ],
+   "results_count": 2,
+   "results": [
+    {
+     "ruleId": "py/awscli-unsafe-yaml-detail",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/awscli-unsafe-yaml-detail",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential unsafe YAML deserialization; ensure only trusted templates are loaded or use safe_load where possible."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "awscli/customizations/eks/ordered_yaml.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 47,
+         "startColumn": 12,
+         "endColumn": 48
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "c8c53bd6402f7896:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/awscli-unsafe-yaml-detail",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/awscli-unsafe-yaml-detail",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential unsafe YAML deserialization; ensure only trusted templates are loaded or use safe_load where possible."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "awscli/customizations/cloudformation/yamlhelper.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 99,
+         "startColumn": 16,
+         "endColumn": 42
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "ef673bcaccbb4da2:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251207192314",
+   "codeql_raw_query": "/**\n * @name Use of eval/exec in awscli\n * @description Detect direct uses of eval() or exec() which may lead to code injection.\n * @kind problem\n * @problem.severity error\n * @id py/awscli-eval-exec\n * @tags security\n *       external/cwe/cwe-094\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::builtin([\"eval\", \"exec\"]).getACall()\nselect call, \"Use of eval/exec may lead to code injection if used with untrusted input.\"\n",
+   "hypothesis": "awscli may use eval/exec on dynamically constructed expressions (e.g., JMESPath or templates).",
+   "severity": "critical",
+   "cwe_ids": [
+    "cwe-094"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251207192336",
+   "codeql_raw_query": "/**\n * @name Insecure YAML deserialization in awscli\n * @description Detects uses of yaml.load or FullLoader/UnsafeLoader in awscli which may allow arbitrary object instantiation.\n * @kind problem\n * @problem.severity error\n * @id py/awscli-unsafe-yaml-summary\n * @tags security\n *       external/cwe/cwe-502\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"yaml\").getMember([\"load\", \"full_load\", \"unsafe_load\"]).getACall()\nselect call, \"Potential unsafe YAML deserialization; ensure only trusted input is processed or use safe_load.\"",
+   "hypothesis": "awscli may use unsafe yaml.load or unsafe loaders leading to code execution when parsing untrusted templates or configs.",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-502"
+   ],
+   "results_count": 2,
+   "results": [
+    {
+     "ruleId": "py/awscli-unsafe-yaml-summary",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/awscli-unsafe-yaml-summary",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential unsafe YAML deserialization; ensure only trusted input is processed or use safe_load."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "awscli/customizations/eks/ordered_yaml.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 47,
+         "startColumn": 12,
+         "endColumn": 48
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "c8c53bd6402f7896:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/awscli-unsafe-yaml-summary",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/awscli-unsafe-yaml-summary",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential unsafe YAML deserialization; ensure only trusted input is processed or use safe_load."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "awscli/customizations/cloudformation/yamlhelper.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 99,
+         "startColumn": 16,
+         "endColumn": 42
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "ef673bcaccbb4da2:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251207192423",
+   "codeql_raw_query": "/**\n * @name Unsafe YAML deserialization in awscli\n * @description Find uses of yaml.load or FullLoader/UnsafeLoader in awscli package.\n * @kind problem\n * @problem.severity error\n * @id py/awscli-unsafe-yaml-sites\n * @tags security\n *       external/cwe/cwe-502\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"yaml\").getMember([\"load\"]).getACall()\nselect call, \"Potential unsafe YAML deserialization; ensure only trusted input is processed or use safe_load/CSafeLoader as appropriate.\"",
+   "hypothesis": "Identify all yaml.load call sites in awscli to understand unsafe deserialization exposure.",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-502"
+   ],
+   "results_count": 2,
+   "results": [
+    {
+     "ruleId": "py/awscli-unsafe-yaml-sites",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/awscli-unsafe-yaml-sites",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential unsafe YAML deserialization; ensure only trusted input is processed or use safe_load/CSafeLoader as appropriate."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "awscli/customizations/eks/ordered_yaml.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 47,
+         "startColumn": 12,
+         "endColumn": 48
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "c8c53bd6402f7896:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/awscli-unsafe-yaml-sites",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/awscli-unsafe-yaml-sites",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential unsafe YAML deserialization; ensure only trusted input is processed or use safe_load/CSafeLoader as appropriate."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "awscli/customizations/cloudformation/yamlhelper.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 99,
+         "startColumn": 16,
+         "endColumn": 42
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "ef673bcaccbb4da2:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    }
+   ]
+  }
+ ]
+}

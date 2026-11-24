@@ -1,0 +1,322 @@
+{
+ "session_id": "20251219025929",
+ "package_name": "pygments-2.19.2",
+ "package_path": "packages/pygments-2.19.2",
+ "database_path": "databases/pygments-2.19.2-db",
+ "model": "gpt-5.1",
+ "temperature": 0.0,
+ "max_tokens": 8000,
+ "iterations": 15,
+ "total_input_tokens": 217417,
+ "total_output_tokens": 7684,
+ "total_tokens": 225101,
+ "elapsed_time_seconds": 471.12,
+ "estimated_cost_usd": 0.3486,
+ "summary": "## Overview\n\nAnalyzed package: **Pygments 2.19.2**  \nType: Syntax highlighting library with CLI (`pygmentize`)  \nScope: 350 Python files, ~111k LOC, including core lexers/formatters, CLI, Sphinx extension, and numerous language-specific lexers and builtin tables.\n\nFocus areas:\n- Command execution and subprocess usage (CWE-78)\n- File-system access patterns (CWE-22 / CWE-73)\n- HTML/markup generation and potential XSS (CWE-79)\n- Deserialization and dynamic code execution (CWE-94 / CWE-502)\n- General unsafe patterns in CLI and library APIs\n\nWithin the iteration budget, no concrete, directly exploitable vulnerabilities were identified in the Pygments 2.19.2 codebase as shipped. The findings below are **security-relevant patterns** that warrant awareness and safe usage, but they do not, by themselves, constitute vulnerabilities inside Pygments absent a hostile caller.\n\n---\n\n## Key Security-Relevant Findings\n\n### 1. Use of System Command Execution APIs\n\n**Files involved (from CodeQL findings):**\n- `pygments/formatters/img.py` (image formatter)\n- `pygments/lexers/_scilab_builtins.py` (Scilab builtins table)\n\n**Pattern:**\n- Calls to `subprocess` / `os.system` or equivalent command execution APIs were detected.\n- In `img.py`, the image formatter historically shells out to external tools (e.g., ImageMagick or similar) to render highlighted code to images.\n- In `_scilab_builtins.py`, the flagged region is part of a large, generated builtins table; the command-execution usage appears to be tooling-related or static data rather than runtime execution in normal library use.\n\n**Risk assessment:**\n- **CWE-78: Improper Neutralization of Special Elements used in an OS Command ('OS Command Injection')**\n- Severity: **Low to Medium**, depending on how the library is embedded.\n- Pygments itself does not accept remote input directly; it is a library. The risk arises when **callers pass untrusted data into APIs that eventually influence command arguments**.\n- In the standard usage of `ImageFormatter` and related classes, command arguments are constructed from configuration options (e.g., font, style, output format) that are typically static or application-controlled. If an application exposes these options directly to untrusted users without validation, there is a potential for command injection at the application layer.\n\n**Mitigations / Guidance for Consumers:**\n- Treat any Pygments configuration that can influence external commands (e.g., image formatter options) as **sensitive**.\n- Do **not** pass raw user input into formatter options that are used to build command lines without strict validation and whitelisting.\n- Prefer running Pygments in environments where external tools used by `img.py` are either not present or tightly controlled if you cannot fully trust the input.\n\n**Assessment for Pygments maintainers:**\n- The current patterns appear **intentional** and are typical for a formatter that delegates to external tools.\n- If not already done, ensure:\n  - Command arguments are constructed without shell=True where possible.\n  - Only a constrained set of options is allowed, and they are validated (e.g., enumerated formats, fonts, sizes).\n\n---\n\n### 2. File-System Access in Lexers and Formatters\n\n**Representative files (sample from noisy CodeQL query):**\n- `pygments/formatters/__init__.py`\n- `pygments/lexers/__init__.py`\n- `pygments/lexers/_cocoa_builtins.py`\n- `pygments/lexers/_lua_builtins.py`\n- Many others (query returned >25 results, indicating broad use)\n\n**Pattern:**\n- Various components perform file-system operations: loading mapping tables, style definitions, or language-specific builtin lists.\n- These are typically **static resources** bundled with Pygments, accessed via known paths.\n\n**Risk assessment:**\n- **CWE-22: Path Traversal** / **CWE-73: External Control of File Name or Path** (theoretical)\n- Severity: **Low** in the library as written.\n- The CodeQL query was intentionally broad and flagged any file access. Manual reasoning indicates that Pygments generally uses **fixed, package-internal paths**, not user-controlled paths.\n\n**Mitigations / Guidance for Consumers:**\n- If you build higher-level APIs that let users specify arbitrary file paths for lexers, styles, or formatter resources, validate and constrain those paths.\n- Avoid passing untrusted paths directly into any Pygments helper that might open files; instead, map user choices to a **whitelist of known identifiers** (e.g., style names, lexer names) and let Pygments resolve them internally.\n\n**Assessment for Pygments maintainers:**\n- No direct evidence of path traversal or unsafe path concatenation was found in the library itself within the query coverage.\n\n---\n\n### 3. HTML and Markup Generation (Potential XSS Surfaces)\n\n**Files of interest:**\n- `pygments/formatters/html.py`\n- `pygments/formatters/rtf.py`, `latex.py`, `bbcode.py`, `svg.py`, etc.\n\n**Patterns checked via CodeQL:**\n- Calls into `pygments.formatters.html` were enumerated to identify potential HTML sinks.\n- A syntactic query looked for direct writes via `self.outfile` attributes that might bypass escaping.\n- No specific flows from untrusted input to unescaped HTML sinks were identified by the queries used.\n\n**Risk assessment:**\n- **CWE-79: Improper Neutralization of Input During Web Page Generation ('Cross-site Scripting')**\n- Severity: **Low to Medium**, but **entirely dependent on how the embedding application uses Pygments**.\n- Pygments is designed to output HTML that represents source code. It generally treats the input as code, not as HTML, and escapes appropriately.\n- However, if an application:\n  - Mixes Pygments output into larger HTML templates without proper context handling, or\n  - Uses custom formatters or overrides that bypass escaping,\n  then XSS can arise at the application layer.\n\n**Mitigations / Guidance for Consumers:**\n- Always treat Pygments HTML output as **already-escaped code content**, and insert it into HTML in a context where that assumption holds (e.g., inside `<pre>`/`<code>` blocks, not inside `<script>` or event handler attributes).\n- Avoid writing custom formatters that directly concatenate untrusted strings into HTML without escaping.\n- When in doubt, run additional HTML-escaping at the template layer, or use templating engines that auto-escape by default.\n\n**Assessment for Pygments maintainers:**\n- Within the queries run, no obvious unescaped injection points were detected in the core HTML formatter.\n- The main XSS risk is **misuse by callers**, not a flaw in Pygments itself.\n\n---\n\n### 4. Deserialization and Dynamic Code Execution\n\n**Patterns checked via CodeQL:**\n- Searched for calls to `pickle`, `yaml.load`, `marshal`, etc., across the codebase.\n- No such calls were found in the Pygments library code under the queries executed.\n\n**Risk assessment:**\n- **CWE-502: Deserialization of Untrusted Data**\n- **CWE-94: Code Injection**\n- Severity: **None observed in Pygments itself**.\n\n**Guidance:**\n- If your application uses Pygments in combination with its own deserialization or dynamic code execution, ensure that untrusted data is never passed into those mechanisms.\n- Pygments itself does not appear to introduce additional deserialization/code-execution attack surface in this version.\n\n---\n\n### 5. CLI (`pygmentize`) and General Input Handling\n\n**Files of interest:**\n- `pygments/cmdline.py`\n- `pygments/__main__.py`\n\n**Patterns checked via CodeQL:**\n- General unsafe patterns in CLI argument handling, subprocess usage, and file access.\n- No concrete vulnerabilities were surfaced by the queries executed.\n\n**Risk assessment:**\n- The CLI reads files and stdin and writes formatted output. As long as it is used as a local tool (the typical case), this is expected and low risk.\n- If an application exposes `pygmentize` as a service endpoint (e.g., web API that shells out to `pygmentize`), then all the usual service-hardening considerations apply (resource limits, timeouts, sandboxing, etc.).\n\n---\n\n## Overall Security Posture\n\nWithin the coverage of the CodeQL queries and the time budget:\n\n- **No direct, standalone vulnerabilities** (e.g., trivially exploitable command injection, path traversal, unsafe deserialization) were identified in Pygments 2.19.2 itself.\n- The main security-relevant aspects are **expected for a syntax-highlighting library**:\n  - It can invoke external tools (image formatter) – callers must not let untrusted users control those options without validation.\n  - It performs file-system reads of its own data – callers must not misuse these APIs with arbitrary untrusted paths.\n  - It generates HTML and other markup – callers must embed the output in a safe context to avoid XSS.\n\nGiven Pygments’ role as a library, most real-world vulnerabilities will arise from **how an application integrates and exposes Pygments to untrusted input**, rather than from flaws in Pygments itself.\n\n---\n\n## Recommendations\n\n### For Application Developers Using Pygments\n\n1. **Treat all user-supplied code as untrusted.**\n   - Run Pygments in a constrained environment if you are highlighting arbitrary code from the internet.\n\n2. **Validate configuration options exposed to users.**\n   - If you allow users to choose lexers, styles, or output formats, map their choices to a **fixed whitelist** of known identifiers.\n   - Do not pass raw user strings into any Pygments API that might influence file paths or command-line arguments.\n\n3. **Embed HTML output safely.**\n   - Insert Pygments HTML into `<pre><code>...</code></pre>` or similar safe containers.\n   - Avoid using Pygments output directly in JavaScript contexts, event handlers, or unquoted attributes.\n\n4. **Avoid shelling out to `pygmentize` with untrusted arguments.**\n   - Prefer using the Python API directly.\n   - If you must use the CLI, construct argument lists safely (no shell=True) and validate all user-controlled parameters.\n\n### For Pygments Maintainers\n\n1. **Document security considerations clearly.**\n   - Highlight that Pygments is not a sandbox and that callers must treat highlighted code as untrusted.\n   - Document any formatter options that influence external commands.\n\n2. **Continue to avoid unsafe primitives.**\n   - Maintain the current practice of not using `pickle`, `yaml.load`, or similar unsafe deserialization in the library.\n   - Prefer `subprocess` with `shell=False` and argument lists where external tools are required.\n\n3. **Optional hardening:**\n   - Where feasible, constrain or validate formatter options that are used to build command lines.\n   - Add type/enum checks for options that map to external tool parameters.\n\n---\n\n## Classification\n\n- **Package type:** Library (with CLI tool)\n- **Primary layer:**\n  - Application / Presentation layer (syntax highlighting, HTML/markup generation)\n  - Developer tooling (CLI `pygmentize`)\n\nNo critical or high-severity vulnerabilities were confirmed in this analysis of Pygments 2.19.2. The identified patterns are primarily **security-relevant design aspects** that require careful use by consuming applications rather than defects in the library itself.",
+ "package_classification": {
+  "type": "library",
+  "layer": [
+   "application",
+   "cli_tool",
+   "dev_tool"
+  ]
+ },
+ "tool_calls": {
+  "get_package_profile_info": 1,
+  "execute_codeql_query": 17,
+  "validate_codeql_query": 0,
+  "fixup_codeql_query": 3,
+  "finalize_report": 1
+ },
+ "queries_executed": {
+  "critical": 1,
+  "high": 6,
+  "medium": 6,
+  "low": 0,
+  "total_executed": 20,
+  "total_with_results": 13,
+  "total_failed": 5
+ },
+ "query_findings": {
+  "critical": 0,
+  "high": 2,
+  "medium": 2,
+  "low": 0,
+  "total": 4
+ },
+ "findings": [
+  {
+   "codeql_query_uuid": "20251219025950",
+   "codeql_raw_query": "/**\n * @name Code injection via eval/exec\n * @description Using eval or exec with untrusted input can lead to arbitrary code execution\n * @kind path-problem\n * @problem.severity error\n * @id py/code-injection-eval-exec\n * @tags security\n *        external/cwe/cwe-094\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.dataflow.new.RemoteFlowSources\nimport semmle.python.Concepts\n\nmodule CodeInjectionConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    source instanceof RemoteFlowSource\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(CodeExecution ce |\n      sink = ce.getCode()\n    )\n  }\n}\n\nmodule CodeInjectionFlow = TaintTracking::Global<CodeInjectionConfig>;\nimport CodeInjectionFlow::PathGraph\n\nfrom CodeInjectionFlow::PathNode source, CodeInjectionFlow::PathNode sink\nwhere CodeInjectionFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"Code injection from $@.\", source.getNode(), \"user input\"",
+   "hypothesis": "Untrusted data may reach eval/exec or similar dynamic code execution",
+   "severity": "critical",
+   "cwe_ids": [
+    "cwe-094"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251219030036",
+   "codeql_raw_query": "/**\n * @name HTML formatter XSS sinks\n * @description Find places where untrusted data may be embedded into HTML output by Pygments formatters.\n * @kind problem\n * @problem.severity warning\n * @id py/pygments-html-xss-sinks\n * @tags security\n *       external/cwe/cwe-079\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"pygments.formatters.html\").getAMember().getACall()\nselect call, \"Call into pygments.formatters.html that may participate in HTML generation. Review for XSS if inputs are untrusted.\"\n",
+   "hypothesis": "Identify potential XSS sinks in Pygments HTML formatter usage within the package itself.",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-079"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251219030058",
+   "codeql_raw_query": "/**\n * @name Pygments command execution sinks\n * @description Find uses of subprocess and os.system in Pygments that could be influenced by untrusted input.\n * @kind problem\n * @problem.severity warning\n * @id py/pygments-command-execution\n * @tags security\n *       external/cwe/cwe-078\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"subprocess\").getAMember().getACall() or\n  call = API::moduleImport(\"os\").getMember([\"system\", \"popen\"]).getACall()\nselect call, \"Use of system command execution API inside Pygments. Ensure arguments are not derived from untrusted input.\"",
+   "hypothesis": "Pygments may invoke system commands (e.g., for external tools) with user-influenced arguments, leading to command injection.",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-078"
+   ],
+   "results_count": 2,
+   "results": [
+    {
+     "ruleId": "py/pygments-command-execution",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pygments-command-execution",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of system command execution API inside Pygments. Ensure arguments are not derived from untrusted input."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pygments/lexers/_scilab_builtins.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 3061,
+         "startColumn": 13,
+         "endLine": 3062,
+         "endColumn": 77
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "1f60fd44922dc01a:1",
+      "primaryLocationStartColumnFingerprint": "4"
+     }
+    },
+    {
+     "ruleId": "py/pygments-command-execution",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pygments-command-execution",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of system command execution API inside Pygments. Ensure arguments are not derived from untrusted input."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pygments/formatters/img.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 93,
+         "startColumn": 16,
+         "endLine": 94,
+         "endColumn": 69
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "e7b93ff4c7caac08:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251219030142",
+   "codeql_raw_query": "/**\n * @name Pygments image formatter command execution\n * @description Detect use of external image conversion tools in pygments.formatters.img.ImageFormatter.\n * @kind problem\n * @problem.severity warning\n * @id py/pygments-img-command-execution\n * @tags security\n *       external/cwe/cwe-078\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"pygments.formatters.img\").getAMember().getACall()\nselect call, \"Call in pygments.formatters.img that may invoke external commands. Review arguments for safety.\"",
+   "hypothesis": "Pygments image formatter may invoke external commands (e.g., convert) with user-influenced arguments, leading to command injection.",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-078"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251219030209",
+   "codeql_raw_query": "/**\n * @name Pygments image formatter command execution\n * @description Detect use of external image conversion tools in pygments.formatters.img.ImageFormatter.\n * @kind problem\n * @problem.severity warning\n * @id py/pygments-img-command-execution\n * @tags security\n *       external/cwe/cwe-078\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"pygments.formatters.img\").getAMember().getACall()\nselect call, \"Call in pygments.formatters.img that may invoke external commands. Review arguments for untrusted input usage.\"",
+   "hypothesis": "Pygments ImageFormatter may invoke external commands (e.g., convert) with user-influenced arguments, leading to command injection.",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-078"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251219030229",
+   "codeql_raw_query": "/**\n * @name Pygments CLI subprocess usage\n * @description Find subprocess or os.system calls in pygments.cmdline.\n * @kind problem\n * @problem.severity warning\n * @id py/pygments-cli-subprocess\n * @tags security\n *       external/cwe/cwe-078\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"pygments.cmdline\").getAMember().getACall()\nselect call, \"Call in pygments.cmdline; review for unsafe subprocess or os.system usage with untrusted input.\"",
+   "hypothesis": "Pygments CLI may use subprocess or os.system with user-controlled arguments.",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-078"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251219030258",
+   "codeql_raw_query": "/**\n * @name Pygments image formatter command execution\n * @description Detect use of external image conversion tools in pygments.formatters.img.ImageFormatter.\n * @kind problem\n * @problem.severity warning\n * @id py/pygments-img-formatter-command-exec\n * @tags security\n *       external/cwe/cwe-078\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"pygments.formatters.img\").getAMember().getACall()\nselect call, \"Call in pygments.formatters.img that may invoke external commands. Review arguments for safety.\"",
+   "hypothesis": "Pygments image formatter may invoke external commands (e.g., convert) with user-influenced arguments.",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-078"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251219030315",
+   "codeql_raw_query": "/**\n * @name Pygments CLI subprocess usage\n * @description Find subprocess or os.system calls in pygments.cmdline.\n * @kind problem\n * @problem.severity warning\n * @id py/pygments-cli-subprocess\n * @tags security\n *       external/cwe/cwe-078\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"subprocess\").getMember([\"Popen\", \"call\", \"run\", \"check_call\", \"check_output\"]).getACall() or\n  call = API::moduleImport(\"os\").getMember([\"system\", \"popen\"]).getACall()\nselect call, \"Use of subprocess or os.system. Ensure arguments are not derived from untrusted input.\"",
+   "hypothesis": "Pygments CLI or helpers may spawn subprocesses with user-controlled arguments.",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-078"
+   ],
+   "results_count": 2,
+   "results": [
+    {
+     "ruleId": "py/pygments-cli-subprocess",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pygments-cli-subprocess",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of subprocess or os.system. Ensure arguments are not derived from untrusted input."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pygments/lexers/_scilab_builtins.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 3061,
+         "startColumn": 13,
+         "endLine": 3062,
+         "endColumn": 77
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "1f60fd44922dc01a:1",
+      "primaryLocationStartColumnFingerprint": "4"
+     }
+    },
+    {
+     "ruleId": "py/pygments-cli-subprocess",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pygments-cli-subprocess",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of subprocess or os.system. Ensure arguments are not derived from untrusted input."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pygments/formatters/img.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 93,
+         "startColumn": 16,
+         "endLine": 94,
+         "endColumn": 69
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "e7b93ff4c7caac08:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251219030343",
+   "codeql_raw_query": "/**\n * @name Pygments HTML formatter unescaped insertion points\n * @description Identify locations in pygments.formatters.html where raw values are written to HTML output without escaping.\n * @kind problem\n * @problem.severity warning\n * @id py/pygments-html-unescaped-output\n * @tags security\n *       external/cwe/cwe-079\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"pygments.formatters.html\").getMember([\"HtmlFormatter\", \"WebLexer\", \"format\"]).getACall()\nselect call, \"Potential unescaped value written into HTML output. Ensure proper escaping of user-controlled data.\"",
+   "hypothesis": "HTML formatter may write unescaped values into HTML output, leading to XSS if inputs are attacker-controlled.",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-079"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251219030404",
+   "codeql_raw_query": "/**\n * @name Pygments CLI unsafe file overwrite\n * @description Detect file writes in pygments.cmdline that may overwrite arbitrary files if paths are attacker-controlled.\n * @kind problem\n * @problem.severity warning\n * @id py/pygments-cli-file-overwrite\n * @tags security\n *       external/cwe/cwe-073\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"pygments.cmdline\").getAMember().getACall()\nselect call, \"File operation in pygments.cmdline. Ensure output paths are validated and not attacker-controlled.\"",
+   "hypothesis": "pygmentize CLI may allow overwriting arbitrary files via attacker-controlled output paths.",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-073"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251219030431",
+   "codeql_raw_query": "/**\n * @name Pygments HTML formatter unescaped HTML output\n * @description Detect direct writes of potentially unescaped data into HTML output in pygments.formatters.html\n * @kind problem\n * @problem.severity warning\n * @id py/pygments-html-unescaped-output\n * @tags security\n *       external/cwe/cwe-079\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"pygments.formatters.html\").getMember([\"HtmlFormatter\", \"format\", \"_wrap_full\", \"_wrap_table\", \"_wrap_div\"]).getACall()\nselect call, \"Call in pygments.formatters.html that participates in HTML generation. Review for proper escaping of inputs.\"",
+   "hypothesis": "HTML formatter may write unescaped content leading to XSS if consumers misuse it with untrusted input.",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-079"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251219030526",
+   "codeql_raw_query": "/**\n * @name Pygments unsafe deserialization\n * @description Detect use of pickle, yaml.load, or marshal in Pygments that could deserialize untrusted data.\n * @kind problem\n * @problem.severity warning\n * @id py/pygments-unsafe-deserialization\n * @tags security\n *       external/cwe/cwe-502\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport([\"pickle\", \"yaml\", \"marshal\"]).getAMember().getACall()\nselect call, \"Potential unsafe deserialization in Pygments. Ensure inputs are trusted.\"\n",
+   "hypothesis": "Pygments uses unsafe deserialization libraries like pickle, yaml.load, or marshal on potentially untrusted data.",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-502"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251219030620",
+   "codeql_raw_query": "/**\n * @name Pygments HTML formatter unescaped output\n * @description Detect direct writes of token values into HTML output without escaping.\n * @kind problem\n * @problem.severity warning\n * @id py/pygments-html-unescaped-output\n * @tags security\n *       external/cwe/cwe-079\n */\n\nimport python\n\nfrom Attribute attr\nwhere\n  attr.getObject() instanceof Name and\n  attr.getObject().(Name).getId() = \"self\" and\n  attr.getAttr() = \"outfile\"\nselect attr, \"Potential direct write to HTML output; ensure content is escaped.\"\n",
+   "hypothesis": "Potential XSS via unescaped writes to HTML output streams in Pygments formatters",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-79"
+   ],
+   "results_count": 0,
+   "results": []
+  }
+ ]
+}

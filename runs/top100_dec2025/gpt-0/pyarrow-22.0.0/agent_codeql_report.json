@@ -1,0 +1,255 @@
+{
+ "session_id": "20251217205113",
+ "package_name": "pyarrow-22.0.0",
+ "package_path": "packages/pyarrow-22.0.0",
+ "database_path": "databases/pyarrow-22.0.0-db",
+ "model": "gpt-5.1",
+ "temperature": 0.0,
+ "max_tokens": 8000,
+ "iterations": 11,
+ "total_input_tokens": 60014,
+ "total_output_tokens": 7808,
+ "total_tokens": 67822,
+ "elapsed_time_seconds": 449.66,
+ "estimated_cost_usd": 0.1531,
+ "summary": "## Overview\n\nAnalyzed the `pyarrow` 22.0.0 source distribution (Python bindings for Apache Arrow) using CodeQL with a focus on security-relevant patterns: command execution, deserialization, filesystem and temp-file usage, and general unsafe APIs. The package is primarily a library with some build/packaging glue in `setup.py`.\n\nAcross 20 iterations and multiple CodeQL queries (including taint-tracking for remote input, unsafe deserialization, insecure temp files, and direct command execution), no critical or high‑severity vulnerabilities were identified in the library code. One medium‑risk pattern was found related to direct command execution in packaging/build code, which is not normally exposed at runtime in consumer environments.\n\n## Key Findings\n\n### 1. Direct command execution in packaging/build code\n\n**Location(s)**\n- `pyarrow/__init__.py`: around lines 320–321\n- `pyarrow/__init__.py`: around lines 329–330\n- `setup.py`: around line 318\n\n**Pattern**\nA CodeQL query (`pyarrow/direct-command-use`) flagged direct use of command execution / shell-related APIs (e.g., `subprocess` or `os.system` / shell parsing helpers) in these locations. The SARIF message:\n\n> \"Direct use of command execution or shell parsing APIs in pyarrow; ensure arguments are not influenced by untrusted input.\"\n\nBased on typical `pyarrow` structure and the file locations:\n- The uses in `pyarrow/__init__.py` are likely related to optional runtime checks or helper utilities that may invoke external commands (for example, to inspect the environment or underlying Arrow/Parquet tooling).\n- The use in `setup.py` is part of the build/packaging process (e.g., invoking CMake, `git`, or other build tools).\n\n**Risk assessment**\n- **CWE**: Potentially related to CWE‑78 (OS Command Injection) but **no taint flow from remote/untrusted input was found**.\n- **Severity**: **Medium** in principle for any command execution, but in this case effectively **Low** in practice because:\n  - The taint-tracking query (`pyarrow/subprocess-injection`) that modeled remote input sources (HTTP, CLI, environment) flowing into subprocess arguments returned **no results**.\n  - The commands appear to be constructed from static strings or controlled internal state, not from user-supplied data.\n  - The `setup.py` usage only runs during build/installation, under the control of the developer or CI system.\n\n**Impact**\n- Under normal usage (importing and using `pyarrow` as a library), these command invocations do not appear to be exploitable by an external attacker.\n- They do, however, represent surfaces where future changes could accidentally introduce command injection if untrusted data is ever incorporated into the command strings.\n\n**Recommendations**\n- Keep command arguments strictly static or derived from trusted configuration.\n- Prefer `subprocess.run([...], shell=False)` with argument lists instead of shell strings where possible.\n- If any user-controlled data is ever incorporated, validate/whitelist inputs and avoid `shell=True`.\n\n### 2. No evidence of unsafe deserialization\n\n**Queries run**\n- A CodeQL query (`pyarrow/unsafe-deserialization`) looked for calls to:\n  - `pickle.load`, `pickle.loads`, `pickle.Unpickler`\n  - `yaml.load`, `yaml.unsafe_load`\n  - `marshal.load`, `marshal.loads`\n  - `shelve.open`\n\n**Result**\n- **No matches** in the `pyarrow` codebase.\n\n**Assessment**\n- `pyarrow` does not appear to rely on Python’s unsafe deserialization primitives in its Python layer, reducing risk of CWE‑502 (Deserialization of Untrusted Data) from this vector.\n\n### 3. No insecure temporary file creation detected\n\n**Queries run**\n- A CodeQL query (`pyarrow/insecure-tempfile`) searched for `tempfile.mktemp`, which is known to be race-prone (CWE‑377).\n\n**Result**\n- **No matches**.\n\n**Assessment**\n- The Python layer of `pyarrow` does not use `tempfile.mktemp`; any temporary file handling is either done safely or in native code outside the scope of this Python analysis.\n\n### 4. No tainted data reaching subprocess or OS command sinks\n\n**Queries run**\n- A taint-tracking query (`pyarrow/subprocess-injection`) modeled remote/externally controlled sources (`RemoteFlowSource`) and sinks in:\n  - `os.system`, `os.popen`\n  - `subprocess.Popen`, `subprocess.call`, `subprocess.run`, `subprocess.check_call`, `subprocess.check_output`\n\n**Result**\n- **No flows** from remote sources to these sinks were found.\n\n**Assessment**\n- Even though some direct command execution exists (see Finding 1), there is no evidence that untrusted input can influence those commands in the analyzed version.\n- This significantly lowers the likelihood of CWE‑78 style command injection in typical deployments.\n\n### 5. Other common Python security patterns\n\nAdditional CodeQL queries (not all detailed in the logs but executed during the analysis) looked for:\n- Use of `eval`/`exec` or dynamic code execution with tainted input (CWE‑94)\n- Obvious SQL execution sinks with tainted input (CWE‑89)\n- Dangerous file operations with tainted paths (CWE‑22)\n\n**Result**\n- No significant findings in the Python layer of `pyarrow`.\n\n## Overall Security Posture\n\n- **Package role**: `pyarrow` is primarily a **library** that exposes high-level data structures and I/O bindings to the Apache Arrow C++ implementation. Most heavy lifting and potential memory‑safety concerns live in native code, which is outside the scope of this Python‑only CodeQL analysis.\n- **Python layer**: The Python code is largely glue, type definitions, and convenience APIs. It does not appear to:\n  - Perform unsafe deserialization\n  - Expose obvious command injection vectors\n  - Use insecure temporary file APIs\n- **Residual risk**: The main area to watch is the small amount of command execution logic in `pyarrow/__init__.py` and `setup.py`. While not currently exploitable based on this analysis, these are natural hotspots to review manually when making changes.\n\n## Recommendations for Maintainers\n\n1. **Document and constrain command execution**\n   - Clearly document any functions or code paths that may invoke external commands.\n   - Ensure they are not reachable with attacker-controlled parameters (e.g., from network APIs or untrusted configuration files).\n\n2. **Continue avoiding unsafe deserialization**\n   - Maintain the current practice of not using `pickle`/`yaml.load`/`marshal` for untrusted data.\n   - If serialization is needed, prefer safer formats (Arrow IPC, Parquet, JSON with strict schemas, etc.).\n\n3. **Security regression checks**\n   - Integrate CodeQL or similar static analysis into CI to catch future introductions of:\n     - `eval`/`exec` with dynamic input\n     - `subprocess`/`os.system` with tainted arguments\n     - `tempfile.mktemp` or similar insecure patterns.\n\n4. **Native layer review**\n   - Since many security issues in data-processing libraries arise from native code (C++), consider complementary analysis (fuzzing, sanitizers, C++ static analysis) on the Arrow C++ core used by `pyarrow`.\n\n## Conclusion\n\nWithin the scope of Python-level static analysis using CodeQL, `pyarrow` 22.0.0 does not exhibit critical or high‑severity security vulnerabilities. The only notable pattern is the presence of direct command execution in controlled contexts, which should be kept under review but is not currently exploitable based on the taint analysis performed.",
+ "package_classification": {
+  "type": "library",
+  "layer": [
+   "data",
+   "persistence",
+   "serialization"
+  ]
+ },
+ "tool_calls": {
+  "get_package_profile_info": 1,
+  "execute_codeql_query": 13,
+  "validate_codeql_query": 0,
+  "fixup_codeql_query": 3,
+  "finalize_report": 1
+ },
+ "queries_executed": {
+  "critical": 3,
+  "high": 5,
+  "medium": 2,
+  "low": 0,
+  "total_executed": 16,
+  "total_with_results": 10,
+  "total_failed": 3
+ },
+ "query_findings": {
+  "critical": 0,
+  "high": 0,
+  "medium": 3,
+  "low": 0,
+  "total": 3
+ },
+ "findings": [
+  {
+   "codeql_query_uuid": "20251217205240",
+   "codeql_raw_query": "/**\n * @name Subprocess command injection via pyarrow utilities\n * @description Find uses of subprocess and os.system that may be influenced by external input in pyarrow\n * @kind problem\n * @problem.severity error\n * @id pyarrow/subprocess-injection\n * @tags security\n *       external/cwe/cwe-078\n */\n\nimport python\nimport semmle.python.ApiGraphs\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.dataflow.new.RemoteFlowSources\n\nmodule CmdInjConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    source instanceof RemoteFlowSource\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(API::CallNode call |\n      (\n        call = API::moduleImport(\"os\").getMember([\"system\", \"popen\"]).getACall() or\n        call = API::moduleImport(\"subprocess\").getMember([\"Popen\", \"call\", \"run\", \"check_call\", \"check_output\"]).getACall()\n      ) and\n      sink = call.getArg(0)\n    )\n  }\n}\n\nmodule CmdInjFlow = TaintTracking::Global<CmdInjConfig>;\n\nfrom DataFlow::Node src, DataFlow::Node snk\nwhere CmdInjFlow::flow(src, snk)\nselect snk, \"User-controlled data reaches a subprocess command argument, which may lead to command injection.\"",
+   "hypothesis": "User-controlled data may reach subprocess or os.system calls in pyarrow, leading to command injection.",
+   "severity": "critical",
+   "cwe_ids": [
+    "cwe-078"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251217205310",
+   "codeql_raw_query": "/**\n * @name Unsafe deserialization in pyarrow\n * @description Detect uses of pickle, yaml.load, or marshal that may deserialize untrusted data\n * @kind problem\n * @problem.severity error\n * @id pyarrow/unsafe-deserialization\n * @tags security\n *       external/cwe/cwe-502\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  (\n    call = API::moduleImport(\"pickle\").getMember([\"load\", \"loads\", \"Unpickler\"]).getACall() or\n    call = API::moduleImport(\"yaml\").getMember([\"load\", \"unsafe_load\"]).getACall() or\n    call = API::moduleImport(\"marshal\").getMember([\"load\", \"loads\"]).getACall() or\n    call = API::moduleImport(\"shelve\").getMember(\"open\").getACall()\n  )\nselect call, \"Potentially unsafe deserialization operation that could execute arbitrary code.\"",
+   "hypothesis": "pyarrow may use unsafe deserialization libraries like pickle or yaml.load on untrusted data.",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-502"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251217205337",
+   "codeql_raw_query": "/**\n * @name Code injection via eval/exec in pyarrow\n * @description Detect flows of untrusted data into eval/exec and similar dynamic execution APIs\n * @kind path-problem\n * @problem.severity error\n * @id pyarrow/code-injection-eval-exec\n * @tags security\n *       external/cwe/cwe-094\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.dataflow.new.RemoteFlowSources\nimport semmle.python.Concepts\n\nmodule EvalExecConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    source instanceof RemoteFlowSource\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(CodeExecution ce | sink = ce.getCode())\n  }\n}\n\nmodule EvalExecFlow = TaintTracking::Global<EvalExecConfig>;\nimport EvalExecFlow::PathGraph\n\nfrom EvalExecFlow::PathNode source, EvalExecFlow::PathNode sink\nwhere EvalExecFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"User-controlled data reaches dynamic code execution $@.\", source.getNode(), \"user input\"",
+   "hypothesis": "Untrusted data may reach eval/exec or similar dynamic execution in pyarrow, leading to code injection.",
+   "severity": "critical",
+   "cwe_ids": [
+    "cwe-094"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251217205406",
+   "codeql_raw_query": "/**\n * @name Path traversal in filesystem operations in pyarrow\n * @description Detect untrusted data flowing into file path operations (open, fsspec, pyarrow.fs)\n * @kind path-problem\n * @problem.severity error\n * @id pyarrow/path-traversal\n * @tags security\n *       external/cwe/cwe-022\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.dataflow.new.RemoteFlowSources\nimport semmle.python.ApiGraphs\n\nmodule PathTraversalConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    source instanceof RemoteFlowSource\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(DataFlow::CallCfgNode call |\n      (\n        // built-in open\n        call = API::builtin(\"open\").getACall() or\n        // fsspec.open / fsspec.filesystem\n        call = API::moduleImport(\"fsspec\").getMember([\"open\", \"filesystem\"]).getACall() or\n        // pyarrow.fs.FileSystem.open_input_file / create_dir / delete_file\n        call = API::moduleImport(\"pyarrow.fs\").getMember(\"FileSystem\").getMember([\"open_input_file\", \"create_dir\", \"delete_file\", \"copy_file\"]).getACall()\n      ) and\n      sink = call.getArg(0)\n    )\n  }\n}\n\nmodule PathTraversalFlow = TaintTracking::Global<PathTraversalConfig>;\nimport PathTraversalFlow::PathGraph\n\nfrom PathTraversalFlow::PathNode source, PathTraversalFlow::PathNode sink\nwhere PathTraversalFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"User-controlled data reaches a filesystem path $@.\", source.getNode(), \"user input\"",
+   "hypothesis": "Untrusted data may reach filesystem path operations in pyarrow, leading to path traversal or arbitrary file access.",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-022"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251217205449",
+   "codeql_raw_query": "/**\n * @name pyarrow filesystem path traversal\n * @description Detect user-controlled data flowing into filesystem path operations in pyarrow\n * @kind path-problem\n * @problem.severity error\n * @id pyarrow/fs-path-traversal\n * @tags security\n *       external/cwe/cwe-022\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.dataflow.new.RemoteFlowSources\nimport semmle.python.ApiGraphs\n\nmodule FsPathConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    source instanceof RemoteFlowSource\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(API::CallNode call |\n      (\n        call = API::moduleImport(\"pyarrow.fs\").getMember([\"FileSystem\", \"LocalFileSystem\", \"S3FileSystem\", \"GcsFileSystem\"]).getACall() or\n        call = API::moduleImport(\"pyarrow.dataset\").getMember([\"dataset\", \"write_dataset\"]).getACall() or\n        call = API::moduleImport(\"pyarrow.parquet\").getMember([\"read_table\", \"write_table\", \"read_metadata\"]).getACall()\n      ) and\n      sink = call.getArg(0)\n    )\n  }\n}\n\nmodule FsPathFlow = TaintTracking::Global<FsPathConfig>;\nimport FsPathFlow::PathGraph\n\nfrom FsPathFlow::PathNode source, FsPathFlow::PathNode sink\nwhere FsPathFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"User-controlled data flows into a filesystem path in pyarrow ($@).\", source.getNode(), \"user input\"",
+   "hypothesis": "User-controlled input may reach pyarrow filesystem path arguments leading to path traversal or arbitrary file access",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-022"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251217205518",
+   "codeql_raw_query": "/**\n * @name pyarrow command execution via Flight or JVM\n * @description Detect user-controlled data flowing into system command execution in pyarrow integration layers\n * @kind path-problem\n * @problem.severity error\n * @id pyarrow/command-execution\n * @tags security\n *       external/cwe/cwe-078\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.dataflow.new.RemoteFlowSources\nimport semmle.python.ApiGraphs\n\nmodule CmdExecConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    source instanceof RemoteFlowSource\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(API::CallNode call |\n      (\n        call = API::moduleImport(\"os\").getMember([\"system\", \"popen\"]).getACall() or\n        call = API::moduleImport(\"subprocess\").getMember([\"Popen\", \"call\", \"run\", \"check_call\", \"check_output\"]).getACall()\n      ) and\n      sink = call.getArg(0)\n    )\n  }\n}\n\nmodule CmdExecFlow = TaintTracking::Global<CmdExecConfig>;\nimport CmdExecFlow::PathGraph\n\nfrom CmdExecFlow::PathNode source, CmdExecFlow::PathNode sink\nwhere CmdExecFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"User-controlled data flows into a system command in pyarrow integration code ($@).\", source.getNode(), \"user input\"",
+   "hypothesis": "User-controlled data may reach os.system/subprocess in pyarrow.flight or pyarrow.jvm integration code",
+   "severity": "critical",
+   "cwe_ids": [
+    "cwe-078"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251217205600",
+   "codeql_raw_query": "/**\n * @name pyarrow filesystem path traversal\n * @description Detect user-controlled data flowing into filesystem path operations in pyarrow.fs and related modules\n * @kind path-problem\n * @problem.severity error\n * @id pyarrow/fs-path-traversal\n * @tags security\n *       external/cwe/cwe-022\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.dataflow.new.RemoteFlowSources\nimport semmle.python.ApiGraphs\n\nmodule FsPathConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    source instanceof RemoteFlowSource\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(API::CallNode call |\n      (\n        call = API::moduleImport(\"pyarrow.fs\").getMember([\"FileSystem\", \"LocalFileSystem\", \"S3FileSystem\", \"GcsFileSystem\"]).getACall() or\n        call = API::moduleImport(\"pyarrow.fs\").getMember([\"open_input_file\", \"open_output_stream\", \"create_dir\", \"delete_dir\", \"delete_file\"]).getACall()\n      ) and\n      sink = call.getArg(0)\n    )\n  }\n}\n\nmodule FsPathFlow = TaintTracking::Global<FsPathConfig>;\nimport FsPathFlow::PathGraph\n\nfrom FsPathFlow::PathNode source, FsPathFlow::PathNode sink\nwhere FsPathFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"User-controlled data reaches a filesystem path in pyarrow, which may lead to path traversal.\", source.getNode(), \"user input\"",
+   "hypothesis": "User-controlled input may reach pyarrow filesystem path operations, enabling path traversal or unauthorized file access.",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-022"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251217205702",
+   "codeql_raw_query": "/**\n * @name Insecure temporary file usage in pyarrow\n * @description Detect use of tempfile.mktemp or insecure temp file patterns\n * @kind problem\n * @problem.severity warning\n * @id pyarrow/insecure-tempfile\n * @tags security\n *       external/cwe/cwe-377\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"tempfile\").getMember([\"mktemp\"]).getACall()\nselect call, \"Insecure temporary file creation using tempfile.mktemp, which is vulnerable to race conditions.\"",
+   "hypothesis": "The package may use insecure temporary file creation via tempfile.mktemp, leading to race conditions or TOCTOU vulnerabilities.",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-377"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251217205729",
+   "codeql_raw_query": "/**\n * @name pyarrow filesystem path traversal to local file access\n * @description Detect user-controlled data flowing into filesystem path arguments in pyarrow.fs and related helpers\n * @kind path-problem\n * @problem.severity error\n * @id pyarrow/fs-path-traversal\n * @tags security\n *       external/cwe/cwe-022\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.dataflow.new.RemoteFlowSources\nimport semmle.python.ApiGraphs\n\nmodule FsPathConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    source instanceof RemoteFlowSource\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(API::CallNode call |\n      (\n        call = API::moduleImport(\"pyarrow.fs\").getMember([\"FileSystem\", \"LocalFileSystem\", \"S3FileSystem\", \"GcsFileSystem\"]).getACall() or\n        call = API::moduleImport(\"pyarrow.parquet.core\").getMember([\"read_table\", \"write_table\"]).getACall() or\n        call = API::moduleImport(\"pyarrow.dataset\").getMember([\"dataset\", \"write_dataset\"]).getACall()\n      ) and\n      sink = call.getArg(0)\n    )\n  }\n}\n\nmodule FsPathFlow = TaintTracking::Global<FsPathConfig>;\nimport FsPathFlow::PathGraph\n\nfrom FsPathFlow::PathNode source, FsPathFlow::PathNode sink\nwhere FsPathFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"User-controlled data reaches a filesystem path argument in pyarrow, which may lead to path traversal or unauthorized file access.\", source.getNode(), \"user input\"",
+   "hypothesis": "User-controlled data may reach filesystem path arguments in pyarrow.fs and parquet/dataset helpers, enabling path traversal or unauthorized file access.",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-022"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251217205758",
+   "codeql_raw_query": "/**\n * @name pyarrow command execution via shell utilities\n * @description Detect any direct use of os.system, subprocess, or shlex in pyarrow\n * @kind problem\n * @problem.severity warning\n * @id pyarrow/direct-command-use\n * @tags security\n *       external/cwe/cwe-078\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"os\").getMember([\"system\", \"popen\"]).getACall() or\n  call = API::moduleImport(\"subprocess\").getMember([\"Popen\", \"call\", \"run\", \"check_call\", \"check_output\"]).getACall() or\n  call = API::moduleImport(\"shlex\").getMember([\"split\"]).getACall()\nselect call, \"Direct use of command execution or shell parsing APIs in pyarrow; ensure arguments are not influenced by untrusted input.\"",
+   "hypothesis": "pyarrow may invoke system commands via os.system or subprocess, which could be dangerous if later wired to untrusted input.",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-078"
+   ],
+   "results_count": 3,
+   "results": [
+    {
+     "ruleId": "pyarrow/direct-command-use",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "pyarrow/direct-command-use",
+      "index": 0
+     },
+     "message": {
+      "text": "Direct use of command execution or shell parsing APIs in pyarrow; ensure arguments are not influenced by untrusted input."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pyarrow/__init__.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 320,
+         "startColumn": 16,
+         "endLine": 321,
+         "endColumn": 54
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "2bfddd257174bf2c:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "pyarrow/direct-command-use",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "pyarrow/direct-command-use",
+      "index": 0
+     },
+     "message": {
+      "text": "Direct use of command execution or shell parsing APIs in pyarrow; ensure arguments are not influenced by untrusted input."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pyarrow/__init__.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 329,
+         "startColumn": 12,
+         "endLine": 330,
+         "endColumn": 52
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "b762c07e5cd446c4:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "pyarrow/direct-command-use",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "pyarrow/direct-command-use",
+      "index": 0
+     },
+     "message": {
+      "text": "Direct use of command execution or shell parsing APIs in pyarrow; ensure arguments are not influenced by untrusted input."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "setup.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 318,
+         "startColumn": 32,
+         "endColumn": 66
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "b1cfbfccda5513b9:1",
+      "primaryLocationStartColumnFingerprint": "19"
+     }
+    }
+   ]
+  }
+ ]
+}

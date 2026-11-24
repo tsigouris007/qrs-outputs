@@ -1,0 +1,427 @@
+{
+ "session_id": "20251219220126",
+ "package_name": "s3transfer-0.14.0",
+ "package_path": "packages/s3transfer-0.14.0",
+ "database_path": "databases/s3transfer-0.14.0-db",
+ "model": "gemini/gemini-3-pro-preview",
+ "temperature": 0.0,
+ "max_tokens": 8000,
+ "iterations": 17,
+ "total_input_tokens": 137307,
+ "total_output_tokens": 23610,
+ "total_tokens": 160917,
+ "elapsed_time_seconds": 645.04,
+ "estimated_cost_usd": 0.5579,
+ "summary": "Security analysis of `s3transfer` (v0.14.0) revealed no critical vulnerabilities. The analysis focused on common vulnerability classes including injection, deserialization, and cryptographic weaknesses.\n\n**Key Findings:**\n\n1.  **Potential Unsafe Deserialization (CWE-502):**\n    -   The analysis identified usage of `multiprocessing` primitives (Queues) in `s3transfer/processpool.py` (lines 314-315). Python's `multiprocessing` relies on `pickle` for serialization between processes. While `pickle` is inherently unsafe if used with untrusted data, this usage appears to be for internal inter-process communication (IPC) within the library's process pool manager. Unless an attacker can already manipulate the IPC channel, this risk is low.\n\n2.  **Weak Randomness (CWE-338):**\n    -   Calls to the standard `random` module were found in `s3transfer/__init__.py` (line 160) and `s3transfer/utils.py` (line 54). These appear to be used for calculating exponential backoff/jitter for retries, which is a non-cryptographic use case. This is considered acceptable practice for this context.\n\n**Other Checks:**\n-   **Command Injection (CWE-78):** No evidence of OS command execution with user input was found.\n-   **Path Traversal (CWE-22):** No unsafe file handling patterns were detected.\n-   **Hardcoded Credentials (CWE-798):** No hardcoded secrets were identified.\n-   **XML External Entity (CWE-611):** No unsafe XML parsing was found.\n\nThe package appears to follow standard practices for a transfer manager library, with the identified findings being typical for internal concurrency management and retry logic.",
+ "package_classification": {
+  "type": [
+   "Library"
+  ],
+  "layer": [
+   "Middleware",
+   "Network"
+  ]
+ },
+ "tool_calls": {
+  "get_package_profile_info": 1,
+  "execute_codeql_query": 25,
+  "validate_codeql_query": 0,
+  "fixup_codeql_query": 1,
+  "finalize_report": 1
+ },
+ "queries_executed": {
+  "critical": 0,
+  "high": 3,
+  "medium": 14,
+  "low": 5,
+  "total_executed": 26,
+  "total_with_results": 23,
+  "total_failed": 2
+ },
+ "query_findings": {
+  "critical": 0,
+  "high": 0,
+  "medium": 2,
+  "low": 2,
+  "total": 4
+ },
+ "findings": [
+  {
+   "codeql_query_uuid": "20251219220143",
+   "codeql_raw_query": "/**\n * @name Potential Path Traversal\n * @description Detects file opens where the path might be controlled by external input (e.g. S3 key).\n * @kind path-problem\n * @problem.severity error\n * @id py/s3transfer-path-traversal\n * @tags security\n *       external/cwe/cwe-022\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.Concepts\n\nmodule PathTraversalConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    // Consider parameters of public methods in download/manager as potential sources\n    // This is a heuristic since we don't have a web app context.\n    exists(Function f |\n      f.getName() in [\"download\", \"download_file\", \"download_fileobj\"] and\n      source.(DataFlow::ParameterNode).getParameter() = f.getArgByName(\"key\")\n    )\n    or\n    exists(Function f |\n        f.getName() in [\"download\", \"download_file\", \"download_fileobj\"] and\n        source.(DataFlow::ParameterNode).getParameter() = f.getArgByName(\"bucket\")\n    )\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    sink = any(FileSystemAccess fa).getAPathArgument()\n  }\n}\n\nmodule PathTraversalFlow = TaintTracking::Global<PathTraversalConfig>;\nimport PathTraversalFlow::PathGraph\n\nfrom PathTraversalFlow::PathNode source, PathTraversalFlow::PathNode sink\nwhere PathTraversalFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"Potential path traversal from $@.\", source.getNode(), \"S3 key/bucket\"\n",
+   "hypothesis": "S3 keys or bucket names might be used to construct file paths without sanitization, leading to path traversal.",
+   "severity": "high",
+   "cwe_ids": [
+    "CWE-22"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251219220203",
+   "codeql_raw_query": "/**\n * @name Unsafe Deserialization\n * @description Detects usage of pickle or other unsafe deserialization methods.\n * @kind problem\n * @problem.severity error\n * @id py/unsafe-deserialization\n * @tags security\n *       external/cwe/cwe-502\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  (\n    call = API::moduleImport(\"pickle\").getMember([\"load\", \"loads\", \"Unpickler\"]).getACall() or\n    call = API::moduleImport(\"yaml\").getMember([\"load\", \"unsafe_load\"]).getACall() or\n    call = API::moduleImport(\"marshal\").getMember([\"load\", \"loads\"]).getACall() or\n    call = API::moduleImport(\"shelve\").getMember(\"open\").getACall() or\n    call = API::moduleImport(\"dill\").getMember([\"load\", \"loads\"]).getACall()\n  )\nselect call, \"Potentially unsafe deserialization operation.\"\n",
+   "hypothesis": "The package might use unsafe deserialization (pickle) for IPC or state management.",
+   "severity": "medium",
+   "cwe_ids": [
+    "CWE-502"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251219220230",
+   "codeql_raw_query": "/**\n * @name Insecure temporary file creation\n * @description Creating temporary files with insecure permissions or using insecure functions like mktemp.\n * @kind problem\n * @problem.severity warning\n * @id py/insecure-temp-file\n * @tags security\n *       external/cwe/cwe-377\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"tempfile\").getMember(\"mktemp\").getACall()\nselect call, \"Usage of insecure function tempfile.mktemp.\"\n",
+   "hypothesis": "Usage of insecure tempfile.mktemp function.",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-377"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251219220244",
+   "codeql_raw_query": "/**\n * @name Unsafe deserialization\n * @description Deserializing untrusted data using pickle.\n * @kind problem\n * @problem.severity error\n * @id py/unsafe-deserialization\n * @tags security\n *       external/cwe/cwe-502\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"pickle\").getMember([\"load\", \"loads\"]).getACall()\nselect call, \"Potential unsafe deserialization using pickle.\"\n",
+   "hypothesis": "Unsafe deserialization using pickle.",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-502"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251219220315",
+   "codeql_raw_query": "/**\n * @name Time-of-check Time-of-use (TOCTOU)\n * @description Checking for file existence before opening it can lead to race conditions.\n * @kind problem\n * @problem.severity warning\n * @id py/toctou\n * @tags security\n *       external/cwe/cwe-367\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode check, DataFlow::CallCfgNode use\nwhere\n  (\n    check = API::moduleImport(\"os\").getMember(\"path\").getMember([\"exists\", \"isfile\", \"isdir\"]).getACall() or\n    check = API::moduleImport(\"pathlib\").getMember(\"Path\").getMember([\"exists\", \"is_file\", \"is_dir\"]).getACall()\n  )\n  and\n  (\n    use = API::builtin(\"open\").getACall() or\n    use = API::moduleImport(\"io\").getMember(\"open\").getACall() or\n    use = API::moduleImport(\"os\").getMember(\"open\").getACall()\n  )\n  and\n  DataFlow::localFlow(check.getArg(0), use.getArg(0))\nselect use, \"Potential TOCTOU race condition: File is checked at $@ before being used.\", check, \"here\"\n",
+   "hypothesis": "File access race condition (TOCTOU) where a file is checked for existence before being opened.",
+   "severity": "medium",
+   "cwe_ids": [
+    "CWE-367"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251219220332",
+   "codeql_raw_query": "/**\n * @name Sensitive information in logs\n * @description Logging sensitive information such as keys or tokens.\n * @kind problem\n * @problem.severity warning\n * @id py/sensitive-log\n * @tags security\n *       external/cwe/cwe-532\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode logCall, DataFlow::Node arg\nwhere\n  logCall = API::moduleImport(\"logging\").getMember([\"debug\", \"info\", \"warning\", \"error\", \"critical\", \"log\"]).getACall()\n  and\n  arg = logCall.getArg(_)\n  and\n  (\n    arg.asExpr().(StrConst).getText().regexpMatch(\"(?i).*(password|secret|token|key|auth|credential).*\")\n    or\n    exists(string s | s = arg.asExpr().(StrConst).getText() |\n      s.regexpMatch(\"(?i).*(password|secret|token|key|auth|credential).*\")\n    )\n  )\nselect logCall, \"Potential logging of sensitive information.\"\n",
+   "hypothesis": "Sensitive information (passwords, keys, tokens) might be written to log files.",
+   "severity": "low",
+   "cwe_ids": [
+    "CWE-532"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251219220400",
+   "codeql_raw_query": "/**\n * @name Time-of-check Time-of-use (TOCTOU)\n * @description Checking for file existence before opening it can lead to race conditions.\n * @kind problem\n * @problem.severity warning\n * @id py/toctou\n * @tags security\n *       external/cwe/cwe-367\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode check, DataFlow::CallCfgNode use\nwhere\n  (\n    check = API::moduleImport(\"os\").getMember(\"path\").getMember([\"exists\", \"isfile\", \"isdir\"]).getACall() or\n    check = API::moduleImport(\"pathlib\").getMember(\"Path\").getMember([\"exists\", \"is_file\", \"is_dir\"]).getACall()\n  ) and\n  (\n    use = API::builtin(\"open\").getACall() or\n    use = API::moduleImport(\"io\").getMember(\"open\").getACall() or\n    use = API::moduleImport(\"os\").getMember([\"open\", \"remove\", \"unlink\", \"rmdir\", \"rename\"]).getACall()\n  ) and\n  check.getArg(0).asExpr() = use.getArg(0).asExpr() and\n  check.getLocation().getFile() = use.getLocation().getFile() and\n  check.getLocation().getStartLine() < use.getLocation().getStartLine()\nselect use, \"Potential TOCTOU race condition: File is checked at $@ and then used here.\", check, \"check\"\n",
+   "hypothesis": "Race conditions checking file existence before usage.",
+   "severity": "medium",
+   "cwe_ids": [
+    "CWE-367"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251219220415",
+   "codeql_raw_query": "/**\n * @name Insertion of Sensitive Information into Log File\n * @description Logging sensitive information such as credentials or keys.\n * @kind problem\n * @problem.severity warning\n * @id py/sensitive-logging\n * @tags security\n *       external/cwe/cwe-532\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode logCall, DataFlow::Node arg\nwhere\n  logCall = API::moduleImport(\"logging\").getMember([\"debug\", \"info\", \"warning\", \"error\", \"critical\", \"exception\"]).getACall() and\n  arg = logCall.getArg(_) and\n  exists(string s |\n    s = arg.asExpr().(StrConst).getText() and\n    (\n      s.matches(\"%password%\") or\n      s.matches(\"%secret%\") or\n      s.matches(\"%key%\") or\n      s.matches(\"%token%\") or\n      s.matches(\"%auth%\")\n    )\n  )\nselect logCall, \"Potential logging of sensitive information.\"\n",
+   "hypothesis": "Logging of sensitive information like passwords or keys.",
+   "severity": "medium",
+   "cwe_ids": [
+    "CWE-532"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251219220445",
+   "codeql_raw_query": "/**\n * @name Time-of-check Time-of-use (TOCTOU)\n * @description Checking for file existence before opening it can lead to race conditions.\n * @kind problem\n * @problem.severity warning\n * @id py/toctou\n * @tags security\n *       external/cwe/cwe-367\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode check, DataFlow::CallCfgNode use\nwhere\n  (\n    check = API::moduleImport(\"os\").getMember(\"path\").getMember(\"exists\").getACall() or\n    check = API::moduleImport(\"os\").getMember(\"path\").getMember(\"isfile\").getACall()\n  ) and\n  use = API::builtin(\"open\").getACall() and\n  check.getArg(0).asExpr() = use.getArg(0).asExpr() and\n  check.getLocation().getFile() = use.getLocation().getFile() and\n  check.getLocation().getStartLine() < use.getLocation().getStartLine()\nselect use, \"Potential TOCTOU race condition with check at $@\", check, \"here\"",
+   "hypothesis": "Checking file existence before opening it creates a race condition window.",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-367"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251219220500",
+   "codeql_raw_query": "/**\n * @name Unsafe deserialization in multiprocessing\n * @description Using multiprocessing with unsafe serialization can be dangerous if data is untrusted.\n * @kind problem\n * @problem.severity warning\n * @id py/multiprocessing-pickle\n * @tags security\n *       external/cwe/cwe-502\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"multiprocessing\").getMember([\"Queue\", \"Pipe\", \"Manager\"]).getACall()\nselect call, \"Usage of multiprocessing primitives that rely on pickle serialization.\"",
+   "hypothesis": "Multiprocessing often uses pickle for IPC, which can be unsafe if untrusted data is passed.",
+   "severity": "low",
+   "cwe_ids": [
+    "cwe-502"
+   ],
+   "results_count": 2,
+   "results": [
+    {
+     "ruleId": "py/multiprocessing-pickle",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/multiprocessing-pickle",
+      "index": 0
+     },
+     "message": {
+      "text": "Usage of multiprocessing primitives that rely on pickle serialization."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "s3transfer/processpool.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 314,
+         "startColumn": 40,
+         "endColumn": 67
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "476bb85d5b34d7bd:1",
+      "primaryLocationStartColumnFingerprint": "31"
+     }
+    },
+    {
+     "ruleId": "py/multiprocessing-pickle",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/multiprocessing-pickle",
+      "index": 0
+     },
+     "message": {
+      "text": "Usage of multiprocessing primitives that rely on pickle serialization."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "s3transfer/processpool.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 315,
+         "startColumn": 30,
+         "endColumn": 57
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "17c24c7d615dd248:1",
+      "primaryLocationStartColumnFingerprint": "21"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251219220530",
+   "codeql_raw_query": "/**\n * @name Symlink attack\n * @description Opening a file without checking if it is a symlink can lead to accessing unintended files.\n * @kind problem\n * @problem.severity warning\n * @id py/symlink-attack\n * @tags security\n *       external/cwe/cwe-059\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n    call = API::moduleImport(\"os\").getMember(\"symlink\").getACall()\nselect call, \"Potential symlink creation.\"\n",
+   "hypothesis": "Improper Link Resolution Before File Access (Symlink Attack)",
+   "severity": "medium",
+   "cwe_ids": [
+    "CWE-59"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251219220545",
+   "codeql_raw_query": "/**\n * @name Insecure file permissions\n * @description Creating files with insecure permissions can allow unauthorized access.\n * @kind problem\n * @problem.severity warning\n * @id py/insecure-file-permissions\n * @tags security\n *       external/cwe/cwe-276\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n    call = API::moduleImport(\"os\").getMember(\"chmod\").getACall()\nselect call, \"File permission modification.\"\n",
+   "hypothesis": "Insecure File Permissions",
+   "severity": "medium",
+   "cwe_ids": [
+    "CWE-276"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251219220633",
+   "codeql_raw_query": "/**\n * @name Use of weak hashing algorithm\n * @description Using weak hashing algorithms like MD5 or SHA1 is insecure for collision resistance.\n * @kind problem\n * @problem.severity warning\n * @id py/weak-hashing\n * @tags security\n *       external/cwe/cwe-327\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"hashlib\").getMember([\"md5\", \"sha1\"]).getACall() or\n  call = API::moduleImport(\"cryptography\").getMember(\"hazmat\").getMember(\"primitives\").getMember(\"hashes\").getMember([\"MD5\", \"SHA1\"]).getACall()\nselect call, \"Usage of weak hashing algorithm.\"\n",
+   "hypothesis": "Usage of weak hashing algorithms (MD5, SHA1).",
+   "severity": "low",
+   "cwe_ids": [
+    "cwe-327"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251219220702",
+   "codeql_raw_query": "/**\n * @name Insecure temporary file creation\n * @description Calling tempfile.mktemp() is insecure as it allows a race condition.\n * @kind problem\n * @problem.severity error\n * @id py/insecure-temp-file\n * @tags security\n *       external/cwe/cwe-377\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"tempfile\").getMember(\"mktemp\").getACall()\nselect call, \"Call to deprecated and insecure tempfile.mktemp().\"",
+   "hypothesis": "Usage of insecure tempfile.mktemp function.",
+   "severity": "medium",
+   "cwe_ids": [
+    "CWE-377"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251219220715",
+   "codeql_raw_query": "/**\n * @name Improper Link Resolution Before File Access\n * @description Creation of symbolic links can lead to vulnerabilities if not handled correctly.\n * @kind problem\n * @problem.severity warning\n * @id py/symlink-creation\n * @tags security\n *       external/cwe/cwe-059\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"os\").getMember(\"symlink\").getACall()\nselect call, \"Creation of symbolic link.\"",
+   "hypothesis": "Unsafe creation of symbolic links.",
+   "severity": "low",
+   "cwe_ids": [
+    "CWE-59"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251219220803",
+   "codeql_raw_query": "/**\n * @name Weak Randomness\n * @description Use of random module for security-critical purposes.\n * @kind problem\n * @problem.severity warning\n * @id py/weak-randomness\n * @tags security\n *       external/cwe/cwe-330\n */\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"random\").getMember([\"random\", \"randint\", \"choice\", \"randrange\", \"uniform\"]).getACall()\nselect call, \"Usage of weak random number generator.\"",
+   "hypothesis": "Using the 'random' module for security-sensitive operations (like token generation) is insecure because it is not cryptographically strong.",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-330"
+   ],
+   "results_count": 2,
+   "results": [
+    {
+     "ruleId": "py/weak-randomness",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/weak-randomness",
+      "index": 0
+     },
+     "message": {
+      "text": "Usage of weak random number generator."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "s3transfer/__init__.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 160,
+         "startColumn": 20,
+         "endColumn": 51
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "5ffa55b4d8b60048:1",
+      "primaryLocationStartColumnFingerprint": "15"
+     }
+    },
+    {
+     "ruleId": "py/weak-randomness",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/weak-randomness",
+      "index": 0
+     },
+     "message": {
+      "text": "Usage of weak random number generator."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "s3transfer/utils.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 54,
+         "startColumn": 20,
+         "endColumn": 51
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "8d36242136edfd99:1",
+      "primaryLocationStartColumnFingerprint": "15"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251219220903",
+   "codeql_raw_query": "/**\n * @name Insecure temporary file creation\n * @description Creating a temporary file using insecure methods can lead to race conditions.\n * @kind problem\n * @problem.severity error\n * @id py/insecure-temp-file\n * @tags security\n *       external/cwe/cwe-377\n */\n\nimport python\nimport semmle.python.ApiGraphs\nimport semmle.python.dataflow.new.DataFlow\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"tempfile\").getMember(\"mktemp\").getACall() or\n  call = API::moduleImport(\"os\").getMember(\"tempnam\").getACall() or\n  call = API::moduleImport(\"os\").getMember(\"tmpnam\").getACall()\nselect call, \"Insecure temporary file creation.\"",
+   "hypothesis": "No hypothesis provided",
+   "severity": "N/A",
+   "cwe_ids": [],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251219220930",
+   "codeql_raw_query": "/**\n * @name XML External Entity (XXE)\n * @description Parsing untrusted XML with a vulnerable parser can lead to XXE.\n * @kind problem\n * @problem.severity error\n * @id py/xxe\n * @tags security\n *       external/cwe/cwe-611\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  (\n    call = API::moduleImport(\"xml\").getMember(\"etree\").getMember(\"ElementTree\").getMember(\"parse\").getACall() or\n    call = API::moduleImport(\"xml\").getMember(\"etree\").getMember(\"ElementTree\").getMember(\"fromstring\").getACall() or\n    call = API::moduleImport(\"lxml\").getMember(\"etree\").getMember(\"parse\").getACall() or\n    call = API::moduleImport(\"lxml\").getMember(\"etree\").getMember(\"fromstring\").getACall() or\n    call = API::moduleImport(\"xml\").getMember(\"dom\").getMember(\"minidom\").getMember(\"parse\").getACall() or\n    call = API::moduleImport(\"xml\").getMember(\"dom\").getMember(\"minidom\").getMember(\"parseString\").getACall() or\n    call = API::moduleImport(\"xml\").getMember(\"sax\").getMember(\"parse\").getACall() or\n    call = API::moduleImport(\"xml\").getMember(\"sax\").getMember(\"parseString\").getACall()\n  )\nselect call, \"Potential XML External Entity (XXE) vulnerability due to unsafe XML parsing.\"",
+   "hypothesis": "XML parsing without disabling external entities can lead to XXE.",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-611"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251219220944",
+   "codeql_raw_query": "/**\n * @name Insecure Temporary File Creation\n * @description Creating temporary files with insecure permissions or predictable names.\n * @kind problem\n * @problem.severity warning\n * @id py/insecure-temp-file\n * @tags security\n *       external/cwe/cwe-377\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  (\n    call = API::moduleImport(\"tempfile\").getMember(\"mktemp\").getACall() or\n    call = API::moduleImport(\"os\").getMember(\"tempnam\").getACall() or\n    call = API::moduleImport(\"os\").getMember(\"tmpnam\").getACall()\n  )\nselect call, \"Use of insecure temporary file creation function.\"",
+   "hypothesis": "Usage of insecure temporary file functions like mktemp.",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-377"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251219221034",
+   "codeql_raw_query": "/**\n * @name Time-of-check Time-of-use (TOCTOU)\n * @description Checking for file existence before opening it can lead to race conditions.\n * @kind problem\n * @problem.severity warning\n * @id py/toctou\n * @tags security\n *       external/cwe/cwe-367\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode check, DataFlow::CallCfgNode use, Variable v\nwhere\n  check = API::moduleImport(\"os\").getMember(\"path\").getMember(\"exists\").getACall() and\n  use = API::builtin(\"open\").getACall() and\n  check.getArg(0).asExpr() = v.getAnAccess() and\n  use.getArg(0).asExpr() = v.getAnAccess() and\n  check.getLocation().getStartLine() < use.getLocation().getStartLine() and\n  check.getScope() = use.getScope()\nselect use, \"Potential TOCTOU race condition with check at $@\", check, \"preceding check\"",
+   "hypothesis": "Race condition between file check and usage (TOCTOU).",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-367"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251219221047",
+   "codeql_raw_query": "/**\n * @name Insertion of Sensitive Information into Log File\n * @description Logging sensitive information such as passwords or keys can lead to information disclosure.\n * @kind problem\n * @problem.severity warning\n * @id py/sensitive-log\n * @tags security\n *       external/cwe/cwe-532\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call, DataFlow::Node arg\nwhere\n  call = API::moduleImport(\"logging\").getMember([\"debug\", \"info\", \"warning\", \"error\", \"critical\", \"log\"]).getACall() and\n  arg = call.getArg(_) and\n  exists(string name |\n    name = arg.asExpr().(Name).getId() and\n    (\n      name.matches(\"%password%\") or\n      name.matches(\"%secret%\") or\n      name.matches(\"%key%\") or\n      name.matches(\"%token%\") or\n      name.matches(\"%auth%\") or\n      name.matches(\"%cred%\")\n    )\n  )\nselect call, \"Potential logging of sensitive information via variable $@\", arg, arg.asExpr().(Name).getId()",
+   "hypothesis": "Logging of sensitive information like passwords or keys.",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-532"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251219221121",
+   "codeql_raw_query": "/**\n * @name Insertion of sensitive information into log files\n * @description Writing sensitive information to log files can allow attackers to gather information.\n * @kind problem\n * @problem.severity warning\n * @id py/log-sensitive-data\n * @tags security\n *       external/cwe/cwe-532\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call, DataFlow::Node arg\nwhere\n  call = API::moduleImport(\"logging\").getMember([\"debug\", \"info\", \"warning\", \"error\", \"critical\", \"exception\"]).getACall() and\n  arg = call.getArg(_) and\n  exists(string s |\n    s = arg.asExpr().(StrConst).getText() and\n    (\n      s.matches(\"%password%\") or\n      s.matches(\"%secret%\") or\n      s.matches(\"%key%\") or\n      s.matches(\"%token%\") or\n      s.matches(\"%auth%\")\n    )\n  )\nselect call, \"Potential logging of sensitive information.\"\n",
+   "hypothesis": "Logging of sensitive information like passwords or keys.",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-532"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251219221133",
+   "codeql_raw_query": "/**\n * @name Insecure file permissions\n * @description Creating files with insecure permissions can allow unauthorized access.\n * @kind problem\n * @problem.severity warning\n * @id py/insecure-file-permissions\n * @tags security\n *       external/cwe/cwe-732\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"os\").getMember(\"chmod\").getACall() and\n  exists(int mode |\n    mode = call.getArg(1).asExpr().(IntegerLiteral).getValue() and\n    (mode % 8 >= 4 or (mode / 8) % 8 >= 4) // World or Group readable/writable\n  )\nselect call, \"File permissions may be overly permissive.\"\n",
+   "hypothesis": "Setting insecure file permissions.",
+   "severity": "low",
+   "cwe_ids": [
+    "cwe-732"
+   ],
+   "results_count": 0,
+   "results": []
+  }
+ ]
+}

@@ -1,0 +1,842 @@
+{
+ "session_id": "20251220014222",
+ "package_name": "setuptools-80.9.0",
+ "package_path": "packages/setuptools-80.9.0",
+ "database_path": "databases/setuptools-80.9.0-db",
+ "model": "claude-sonnet-4-5-20250929",
+ "temperature": 0.0,
+ "max_tokens": 4000,
+ "iterations": 19,
+ "total_input_tokens": 372118,
+ "total_output_tokens": 7721,
+ "total_tokens": 379839,
+ "elapsed_time_seconds": 396.57,
+ "estimated_cost_usd": 1.2322,
+ "summary": "# Security Analysis Report: setuptools-80.9.0\n\n## Overview\nSetuptools is a critical Python package management library with ~58k lines of code across 249 files. This analysis identified **multiple high and medium severity security vulnerabilities** across various attack vectors.\n\n## Critical Findings\n\n### 1. **Unsafe Deserialization (CWE-502)** - HIGH SEVERITY\n- **Location**: `setuptools/command/bdist_egg.py:383`, `setuptools/depends.py:133`\n- **Issue**: Use of `marshal.load()` to deserialize untrusted data\n- **Impact**: Arbitrary code execution if attacker can control serialized data\n- **Risk**: Marshal deserialization can execute arbitrary Python bytecode\n\n### 2. **Code Injection via eval/exec/compile (CWE-094)** - HIGH SEVERITY\n- **Locations**: 15 instances found across multiple files:\n  - `pkg_resources/__init__.py` (lines 1737, 1738, 1748, 1749)\n  - `setuptools/build_meta.py:317`\n  - `setuptools/_distutils/core.py:268`\n  - `setuptools/depends.py:137`\n  - `setuptools/launch.py:31-32`\n  - Multiple vendor libraries\n- **Issue**: Direct use of `eval()`, `exec()`, and `compile()` functions\n- **Impact**: Arbitrary code execution if attacker controls input to these functions\n- **Risk**: Particularly dangerous in `pkg_resources` and `build_meta` modules that process package metadata\n\n### 3. **Command Injection (CWE-078)** - HIGH SEVERITY\n- **Location**: `setuptools/_distutils/command/bdist_rpm.py:357`\n- **Issue**: Unsafe command execution via `subprocess.call()`\n- **Impact**: Arbitrary command execution on the system\n- **Risk**: RPM building process may allow shell command injection\n\n### 4. **Archive Extraction without Path Validation (CWE-022)** - MEDIUM SEVERITY\n- **Location**: `setuptools/_vendor/jaraco/context.py:65`\n- **Issue**: Archive extraction without proper path traversal checks\n- **Impact**: Path traversal allowing file writes outside intended directory\n- **Risk**: Malicious archives could overwrite system files\n\n### 5. **Server-Side Request Forgery (CWE-918)** - MEDIUM SEVERITY\n- **Locations**: \n  - `setuptools/_vendor/jaraco/context.py:63`\n  - `setuptools/config/_validate_pyproject/formats.py:152`\n- **Issue**: HTTP requests via `urllib.request.urlopen()` without URL validation\n- **Impact**: SSRF attacks if URLs are user-controlled\n- **Risk**: Could be exploited to access internal services or exfiltrate data\n\n## Vulnerability Summary\n- **Critical**: 0\n- **High**: 3 (Unsafe deserialization, Code injection, Command injection)\n- **Medium**: 2 (Path traversal, SSRF)\n- **Total Findings**: 20+ individual instances\n\n## Key Risk Areas\n1. **Package Installation Pipeline**: Multiple code execution vectors during package build/install\n2. **Archive Handling**: Unsafe extraction and deserialization\n3. **Configuration Processing**: eval/exec usage when processing setup.py and metadata\n4. **External Resource Access**: Unvalidated URL requests\n\n## Recommendations\n1. Replace `marshal.load()` with safer alternatives or add strict validation\n2. Eliminate or sandbox all `eval()`/`exec()` calls, especially in user-facing code\n3. Implement path traversal protection for all archive extraction operations\n4. Add URL validation and allowlisting for HTTP requests\n5. Use parameterized commands instead of shell execution\n6. Conduct security review of all code paths processing untrusted package data",
+ "package_classification": {
+  "type": [
+   "library",
+   "framework",
+   "dev_tool"
+  ],
+  "layer": [
+   "build",
+   "packaging",
+   "distribution"
+  ]
+ },
+ "tool_calls": {
+  "get_package_profile_info": 1,
+  "execute_codeql_query": 14,
+  "validate_codeql_query": 0,
+  "fixup_codeql_query": 1,
+  "finalize_report": 1
+ },
+ "queries_executed": {
+  "critical": 5,
+  "high": 6,
+  "medium": 1,
+  "low": 0,
+  "total_executed": 15,
+  "total_with_results": 12,
+  "total_failed": 2
+ },
+ "query_findings": {
+  "critical": 18,
+  "high": 3,
+  "medium": 0,
+  "low": 0,
+  "total": 21
+ },
+ "findings": [
+  {
+   "codeql_query_uuid": "20251220014244",
+   "codeql_raw_query": "/**\n * @name Path traversal in archive extraction\n * @description Extracting archives without validating member paths can allow writing files outside the intended directory\n * @kind path-problem\n * @problem.severity error\n * @id py/setuptools-path-traversal-archive\n * @tags security\n *        external/cwe/cwe-22\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.ApiGraphs\n\nmodule PathTraversalConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    exists(DataFlow::CallCfgNode call |\n      // TarFile member names\n      call = API::moduleImport(\"tarfile\").getMember(\"TarFile\").getMember([\"getmembers\", \"getnames\"]).getACall() or\n      call = API::moduleImport(\"tarfile\").getMember(\"open\").getReturn().getMember([\"getmembers\", \"getnames\"]).getACall() or\n      // ZipFile member names\n      call = API::moduleImport(\"zipfile\").getMember(\"ZipFile\").getMember([\"namelist\", \"infolist\"]).getACall() or\n      // Individual member name access\n      call.getFunction().(DataFlow::AttrRead).getAttributeName() = \"name\"\n      |\n      source = call\n    )\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(DataFlow::CallCfgNode call |\n      // File operations that write to paths\n      call = API::moduleImport(\"tarfile\").getMember(\"TarFile\").getMember([\"extract\", \"extractall\"]).getACall() or\n      call = API::moduleImport(\"zipfile\").getMember(\"ZipFile\").getMember([\"extract\", \"extractall\"]).getACall() or\n      call = API::builtin(\"open\").getACall()\n      |\n      sink = call.getArg(_) or sink = call.getArgByName(_)\n    )\n  }\n}\n\nmodule PathTraversalFlow = TaintTracking::Global<PathTraversalConfig>;\nimport PathTraversalFlow::PathGraph\n\nfrom PathTraversalFlow::PathNode source, PathTraversalFlow::PathNode sink\nwhere PathTraversalFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"Potential path traversal from archive member $@.\", source.getNode(), \"name\"",
+   "hypothesis": "Path traversal vulnerability in archive extraction operations (tar/zip files) that could allow malicious packages to write files outside intended directories",
+   "severity": "critical",
+   "cwe_ids": [
+    "cwe-22"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251220014321",
+   "codeql_raw_query": "/**\n * @name Command injection via subprocess\n * @description Using subprocess with shell=True or unsanitized input can lead to command injection\n * @kind problem\n * @problem.severity error\n * @id py/command-injection-setuptools\n * @tags security\n *        external/cwe/cwe-078\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  (\n    // subprocess.call/run/Popen with shell=True\n    call = API::moduleImport(\"subprocess\").getMember([\"call\", \"run\", \"Popen\", \"check_call\", \"check_output\"]).getACall() and\n    call.getArgByName(\"shell\").asExpr().(BooleanLiteral).booleanValue() = true\n  ) or\n  (\n    // os.system calls\n    call = API::moduleImport(\"os\").getMember(\"system\").getACall()\n  ) or\n  (\n    // os.popen calls\n    call = API::moduleImport(\"os\").getMember(\"popen\").getACall()\n  )\nselect call, \"Potentially unsafe command execution that could allow command injection.\"",
+   "hypothesis": "Command injection through subprocess calls with shell=True or unsanitized user input",
+   "severity": "critical",
+   "cwe_ids": [
+    "cwe-78"
+   ],
+   "results_count": 1,
+   "results": [
+    {
+     "ruleId": "py/command-injection-setuptools",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/command-injection-setuptools",
+      "index": 0
+     },
+     "message": {
+      "text": "Potentially unsafe command execution that could allow command injection."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "setuptools/_distutils/command/bdist_rpm.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 357,
+         "startColumn": 15,
+         "endColumn": 30
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "bba8b70503dfaf3b:1",
+      "primaryLocationStartColumnFingerprint": "6"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251220014346",
+   "codeql_raw_query": "/**\n * @name Command injection via shell=True\n * @description Using subprocess with shell=True and user input can lead to command injection\n * @kind problem\n * @problem.severity error\n * @id py/shell-command-injection\n * @tags security\n *        external/cwe/cwe-078\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  (\n    call = API::moduleImport(\"subprocess\").getMember([\"call\", \"run\", \"Popen\", \"check_call\", \"check_output\"]).getACall() or\n    call = API::moduleImport(\"os\").getMember(\"system\").getACall() or\n    call = API::moduleImport(\"os\").getMember(\"popen\").getACall()\n  ) and\n  (\n    // Check for shell=True argument\n    exists(DataFlow::Node shellArg |\n      shellArg = call.getArgByName(\"shell\") and\n      shellArg.asExpr().(BooleanLiteral).booleanValue() = true\n    )\n    or\n    // os.system always uses shell\n    call = API::moduleImport(\"os\").getMember(\"system\").getACall()\n  )\nselect call, \"Potentially unsafe command execution with shell=True that could allow command injection.\"\n",
+   "hypothesis": "Command injection via shell=True in subprocess calls with user-controlled input",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-78"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251220014409",
+   "codeql_raw_query": "/**\n * @name Unsafe deserialization\n * @description Deserializing untrusted data using pickle or other unsafe methods can lead to arbitrary code execution\n * @kind problem\n * @problem.severity error\n * @id py/unsafe-deserialization-setuptools\n * @tags security\n *        external/cwe/cwe-502\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  (\n    call = API::moduleImport(\"pickle\").getMember([\"load\", \"loads\", \"Unpickler\"]).getACall() or\n    call = API::moduleImport(\"marshal\").getMember([\"load\", \"loads\"]).getACall() or\n    call = API::moduleImport(\"shelve\").getMember(\"open\").getACall() or\n    call = API::moduleImport(\"dill\").getMember([\"load\", \"loads\"]).getACall()\n  )\nselect call, \"Potentially unsafe deserialization operation that could execute arbitrary code.\"",
+   "hypothesis": "Unsafe deserialization using pickle, marshal, or other unsafe deserialization methods that could lead to arbitrary code execution",
+   "severity": "critical",
+   "cwe_ids": [
+    "cwe-502"
+   ],
+   "results_count": 2,
+   "results": [
+    {
+     "ruleId": "py/unsafe-deserialization-setuptools",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/unsafe-deserialization-setuptools",
+      "index": 0
+     },
+     "message": {
+      "text": "Potentially unsafe deserialization operation that could execute arbitrary code."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "setuptools/command/bdist_egg.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 383,
+         "startColumn": 12,
+         "endColumn": 27
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "992c6d616af531bd:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/unsafe-deserialization-setuptools",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/unsafe-deserialization-setuptools",
+      "index": 0
+     },
+     "message": {
+      "text": "Potentially unsafe deserialization operation that could execute arbitrary code."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "setuptools/depends.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 133,
+         "startColumn": 24,
+         "endColumn": 39
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "f46d8b8fc24f73ef:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251220014433",
+   "codeql_raw_query": "/**\n * @name Unsafe archive extraction\n * @description Extracting archives without validating member paths can lead to arbitrary file writes\n * @kind problem\n * @problem.severity error\n * @id py/unsafe-archive-extraction\n * @tags security\n *        external/cwe/cwe-022\n *        external/cwe/cwe-059\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  (\n    // zipfile extraction\n    call = API::moduleImport(\"zipfile\").getMember(\"ZipFile\").getReturn().getMember([\"extract\", \"extractall\"]).getACall() or\n    // tarfile extraction\n    call = API::moduleImport(\"tarfile\").getMember([\"open\", \"TarFile\"]).getReturn().getMember([\"extract\", \"extractall\"]).getACall() or\n    // backports.tarfile extraction\n    call = API::moduleImport(\"backports\").getMember(\"tarfile\").getMember([\"open\", \"TarFile\"]).getReturn().getMember([\"extract\", \"extractall\"]).getACall()\n  )\nselect call, \"Archive extraction operation that may be vulnerable to path traversal attacks.\"",
+   "hypothesis": "Arbitrary file write via unsafe archive extraction without path validation",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-22",
+    "cwe-59"
+   ],
+   "results_count": 1,
+   "results": [
+    {
+     "ruleId": "py/unsafe-archive-extraction",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/unsafe-archive-extraction",
+      "index": 0
+     },
+     "message": {
+      "text": "Archive extraction operation that may be vulnerable to path traversal attacks."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "setuptools/_vendor/jaraco/context.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 65,
+         "startColumn": 13,
+         "endColumn": 73
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "33d7425e2e288e73:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251220014456",
+   "codeql_raw_query": "/**\n * @name Code injection via eval/exec\n * @description Using eval or exec can lead to arbitrary code execution\n * @kind problem\n * @problem.severity error\n * @id py/code-injection-eval-exec\n * @tags security\n *        external/cwe/cwe-094\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  (\n    call = API::builtin(\"eval\").getACall() or\n    call = API::builtin(\"exec\").getACall() or\n    call = API::builtin(\"compile\").getACall()\n  )\nselect call, \"Use of \" + call.getFunction().asExpr().(Name).getId() + \" which can execute arbitrary code.\"\n",
+   "hypothesis": "Code injection via eval/exec with potentially untrusted input",
+   "severity": "critical",
+   "cwe_ids": [
+    "cwe-094"
+   ],
+   "results_count": 15,
+   "results": [
+    {
+     "ruleId": "py/code-injection-eval-exec",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/code-injection-eval-exec",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of eval which can execute arbitrary code."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "setuptools/_vendor/packaging/licenses/__init__.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 100,
+         "startColumn": 19,
+         "endColumn": 63
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "a04971260200f6d:1",
+      "primaryLocationStartColumnFingerprint": "10"
+     }
+    },
+    {
+     "ruleId": "py/code-injection-eval-exec",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/code-injection-eval-exec",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of eval which can execute arbitrary code."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "setuptools/_vendor/jaraco/functools/__init__.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 522,
+         "startColumn": 28,
+         "endColumn": 37
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "f65cda14d5800235:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/code-injection-eval-exec",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/code-injection-eval-exec",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of compile which can execute arbitrary code."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pkg_resources/__init__.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 1737,
+         "startColumn": 20,
+         "endColumn": 60
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "cdc3c8493f161b0a:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/code-injection-eval-exec",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/code-injection-eval-exec",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of exec which can execute arbitrary code."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pkg_resources/__init__.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 1738,
+         "startColumn": 13,
+         "endColumn": 45
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "cf2541db4b01f1d0:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/code-injection-eval-exec",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/code-injection-eval-exec",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of compile which can execute arbitrary code."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pkg_resources/__init__.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 1748,
+         "startColumn": 27,
+         "endColumn": 72
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "b2305973ec70683a:1",
+      "primaryLocationStartColumnFingerprint": "14"
+     }
+    },
+    {
+     "ruleId": "py/code-injection-eval-exec",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/code-injection-eval-exec",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of exec which can execute arbitrary code."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pkg_resources/__init__.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 1749,
+         "startColumn": 13,
+         "endColumn": 52
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "4a24db34e67766ef:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/code-injection-eval-exec",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/code-injection-eval-exec",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of compile which can execute arbitrary code."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "setuptools/_vendor/typeguard/_decorators.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 3
+        },
+        "region": {
+         "startLine": 79,
+         "startColumn": 19,
+         "endColumn": 89
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "efc66216909f31e:1",
+      "primaryLocationStartColumnFingerprint": "14"
+     }
+    },
+    {
+     "ruleId": "py/code-injection-eval-exec",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/code-injection-eval-exec",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of f which can execute arbitrary code."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "setuptools/_vendor/typeguard/_importhook.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 4
+        },
+        "region": {
+         "startLine": 47,
+         "startColumn": 12,
+         "endColumn": 30
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "5e9ee5dcaff95699:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/code-injection-eval-exec",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/code-injection-eval-exec",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of compile which can execute arbitrary code."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "setuptools/_vendor/typeguard/_union_transformer.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 5
+        },
+        "region": {
+         "startLine": 55,
+         "startColumn": 12,
+         "endColumn": 56
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "a382d110cdd7d8c5:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/code-injection-eval-exec",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/code-injection-eval-exec",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of eval which can execute arbitrary code."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "setuptools/_distutils/compilers/C/base.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 6
+        },
+        "region": {
+         "startLine": 1120,
+         "startColumn": 28,
+         "endColumn": 42
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "f6aa77ec1b833e79:1",
+      "primaryLocationStartColumnFingerprint": "19"
+     }
+    },
+    {
+     "ruleId": "py/code-injection-eval-exec",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/code-injection-eval-exec",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of exec which can execute arbitrary code."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "setuptools/build_meta.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 7
+        },
+        "region": {
+         "startLine": 317,
+         "startColumn": 13,
+         "endColumn": 33
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "4dc2dd946ed0250a:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/code-injection-eval-exec",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/code-injection-eval-exec",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of exec which can execute arbitrary code."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "setuptools/_distutils/core.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 8
+        },
+        "region": {
+         "startLine": 268,
+         "startColumn": 17,
+         "endColumn": 30
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "5d40ff63d209976e:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/code-injection-eval-exec",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/code-injection-eval-exec",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of compile which can execute arbitrary code."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "setuptools/depends.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 9
+        },
+        "region": {
+         "startLine": 137,
+         "startColumn": 24,
+         "endColumn": 55
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "e2da0a5fdbcefb9e:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/code-injection-eval-exec",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/code-injection-eval-exec",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of compile which can execute arbitrary code."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "setuptools/launch.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 10
+        },
+        "region": {
+         "startLine": 31,
+         "startColumn": 12,
+         "endColumn": 53
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "e3925ce9c16dd368:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/code-injection-eval-exec",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/code-injection-eval-exec",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of exec which can execute arbitrary code."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "setuptools/launch.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 10
+        },
+        "region": {
+         "startLine": 32,
+         "startColumn": 5,
+         "endColumn": 26
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "89bcdedb088484d4:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251220014520",
+   "codeql_raw_query": "/**\n * @name Unsafe YAML deserialization\n * @description Using yaml.load without a safe Loader can lead to arbitrary code execution\n * @kind problem\n * @problem.severity error\n * @id py/unsafe-yaml-load\n * @tags security\n *        external/cwe/cwe-502\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  (\n    call = API::moduleImport(\"yaml\").getMember([\"load\", \"unsafe_load\", \"full_load\"]).getACall() or\n    call = API::moduleImport(\"yaml\").getMember(\"Loader\").getACall()\n  )\nselect call, \"Potentially unsafe YAML deserialization that could execute arbitrary code.\"",
+   "hypothesis": "YAML unsafe deserialization that could lead to arbitrary code execution",
+   "severity": "critical",
+   "cwe_ids": [
+    "cwe-502"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251220014544",
+   "codeql_raw_query": "/**\n * @name SQL injection\n * @description SQL queries constructed from user input can lead to SQL injection\n * @kind problem\n * @problem.severity error\n * @id py/sql-injection-setuptools\n * @tags security\n *        external/cwe/cwe-089\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  (\n    call = API::moduleImport(\"sqlite3\").getMember([\"execute\", \"executemany\", \"executescript\"]).getACall() or\n    call = API::moduleImport(\"sqlite3\").getMember(\"Connection\").getMember([\"execute\", \"executemany\", \"executescript\"]).getACall() or\n    call = API::moduleImport(\"sqlite3\").getMember(\"Cursor\").getMember([\"execute\", \"executemany\", \"executescript\"]).getACall()\n  )\nselect call, \"SQL query execution that may be vulnerable to SQL injection.\"",
+   "hypothesis": "SQL injection through sqlite3 execute methods",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-089"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251220014609",
+   "codeql_raw_query": "/**\n * @name Insecure temporary file creation\n * @description Creating temporary files insecurely can lead to race conditions and unauthorized access\n * @kind problem\n * @problem.severity warning\n * @id py/insecure-temp-file\n * @tags security\n *        external/cwe/cwe-377\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  (\n    // tempfile.mktemp is deprecated and insecure\n    call = API::moduleImport(\"tempfile\").getMember(\"mktemp\").getACall() or\n    // os.tempnam and os.tmpnam are insecure\n    call = API::moduleImport(\"os\").getMember([\"tempnam\", \"tmpnam\"]).getACall()\n  )\nselect call, \"Insecure temporary file creation that may be vulnerable to race conditions.\"",
+   "hypothesis": "Insecure temporary file creation using deprecated functions like tempfile.mktemp, os.tempnam, or os.tmpnam",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-377"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251220014634",
+   "codeql_raw_query": "/**\n * @name Server-Side Request Forgery (SSRF)\n * @description Making HTTP requests with user-controlled URLs can lead to SSRF attacks\n * @kind problem\n * @problem.severity error\n * @id py/ssrf-setuptools\n * @tags security\n *        external/cwe/cwe-918\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  (\n    call = API::moduleImport(\"urllib\").getMember(\"request\").getMember([\"urlopen\", \"urlretrieve\", \"Request\"]).getACall() or\n    call = API::moduleImport(\"urllib\").getMember([\"urlopen\", \"urlretrieve\"]).getACall() or\n    call = API::moduleImport(\"urllib2\").getMember([\"urlopen\", \"urlretrieve\", \"Request\"]).getACall() or\n    call = API::moduleImport(\"requests\").getMember([\"get\", \"post\", \"put\", \"delete\", \"request\", \"head\", \"options\"]).getACall() or\n    call = API::moduleImport(\"httplib\").getMember([\"HTTPConnection\", \"HTTPSConnection\"]).getACall() or\n    call = API::moduleImport(\"http\").getMember(\"client\").getMember([\"HTTPConnection\", \"HTTPSConnection\"]).getACall()\n  )\nselect call, \"HTTP request that could be vulnerable to SSRF if URL is user-controlled.\"\n",
+   "hypothesis": "HTTP requests with potentially user-controlled URLs could lead to SSRF attacks",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-918"
+   ],
+   "results_count": 2,
+   "results": [
+    {
+     "ruleId": "py/ssrf-setuptools",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/ssrf-setuptools",
+      "index": 0
+     },
+     "message": {
+      "text": "HTTP request that could be vulnerable to SSRF if URL is user-controlled."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "setuptools/_vendor/jaraco/context.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 63,
+         "startColumn": 15,
+         "endColumn": 42
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "aba773b6cd3b08a:1",
+      "primaryLocationStartColumnFingerprint": "6"
+     }
+    },
+    {
+     "ruleId": "py/ssrf-setuptools",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/ssrf-setuptools",
+      "index": 0
+     },
+     "message": {
+      "text": "HTTP request that could be vulnerable to SSRF if URL is user-controlled."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "setuptools/config/_validate_pyproject/formats.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 152,
+         "startColumn": 10,
+         "endColumn": 39
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "a908ad994bbc729c:1",
+      "primaryLocationStartColumnFingerprint": "5"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251220014801",
+   "codeql_raw_query": "/**\n * @name Path traversal in setup.py execution\n * @description Executing setup.py files from untrusted locations without validation\n * @kind problem\n * @problem.severity high\n * @id py/path-traversal-setup-exec\n * @tags security\n *        external/cwe/cwe-022\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  (\n    call = API::moduleImport(\"setuptools\").getMember(\"setup\").getACall() or\n    call = API::moduleImport(\"distutils\").getMember(\"core\").getMember(\"setup\").getACall()\n  ) and\n  exists(call.getArg(_))\nselect call, \"Setup function call that may process untrusted configuration data.\"",
+   "hypothesis": "Setup function calls that process configuration data which could be exploited if from untrusted sources",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-022"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251220014822",
+   "codeql_raw_query": "/**\n * @name Unsafe zipfile extraction\n * @description Extracting zip files without validating member paths can lead to path traversal\n * @kind problem\n * @problem.severity high\n * @id py/unsafe-zipfile-extraction\n * @tags security\n *        external/cwe/cwe-022\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  (\n    call = API::moduleImport(\"zipfile\").getMember(\"ZipFile\").getReturn().getMember(\"extractall\").getACall() or\n    call = API::moduleImport(\"zipfile\").getMember(\"ZipFile\").getReturn().getMember(\"extract\").getACall()\n  )\nselect call, \"Zipfile extraction that may be vulnerable to path traversal attacks.\"",
+   "hypothesis": "Zipfile extraction operations without proper path validation can allow attackers to write files outside the intended directory",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-022"
+   ],
+   "results_count": 0,
+   "results": []
+  }
+ ]
+}

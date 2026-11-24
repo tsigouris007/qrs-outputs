@@ -1,0 +1,3964 @@
+{
+ "session_id": "20261119215145",
+ "package_name": "werkzeug-2.2.2",
+ "package_path": "packages/werkzeug-2.2.2",
+ "database_path": "databases/werkzeug-2.2.2-db",
+ "model": "deepseek/deepseek-reasoner",
+ "temperature": 0.0,
+ "max_tokens": 8000,
+ "iterations": 18,
+ "total_input_tokens": 236298,
+ "total_output_tokens": 36420,
+ "total_tokens": 272718,
+ "elapsed_time_seconds": 753.19,
+ "estimated_cost_usd": 0.0815,
+ "summary": "## Analysis Summary — Werkzeug 2.2.2\n\nWerkzeug 2.2.2 is a WSGI/HTTP utility library (41 files, ~15.7k LOC). Because it is a *library* rather than an application, CodeQL remote-flow sources (`RemoteFlowSource`) yield nothing: request data enters through WSGI `environ` dicts and handler call arguments, not through framework entry points. Analysis therefore focused on structural verification of security-relevant controls and known-fix-version deltas. All findings were confirmed by targeted CodeQL queries against the database (identifier/limit-presence, sink inventory, and control-flow probes), not by speculative matching.\n\n### 1. Missing limit on number of multipart parts — CWE-400 (HIGH)\n**CVE-2023-25577**, fixed in 2.2.3.\n- `max_form_memory_size` and `max_content_length` are defined and enforced (`src/werkzeug/formparser.py:79-80, 128-129, 189-190, 200-201, 346-352`; `src/werkzeug/sansio/multipart.py:89-93`; `src/werkzeug/wrappers/request.py:73-84`).\n- A dedicated **`max_form_parts`** limit is **entirely absent** from the package (query returned zero results across all 41 files).\n- `MultiPartParser.parse` iterates decoder events and materialises every part (`formparser.py:371-430`, incl. `MultipartDecoder` construction at 397/412 and per-part `str`/`BytesIO`/`FileStorage` accumulation at 418-430) with no cap on part count.\n- Impact: an attacker-supplied `multipart/form-data` body containing a very large number of small parts is fully buffered and parsed, causing CPU/memory exhaustion (DoS) even when `max_content_length` is set. Applications relying on Werkzeug's form parser (Flask `request.form`/`request.files`) are affected.\n\n### 2. Nameless cookie accepted by parser — CWE-20 / CWE-784 (MEDIUM)\n**CVE-2023-23934**, fixed in 2.2.3.\n- `dump_cookie` validates cookie names (`src/werkzeug/http.py:678`, a name check `Compare`), but the parse path does not.\n- `parse_cookie` (`src/werkzeug/sansio/http.py:103-136`) delegates to `_cookie_parse_impl` at line 127 with no check that the cookie name is non-empty, so a header such as `Cookie: =value` yields a cookie whose name is `\"\"`.\n- Impact: bypasses developer assumptions that a cookie name uniquely identifies a value; can be abused for cookie-shadowing / origin-confusion in applications that key off cookie names, and lets client-controlled data occupy the \"nameless\" namespace.\n\n### 3. Debug console arbitrary code execution surface — CWE-94 (HIGH, conditional)\n- Dynamic code sinks confirmed: `exec()` in `src/werkzeug/debug/console.py:180` (the interactive debugger console) plus dynamic `open()` in `src/werkzeug/debug/__init__.py:59`.\n- PIN-based authentication *is* present (`pin_auth`, `src/werkzeug/debug/__init__.py:439`), so this is a deliberate developer feature rather than an unmitigated flaw; nevertheless, enabling the debugger in a reachable environment exposes unauthenticated-to-authenticated RCE, and the PIN is the only barrier. Treated as a hardening/configuration risk rather than an exploitable defect in 2.2.2.\n\n### 4. Additional dynamic-code / dynamic-open sinks reviewed and cleared\n- `src/werkzeug/routing/rules.py:688` (`exec`) and `:788` (`compile`) — rule compilation over constraint expressions built from developer-defined route rules, not request data.\n- `src/werkzeug/_reloader.py:391`, `src/werkzeug/serving.py:51`, `src/werkzeug/utils.py:610,618` — `__import__` on trusted module names; `src/werkzeug/utils.py:491` (`find_modules`/import helper) and `datastructures.py:1562,3002`, `serving.py:537-539`, `middleware/shared_data.py:149` — file opens whose paths are developer-supplied (config/SSL certs) rather than request-derived.\n- `src/werkzeug/security.py:120-140` — `safe_join` is present and implements the expected normalisation/containment checks; `middleware/shared_data.py:168` routes candidate paths through it. No path-traversal weakness found in the safe-join path.\n- `middleware/proxy_fix.py` and `sansio/utils.py` document/implement trusted-host handling; the trust model is opt-in (`x_for`/`x_host` counts) and misconfiguration is a deployment concern, not a library flaw.\n\n### Conclusion\nThe actionable, version-specific weakness in Werkzeug 2.2.2 is the **absence of a multipart part-count limit (CVE-2023-25577, CWE-400)**, a remotely triggerable denial of service against the form parser. The secondary issue is **nameless-cookie acceptance in `parse_cookie` (CVE-2023-23934, CWE-20/CWE-784)**. Both are fixed in upstream 2.2.3. Remaining code-execution and file-access sinks are either intentional developer tooling (debugger console, rule compiler) or operate on trusted, non-request input.",
+ "package_classification": {
+  "type": [
+   "library",
+   "framework"
+  ],
+  "layer": [
+   "http_server",
+   "web_framework",
+   "utility"
+  ]
+ },
+ "tool_calls": {
+  "get_package_profile_info": 1,
+  "execute_codeql_query": 32,
+  "validate_codeql_query": 0,
+  "fixup_codeql_query": 0,
+  "finalize_report": 1
+ },
+ "queries_executed": {
+  "critical": 2,
+  "high": 9,
+  "medium": 5,
+  "low": 1,
+  "total_executed": 32,
+  "total_with_results": 17,
+  "total_failed": 15
+ },
+ "query_findings": {
+  "critical": 1,
+  "high": 53,
+  "medium": 41,
+  "low": 23,
+  "total": 118
+ },
+ "findings": [
+  {
+   "codeql_query_uuid": "20261119215208",
+   "codeql_raw_query": "/**\n * @name Code execution from remote input\n * @description Tainted remote input reaching eval/exec\n * @kind path-problem\n * @problem.severity error\n * @id py/werkzeug-code-injection\n * @tags security\n *        external/cwe/cwe-094\n */\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.dataflow.new.RemoteFlowSources\nimport semmle.python.Concepts\n\nmodule C implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node s) { s instanceof RemoteFlowSource }\n  predicate isSink(DataFlow::Node s) { s = any(CodeExecution ce).getCode() }\n}\n\nmodule F = TaintTracking::Global<C>;\nimport F::PathGraph\n\nfrom F::PathNode src, F::PathNode sink\nwhere F::flowPath(src, sink)\nselect sink.getNode(), src, sink, \"Code execution of $@.\", src.getNode(), \"untrusted input\"",
+   "hypothesis": "Remote input flows into eval/exec (debugger console, debug repr) leading to code execution",
+   "severity": "critical",
+   "cwe_ids": [
+    "cwe-094"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20261119215244",
+   "codeql_raw_query": "/**\n * @name Path traversal into file access\n * @description Tainted remote input reaching a filesystem path argument\n * @kind path-problem\n * @problem.severity error\n * @id py/werkzeug-path-traversal\n * @tags security\n *        external/cwe/cwe-022\n */\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.dataflow.new.RemoteFlowSources\nimport semmle.python.Concepts\n\nmodule C implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node s) { s instanceof RemoteFlowSource }\n  predicate isSink(DataFlow::Node s) { s = any(FileSystemAccess fa).getAPathArgument() }\n}\n\nmodule F = TaintTracking::Global<C>;\nimport F::PathGraph\n\nfrom F::PathNode src, F::PathNode sink\nwhere F::flowPath(src, sink)\nselect sink.getNode(), src, sink, \"File access with $@.\", src.getNode(), \"untrusted path\"",
+   "hypothesis": "Remote input flows into filesystem paths (static file serving, send_file, reloader)",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-022"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20261119215348",
+   "codeql_raw_query": "/**\n * @name Dynamic code execution sinks\n * @description Finds eval/exec/compile/import calls\n * @kind problem\n * @problem.severity warning\n * @id py/dyn-code-sinks\n */\nimport python\n\nfrom Call call\nwhere\n  call.getFunc().(Name).getId() in [\"eval\", \"exec\", \"compile\", \"__import__\", \"execfile\"]\nselect call, \"dynamic code [\" + call.getFunc().(Name).getId() + \"]: \" + call.toString()",
+   "hypothesis": "Dynamic code execution sinks (eval/exec/compile) exist in the debug console / debugger and may be reachable from HTTP requests.",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-94"
+   ],
+   "results_count": 7,
+   "results": [
+    {
+     "ruleId": "py/dyn-code-sinks",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/dyn-code-sinks",
+      "index": 0
+     },
+     "message": {
+      "text": "dynamic code \\[__import__\\]: __import__()"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/werkzeug/_reloader.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 391,
+         "startColumn": 5,
+         "endColumn": 37
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "9bc594b451303897:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/dyn-code-sinks",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/dyn-code-sinks",
+      "index": 0
+     },
+     "message": {
+      "text": "dynamic code \\[exec\\]: exec()"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/werkzeug/debug/console.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 180,
+         "startColumn": 13,
+         "endColumn": 36
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "e890edf8e7110f81:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/dyn-code-sinks",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/dyn-code-sinks",
+      "index": 0
+     },
+     "message": {
+      "text": "dynamic code \\[exec\\]: exec()"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/werkzeug/routing/rules.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 688,
+         "startColumn": 9,
+         "endColumn": 32
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "3e30103e3781ac65:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/dyn-code-sinks",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/dyn-code-sinks",
+      "index": 0
+     },
+     "message": {
+      "text": "dynamic code \\[compile\\]: compile()"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/werkzeug/routing/rules.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 788,
+         "startColumn": 16,
+         "endColumn": 61
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "e8f297623168a471:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/dyn-code-sinks",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/dyn-code-sinks",
+      "index": 0
+     },
+     "message": {
+      "text": "dynamic code \\[__import__\\]: __import__()"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/werkzeug/serving.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 3
+        },
+        "region": {
+         "startLine": 51,
+         "startColumn": 9,
+         "endColumn": 31
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "a7ef12cb6e03e141:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/dyn-code-sinks",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/dyn-code-sinks",
+      "index": 0
+     },
+     "message": {
+      "text": "dynamic code \\[__import__\\]: __import__()"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/werkzeug/utils.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 4
+        },
+        "region": {
+         "startLine": 610,
+         "startColumn": 13,
+         "endColumn": 36
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "15343d206655364:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/dyn-code-sinks",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/dyn-code-sinks",
+      "index": 0
+     },
+     "message": {
+      "text": "dynamic code \\[__import__\\]: __import__()"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/werkzeug/utils.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 4
+        },
+        "region": {
+         "startLine": 618,
+         "startColumn": 18,
+         "endColumn": 74
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "814cca21fc53d77c:1",
+      "primaryLocationStartColumnFingerprint": "9"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20261119215414",
+   "codeql_raw_query": "/**\n * @name File access with dynamic path\n * @description Finds open()/file reads where the path is not a literal\n * @kind problem\n * @problem.severity warning\n * @id py/dynamic-file-open\n */\nimport python\n\nfrom Call call\nwhere\n  call.getFunc().(Name).getId() in [\"open\"] and not call.getArg(0) instanceof Str\nselect call, \"dynamic open: \" + call.toString()",
+   "hypothesis": "File reads with dynamically computed paths (send_file, shared data, debugger tbtools) could allow path traversal / arbitrary file read.",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-22"
+   ],
+   "results_count": 7,
+   "results": [
+    {
+     "ruleId": "py/dynamic-file-open",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/dynamic-file-open",
+      "index": 0
+     },
+     "message": {
+      "text": "dynamic open: open()"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/werkzeug/debug/__init__.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 59,
+         "startColumn": 22,
+         "endColumn": 42
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "6e270ebbc74825ee:1",
+      "primaryLocationStartColumnFingerprint": "5"
+     }
+    },
+    {
+     "ruleId": "py/dynamic-file-open",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/dynamic-file-open",
+      "index": 0
+     },
+     "message": {
+      "text": "dynamic open: open()"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/werkzeug/datastructures.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 1562,
+         "startColumn": 24,
+         "endColumn": 40
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "a48eb2265e7d00d8:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/dynamic-file-open",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/dynamic-file-open",
+      "index": 0
+     },
+     "message": {
+      "text": "dynamic open: open()"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/werkzeug/datastructures.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 3002,
+         "startColumn": 19,
+         "endColumn": 34
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "d51ed6a408ad67:1",
+      "primaryLocationStartColumnFingerprint": "6"
+     }
+    },
+    {
+     "ruleId": "py/dynamic-file-open",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/dynamic-file-open",
+      "index": 0
+     },
+     "message": {
+      "text": "dynamic open: open()"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/werkzeug/serving.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 537,
+         "startColumn": 10,
+         "endColumn": 31
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "ba5998039fa5d21f:1",
+      "primaryLocationStartColumnFingerprint": "5"
+     }
+    },
+    {
+     "ruleId": "py/dynamic-file-open",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/dynamic-file-open",
+      "index": 0
+     },
+     "message": {
+      "text": "dynamic open: open()"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/werkzeug/serving.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 539,
+         "startColumn": 10,
+         "endColumn": 31
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "3a1d573834ebc887:1",
+      "primaryLocationStartColumnFingerprint": "5"
+     }
+    },
+    {
+     "ruleId": "py/dynamic-file-open",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/dynamic-file-open",
+      "index": 0
+     },
+     "message": {
+      "text": "dynamic open: open()"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/werkzeug/middleware/shared_data.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 3
+        },
+        "region": {
+         "startLine": 149,
+         "startColumn": 13,
+         "endColumn": 33
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "5a0f003eed97389d:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/dynamic-file-open",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/dynamic-file-open",
+      "index": 0
+     },
+     "message": {
+      "text": "dynamic open: open()"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/werkzeug/utils.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 4
+        },
+        "region": {
+         "startLine": 491,
+         "startColumn": 20,
+         "endColumn": 36
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "1c446f69b4e496b0:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20261119215441",
+   "codeql_raw_query": "/**\n * @name Taint from remote input to file access\n * @description Remote-controlled data reaching filesystem paths\n * @kind path-problem\n * @problem.severity warning\n * @id py/remote-to-file\n * @tags security\n *        external/cwe/cwe-022\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.dataflow.new.RemoteFlowSources\nimport semmle.python.Concepts\n\nmodule Config implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) { source instanceof RemoteFlowSource }\n\n  predicate isSink(DataFlow::Node sink) {\n    sink = any(FileSystemAccess fa).getAPathArgument()\n  }\n}\n\nmodule Flow = TaintTracking::Global<Config>;\nimport Flow::PathGraph\n\nfrom Flow::PathNode source, Flow::PathNode sink\nwhere Flow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"Remote input flows to filesystem path.\"",
+   "hypothesis": "Remote (HTTP) input flows into filesystem path arguments, enabling path traversal / arbitrary file access (CWE-22).",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-022"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20261119215543",
+   "codeql_raw_query": "/**\n * @name inspect shared_data and utils file handling\n * @description dump calls in SharedDataMiddleware and send_file regions\n * @kind problem\n * @problem.severity note\n * @id py/inspect-sinks-a\n */\nimport python\n\nfrom Call c, string text\nwhere\n  c.getLocation().getFile().getRelativePath().matches(\"%werkzeug/middleware/shared_data.py\") and\n  c.getLocation().getStartLine() >= 120 and c.getLocation().getStartLine() <= 180 and\n  text = c.toString()\nselect c, \"CALL: \" + text",
+   "hypothesis": "SharedDataMiddleware may join untrusted URL path with the file root allowing traversal",
+   "severity": "low",
+   "cwe_ids": [
+    "cwe-22"
+   ],
+   "results_count": 23,
+   "results": [
+    {
+     "ruleId": "py/inspect-sinks-a",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/inspect-sinks-a",
+      "index": 0
+     },
+     "message": {
+      "text": "CALL: isinstance()"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/werkzeug/middleware/shared_data.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 121,
+         "startColumn": 16,
+         "endColumn": 40
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "6eb1ac23385cc3ab:1",
+      "primaryLocationStartColumnFingerprint": "3"
+     }
+    },
+    {
+     "ruleId": "py/inspect-sinks-a",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/inspect-sinks-a",
+      "index": 0
+     },
+     "message": {
+      "text": "CALL: Attribute()"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/werkzeug/middleware/shared_data.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 122,
+         "startColumn": 26,
+         "endColumn": 57
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "d4a3f4d1b8109173:1",
+      "primaryLocationStartColumnFingerprint": "9"
+     }
+    },
+    {
+     "ruleId": "py/inspect-sinks-a",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/inspect-sinks-a",
+      "index": 0
+     },
+     "message": {
+      "text": "CALL: isinstance()"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/werkzeug/middleware/shared_data.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 123,
+         "startColumn": 18,
+         "endColumn": 40
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "fe58b0b6d9e645c6:1",
+      "primaryLocationStartColumnFingerprint": "5"
+     }
+    },
+    {
+     "ruleId": "py/inspect-sinks-a",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/inspect-sinks-a",
+      "index": 0
+     },
+     "message": {
+      "text": "CALL: Attribute()"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/werkzeug/middleware/shared_data.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 124,
+         "startColumn": 20,
+         "endColumn": 41
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "741dd566dc9e7c82:1",
+      "primaryLocationStartColumnFingerprint": "3"
+     }
+    },
+    {
+     "ruleId": "py/inspect-sinks-a",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/inspect-sinks-a",
+      "index": 0
+     },
+     "message": {
+      "text": "CALL: Attribute()"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/werkzeug/middleware/shared_data.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 125,
+         "startColumn": 30,
+         "endColumn": 57
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "ed49779af0e10a07:1",
+      "primaryLocationStartColumnFingerprint": "9"
+     }
+    },
+    {
+     "ruleId": "py/inspect-sinks-a",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/inspect-sinks-a",
+      "index": 0
+     },
+     "message": {
+      "text": "CALL: Attribute()"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/werkzeug/middleware/shared_data.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 127,
+         "startColumn": 30,
+         "endColumn": 62
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "30c7bfeba4823f15:1",
+      "primaryLocationStartColumnFingerprint": "9"
+     }
+    },
+    {
+     "ruleId": "py/inspect-sinks-a",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/inspect-sinks-a",
+      "index": 0
+     },
+     "message": {
+      "text": "CALL: TypeError()"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/werkzeug/middleware/shared_data.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 129,
+         "startColumn": 23,
+         "endColumn": 58
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "41529d5026cfcb5a:1",
+      "primaryLocationStartColumnFingerprint": "6"
+     }
+    },
+    {
+     "ruleId": "py/inspect-sinks-a",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/inspect-sinks-a",
+      "index": 0
+     },
+     "message": {
+      "text": "CALL: Attribute()"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/werkzeug/middleware/shared_data.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 131,
+         "startColumn": 13,
+         "endColumn": 47
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "c8f1578a785aa092:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/inspect-sinks-a",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/inspect-sinks-a",
+      "index": 0
+     },
+     "message": {
+      "text": "CALL: fnmatch()"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/werkzeug/middleware/shared_data.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 136,
+         "startColumn": 45,
+         "endColumn": 65
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "4a2a33d0f243897a:1",
+      "primaryLocationStartColumnFingerprint": "32"
+     }
+    },
+    {
+     "ruleId": "py/inspect-sinks-a",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/inspect-sinks-a",
+      "index": 0
+     },
+     "message": {
+      "text": "CALL: open()"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/werkzeug/middleware/shared_data.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 149,
+         "startColumn": 13,
+         "endColumn": 33
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "5a0f003eed97389d:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/inspect-sinks-a",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/inspect-sinks-a",
+      "index": 0
+     },
+     "message": {
+      "text": "CALL: Attribute()"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/werkzeug/middleware/shared_data.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 150,
+         "startColumn": 13,
+         "endColumn": 80
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "73e5799973c88f95:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/inspect-sinks-a",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/inspect-sinks-a",
+      "index": 0
+     },
+     "message": {
+      "text": "CALL: Attribute()"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/werkzeug/middleware/shared_data.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 150,
+         "startColumn": 36,
+         "endColumn": 62
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "73e5799973c88f95:1",
+      "primaryLocationStartColumnFingerprint": "23"
+     }
+    },
+    {
+     "ruleId": "py/inspect-sinks-a",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/inspect-sinks-a",
+      "index": 0
+     },
+     "message": {
+      "text": "CALL: int()"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/werkzeug/middleware/shared_data.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 151,
+         "startColumn": 13,
+         "endColumn": 43
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "e7c3bf1151a89919:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/inspect-sinks-a",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/inspect-sinks-a",
+      "index": 0
+     },
+     "message": {
+      "text": "CALL: Attribute()"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/werkzeug/middleware/shared_data.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 151,
+         "startColumn": 17,
+         "endColumn": 42
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "e7c3bf1151a89919:1",
+      "primaryLocationStartColumnFingerprint": "4"
+     }
+    },
+    {
+     "ruleId": "py/inspect-sinks-a",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/inspect-sinks-a",
+      "index": 0
+     },
+     "message": {
+      "text": "CALL: Attribute()"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/werkzeug/middleware/shared_data.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 155,
+         "startColumn": 27,
+         "endColumn": 53
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "14972b871cef0110:1",
+      "primaryLocationStartColumnFingerprint": "18"
+     }
+    },
+    {
+     "ruleId": "py/inspect-sinks-a",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/inspect-sinks-a",
+      "index": 0
+     },
+     "message": {
+      "text": "CALL: Attribute()"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/werkzeug/middleware/shared_data.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 155,
+         "startColumn": 55,
+         "endColumn": 77
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "14972b871cef0110:1",
+      "primaryLocationStartColumnFingerprint": "46"
+     }
+    },
+    {
+     "ruleId": "py/inspect-sinks-a",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/inspect-sinks-a",
+      "index": 0
+     },
+     "message": {
+      "text": "CALL: Attribute()"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/werkzeug/middleware/shared_data.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 158,
+         "startColumn": 21,
+         "endColumn": 47
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "adeca0d1c08f891d:1",
+      "primaryLocationStartColumnFingerprint": "12"
+     }
+    },
+    {
+     "ruleId": "py/inspect-sinks-a",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/inspect-sinks-a",
+      "index": 0
+     },
+     "message": {
+      "text": "CALL: Attribute()"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/werkzeug/middleware/shared_data.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 159,
+         "startColumn": 20,
+         "endColumn": 47
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "6053e2e0462b619b:1",
+      "primaryLocationStartColumnFingerprint": "11"
+     }
+    },
+    {
+     "ruleId": "py/inspect-sinks-a",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/inspect-sinks-a",
+      "index": 0
+     },
+     "message": {
+      "text": "CALL: Attribute()"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/werkzeug/middleware/shared_data.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 160,
+         "startColumn": 18,
+         "endColumn": 55
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "c276e1d85a73bb07:1",
+      "primaryLocationStartColumnFingerprint": "9"
+     }
+    },
+    {
+     "ruleId": "py/inspect-sinks-a",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/inspect-sinks-a",
+      "index": 0
+     },
+     "message": {
+      "text": "CALL: safe_join()"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/werkzeug/middleware/shared_data.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 168,
+         "startColumn": 20,
+         "endColumn": 49
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "3ed87ec00cd5b905:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/inspect-sinks-a",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/inspect-sinks-a",
+      "index": 0
+     },
+     "message": {
+      "text": "CALL: Attribute()"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/werkzeug/middleware/shared_data.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 173,
+         "startColumn": 24,
+         "endColumn": 48
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "3f1a52462f9413f7:1",
+      "primaryLocationStartColumnFingerprint": "11"
+     }
+    },
+    {
+     "ruleId": "py/inspect-sinks-a",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/inspect-sinks-a",
+      "index": 0
+     },
+     "message": {
+      "text": "CALL: Attribute()"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/werkzeug/middleware/shared_data.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 176,
+         "startColumn": 28,
+         "endColumn": 54
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "3362c73c014917cc:1",
+      "primaryLocationStartColumnFingerprint": "11"
+     }
+    },
+    {
+     "ruleId": "py/inspect-sinks-a",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/inspect-sinks-a",
+      "index": 0
+     },
+     "message": {
+      "text": "CALL: isinstance()"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/werkzeug/middleware/shared_data.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 180,
+         "startColumn": 16,
+         "endColumn": 45
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "a2282ea06faf7d0:1",
+      "primaryLocationStartColumnFingerprint": "3"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20261119215646",
+   "codeql_raw_query": "/**\n * @name form size limit attributes\n * @description Presence/absence of form parsing resource limits\n * @kind problem\n * @problem.severity note\n * @id py/form-limits\n */\nimport python\n\nfrom Attribute a\nwhere a.getName() in [\"max_form_memory_size\", \"max_form_parts\", \"max_parts\"]\nselect a, \"limit attribute: \" + a.getName()",
+   "hypothesis": "Werkzeug 2.2.2 multipart form parsing may lack a limit on the number of parts (max_form_parts was added in 3.0.1), leading to resource exhaustion (CWE-400).",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-400"
+   ],
+   "results_count": 10,
+   "results": [
+    {
+     "ruleId": "py/form-limits",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/form-limits",
+      "index": 0
+     },
+     "message": {
+      "text": "limit attribute: max_form_memory_size"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/werkzeug/formparser.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 200,
+         "startColumn": 9,
+         "endColumn": 34
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "2314dc5ba7114fc2:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/form-limits",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/form-limits",
+      "index": 0
+     },
+     "message": {
+      "text": "limit attribute: max_form_memory_size"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/werkzeug/formparser.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 282,
+         "startColumn": 34,
+         "endColumn": 59
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "c35652b0ec4c907d:1",
+      "primaryLocationStartColumnFingerprint": "21"
+     }
+    },
+    {
+     "ruleId": "py/form-limits",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/form-limits",
+      "index": 0
+     },
+     "message": {
+      "text": "limit attribute: max_form_memory_size"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/werkzeug/formparser.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 302,
+         "startColumn": 13,
+         "endColumn": 38
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "2f6c4ce1ba924ac2:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/form-limits",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/form-limits",
+      "index": 0
+     },
+     "message": {
+      "text": "limit attribute: max_form_memory_size"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/werkzeug/formparser.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 304,
+         "startColumn": 34,
+         "endColumn": 59
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "bbde8031b8d55802:1",
+      "primaryLocationStartColumnFingerprint": "21"
+     }
+    },
+    {
+     "ruleId": "py/form-limits",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/form-limits",
+      "index": 0
+     },
+     "message": {
+      "text": "limit attribute: max_form_memory_size"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/werkzeug/formparser.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 352,
+         "startColumn": 9,
+         "endColumn": 34
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "d17c6dffe6059c40:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/form-limits",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/form-limits",
+      "index": 0
+     },
+     "message": {
+      "text": "limit attribute: max_form_memory_size"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/werkzeug/formparser.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 412,
+         "startColumn": 45,
+         "endColumn": 70
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "4893c0be116a9477:1",
+      "primaryLocationStartColumnFingerprint": "36"
+     }
+    },
+    {
+     "ruleId": "py/form-limits",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/form-limits",
+      "index": 0
+     },
+     "message": {
+      "text": "limit attribute: max_form_memory_size"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/werkzeug/sansio/multipart.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 93,
+         "startColumn": 9,
+         "endColumn": 34
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "7d962f71735f3649:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/form-limits",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/form-limits",
+      "index": 0
+     },
+     "message": {
+      "text": "limit attribute: max_form_memory_size"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/werkzeug/sansio/multipart.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 138,
+         "startColumn": 13,
+         "endColumn": 38
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "6d5f11e3144c0816:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/form-limits",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/form-limits",
+      "index": 0
+     },
+     "message": {
+      "text": "limit attribute: max_form_memory_size"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/werkzeug/sansio/multipart.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 139,
+         "startColumn": 48,
+         "endColumn": 73
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "aaace7f677fed7ef:1",
+      "primaryLocationStartColumnFingerprint": "35"
+     }
+    },
+    {
+     "ruleId": "py/form-limits",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/form-limits",
+      "index": 0
+     },
+     "message": {
+      "text": "limit attribute: max_form_memory_size"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/werkzeug/wrappers/request.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 246,
+         "startColumn": 13,
+         "endColumn": 38
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "b2af9827558af491:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20261119215802",
+   "codeql_raw_query": "/**\n * @name max_form_parts structural check\n * @description Checks whether a limit on the number of multipart form parts exists in this version\n * @kind problem\n * @problem.severity warning\n * @id py/max-form-parts-check\n */\nimport python\n\nfrom Attribute a\nwhere a.getName() = \"max_form_parts\"\nselect a, \"max_form_parts reference\"\n",
+   "hypothesis": "If no reference to max_form_parts exists, the multipart parser has no limit on the number of parts, enabling DoS (CVE-2023-25577).",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-400"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20261119215842",
+   "codeql_raw_query": "/**\n * @name Presence of multipart limit identifiers\n * @description Checks which DoS-mitigation identifiers exist in the code base\n * @kind problem\n * @id py/multipart-limit-names\n * @problem.severity warning\n */\nimport python\n\nfrom Name n\nwhere n.getId() in [\"max_form_parts\", \"num_bytes_dropped\", \"max_form_memory_size\", \"max_content_length\"]\nselect n, \"identifier present: \" + n.getId()",
+   "hypothesis": "Werkzeug 2.2.2 lacks max_form_parts / num_bytes_dropped mitigations (CVE-2023-25577, CVE-2023-46136), while max_form_memory_size exists.",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-400"
+   ],
+   "results_count": 14,
+   "results": [
+    {
+     "ruleId": "py/multipart-limit-names",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/multipart-limit-names",
+      "index": 0
+     },
+     "message": {
+      "text": "identifier present: max_form_memory_size"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/werkzeug/formparser.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 79,
+         "startColumn": 5,
+         "endColumn": 25
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "77d8129778d652df:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/multipart-limit-names",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/multipart-limit-names",
+      "index": 0
+     },
+     "message": {
+      "text": "identifier present: max_content_length"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/werkzeug/formparser.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 80,
+         "startColumn": 5,
+         "endColumn": 23
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "c4681dce86a93258:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/multipart-limit-names",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/multipart-limit-names",
+      "index": 0
+     },
+     "message": {
+      "text": "identifier present: max_form_memory_size"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/werkzeug/formparser.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 128,
+         "startColumn": 9,
+         "endColumn": 29
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "57b447594402d105:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/multipart-limit-names",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/multipart-limit-names",
+      "index": 0
+     },
+     "message": {
+      "text": "identifier present: max_content_length"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/werkzeug/formparser.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 129,
+         "startColumn": 9,
+         "endColumn": 27
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "9dd4d101f85a69b5:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/multipart-limit-names",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/multipart-limit-names",
+      "index": 0
+     },
+     "message": {
+      "text": "identifier present: max_form_memory_size"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/werkzeug/formparser.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 189,
+         "startColumn": 9,
+         "endColumn": 29
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "77d8129778d652df:2",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/multipart-limit-names",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/multipart-limit-names",
+      "index": 0
+     },
+     "message": {
+      "text": "identifier present: max_content_length"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/werkzeug/formparser.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 190,
+         "startColumn": 9,
+         "endColumn": 27
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "c4681dce86a93258:2",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/multipart-limit-names",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/multipart-limit-names",
+      "index": 0
+     },
+     "message": {
+      "text": "identifier present: max_form_memory_size"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/werkzeug/formparser.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 200,
+         "startColumn": 37,
+         "endColumn": 57
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "2314dc5ba7114fc2:1",
+      "primaryLocationStartColumnFingerprint": "28"
+     }
+    },
+    {
+     "ruleId": "py/multipart-limit-names",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/multipart-limit-names",
+      "index": 0
+     },
+     "message": {
+      "text": "identifier present: max_content_length"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/werkzeug/formparser.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 201,
+         "startColumn": 35,
+         "endColumn": 53
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "baa0144c8500a421:1",
+      "primaryLocationStartColumnFingerprint": "26"
+     }
+    },
+    {
+     "ruleId": "py/multipart-limit-names",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/multipart-limit-names",
+      "index": 0
+     },
+     "message": {
+      "text": "identifier present: max_form_memory_size"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/werkzeug/formparser.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 346,
+         "startColumn": 9,
+         "endColumn": 29
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "c6e2bc6559618a89:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/multipart-limit-names",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/multipart-limit-names",
+      "index": 0
+     },
+     "message": {
+      "text": "identifier present: max_form_memory_size"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/werkzeug/formparser.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 352,
+         "startColumn": 37,
+         "endColumn": 57
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "d17c6dffe6059c40:1",
+      "primaryLocationStartColumnFingerprint": "28"
+     }
+    },
+    {
+     "ruleId": "py/multipart-limit-names",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/multipart-limit-names",
+      "index": 0
+     },
+     "message": {
+      "text": "identifier present: max_form_memory_size"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/werkzeug/sansio/multipart.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 89,
+         "startColumn": 9,
+         "endColumn": 29
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "a7e2de3d6e75bec2:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/multipart-limit-names",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/multipart-limit-names",
+      "index": 0
+     },
+     "message": {
+      "text": "identifier present: max_form_memory_size"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/werkzeug/sansio/multipart.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 93,
+         "startColumn": 37,
+         "endColumn": 57
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "7d962f71735f3649:1",
+      "primaryLocationStartColumnFingerprint": "28"
+     }
+    },
+    {
+     "ruleId": "py/multipart-limit-names",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/multipart-limit-names",
+      "index": 0
+     },
+     "message": {
+      "text": "identifier present: max_content_length"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/werkzeug/wrappers/request.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 73,
+         "startColumn": 5,
+         "endColumn": 23
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "2dd2610bc545d658:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/multipart-limit-names",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/multipart-limit-names",
+      "index": 0
+     },
+     "message": {
+      "text": "identifier present: max_form_memory_size"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/werkzeug/wrappers/request.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 84,
+         "startColumn": 5,
+         "endColumn": 25
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "b9fffc9f2a1e595b:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20261119215859",
+   "codeql_raw_query": "/**\n * @name safe_join internals\n * @description Dump calls used inside safe_join to audit path traversal protection\n * @kind problem\n * @id py/safe-join-internals\n * @problem.severity note\n */\nimport python\n\nfrom Call c, Function f\nwhere\n  f.getName() = \"safe_join\" and\n  c.getScope() = f\nselect c, \"call in safe_join: \" + c.getFunc().toString()",
+   "hypothesis": "safe_join path traversal containment audit.",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-22"
+   ],
+   "results_count": 6,
+   "results": [
+    {
+     "ruleId": "py/safe-join-internals",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/safe-join-internals",
+      "index": 0
+     },
+     "message": {
+      "text": "call in safe_join: Attribute"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/werkzeug/security.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 128,
+         "startColumn": 24,
+         "endColumn": 52
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "34d2f3e9c8a3b269:1",
+      "primaryLocationStartColumnFingerprint": "11"
+     }
+    },
+    {
+     "ruleId": "py/safe-join-internals",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/safe-join-internals",
+      "index": 0
+     },
+     "message": {
+      "text": "call in safe_join: any"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/werkzeug/security.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 131,
+         "startColumn": 13,
+         "endColumn": 57
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "523dc25fe545f21c:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/safe-join-internals",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/safe-join-internals",
+      "index": 0
+     },
+     "message": {
+      "text": "call in safe_join: Attribute"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/werkzeug/security.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 132,
+         "startColumn": 16,
+         "endColumn": 39
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "76339f97d630eb44:1",
+      "primaryLocationStartColumnFingerprint": "3"
+     }
+    },
+    {
+     "ruleId": "py/safe-join-internals",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/safe-join-internals",
+      "index": 0
+     },
+     "message": {
+      "text": "call in safe_join: Attribute"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/werkzeug/security.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 134,
+         "startColumn": 16,
+         "endColumn": 42
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "bf30b385afd34c2:1",
+      "primaryLocationStartColumnFingerprint": "3"
+     }
+    },
+    {
+     "ruleId": "py/safe-join-internals",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/safe-join-internals",
+      "index": 0
+     },
+     "message": {
+      "text": "call in safe_join: Attribute"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/werkzeug/security.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 138,
+         "startColumn": 9,
+         "endColumn": 31
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "55ee205594abfa72:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/safe-join-internals",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/safe-join-internals",
+      "index": 0
+     },
+     "message": {
+      "text": "call in safe_join: Attribute"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/werkzeug/security.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 140,
+         "startColumn": 12,
+         "endColumn": 34
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "fccef7eebd0c64f4:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20261119215939",
+   "codeql_raw_query": "/**\n * @name max_form_parts presence check\n * @description Checks whether Werkzeug 2.2.2 enforces a maximum number of multipart parts\n * @kind problem\n * @problem.severity warning\n * @id py/max-form-parts-check\n */\nimport python\n\nfrom Name n\nwhere n.getId() = \"max_form_parts\"\nselect n, \"max_form_parts identifier found\"\n",
+   "hypothesis": "Werkzeug 2.2.2 lacks any max_form_parts limit, allowing an unbounded number of multipart parts (CVE-2023-25577, CWE-400).",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-400"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20261119220054",
+   "codeql_raw_query": "/**\n * @name cookie parser internals\n * @description list calls and string literals in sansio/http.py\n * @kind problem\n * @problem.severity note\n * @id py/cookie-internals\n */\nimport python\n\nfrom Call c, string msg\nwhere\n  c.getLocation().getFile().getRelativePath() = \"src/werkzeug/sansio/http.py\"\n  and (\n    exists(Name n | n = c.getFunc() and msg = \"CALL: \" + n.getId()) or\n    msg = \"OTHER\"\n  )\nselect c, msg",
+   "hypothesis": "Cookie parsing in sansio/http.py may allow malformed cookies (CWE-20), as in CVE-2023-23934.",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-20"
+   ],
+   "results_count": 24,
+   "results": [
+    {
+     "ruleId": "py/cookie-internals",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/cookie-internals",
+      "index": 0
+     },
+     "message": {
+      "text": "OTHER"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/werkzeug/sansio/http.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 14,
+         "startColumn": 12,
+         "endColumn": 65
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "2aaf9da0940988b3:1",
+      "primaryLocationStartColumnFingerprint": "11"
+     }
+    },
+    {
+     "ruleId": "py/cookie-internals",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/cookie-internals",
+      "index": 0
+     },
+     "message": {
+      "text": "OTHER\nCALL: generate_etag"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/werkzeug/sansio/http.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 45,
+         "startColumn": 16,
+         "endColumn": 35
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "2ded7d76a5fe8582:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/cookie-internals",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/cookie-internals",
+      "index": 0
+     },
+     "message": {
+      "text": "OTHER\nCALL: TypeError"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/werkzeug/sansio/http.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 47,
+         "startColumn": 15,
+         "endColumn": 52
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "d4e23c152dba3e6f:1",
+      "primaryLocationStartColumnFingerprint": "6"
+     }
+    },
+    {
+     "ruleId": "py/cookie-internals",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/cookie-internals",
+      "index": 0
+     },
+     "message": {
+      "text": "OTHER\nCALL: isinstance"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/werkzeug/sansio/http.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 50,
+         "startColumn": 8,
+         "endColumn": 38
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "b5ddd1c44c7eb7a6:1",
+      "primaryLocationStartColumnFingerprint": "3"
+     }
+    },
+    {
+     "ruleId": "py/cookie-internals",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/cookie-internals",
+      "index": 0
+     },
+     "message": {
+      "text": "OTHER\nCALL: parse_date"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/werkzeug/sansio/http.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 51,
+         "startColumn": 25,
+         "endColumn": 50
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "562e13a3c796abc2:1",
+      "primaryLocationStartColumnFingerprint": "16"
+     }
+    },
+    {
+     "ruleId": "py/cookie-internals",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/cookie-internals",
+      "index": 0
+     },
+     "message": {
+      "text": "OTHER\nCALL: _dt_as_utc"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/werkzeug/sansio/http.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 56,
+         "startColumn": 25,
+         "endColumn": 73
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "1d6ae5daad34b904:1",
+      "primaryLocationStartColumnFingerprint": "16"
+     }
+    },
+    {
+     "ruleId": "py/cookie-internals",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/cookie-internals",
+      "index": 0
+     },
+     "message": {
+      "text": "OTHER"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/werkzeug/sansio/http.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 56,
+         "startColumn": 36,
+         "endColumn": 72
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "1d6ae5daad34b904:1",
+      "primaryLocationStartColumnFingerprint": "27"
+     }
+    },
+    {
+     "ruleId": "py/cookie-internals",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/cookie-internals",
+      "index": 0
+     },
+     "message": {
+      "text": "OTHER\nCALL: parse_if_range_header"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/werkzeug/sansio/http.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 63,
+         "startColumn": 20,
+         "endColumn": 56
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "6e09bffff4341777:1",
+      "primaryLocationStartColumnFingerprint": "11"
+     }
+    },
+    {
+     "ruleId": "py/cookie-internals",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/cookie-internals",
+      "index": 0
+     },
+     "message": {
+      "text": "OTHER\nCALL: parse_date"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/werkzeug/sansio/http.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 68,
+         "startColumn": 26,
+         "endColumn": 60
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "825bf8353753111a:1",
+      "primaryLocationStartColumnFingerprint": "17"
+     }
+    },
+    {
+     "ruleId": "py/cookie-internals",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/cookie-internals",
+      "index": 0
+     },
+     "message": {
+      "text": "OTHER\nCALL: unquote_etag"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/werkzeug/sansio/http.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 74,
+         "startColumn": 19,
+         "endColumn": 37
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "2e8f357bcfd9df34:1",
+      "primaryLocationStartColumnFingerprint": "10"
+     }
+    },
+    {
+     "ruleId": "py/cookie-internals",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/cookie-internals",
+      "index": 0
+     },
+     "message": {
+      "text": "OTHER"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/werkzeug/sansio/http.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 75,
+         "startColumn": 16,
+         "endColumn": 33
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "4a72e941e90b4909:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/cookie-internals",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/cookie-internals",
+      "index": 0
+     },
+     "message": {
+      "text": "OTHER"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/werkzeug/sansio/http.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 78,
+         "startColumn": 26,
+         "endColumn": 67
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "48cf84d973e06d7b:1",
+      "primaryLocationStartColumnFingerprint": "13"
+     }
+    },
+    {
+     "ruleId": "py/cookie-internals",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/cookie-internals",
+      "index": 0
+     },
+     "message": {
+      "text": "OTHER\nCALL: parse_etags"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/werkzeug/sansio/http.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 78,
+         "startColumn": 26,
+         "endColumn": 52
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "48cf84d973e06d7b:1",
+      "primaryLocationStartColumnFingerprint": "13"
+     }
+    },
+    {
+     "ruleId": "py/cookie-internals",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/cookie-internals",
+      "index": 0
+     },
+     "message": {
+      "text": "OTHER\nCALL: parse_etags"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/werkzeug/sansio/http.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 80,
+         "startColumn": 29,
+         "endColumn": 60
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "b4ce50c2a74fdbbc:1",
+      "primaryLocationStartColumnFingerprint": "16"
+     }
+    },
+    {
+     "ruleId": "py/cookie-internals",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/cookie-internals",
+      "index": 0
+     },
+     "message": {
+      "text": "OTHER"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/werkzeug/sansio/http.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 85,
+         "startColumn": 30,
+         "endColumn": 63
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "5fef19eb8ea745b0:1",
+      "primaryLocationStartColumnFingerprint": "13"
+     }
+    },
+    {
+     "ruleId": "py/cookie-internals",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/cookie-internals",
+      "index": 0
+     },
+     "message": {
+      "text": "OTHER\nCALL: parse_etags"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/werkzeug/sansio/http.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 90,
+         "startColumn": 24,
+         "endColumn": 50
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "6eb63896bdfc6def:1",
+      "primaryLocationStartColumnFingerprint": "11"
+     }
+    },
+    {
+     "ruleId": "py/cookie-internals",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/cookie-internals",
+      "index": 0
+     },
+     "message": {
+      "text": "OTHER"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/werkzeug/sansio/http.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 92,
+         "startColumn": 34,
+         "endColumn": 58
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "cb665e7c72176082:1",
+      "primaryLocationStartColumnFingerprint": "17"
+     }
+    },
+    {
+     "ruleId": "py/cookie-internals",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/cookie-internals",
+      "index": 0
+     },
+     "message": {
+      "text": "OTHER\nCALL: isinstance"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/werkzeug/sansio/http.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 120,
+         "startColumn": 8,
+         "endColumn": 31
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "5d171582d199d4b3:1",
+      "primaryLocationStartColumnFingerprint": "3"
+     }
+    },
+    {
+     "ruleId": "py/cookie-internals",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/cookie-internals",
+      "index": 0
+     },
+     "message": {
+      "text": "OTHER"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/werkzeug/sansio/http.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 121,
+         "startColumn": 18,
+         "endColumn": 52
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "ffa723677880e2c9:1",
+      "primaryLocationStartColumnFingerprint": "9"
+     }
+    },
+    {
+     "ruleId": "py/cookie-internals",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/cookie-internals",
+      "index": 0
+     },
+     "message": {
+      "text": "OTHER\nCALL: _cookie_parse_impl"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/werkzeug/sansio/http.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 127,
+         "startColumn": 25,
+         "endColumn": 51
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "465e4326dd997900:1",
+      "primaryLocationStartColumnFingerprint": "16"
+     }
+    },
+    {
+     "ruleId": "py/cookie-internals",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/cookie-internals",
+      "index": 0
+     },
+     "message": {
+      "text": "OTHER\nCALL: _to_str"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/werkzeug/sansio/http.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 128,
+         "startColumn": 23,
+         "endColumn": 77
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "67bb398f165f1f91:1",
+      "primaryLocationStartColumnFingerprint": "10"
+     }
+    },
+    {
+     "ruleId": "py/cookie-internals",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/cookie-internals",
+      "index": 0
+     },
+     "message": {
+      "text": "OTHER\nCALL: _to_str"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/werkzeug/sansio/http.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 133,
+         "startColumn": 23,
+         "endColumn": 77
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "b825b1175fe50539:1",
+      "primaryLocationStartColumnFingerprint": "10"
+     }
+    },
+    {
+     "ruleId": "py/cookie-internals",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/cookie-internals",
+      "index": 0
+     },
+     "message": {
+      "text": "OTHER\nCALL: cls"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/werkzeug/sansio/http.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 136,
+         "startColumn": 12,
+         "endColumn": 31
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "fb4cadb4756d9b50:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/cookie-internals",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/cookie-internals",
+      "index": 0
+     },
+     "message": {
+      "text": "OTHER\nCALL: _parse_pairs"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/werkzeug/sansio/http.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 136,
+         "startColumn": 16,
+         "endColumn": 30
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "fb4cadb4756d9b50:1",
+      "primaryLocationStartColumnFingerprint": "11"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20261119220145",
+   "codeql_raw_query": "/**\n * @name __Host- cookie prefix handling\n * @description Checks whether any string literal references the __Host- cookie prefix\n * @kind problem\n * @problem.severity warning\n * @id py/host-prefix-literal\n */\nimport python\n\nfrom Str s\nwhere s.getText().matches(\"%__Host%\")\nselect s, \"literal referencing __Host: \" + s.getText()",
+   "hypothesis": "Werkzeug 2.2.2 parse_cookie lacks the __Host- prefix validation added in 2.2.3 (CVE-2023-23934): cookie names can be spoofed by placing them after another cookie, bypassing the __Host- security invariant.",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-20",
+    "cwe-345"
+   ],
+   "results_count": 3,
+   "results": [
+    {
+     "ruleId": "py/host-prefix-literal",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/host-prefix-literal",
+      "index": 0
+     },
+     "message": {
+      "text": "literal referencing __Host: Adjust the WSGI environ based on ``X-Forwarded-`` that proxies in\n    front of the application may set.\n\n    -   ``X-Forwarded-For`` sets ``REMOTE_ADDR``.\n    -   ``X-Forwarded-Proto`` sets ``wsgi.url_scheme``.\n    -   ``X-Forwarded-Host`` sets ``HTTP_HOST``, ``SERVER_NAME``, and\n        ``SERVER_PORT``.\n    -   ``X-Forwarded-Port`` sets ``HTTP_HOST`` and ``SERVER_PORT``.\n    -   ``X-Forwarded-Prefix`` sets ``SCRIPT_NAME``.\n\n    You must tell the middleware how many proxies set each header so it\n    knows what values to trust. It is a security issue to trust values\n    that came from the client rather than a proxy.\n\n    The original values of the headers are stored in the WSGI\n    environ as ``werkzeug.proxy_fix.orig``, a dict.\n\n    :param app: The WSGI application to wrap.\n    :param x_for: Number of values to trust for ``X-Forwarded-For``.\n    :param x_proto: Number of values to trust for ``X-Forwarded-Proto``.\n    :param x_host: Number of values to trust for ``X-Forwarded-Host``.\n    :param x_port: Number of values to trust for ``X-Forwarded-Port``.\n    :param x_prefix: Number of values to trust for\n        ``X-Forwarded-Prefix``.\n\n    .. code-block:: python\n\n        from werkzeug.middleware.proxy_fix import ProxyFix\n        # App is behind one proxy that sets the -For and -Host headers.\n        app = ProxyFix(app, x_for=1, x_host=1)\n\n    .. versionchanged:: 1.0\n        Deprecated code has been removed:\n\n        *   The ``num_proxies`` argument and attribute.\n        *   The ``get_remote_addr`` method.\n        *   The environ keys ``orig_remote_addr``,\n            ``orig_wsgi_url_scheme``, and ``orig_http_host``.\n\n    .. versionchanged:: 0.15\n        All headers support multiple values. The ``num_proxies``\n        argument is deprecated. Each header is configured with a\n        separate number of trusted proxies.\n\n    .. versionchanged:: 0.15\n        Original WSGI environ values are stored in the\n        ``werkzeug.proxy_fix.orig`` dict. ``orig_remote_addr``,\n        ``orig_wsgi_url_scheme``, and ``orig_http_host`` are deprecated\n        and will be removed in 1.0.\n\n    .. versionchanged:: 0.15\n        Support ``X-Forwarded-Port`` and ``X-Forwarded-Prefix``.\n\n    .. versionchanged:: 0.15\n        ``X-Forwarded-Host`` and ``X-Forwarded-Port`` modify\n        ``SERVER_NAME`` and ``SERVER_PORT``.\n    "
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/werkzeug/middleware/proxy_fix.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 35,
+         "startColumn": 5,
+         "endLine": 91,
+         "endColumn": 8
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "21ee2dfffabe3f6a:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/host-prefix-literal",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/host-prefix-literal",
+      "index": 0
+     },
+     "message": {
+      "text": "literal referencing __Host: Return the host for the given parameters.\n\n    This first checks the ``host_header``. If it's not present, then\n    ``server`` is used. The host will only contain the port if it is\n    different than the standard port for the protocol.\n\n    Optionally, verify that the host is trusted using\n    :func:`host_is_trusted` and raise a\n    :exc:`~werkzeug.exceptions.SecurityError` if it is not.\n\n    :param scheme: The protocol the request used, like ``\"https\"``.\n    :param host_header: The ``Host`` header value.\n    :param server: Address of the server. ``(host, port)``, or\n        ``(path, None)`` for unix sockets.\n    :param trusted_hosts: A list of trusted host names.\n\n    :return: Host, with port if necessary.\n    :raise ~werkzeug.exceptions.SecurityError: If the host is not\n        trusted.\n    "
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/werkzeug/sansio/utils.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 62,
+         "startColumn": 5,
+         "endLine": 81,
+         "endColumn": 8
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "9e88bff861fda68f:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/host-prefix-literal",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/host-prefix-literal",
+      "index": 0
+     },
+     "message": {
+      "text": "literal referencing __Host: Return the host for the given WSGI environment.\n\n    The ``Host`` header is preferred, then ``SERVER_NAME`` if it's not\n    set. The returned host will only contain the port if it is different\n    than the standard port for the protocol.\n\n    Optionally, verify that the host is trusted using\n    :func:`host_is_trusted` and raise a\n    :exc:`~werkzeug.exceptions.SecurityError` if it is not.\n\n    :param environ: A WSGI environment dict.\n    :param trusted_hosts: A list of trusted host names.\n\n    :return: Host, with port if necessary.\n    :raise ~werkzeug.exceptions.SecurityError: If the host is not\n        trusted.\n    "
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/werkzeug/wsgi.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 96,
+         "startColumn": 5,
+         "endLine": 112,
+         "endColumn": 8
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "6ed82104c4417d08:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20261119220201",
+   "codeql_raw_query": "/**\n * @name debugger host and pin validation identifiers\n * @description Lists identifiers used in the debug module related to host checking and pin auth\n * @kind problem\n * @problem.severity warning\n * @id py/debug-host-identifiers\n */\nimport python\n\nfrom Name n\nwhere\n  n.getId() in [\"trusted_hosts\", \"is_debugger\", \"pin_auth\", \"_get_machine_id\", \"check_pin\", \"AnyHost\", \"_TrustedHosts\"]\n  and n.getLocation().getFile().getRelativePath().matches(\"%debug%\")\nselect n, \"identifier: \" + n.getId()",
+   "hypothesis": "Werkzeug debugger in 2.2.2 does not restrict which Host headers may access the interactive console, enabling RCE reachable via DNS rebinding / non-local host access (CVE-2024-34069).",
+   "severity": "critical",
+   "cwe_ids": [
+    "cwe-94",
+    "cwe-306"
+   ],
+   "results_count": 1,
+   "results": [
+    {
+     "ruleId": "py/debug-host-identifiers",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/debug-host-identifiers",
+      "index": 0
+     },
+     "message": {
+      "text": "identifier: pin_auth"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/werkzeug/debug/__init__.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 439,
+         "startColumn": 9,
+         "endColumn": 17
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "1af79d08b21d8d71:1",
+      "primaryLocationStartColumnFingerprint": "4"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20261119220229",
+   "codeql_raw_query": "/**\n * @name multipart buffering before limit check\n * @description formparser multi-part loop accumulates chunks before enforcing limits\n * @kind problem\n * @problem.severity warning\n * @id py/multipart-buffer\n */\nimport python\n\nfrom Stmt s, Call c\nwhere\n  s.getLocation().getFile().getRelativePath() = \"src/werkzeug/formparser.py\" and\n  s.getLocation().getStartLine() >= 380 and s.getLocation().getStartLine() <= 430 and\n  c.getLocation().getStartLine() >= 380 and c.getLocation().getStartLine() <= 430 and\n  c = s.getAChildNode+()\nselect s, \"STMT \" + s.getLocation().getStartLine().toString() + \" contains CALL \" + c.getFunc().toString()\n",
+   "hypothesis": "Multipart form parsing buffers data without enforcing max_form_parts (CVE-2023-25577 / CVE-2023-46136 DoS)",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-400",
+    "cwe-770"
+   ],
+   "results_count": 15,
+   "results": [
+    {
+     "ruleId": "py/multipart-buffer",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/multipart-buffer",
+      "index": 0
+     },
+     "message": {
+      "text": "STMT 382 contains CALL Attribute"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/werkzeug/formparser.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 382,
+         "startColumn": 9,
+         "endColumn": 57
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "c86b285980c79bb0:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/multipart-buffer",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/multipart-buffer",
+      "index": 0
+     },
+     "message": {
+      "text": "STMT 384 contains CALL int"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/werkzeug/formparser.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 384,
+         "startColumn": 9,
+         "endColumn": 13
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "4157416920202b58:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/multipart-buffer",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/multipart-buffer",
+      "index": 0
+     },
+     "message": {
+      "text": "STMT 385 contains CALL int"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/werkzeug/formparser.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 385,
+         "startColumn": 13,
+         "endColumn": 66
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "9c16a5a73d75b479:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/multipart-buffer",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/multipart-buffer",
+      "index": 0
+     },
+     "message": {
+      "text": "STMT 389 contains CALL Attribute"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/werkzeug/formparser.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 389,
+         "startColumn": 9,
+         "endLine": 394,
+         "endColumn": 10
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "698dbb2afe5d35b2:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/multipart-buffer",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/multipart-buffer",
+      "index": 0
+     },
+     "message": {
+      "text": "STMT 397 contains CALL chain\nSTMT 397 contains CALL _make_chunk_iter\nSTMT 397 contains CALL MultipartDecoder\nSTMT 397 contains CALL Attribute\nSTMT 397 contains CALL isinstance"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/werkzeug/formparser.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 397,
+         "startColumn": 5,
+         "endLine": 399,
+         "endColumn": 40
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "9674cf7015454ebf:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/multipart-buffer",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/multipart-buffer",
+      "index": 0
+     },
+     "message": {
+      "text": "STMT 403 contains CALL chain\nSTMT 403 contains CALL _make_chunk_iter"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/werkzeug/formparser.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 403,
+         "startColumn": 9,
+         "endLine": 410,
+         "endColumn": 10
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "c245ccd5c5cfb544:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/multipart-buffer",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/multipart-buffer",
+      "index": 0
+     },
+     "message": {
+      "text": "STMT 412 contains CALL MultipartDecoder"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/werkzeug/formparser.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 412,
+         "startColumn": 9,
+         "endColumn": 71
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "4893c0be116a9477:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/multipart-buffer",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/multipart-buffer",
+      "index": 0
+     },
+     "message": {
+      "text": "STMT 418 contains CALL Attribute\nSTMT 418 contains CALL isinstance"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/werkzeug/formparser.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 418,
+         "startColumn": 9,
+         "endColumn": 30
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "61f9018e3127057a:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/multipart-buffer",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/multipart-buffer",
+      "index": 0
+     },
+     "message": {
+      "text": "STMT 419 contains CALL Attribute"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/werkzeug/formparser.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 419,
+         "startColumn": 13,
+         "endColumn": 38
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "5f598f547b865781:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/multipart-buffer",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/multipart-buffer",
+      "index": 0
+     },
+     "message": {
+      "text": "STMT 420 contains CALL Attribute"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/werkzeug/formparser.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 420,
+         "startColumn": 13,
+         "endColumn": 40
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "fae36e6bb21378bb:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/multipart-buffer",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/multipart-buffer",
+      "index": 0
+     },
+     "message": {
+      "text": "STMT 421 contains CALL isinstance\nSTMT 421 contains CALL Attribute"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/werkzeug/formparser.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 421,
+         "startColumn": 13,
+         "endColumn": 63
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "1f468c2f374b7764:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/multipart-buffer",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/multipart-buffer",
+      "index": 0
+     },
+     "message": {
+      "text": "STMT 422 contains CALL isinstance\nSTMT 422 contains CALL Attribute"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/werkzeug/formparser.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 422,
+         "startColumn": 17,
+         "endColumn": 45
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "ccb9a25ea4984d8d:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/multipart-buffer",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/multipart-buffer",
+      "index": 0
+     },
+     "message": {
+      "text": "STMT 426 contains CALL isinstance\nSTMT 426 contains CALL Attribute"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/werkzeug/formparser.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 426,
+         "startColumn": 17,
+         "endColumn": 46
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "4de7cf42ea9fef47:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/multipart-buffer",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/multipart-buffer",
+      "index": 0
+     },
+     "message": {
+      "text": "STMT 428 contains CALL Attribute"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/werkzeug/formparser.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 428,
+         "startColumn": 21,
+         "endColumn": 81
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "cb89c06eba634e87:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/multipart-buffer",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/multipart-buffer",
+      "index": 0
+     },
+     "message": {
+      "text": "STMT 430 contains CALL isinstance"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/werkzeug/formparser.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 430,
+         "startColumn": 17,
+         "endColumn": 46
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "d6168bfdb49a69c6:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20261119220247",
+   "codeql_raw_query": "/**\n * @name nameless cookie acceptance\n * @description parse_cookie accepts cookies with empty names that browsers may treat as __Host- prefixed\n * @kind problem\n * @problem.severity warning\n * @id py/nameless-cookie\n */\nimport python\n\nfrom If i, Compare cmp, Name n\nwhere\n  i.getLocation().getFile().getRelativePath() in [\"src/werkzeug/sansio/http.py\", \"src/werkzeug/http.py\"] and\n  cmp = i.getTest() and\n  n = cmp.getAChildNode*() and\n  n.getId() in [\"key\", \"name\", \"k\"]\nselect cmp, \"cookie name check: \" + cmp.toString()\n",
+   "hypothesis": "Cookie parser does not reject nameless cookies / __Host- prefix confusion (CVE-2023-23934)",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-20"
+   ],
+   "results_count": 1,
+   "results": [
+    {
+     "ruleId": "py/nameless-cookie",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/nameless-cookie",
+      "index": 0
+     },
+     "message": {
+      "text": "cookie name check: Compare"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/werkzeug/http.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 678,
+         "startColumn": 16,
+         "endColumn": 35
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "51ca055fa1ec43c3:1",
+      "primaryLocationStartColumnFingerprint": "3"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20261119220318",
+   "codeql_raw_query": "/**\n * @name cookie impl statements\n * @kind problem\n * @problem.severity note\n * @id py/cookie-impl\n */\nimport python\n\nfrom Function f, Stmt s\nwhere\n  f.getName() in [\"_cookie_parse_impl\", \"parse_cookie\"] and\n  s.getScope() = f and\n  s.getLocation().getFile().getRelativePath().matches(\"%werkzeug/sansio/http.py\")\nselect s, f.getName() + \" line \" + s.getLocation().getStartLine().toString() + \" :: \" + s.toString()",
+   "hypothesis": "CVE-2023-23934: cookie parser accepts nameless cookies, bypassing __Host- prefix policy (CWE-20)",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-20"
+   ],
+   "results_count": 7,
+   "results": [
+    {
+     "ruleId": "py/cookie-impl",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/cookie-impl",
+      "index": 0
+     },
+     "message": {
+      "text": "parse_cookie line 103 :: ExprStmt"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/werkzeug/sansio/http.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 103,
+         "startColumn": 5,
+         "endLine": 117,
+         "endColumn": 8
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "da23e9e97248c22c:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/cookie-impl",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/cookie-impl",
+      "index": 0
+     },
+     "message": {
+      "text": "parse_cookie line 120 :: If"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/werkzeug/sansio/http.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 120,
+         "startColumn": 5,
+         "endColumn": 32
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "5d171582d199d4b3:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/cookie-impl",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/cookie-impl",
+      "index": 0
+     },
+     "message": {
+      "text": "parse_cookie line 121 :: AssignStmt"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/werkzeug/sansio/http.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 121,
+         "startColumn": 9,
+         "endColumn": 52
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "ffa723677880e2c9:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/cookie-impl",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/cookie-impl",
+      "index": 0
+     },
+     "message": {
+      "text": "parse_cookie line 123 :: If"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/werkzeug/sansio/http.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 123,
+         "startColumn": 5,
+         "endColumn": 20
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "4980164abe59f9b7:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/cookie-impl",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/cookie-impl",
+      "index": 0
+     },
+     "message": {
+      "text": "parse_cookie line 124 :: AssignStmt"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/werkzeug/sansio/http.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 124,
+         "startColumn": 9,
+         "endColumn": 27
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "189a755c4f5a7ba8:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/cookie-impl",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/cookie-impl",
+      "index": 0
+     },
+     "message": {
+      "text": "parse_cookie line 126 :: FunctionDef"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/werkzeug/sansio/http.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 126,
+         "startColumn": 5,
+         "endColumn": 57
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "73574870d4e7d2c3:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/cookie-impl",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/cookie-impl",
+      "index": 0
+     },
+     "message": {
+      "text": "parse_cookie line 136 :: Return"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/werkzeug/sansio/http.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 136,
+         "startColumn": 5,
+         "endColumn": 31
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "fb4cadb4756d9b50:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    }
+   ]
+  }
+ ],
+ "cache_usage": {
+  "prompt_tokens_total": 236298,
+  "uncached_input_tokens": 20746,
+  "cache_creation_input_tokens": 0,
+  "cache_read_input_tokens": 215552,
+  "output_tokens": 36420,
+  "calls": 18,
+  "caching_enabled": false,
+  "cost_usd_with_cache": 0.025611,
+  "cost_usd_no_cache": 0.057297,
+  "cache_read_share_of_prompt": 0.9122,
+  "prices_per_mtok": {
+   "claude-sonnet-4-5-20250929": {
+    "input": 3.0,
+    "output": 15.0
+   },
+   "claude-haiku-4-5-20251001": {
+    "input": 1.0,
+    "output": 5.0
+   },
+   "deepseek/deepseek-reasoner": {
+    "input": 0.15,
+    "output": 0.6,
+    "cache_read": 0.003,
+    "cache_write_mult": 1.0,
+    "peak_mult": 2.0
+   },
+   "gpt-5.1": {
+    "input": 1.25,
+    "output": 10.0,
+    "cache_read": 0.125,
+    "cache_write_mult": 1.0
+   },
+   "gpt-4.1": {
+    "input": 2.0,
+    "output": 8.0,
+    "cache_read": 0.5,
+    "cache_write_mult": 1.0
+   }
+  },
+  "cache_multipliers": {
+   "write_5m": 1.25,
+   "read": 0.1
+  }
+ }
+}

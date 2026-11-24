@@ -1,0 +1,677 @@
+{
+ "session_id": "20251207235449",
+ "package_name": "google_auth-2.42.1",
+ "package_path": "packages/google_auth-2.42.1",
+ "database_path": "databases/google_auth-2.42.1-db",
+ "model": "gpt-5.1",
+ "temperature": 0.0,
+ "max_tokens": 8000,
+ "iterations": 11,
+ "total_input_tokens": 96840,
+ "total_output_tokens": 7057,
+ "total_tokens": 103897,
+ "elapsed_time_seconds": 296.21,
+ "estimated_cost_usd": 0.1916,
+ "summary": "Security analysis of the `google-auth` 2.42.1 package (Google Authentication Library) focused on code-level vulnerabilities using CodeQL.\n\n## Package overview\n- Type: Python authentication library for Google APIs.\n- Size: 74 source files, ~14.7k LOC.\n- Key domains: OAuth2 flows, JWT handling, service account credentials, external account and AWS federation, mTLS helpers, pluggable auth, async transports.\n- External deps: `requests`, `urllib3`, `aiohttp`, `grpc`, `cryptography`, `rsa`, `pyasn1`, `OpenSSL`, etc.\n\n## Analysis approach\n- Used CodeQL to scan for:\n  - Command execution / subprocess misuse (CWE-78).\n  - General security-sensitive subprocess usage.\n  - Other generic security patterns (some queries failed to compile and were discarded).\n- Enumerated all subprocess call sites and inspected their context via the SARIF locations.\n\n## Key findings\n\n### 1. Security-sensitive use of subprocess APIs (enumeration only)\n**Severity:** medium (context-dependent)  \n**CWE:** CWE-78 (OS Command Injection) – *potential class*, but no direct injection path identified.  \n**CodeQL rule:** `py/subprocess-usage-enumeration`\n\nCodeQL identified six locations where subprocess APIs are used:\n\n1. `google/auth/_cloud_sdk.py`\n   - Around line 88\n   - Around line 146\n\n2. `google/auth/transport/_mtls_helper.py`\n   - Around lines 242–244\n\n3. `google/auth/pluggable.py`\n   - Around lines 222–229\n   - Around lines 275–282\n\n4. `google/oauth2/webauthn_handler.py`\n   - Around lines 60–62\n\nThese are all legitimate uses where the library interacts with:\n- Local Google Cloud SDK binaries.\n- mTLS helper tooling.\n- Pluggable authentication commands.\n- WebAuthn-related helpers.\n\n**Risk assessment:**\n- The enumeration query flags *all* subprocess usage as “security-sensitive depending on inputs.”\n- In this package, subprocess calls are part of controlled flows (e.g., invoking `gcloud` or helper binaries) and are not obviously constructed directly from remote user input.\n- No CodeQL data-flow paths from `RemoteFlowSource` to subprocess command arguments were successfully validated in this run (our taint-tracking query for command injection did not compile and could not be auto-fixed by the helper tool).\n\nGiven the library’s nature, the main realistic risk is **misuse by consumers**:\n- If an application passes untrusted, unsanitized data into configuration that ultimately influences these subprocess invocations (e.g., environment variables, pluggable command strings), there is a potential for command injection.\n- However, based on the static locations alone and without a working taint-tracking query, we did **not** confirm any concrete injection vulnerability inside `google-auth` itself.\n\n**Recommendation for consumers:**\n- Treat any configuration that can affect subprocess commands (e.g., pluggable auth command lines, paths, or arguments) as security-sensitive.\n- Do not derive such configuration directly from untrusted input (HTTP parameters, user-supplied environment variables, etc.) without strict validation and whitelisting.\n\n**Recommendation for maintainers:**\n- Where feasible, prefer `subprocess.run([...], shell=False)` with fixed argument lists over shell-constructed strings.\n- Document clearly which configuration knobs can influence subprocess execution so downstream users understand the risk.\n\n## Other vulnerability classes\n\nWithin the constraints of the working CodeQL queries in this session:\n- No confirmed issues were reported for:\n  - Unsafe deserialization (pickle/yaml/marshal).\n  - Direct code execution sinks (eval/exec).\n  - Obvious hard-coded secrets.\n  - Direct SQL injection sinks.\n- Some additional custom queries failed to compile due to CodeQL API or syntax issues and were not counted toward findings.\n\nGiven the package’s maturity, scope, and the limited but focused CodeQL coverage achieved here, there is **no evidence of a concrete, exploitable vulnerability** in `google-auth` 2.42.1 from this analysis. The main actionable outcome is awareness of the subprocess usage sites and their potential sensitivity depending on how the library is configured and integrated.\n\n## Overall assessment\n- **Overall risk from this analysis:** Low-to-medium, dominated by context-dependent subprocess usage.\n- **No specific CVE-grade vulnerability** was identified in the library code itself during this run.\n- Users should still follow best practices for configuration hygiene and avoid feeding untrusted data into any mechanism that can influence command execution or external tooling invoked by `google-auth`.",
+ "package_classification": {
+  "type": "library",
+  "layer": [
+   "application",
+   "security",
+   "auth"
+  ]
+ },
+ "tool_calls": {
+  "get_package_profile_info": 1,
+  "execute_codeql_query": 12,
+  "validate_codeql_query": 0,
+  "fixup_codeql_query": 2,
+  "finalize_report": 1
+ },
+ "queries_executed": {
+  "critical": 0,
+  "high": 0,
+  "medium": 3,
+  "low": 2,
+  "total_executed": 12,
+  "total_with_results": 5,
+  "total_failed": 13
+ },
+ "query_findings": {
+  "critical": 0,
+  "high": 0,
+  "medium": 18,
+  "low": 0,
+  "total": 18
+ },
+ "findings": [
+  {
+   "codeql_query_uuid": "20251207235511",
+   "codeql_raw_query": "/**\n * @name Use of insecure randomness for security tokens\n * @description Flags uses of random module where secrets or tokens may be generated.\n * @kind problem\n * @problem.severity warning\n * @id py/google-auth/insecure-random\n * @tags security\n *       external/cwe/cwe-330\n */\n\nimport python\nimport semmle.python.ApiGraphs\nimport semmle.python.dataflow.new.DataFlow\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"random\").getMember([\"random\", \"randint\", \"randrange\", \"getrandbits\"]).getACall()\nselect call, \"Use of random module; ensure this is not used for security-sensitive tokens or nonces.\"",
+   "hypothesis": "Find uses of random module that might be used for security-sensitive values.",
+   "severity": "low",
+   "cwe_ids": [
+    "cwe-330"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251207235700",
+   "codeql_raw_query": "/**\n * @name Use of subprocess module\n * @description Finds uses of subprocess APIs, which may be security-sensitive.\n * @kind problem\n * @problem.severity warning\n * @id py/subprocess-usage-enumeration\n * @tags security\n *       external/cwe/cwe-078\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"subprocess\").getMember([\"Popen\", \"call\", \"run\", \"check_call\", \"check_output\"]).getACall()\nselect call, \"Use of subprocess API here may be security-sensitive depending on inputs.\"\n",
+   "hypothesis": "Enumerate all uses of subprocess APIs to assess potential command injection risks.",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-078"
+   ],
+   "results_count": 6,
+   "results": [
+    {
+     "ruleId": "py/subprocess-usage-enumeration",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/subprocess-usage-enumeration",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of subprocess API here may be security-sensitive depending on inputs."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "google/auth/_cloud_sdk.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 88,
+         "startColumn": 18,
+         "endColumn": 66
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "a1cdbce184913142:1",
+      "primaryLocationStartColumnFingerprint": "9"
+     }
+    },
+    {
+     "ruleId": "py/subprocess-usage-enumeration",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/subprocess-usage-enumeration",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of subprocess API here may be security-sensitive depending on inputs."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "google/auth/_cloud_sdk.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 146,
+         "startColumn": 24,
+         "endColumn": 82
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "bc3896dfc7004b71:1",
+      "primaryLocationStartColumnFingerprint": "15"
+     }
+    },
+    {
+     "ruleId": "py/subprocess-usage-enumeration",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/subprocess-usage-enumeration",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of subprocess API here may be security-sensitive depending on inputs."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "google/auth/transport/_mtls_helper.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 242,
+         "startColumn": 19,
+         "endLine": 244,
+         "endColumn": 10
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "2326e86729b3d5d6:1",
+      "primaryLocationStartColumnFingerprint": "10"
+     }
+    },
+    {
+     "ruleId": "py/subprocess-usage-enumeration",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/subprocess-usage-enumeration",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of subprocess API here may be security-sensitive depending on inputs."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "google/auth/pluggable.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 222,
+         "startColumn": 18,
+         "endLine": 229,
+         "endColumn": 10
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "8ff2d60d68030596:1",
+      "primaryLocationStartColumnFingerprint": "9"
+     }
+    },
+    {
+     "ruleId": "py/subprocess-usage-enumeration",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/subprocess-usage-enumeration",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of subprocess API here may be security-sensitive depending on inputs."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "google/auth/pluggable.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 275,
+         "startColumn": 18,
+         "endLine": 282,
+         "endColumn": 10
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "c4ca65e6d142b745:1",
+      "primaryLocationStartColumnFingerprint": "9"
+     }
+    },
+    {
+     "ruleId": "py/subprocess-usage-enumeration",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/subprocess-usage-enumeration",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of subprocess API here may be security-sensitive depending on inputs."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "google/oauth2/webauthn_handler.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 3
+        },
+        "region": {
+         "startLine": 60,
+         "startColumn": 26,
+         "endLine": 62,
+         "endColumn": 10
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "800da328e1aeecc3:1",
+      "primaryLocationStartColumnFingerprint": "17"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251207235749",
+   "codeql_raw_query": "/**\n * @name Enumeration of subprocess usage\n * @description Lists all uses of the subprocess module and related APIs for manual review.\n * @kind problem\n * @problem.severity note\n * @id py/subprocess-usage-enumeration\n * @tags security\n *       external/cwe/cwe-078\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"subprocess\").getMember([\"Popen\", \"call\", \"check_call\", \"check_output\", \"run\"]).getACall()\nselect call, \"Use of subprocess API here may be security-sensitive depending on inputs.\"\n",
+   "hypothesis": "Enumerate all subprocess.* calls for later manual/automated taint analysis.",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-078"
+   ],
+   "results_count": 6,
+   "results": [
+    {
+     "ruleId": "py/subprocess-usage-enumeration",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/subprocess-usage-enumeration",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of subprocess API here may be security-sensitive depending on inputs."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "google/auth/_cloud_sdk.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 88,
+         "startColumn": 18,
+         "endColumn": 66
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "a1cdbce184913142:1",
+      "primaryLocationStartColumnFingerprint": "9"
+     }
+    },
+    {
+     "ruleId": "py/subprocess-usage-enumeration",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/subprocess-usage-enumeration",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of subprocess API here may be security-sensitive depending on inputs."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "google/auth/_cloud_sdk.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 146,
+         "startColumn": 24,
+         "endColumn": 82
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "bc3896dfc7004b71:1",
+      "primaryLocationStartColumnFingerprint": "15"
+     }
+    },
+    {
+     "ruleId": "py/subprocess-usage-enumeration",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/subprocess-usage-enumeration",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of subprocess API here may be security-sensitive depending on inputs."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "google/auth/transport/_mtls_helper.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 242,
+         "startColumn": 19,
+         "endLine": 244,
+         "endColumn": 10
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "2326e86729b3d5d6:1",
+      "primaryLocationStartColumnFingerprint": "10"
+     }
+    },
+    {
+     "ruleId": "py/subprocess-usage-enumeration",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/subprocess-usage-enumeration",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of subprocess API here may be security-sensitive depending on inputs."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "google/auth/pluggable.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 222,
+         "startColumn": 18,
+         "endLine": 229,
+         "endColumn": 10
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "8ff2d60d68030596:1",
+      "primaryLocationStartColumnFingerprint": "9"
+     }
+    },
+    {
+     "ruleId": "py/subprocess-usage-enumeration",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/subprocess-usage-enumeration",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of subprocess API here may be security-sensitive depending on inputs."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "google/auth/pluggable.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 275,
+         "startColumn": 18,
+         "endLine": 282,
+         "endColumn": 10
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "c4ca65e6d142b745:1",
+      "primaryLocationStartColumnFingerprint": "9"
+     }
+    },
+    {
+     "ruleId": "py/subprocess-usage-enumeration",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/subprocess-usage-enumeration",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of subprocess API here may be security-sensitive depending on inputs."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "google/oauth2/webauthn_handler.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 3
+        },
+        "region": {
+         "startLine": 60,
+         "startColumn": 26,
+         "endLine": 62,
+         "endColumn": 10
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "800da328e1aeecc3:1",
+      "primaryLocationStartColumnFingerprint": "17"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251207235837",
+   "codeql_raw_query": "/**\n * @name Insecure temporary file or directory creation\n * @description Detects use of mkdtemp or mkstemp without secure patterns.\n * @kind problem\n * @problem.severity warning\n * @id py/insecure-tempfile-usage\n * @tags security\n *       external/cwe/cwe-377\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"tempfile\").getMember([\"mkdtemp\", \"mkstemp\"]).getACall()\nselect call, \"Use of low-level tempfile APIs may be insecure; prefer NamedTemporaryFile or TemporaryDirectory with appropriate parameters.\"",
+   "hypothesis": "Insecure use of temporary file/directory creation APIs that may lead to race conditions or symlink attacks.",
+   "severity": "low",
+   "cwe_ids": [
+    "cwe-377"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251207235902",
+   "codeql_raw_query": "/**\n * @name Enumeration of subprocess usage\n * @description Lists all uses of the subprocess module and related APIs for manual review.\n * @kind problem\n * @problem.severity note\n * @id py/subprocess-usage-enumeration\n * @tags security\n *       external/cwe/cwe-078\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"subprocess\").getMember([\"Popen\", \"call\", \"check_call\", \"check_output\", \"run\"]).getACall()\nselect call, \"Use of subprocess API here may be security-sensitive depending on inputs.\"\n",
+   "hypothesis": "Enumerate all subprocess.* calls for later manual taint analysis.",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-078"
+   ],
+   "results_count": 6,
+   "results": [
+    {
+     "ruleId": "py/subprocess-usage-enumeration",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/subprocess-usage-enumeration",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of subprocess API here may be security-sensitive depending on inputs."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "google/auth/_cloud_sdk.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 88,
+         "startColumn": 18,
+         "endColumn": 66
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "a1cdbce184913142:1",
+      "primaryLocationStartColumnFingerprint": "9"
+     }
+    },
+    {
+     "ruleId": "py/subprocess-usage-enumeration",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/subprocess-usage-enumeration",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of subprocess API here may be security-sensitive depending on inputs."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "google/auth/_cloud_sdk.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 146,
+         "startColumn": 24,
+         "endColumn": 82
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "bc3896dfc7004b71:1",
+      "primaryLocationStartColumnFingerprint": "15"
+     }
+    },
+    {
+     "ruleId": "py/subprocess-usage-enumeration",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/subprocess-usage-enumeration",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of subprocess API here may be security-sensitive depending on inputs."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "google/auth/transport/_mtls_helper.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 242,
+         "startColumn": 19,
+         "endLine": 244,
+         "endColumn": 10
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "2326e86729b3d5d6:1",
+      "primaryLocationStartColumnFingerprint": "10"
+     }
+    },
+    {
+     "ruleId": "py/subprocess-usage-enumeration",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/subprocess-usage-enumeration",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of subprocess API here may be security-sensitive depending on inputs."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "google/auth/pluggable.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 222,
+         "startColumn": 18,
+         "endLine": 229,
+         "endColumn": 10
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "8ff2d60d68030596:1",
+      "primaryLocationStartColumnFingerprint": "9"
+     }
+    },
+    {
+     "ruleId": "py/subprocess-usage-enumeration",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/subprocess-usage-enumeration",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of subprocess API here may be security-sensitive depending on inputs."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "google/auth/pluggable.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 275,
+         "startColumn": 18,
+         "endLine": 282,
+         "endColumn": 10
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "c4ca65e6d142b745:1",
+      "primaryLocationStartColumnFingerprint": "9"
+     }
+    },
+    {
+     "ruleId": "py/subprocess-usage-enumeration",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/subprocess-usage-enumeration",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of subprocess API here may be security-sensitive depending on inputs."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "google/oauth2/webauthn_handler.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 3
+        },
+        "region": {
+         "startLine": 60,
+         "startColumn": 26,
+         "endLine": 62,
+         "endColumn": 10
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "800da328e1aeecc3:1",
+      "primaryLocationStartColumnFingerprint": "17"
+     }
+    }
+   ]
+  }
+ ]
+}

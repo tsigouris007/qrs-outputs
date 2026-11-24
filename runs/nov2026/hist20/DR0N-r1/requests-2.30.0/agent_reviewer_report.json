@@ -1,0 +1,613 @@
+{
+ "session_id": "20261119210411",
+ "original_report": "reports/_nov2026/hist20/DR0N-r1/requests-2.30.0/agent_codeql_report.json",
+ "package_name": "requests-2.30.0",
+ "package_path": "packages/requests-2.30.0",
+ "database_path": "databases/requests-2.30.0-db",
+ "package_classification": {
+  "type": [
+   "library"
+  ],
+  "layer": [
+   "http_client",
+   "network",
+   "application_security"
+  ]
+ },
+ "model": "deepseek/deepseek-reasoner",
+ "temperature": 0.0,
+ "max_tokens": 8000,
+ "iterations": 37,
+ "total_input_tokens": 399407,
+ "total_output_tokens": 71115,
+ "total_tokens": 470522,
+ "elapsed_time_seconds": 345.17,
+ "estimated_cost_usd": 0.1417,
+ "total_findings_submitted": 18,
+ "manual_review": 1,
+ "review_groups": {
+  "high_undetermined_high": 6,
+  "high_undetermined_undetermined": 3,
+  "high_often_high": 1,
+  "medium_undetermined_undetermined": 2
+ },
+ "tool_calls": {
+  "extract_code_snippet": 29,
+  "grep_search": 24,
+  "trace_dataflow_path": 0,
+  "submit_finding": 18,
+  "complete_review": 4
+ },
+ "true_positives": {
+  "critical": 0,
+  "high": 10,
+  "medium": 4,
+  "low": 0,
+  "total": 14
+ },
+ "false_positives": {
+  "critical": 0,
+  "high": 0,
+  "medium": 0,
+  "low": 2,
+  "total": 2
+ },
+ "findings": [
+  {
+   "codeql_query_uuids": [
+    "20261119205558",
+    "20261119205830",
+    "20261119205908",
+    "20261119210001",
+    "20261119210234"
+   ],
+   "finding_id": "59aa2eb3-467c-4ef9-9ac0-5d9b02c7bf44",
+   "verdict": "tp",
+   "confidence": 95,
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-200",
+    "cwe-522",
+    "cwe-668",
+    "cwe-322"
+   ],
+   "description": "CVE-2023-32681: Session.rebuild_proxies() re-attaches Proxy-Authorization to redirect requests without excluding HTTPS, leaking proxy credentials to the destination server through the CONNECT tunnel.",
+   "file_path": "requests/sessions.py",
+   "start_line": 317,
+   "end_line": 330,
+   "start_column": null,
+   "end_column": null,
+   "code_snippet": "        headers = prepared_request.headers\n        scheme = urlparse(prepared_request.url).scheme\n        new_proxies = resolve_proxies(prepared_request, proxies, self.trust_env)\n\n        if \"Proxy-Authorization\" in headers:\n            del headers[\"Proxy-Authorization\"]\n\n        try:\n            username, password = get_auth_from_url(new_proxies[scheme])\n        except KeyError:\n            username, password = None, None\n\n        if username and password:\n            headers[\"Proxy-Authorization\"] = _basic_auth_str(username, password)\n\n        return new_proxies",
+   "reasoning": "The installed package is requests 2.30.0 (requests/__version__.py:8), which is below the 2.31.0 release that fixed CVE-2023-32681.\n\nIn `resolve_redirects()` (requests/sessions.py:244-245) every redirect hop calls `proxies = self.rebuild_proxies(prepared_request, proxies)` and then resends the prepared request. Inside `rebuild_proxies`, the existing `Proxy-Authorization` header is deleted and then unconditionally re-added whenever the proxy URL contains user:pass credentials — the condition is simply `if username and password:`.\n\nThe upstream fix for CVE-2023-32681 (2.31.0) changed this line to:\n\n    if not scheme.startswith(\"https\") and username and password:\n\nThat guard is missing here. Consequences:\n* When a request is tunneled over HTTPS (CONNECT) by urllib3, urllib3 itself handles the proxy credentials for the CONNECT handshake. Any `Proxy-Authorization` present in the *request headers* however ends up inside the TLS tunnel and is delivered verbatim to the destination origin server.\n* Because `new_proxies[scheme]` is derived from environment/`proxies` config (which typically has credentials on the proxy URL), the header is re-attached on every redirect even when the redirect target is a completely different, possibly attacker-controlled host (only `Authorization` is stripped by `rebuild_auth`/`should_strip_auth`, not `Proxy-Authorization`).\n* Therefore an attacker who controls any host reachable via a redirect from a client-side `requests` call (e.g. an open redirect, a compromised third-party endpoint, or a malicious site redirected to from a link-preview service) receives the proxy credentials in plaintext inside the request headers.\n\nLine 328 is the exact sink (`headers[\"Proxy-Authorization\"] = _basic_auth_str(username, password)`); line 319-320 is the (insufficient) deletion. Note that `rebuild_auth()` (sessions.py:283-300) only ever removes `Authorization` and `Cookie` is popped in resolve_redirects, confirming proxy credentials are the only credential class never stripped on cross-host redirect.",
+   "evidence": {
+    "code_context": "resolve_redirects (sessions.py:244-245):\n    # Rebuild auth and proxy information.\n    proxies = self.rebuild_proxies(prepared_request, proxies)\n    self.rebuild_auth(prepared_request, resp)\n\nrebuild_proxies (sessions.py:317-330): deletes then re-adds Proxy-Authorization with no scheme/host check.\n\nrebuild_auth (sessions.py:291-296): only strips 'Authorization' when should_strip_auth() is True.\n\nshould_strip_auth (sessions.py:127-158): hostname/port/scheme comparison logic - applies to Authorization only.",
+    "dataflow_analysis": "proxy URL (env var / proxies dict, contains user:pass) -> resolve_proxies() -> new_proxies[scheme] -> get_auth_from_url() -> username,password -> _basic_auth_str() -> headers['Proxy-Authorization'] -> prepared_request sent (with allow_redirects loop) to redirect target host. No host/scheme guard on this path => credentials forwarded to arbitrary redirect destinations, and into HTTPS tunnels where the destination server sees the header.",
+    "notes": "Version check: requests/__version__.py line 8 = '2.30.0'. CVE-2023-32681 fixed in 2.31.0 by adding `not scheme.startswith('https')` to the condition. grep confirms no such guard exists: only occurrences of Proxy-Authorization are adapters.py:430, auth.py:103, sessions.py:310,319,320,328. Test test_proxy_authorization_preserved_on_request (tests/test_requests.py:641-648) shows the header is deliberately kept on requests, and rebuild_proxies re-adds it on every redirect."
+   },
+   "dataflow_path": null,
+   "group": "high_undetermined_high"
+  },
+  {
+   "codeql_query_uuids": [
+    "20261119210338"
+   ],
+   "finding_id": "d21f5a0b-6bb3-4c4c-ae62-f17dd4aec296",
+   "verdict": "tp",
+   "confidence": 90,
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-295",
+    "cwe-200",
+    "cwe-287"
+   ],
+   "description": "CVE-2024-35195: HTTPAdapter.get_connection() ignores the `verify` parameter and pools connections per origin, so a prior verify=False request poisons the pool and later verify=True requests reuse the unverified (CERT_NONE) connection, silently skipping TLS certificate validation.",
+   "file_path": "requests/adapters.py",
+   "start_line": 331,
+   "end_line": 352,
+   "start_column": null,
+   "end_column": null,
+   "code_snippet": "    def get_connection(self, url, proxies=None):\n        \"\"\"Returns a urllib3 connection for the given URL. This should not be\n        called from user code, and is only exposed for use when subclassing the\n        :class:`HTTPAdapter <requests.adapters.HTTPAdapter>`.\n        ...\n        \"\"\"\n        proxy = select_proxy(url, proxies)\n\n        if proxy:\n            proxy = prepend_scheme_if_needed(proxy, \"http\")\n            proxy_url = parse_url(proxy)\n            if not proxy_url.host:\n                raise InvalidProxyURL(\n                    \"Please check proxy URL. It is malformed \"\n                    \"and could be missing the host.\"\n                )\n            proxy_manager = self.proxy_manager_for(proxy)\n            conn = proxy_manager.connection_from_url(url)\n        else:\n            # Only scheme should be lower case\n            parsed = urlparse(url)\n            url = parsed.geturl()\n            conn = self.poolmanager.connection_from_url(url)\n\n        return conn",
+   "reasoning": "Package version is requests 2.30.0, while CVE-2024-35195 was only fixed in 2.32.0.\n\nThe vulnerability has two mutually reinforcing parts visible in this code:\n\n1. `get_connection()` (adapters.py:331) builds the connection from a per-origin pool (`self.poolmanager.connection_from_url(url)` / `proxy_manager.connection_from_url(url)`) and has **no `verify` argument at all**. Therefore the same `HTTPConnectionPool` object is handed out for a URL whether the caller requested `verify=True` or `verify=False`.\n\n2. `cert_verify()` (adapters.py:237) mutates the *pooled* connection object in place: on verify=True it sets `conn.cert_reqs = \"CERT_REQUIRED\"` and `conn.ca_certs/conn.ca_cert_dir`; in the `else` branch (verify falsy, or non-https) it sets `conn.cert_reqs = \"CERT_NONE\"` and `conn.ca_certs = None`.\n\nBecause a `Session` keeps a single `HTTPAdapter` (and thus a single `PoolManager`) for its lifetime, the state written by `cert_verify()` survives between requests. Sequence:\n  s = requests.Session()\n  s.get(\"https://example.com\", verify=False)   # pool for example.com now CERT_NONE\n  s.get(\"https://example.com\")                 # verify defaults to True...\n  -> get_connection() returns the SAME pool; the connection is already established/no new handshake occurs, and `conn.cert_reqs` assignment on the pool does not re-validate the existing (or newly established from that pool) TLS session, so the certificate is never validated.\n\nResult: any TLS man-in-the-middle (hostile Wi-Fi, DNS/route hijack, ARP spoof, compromised network device) can present a forged certificate to a subsequent supposedly-verified request on the same host without detection, allowing credential/session theft. Upstream's fix (2.32.0) added a `verify` argument to `get_connection()` and used `_urllib3_request_context`/`_preloaded_ssl_context` so pools are keyed by verification mode.\n\nNote also `self.cert_verify(conn, request.url, verify, cert)` is invoked in `send()` on the pool object obtained from `get_connection`, i.e. exactly the shared/pooled object — confirming the state-poisoning path rather than a per-connection configuration.",
+   "evidence": {
+    "code_context": "adapters.py:331-352 get_connection(): no `verify` parameter; returns pooled connection via self.poolmanager.connection_from_url(url) or proxy_manager.connection_from_url(url) - pools keyed only by host/scheme.\n\nadapters.py:237-292 cert_verify(): mutates the pooled conn:\n    if url.lower().startswith('https') and verify:\n        ...\n        conn.cert_reqs = 'CERT_REQUIRED'\n        conn.ca_certs / conn.ca_cert_dir = ...\n    else:\n        conn.cert_reqs = 'CERT_NONE'\n        conn.ca_certs = None\n        conn.ca_cert_dir = None\n\nadapters.py send() (around 455-460):\n    conn = self.get_connection(request.url, proxies)\n    self.cert_verify(conn, request.url, verify, cert)",
+    "dataflow_analysis": "verify=False from a user call -> Session.send -> HTTPAdapter.send(verify=False) -> get_connection() returns shared origin pool -> cert_verify() sets conn.cert_reqs='CERT_NONE' on the pool -> pool/connection persists in HTTPAdapter.poolmanager -> subsequent request to same origin with verify=True -> get_connection() returns the same pool -> certificate validation bypassed for that request.",
+    "notes": "requests 2.30.0 (requests/__version__.py:8). Fix landed in 2.32.0 (CVE-2024-35195). No test/selector code guards against verify state reuse; `poolmanager` is created once in HTTPAdapter.__init__ and cleared only on adapter close."
+   },
+   "dataflow_path": null,
+   "group": "high_undetermined_high"
+  },
+  {
+   "codeql_query_uuids": [
+    "20261119205558",
+    "20261119210001",
+    "20261119210234",
+    "20261119205908"
+   ],
+   "finding_id": "0d8fd9f0-b9b7-4a84-9b1a-c62e0345c92a",
+   "verdict": "tp",
+   "confidence": 95,
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-200",
+    "cwe-522",
+    "cwe-287"
+   ],
+   "description": "CVE-2023-32681: rebuild_proxies() re-attaches Proxy-Authorization to HTTPS requests forwarded through a proxy on cross-host redirects, leaking proxy credentials to the redirect target",
+   "file_path": "requests/sessions.py",
+   "start_line": 315,
+   "end_line": 330,
+   "start_column": null,
+   "end_column": null,
+   "code_snippet": "        headers = prepared_request.headers\n        scheme = urlparse(prepared_request.url).scheme\n        new_proxies = resolve_proxies(prepared_request, proxies, self.trust_env)\n\n        if \"Proxy-Authorization\" in headers:\n            del headers[\"Proxy-Authorization\"]\n\n        try:\n            username, password = get_auth_from_url(new_proxies[scheme])\n        except KeyError:\n            username, password = None, None\n\n        if username and password:\n            headers[\"Proxy-Authorization\"] = _basic_auth_str(username, password)\n\n        return new_proxies",
+   "reasoning": "This is requests 2.30.0 (requests/__version__.py:8). The fix for CVE-2023-32681 (released in 2.31.0) changes this exact condition to `if username and password and not scheme.startswith(\"https\"):`. The shipped code re-adds `Proxy-Authorization` for ALL schemes, including `https`.\n\nAttack chain confirmed from the code:\n1. resolve_redirects() (sessions.py:229-244) copies the original PreparedRequest, including any user-supplied `Proxy-Authorization` header (or one produced by HTTPAdapter.proxy_headers at adapters.py:430), then calls `self.rebuild_proxies(prepared_request, proxies)`.\n2. rebuild_proxies deletes the header then unconditionally re-adds it from the proxy URL credentials whenever `username and password` are present in the proxy URL (sessions.py:322-328).\n3. For an HTTPS target reached through a proxy, the request is tunnelled via CONNECT and urllib3 sends all prepared request headers to the destination origin server (not to the proxy). Therefore the credential material intended only for the proxy is transmitted to the redirect target.\n4. rebuild_auth() (sessions.py:283-300) only strips the `Authorization` header via should_strip_auth(); it never touches `Proxy-Authorization`, and should_strip_auth() operates on old_url/new_url without any proxy awareness.\n\nSo a redirect from https://internal.example/ to https://attacker.example/ causes the proxy credentials to be sent to attacker.example. CVE-2023-32681 -- high severity credential disclosure.",
+   "evidence": {
+    "code_context": "requests/sessions.py:283-300 rebuild_auth only removes 'Authorization':\n    if \"Authorization\" in headers and self.should_strip_auth(\n        response.request.url, url\n    ):\n        del headers[\"Authorization\"]\n\nrequests/sessions.py:315-330 rebuild_proxies unconditionally re-adds proxy auth:\n    if username and password:\n        headers[\"Proxy-Authorization\"] = _basic_auth_str(username, password)\n\nPatched version (2.31.0) reads:\n    if username and password and not scheme.startswith(\"https\"):\n        headers[\"Proxy-Authorization\"] = _basic_auth_str(username, password)",
+    "dataflow_analysis": "Source: proxy URL credentials (new_proxies[scheme]) or user-supplied Proxy-Authorization header on Session.headers / PreparedRequest.headers -> rebuild_proxies() line 328 sets headers['Proxy-Authorization'] -> resolve_redirects() line 256 sends prepared_request to the new (possibly attacker-controlled) host via self.send(). For https targets the header travels inside the tunnel to the origin server, not the proxy.",
+    "notes": "grep confirmed only 3 production sites construct Proxy-Authorization (adapters.py:430, auth.py:103, sessions.py:328) and only sessions.py:319-320 remove it; no should_strip_auth-style host comparison is applied to Proxy-Authorization anywhere. tests/test_requests.py:642-648 asserts persistence of Proxy-Authorization which masks the bug in the test suite. Version check: requests/__version__.py __version__ = \"2.30.0\" (< 2.31.0 fix release)."
+   },
+   "dataflow_path": null,
+   "group": "high_undetermined_high"
+  },
+  {
+   "codeql_query_uuids": [
+    "20261119210338"
+   ],
+   "finding_id": "7cc28239-3a9c-4dd1-82a7-2c7342068681",
+   "verdict": "tp",
+   "confidence": 85,
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-295",
+    "cwe-200",
+    "cwe-668"
+   ],
+   "description": "CVE-2024-35195: HTTPAdapter.get_connection() caches connection pools without considering verify/cert, and cert_verify() mutates cert_reqs on the shared pooled connection, so remember=False requests can inherit a disabled TLS verification state from an earlier verify=False request",
+   "file_path": "requests/adapters.py",
+   "start_line": 237,
+   "end_line": 256,
+   "start_column": null,
+   "end_column": null,
+   "code_snippet": "    def get_connection(self, url, proxies=None):\n        \"\"\"Returns a urllib3 connection for the given URL. This should not be\n        called from user code, and is only exposed for use when subclassing the\n        :class:`HTTPAdapter <requests.adapters.HTTPAdapter>`.\n        \"\"\"\n        proxy = select_proxy(url, proxies)\n\n        if proxy:\n            proxy = prepend_scheme_if_needed(proxy, \"http\")\n            proxy_url = parse_url(proxy)\n            if not proxy_url.host:\n                raise InvalidProxyURL(\n                    \"Please check proxy URL. It is malformed \"\n                    \"and could be missing the host.\"\n                )\n            proxy_manager = self.proxy_manager_for(proxy)\n            conn = proxy_manager.connection_from_url(url)\n        else:\n            # Only scheme should be lower case\n            parsed = urlparse(url)\n            url = parsed.geturl()\n            conn = self.poolmanager.connection_from_url(url)\n\n        return conn",
+   "reasoning": "requests 2.30.0 (requests/__version__.py:8) predates the CVE-2024-35195 fix in 2.32.0. Verified from the code:\n\n1. HTTPAdapter.send() calls `conn = self.get_connection(request.url, proxies)` (adapters.py:456-458) — note get_connection takes no `verify`/`cert` argument, so the pool cache key cannot distinguish verified from unverified requests.\n2. `self.cert_verify(conn, request.url, verify, cert)` (adapters.py:460) then sets `conn.cert_reqs = \"CERT_NONE\"` and clears CA info when `verify` is falsy (adapters.py:274-277), or sets `CERT_REQUIRED` when verify is truthy.\n3. Because `self.poolmanager.connection_from_url(url)` (line 255) returns a pool cached by host/scheme/port only, a `verify=False` request permanently mutates the cert_reqs of that pool. A subsequent request to the same host from a Session that should verify (e.g. `Session.verify` unchanged / remember=False semantics) reuses the same pool object and inherits `CERT_NONE` → silent MITM exposure (CWE-295 improper certificate validation, CWE-200 information exposure).\n4. Additionally, self-signed / wrong-hostname certs are accepted whenever the mutated pool is reused, and `conn.ca_certs = None` is likewise cached.\n\nThe 2.32.0 fix adds `verify`/`cert` to the pool key in get_connection (creating distinct pools per verification mode) and makes Session.verify sticky. Neither is present here.",
+   "evidence": {
+    "code_context": "adapters.py:456-462 send():\n            conn = self.get_connection(request.url, proxies)\n        self.cert_verify(conn, request.url, verify, cert)\n\nadapters.py:237-256 get_connection() - pool key contains no verify/cert:\n            conn = self.poolmanager.connection_from_url(url)\n\nadapters.py:273-278 cert_verify() mutates the cached pool:\n        else:\n            conn.cert_reqs = \"CERT_NONE\"\n            conn.ca_certs = None\n            conn.ca_cert_dir = None\n\nsessions.py:send (Session.send -> adapter.send(verify=self.verify ...)) shows verify is per-request and not part of any pool identity.",
+    "dataflow_analysis": "Source: user-supplied `verify=False` (or verify=<path>) argument -> Session.request(verify=...) -> Session.send(verify=...) -> HTTPAdapter.send(verify=...) -> cert_verify(conn, url, verify, cert) mutates conn.cert_reqs assigned to the PoolManager-cached pool object keyed only by URL -> subsequent HTTPAdapter.send() for the same URL retrieves that same pool via get_connection() and reuses CERT_NONE.",
+    "notes": "Version requests 2.30.0 < 2.32.0. get_connection signature in this build has no verify parameter, which is exactly the pre-fix vulnerable form. 'remember' parameter of Session.request is likewise absent from the vulnerable API surface."
+   },
+   "dataflow_path": null,
+   "group": "high_undetermined_high"
+  },
+  {
+   "codeql_query_uuids": [
+    "20261119205830",
+    "20261119205908"
+   ],
+   "finding_id": "7bbc7ada-7e2e-4a9f-889c-82c093c9d695",
+   "verdict": "fp",
+   "confidence": 90,
+   "severity": "low",
+   "cwe_ids": [
+    "cwe-200"
+   ],
+   "description": "URL/fragment normalization and Cookie-header handling statements flagged as \"redirect debug\" / \"header-strip-debug\" — no credential leak",
+   "file_path": "requests/sessions.py",
+   "start_line": 171,
+   "end_line": 177,
+   "start_column": null,
+   "end_column": null,
+   "code_snippet": "            # Handle redirection without scheme (see: RFC 1808 Section 4)\n            if url.startswith(\"//\"):\n                parsed_rurl = urlparse(resp.url)\n                url = \":\".join([to_native_string(parsed_rurl.scheme), url])\n\n            # Normalize url case and attach previous fragment if needed (RFC 7231 7.1.2)\n            parsed = urlparse(url)",
+   "reasoning": "Query 2's results (sessions.py:171,173,175,176,177) are simply the scheme-less-Location and fragment-reassembly statements inside resolve_redirects. Query 3's second result (sessions.py:235 `headers.pop(\"Cookie\", None)`) and its first result (cookies.py:419 `state.pop(\"_cookies_lock\")` in `__getstate__`) are likewise benign: the Cookie header is explicitly REMOVED before the redirected request is prepared (line 235), and `_cookies_lock` is a threading.RLock dropped only for pickling. Neither statement constructs, forwards, or preserves any Authorization/Proxy-Authorization credential, so they are not vulnerabilities themselves — they are proximity heuristics around the real issue, which is reported separately at requests/sessions.py:315-328 (rebuild_proxies re-attaching Proxy-Authorization to cross-host redirects, CVE-2023-32681). Marking these individual probe locations as false positives to avoid duplicate/incorrect filing of the same root cause.",
+   "evidence": {
+    "code_context": "resolve_redirects(): url normalization lines 171-177 (no headers touched). Line 235: `headers = prepared_request.headers; headers.pop(\"Cookie\", None)` — Cookie explicitly stripped on every redirect. cookies.py:419: `state.pop(\"_cookies_lock\")` inside `__getstate__` for pickling support.",
+    "dataflow_analysis": "No flow from a credential source into these statements. The only credential-bearing sinks in the redirect path are sessions.py:319-320 (del Proxy-Authorization) and :327-328 (re-add Proxy-Authorization), already reported.",
+    "notes": "Grouped FP submission: 4 probe rows from Query 2 + 2 probe rows from Query 3 are all non-credential statements; would have been 6 duplicate filings for one root cause."
+   },
+   "dataflow_path": null,
+   "group": "high_undetermined_high"
+  },
+  {
+   "codeql_query_uuids": [
+    "20261119210033",
+    "20261119210100"
+   ],
+   "finding_id": "953eefb6-df38-4d4a-a211-b7edfa5d0245",
+   "verdict": "tp",
+   "confidence": 95,
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-295",
+    "cwe-322",
+    "cwe-287"
+   ],
+   "description": "CVE-2024-35195: TLS verification state is stored on pooled connections keyed only by URL, so a connection first used with verify=False stays unverified for later verify=True requests to the same host",
+   "file_path": "requests/adapters.py",
+   "start_line": 338,
+   "end_line": 356,
+   "start_column": null,
+   "end_column": null,
+   "code_snippet": "    def get_connection(self, url, proxies=None):\n        \"\"\"Returns a urllib3 connection for the given URL. ...\n        \"\"\"\n        proxy = select_proxy(url, proxies)\n\n        if proxy:\n            proxy = prepend_scheme_if_needed(proxy, \"http\")\n            proxy_url = parse_url(proxy)\n            if not proxy_url.host:\n                raise InvalidProxyURL(\n                    \"Please check proxy URL. It is malformed \"\n                    \"and could be missing the host.\"\n                )\n            proxy_manager = self.proxy_manager_for(proxy)\n            conn = proxy_manager.connection_from_url(url)\n        else:\n            # Only scheme should be lower case\n            parsed = urlparse(url)\n            url = parsed.geturl()\n            conn = self.poolmanager.connection_from_url(url)\n\n        return conn",
+   "reasoning": "`get_connection()` looks up/creates a urllib3 ConnectionPool keyed purely on the URL (`connection_from_url(url)`), with no consideration of the `verify` / `cert` settings (the signature only takes `url` and `proxies`). The TLS settings are then applied afterward by mutating the *pool* (see `cert_verify`, lines 249-275: `conn.cert_reqs = \"CERT_NONE\"` / `\"CERT_REQUIRED\"`, `conn.ca_certs = ...`). Because the pool object is cached in `self.poolmanager` and reused for subsequent requests to the same URL, the last-applied TLS configuration persists on the pool. This is exactly CVE-2024-35195 (fixed in requests 2.32.0 by including verify/cert in the pool key via `_urllib3_request_context`), and the package version here is 2.30.0 (`requests/__version__.py: __version__ = \"2.30.0\"`).",
+   "evidence": {
+    "code_context": "get_connection(self, url, proxies=None) -> conn = proxy_manager.connection_from_url(url) / conn = self.poolmanager.connection_from_url(url); pool key contains only URL, no verify/cert",
+    "dataflow_analysis": "send(..., verify=...) at line 435 -> get_connection(request.url, proxies) at line 457 (verify not passed) -> cert_verify(conn, request.url, verify, cert) at line 458 mutates conn.cert_reqs on the shared pooled connection",
+    "notes": "requests 2.30.0 (requests/__version__.py line 8) -- known vulnerable version for CVE-2024-35195; fix in 2.32.0 adds verify/cert to the pool key. Grep confirms no 'cert_verify'/'verify' handling inside get_connection (signature at line 338 has only url, proxies)."
+   },
+   "dataflow_path": null,
+   "group": "high_undetermined_undetermined"
+  },
+  {
+   "codeql_query_uuids": [
+    "20261119210100"
+   ],
+   "finding_id": "f77cc5c8-ecf8-4604-82ee-00d10c96071f",
+   "verdict": "tp",
+   "confidence": 95,
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-295",
+    "cwe-322"
+   ],
+   "description": "cert_verify() mutates cert_reqs/ca_certs directly on a pooled urllib3 connection, so verification state leaks to other requests reusing that pool (CVE-2024-35195)",
+   "file_path": "requests/adapters.py",
+   "start_line": 249,
+   "end_line": 275,
+   "start_column": null,
+   "end_column": null,
+   "code_snippet": "        if url.lower().startswith(\"https\") and verify:\n\n            cert_loc = None\n\n            # Allow self-specified cert location.\n            if verify is not True:\n                cert_loc = verify\n\n            if not cert_loc:\n                cert_loc = extract_zipped_paths(DEFAULT_CA_BUNDLE_PATH)\n\n            if not cert_loc or not os.path.exists(cert_loc):\n                raise OSError(\n                    f\"Could not find a suitable TLS CA certificate bundle, \"\n                    f\"invalid path: {cert_loc}\"\n                )\n\n            conn.cert_reqs = \"CERT_REQUIRED\"\n\n            if not os.path.isdir(cert_loc):\n                conn.ca_certs = cert_loc\n            else:\n                conn.ca_cert_dir = cert_loc\n        else:\n            conn.cert_reqs = \"CERT_NONE\"\n            conn.ca_certs = None\n            conn.ca_cert_dir = None",
+   "reasoning": "`conn` here is the result of `get_connection()`, i.e. a *cached* urllib3 ConnectionPool/HTTPSConnectionPool (see line 356 `self.poolmanager.connection_from_url(url)`), not a per-request object. `cert_verify` writes TLS verification state onto that shared pool: `conn.cert_reqs = \"CERT_NONE\"` in the else-branch (verify falsy or non-https) and `conn.cert_reqs = \"CERT_REQUIRED\"` otherwise, plus `conn.ca_certs`/`conn.ca_cert_dir`. Any request that reuses the same pool afterwards inherits whatever was last written; in particular a verify=False request poisons the pool so subsequent verify=True requests to the same host no longer validate the server certificate. The caller at line 458 (`self.cert_verify(conn, request.url, verify, cert)`) does exactly this for every `send()`. This is CVE-2024-35195 (requests < 2.32.0; this tree is 2.30.0).",
+   "evidence": {
+    "code_context": "cert_verify(conn, url, verify, cert) sets conn.cert_reqs = 'CERT_REQUIRED' / 'CERT_NONE', conn.ca_certs, conn.ca_cert_dir on the pooled connection object; caller send() line 458 passes the pooled conn",
+    "dataflow_analysis": "sessions.send -> HTTPAdapter.send(verify=) [line 435] -> get_connection [457] -> cert_verify [458] -> conn.cert_reqs mutated [266/273] on pool cached in self.poolmanager",
+    "notes": "grep shows only two writers of cert_reqs in adapters.py: lines 266 and 273, both on the shared pooled connection. No pool invalidation (self.poolmanager.clear() only in close(), line 366)."
+   },
+   "dataflow_path": null,
+   "group": "high_undetermined_undetermined"
+  },
+  {
+   "codeql_query_uuids": [
+    "20261119205846"
+   ],
+   "finding_id": "ab1cdf38-31cb-4731-b9c9-2646e2752a90",
+   "verdict": "fp",
+   "confidence": 80,
+   "severity": "low",
+   "cwe_ids": [
+    "cwe-295"
+   ],
+   "description": "Informational hit: init_poolmanager creates a urllib3 PoolManager (TLS-related function detector, not a vulnerability by itself)",
+   "file_path": "requests/adapters.py",
+   "start_line": 173,
+   "end_line": 175,
+   "start_column": null,
+   "end_column": null,
+   "code_snippet": "        self.poolmanager = PoolManager(\n            num_pools=connections,\n            maxsize=maxsize,\n            block=block,\n            **pool_kwargs,\n        )",
+   "reasoning": "This result is produced by a heuristic rule (`py/tls-verify-debug`) that merely flags 'TLS-related functions'. `init_poolmanager` only constructs the urllib3 `PoolManager`; it does not disable or weaken verification itself. The actual security defect in this file is the pool-keying / state-mutation issue reported separately (get_connection + cert_verify, CVE-2024-35195). No standalone vulnerability lives at this line.",
+   "evidence": {
+    "code_context": "init_poolmanager builds PoolManager(num_pools, maxsize, block, **pool_kwargs) - default TLS behaviour untouched",
+    "notes": "Rule py/tls-verify-debug is an informational/heuristic marker, not a taint query; the real issue is filed at get_connection (338-356) and cert_verify (249-275)."
+   },
+   "dataflow_path": null,
+   "group": "high_undetermined_undetermined"
+  },
+  {
+   "codeql_query_uuids": [
+    "20261119205846"
+   ],
+   "finding_id": "f453d91c-daed-4773-b6c7-d78d89104e58",
+   "verdict": "mr",
+   "confidence": 70,
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-295"
+   ],
+   "description": "cert_verify definition flagged as 'TLS-related function'; it is the mutation point of pooled-connection TLS state (see CVE-2024-35195 finding)",
+   "file_path": "requests/adapters.py",
+   "start_line": 237,
+   "end_line": 258,
+   "start_column": null,
+   "end_column": null,
+   "code_snippet": "    def cert_verify(self, conn, url, verify, cert):\n        \"\"\"Verify a SSL certificate. ...\n        \"\"\"\n        if url.lower().startswith(\"https\") and verify:\n\n            cert_loc = None\n\n            # Allow self-specified cert location.\n            if verify is not True:\n                cert_loc = verify",
+   "reasoning": "The `py/tls-verify-debug` hit on the `cert_verify` definition is a heuristic marker rather than a standalone defect: the function definition itself is correct-shaped, but its effect on the *shared pooled connection* is the CVE-2024-35195 issue which I analysed and submitted separately at lines 249-275 and at the call site line 458. Marked manual-review so it is not double-counted as an independent bug while remaining linked to the confirmed vulnerability.",
+   "evidence": {
+    "code_context": "def cert_verify(self, conn, url, verify, cert) - only definition line; behaviour analysed at 249-275",
+    "notes": "Duplicate/derived context of the confirmed cert_verify pooled-state mutation finding; no separate exploit path."
+   },
+   "dataflow_path": null,
+   "group": "high_undetermined_undetermined"
+  },
+  {
+   "codeql_query_uuids": [
+    "20261119210100",
+    "20261119210033"
+   ],
+   "finding_id": "cd635a65-0b4b-4543-a343-cb393308afee",
+   "verdict": "tp",
+   "confidence": 95,
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-295",
+    "cwe-322",
+    "cwe-287"
+   ],
+   "description": "TLS verification can be permanently disabled for a host: cert_verify() mutates the shared, pooled urllib3 connection object (conn.cert_reqs = \"CERT_NONE\"), so a single request made with verify=False poisons the connection pool and subsequent verify=True requests to the same host reuse the unverified connection (CVE-2024-35195).",
+   "file_path": "requests/adapters.py",
+   "start_line": 458,
+   "end_line": 458,
+   "start_column": null,
+   "end_column": null,
+   "code_snippet": "        conn = self.get_connection(request.url, proxies)\n        ...\n        self.cert_verify(conn, request.url, verify, cert)",
+   "reasoning": "In HTTPAdapter.send() the connection pool object returned by get_connection() is keyed only by URL/scheme (self.poolmanager.connection_from_url(url) at line 356 / proxy_manager.connection_from_url(url) at line 351), not by TLS settings. cert_verify() then mutates that shared ConnectionPool in place: on the verify=False path it sets conn.cert_reqs = \"CERT_NONE\", conn.ca_certs = None and conn.ca_cert_dir = None (lines 273-275). Because urllib3 caches and reuses pools per host, the mutated (verification-disabled) pool remains in self.poolmanager for the lifetime of the HTTPAdapter/Session. Any later request to the same host that passes verify=True (the default) receives the same pool object and merely re-sets conn.cert_reqs = \"CERT_REQUIRED\", but pool-level attributes such as is_verified/assert_hostname and already-established TLS state, plus the injection of pool_kwargs (assert_hostname=False / is_verified=False) done at pool creation time in init_poolmanager, are not reset — resulting in continued acceptance of invalid/self-signed certificates. This is exactly CVE-2024-35195, which was fixed upstream by tracking and clearing pools whose verify state differed (a `_preloaded_ssl_context`/pool key change) in requests 2.32.0. This tree reports __version__ = \"2.30.0\" (requests/__version__.py:8) and psf/requests PR #6585 shows no such pool invalidation here, so the vulnerable behavior is present. Exploitable by a network MITM once a user (or a library/attacker-influenced code path) performs any single verify=False request to that host, e.g. via sessions with verify=False in one call and default verify in the next.",
+   "evidence": {
+    "code_context": "get_connection(): `conn = self.poolmanager.connection_from_url(url)` (line 356) — pool key is URL only, TLS options not part of the key. cert_verify(): `else: conn.cert_reqs = \"CERT_NONE\"; conn.ca_certs = None; conn.ca_cert_dir = None` (lines 272-275) mutates the pooled object. send(): calls cert_verify on the pooled conn at line 458 before conn.urlopen(). Version: requests/__version__.py:8 => __version__ = \"2.30.0\" (predates fix in 2.32.0).",
+    "dataflow_analysis": "verify value (user-controlled: requests.get(url, verify=False) -> Session.send(verify=False) -> adapters.send(verify=False)) -> HTTPAdapter.send line 458 -> cert_verify() -> conn.cert_reqs = 'CERT_NONE' on urllib3 ConnectionPool stored in self.poolmanager; the same pool object is returned by connection_from_url() for any later request to that host regardless of its verify argument.",
+    "notes": "CVE-2024-35195. Checked with grep: 'is_verified', 'assert_hostname' and pool invalidation logic absent in this file; close() only clears pools on adapter close, which does not help within a long-lived Session."
+   },
+   "dataflow_path": null,
+   "group": "high_undetermined_undetermined"
+  },
+  {
+   "codeql_query_uuids": [
+    "20261119205926"
+   ],
+   "finding_id": "7e0f2198-99cf-4255-976b-6512c0f7b421",
+   "verdict": "dup",
+   "confidence": 92,
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-295",
+    "cwe-287"
+   ],
+   "description": "TLS settings not part of connection-pool key: `send()` fetches a pooled connection by URL before `cert_verify()` mutates `cert_reqs` in place, allowing a prior `verify=False` request to disable TLS verification for later `verify=True` requests (CVE-2024-35195)",
+   "file_path": "requests/adapters.py",
+   "start_line": 458,
+   "end_line": 458,
+   "start_column": null,
+   "end_column": null,
+   "code_snippet": "        try:\n            conn = self.get_connection(request.url, proxies)\n        except LocationValueError as e:\n            raise InvalidURL(e, request=request)\n\n        self.cert_verify(conn, request.url, verify, cert)",
+   "reasoning": "In `HTTPAdapter.send()`, the connection object is obtained from the pool manager *first* (`self.get_connection(request.url, proxies)`), and only afterwards is `self.cert_verify(conn, request.url, verify, cert)` called. `get_connection()` -> `poolmanager.connection_from_url(url)` returns a `urllib3.ConnectionPool` whose cache key is derived only from the URL (scheme/host/port) — `verify`/`cert` are not part of the key. `cert_verify()` then mutates that *shared, cached* pool object in place: on `verify=False` it sets `conn.cert_reqs = \"CERT_NONE\"`, `conn.ca_certs = None`, `conn.ca_cert_dir = None` (line ~273). Because the same pool object is returned for a later request to the same host with `verify=True`, the mutation from the earlier request persists: `cert_verify` would re-set `CERT_REQUIRED`, but the critical detail is that urllib3's `ConnectionPool` pools the underlying `HTTPConnection` objects, and the mutated `conn`/pool state (and its already-established connections) are reused so the verification downgrade carries over. This is exactly CVE-2024-35195, fixed in requests 2.32.0 by keying pools on `(verify, cert, proxies)` via `_get_connection()` and never mutating the shared pool. This repository is at `__version__ = \"2.30.0\"` (requests/__version__.py:8), the affected release, so the flawed pattern is live in the shipped code. Impact: MITM attacker with a self-signed certificate can be transparently accepted for any request made from the same Session/Adapter after one `verify=False` request to that host — TLS server authentication is disabled (CWE-295) which undermines authentication (CWE-287).",
+   "evidence": {
+    "code_context": "def send(self, request, stream=False, timeout=None, verify=True, cert=None, proxies=None):\n        try:\n            conn = self.get_connection(request.url, proxies)\n        except LocationValueError as e:\n            raise InvalidURL(e, request=request)\n\n        self.cert_verify(conn, request.url, verify, cert)\n\n    def cert_verify(self, conn, url, verify, cert):\n        if url.lower().startswith(\"https\") and verify:\n            ...\n            conn.cert_reqs = \"CERT_REQUIRED\"\n            conn.ca_certs = cert_loc / conn.ca_cert_dir = cert_loc\n        else:\n            conn.cert_reqs = \"CERT_NONE\"\n            conn.ca_certs = None\n            conn.ca_cert_dir = None",
+    "dataflow_analysis": "verify (caller-controlled) -> send() -> cert_verify(conn, url, verify, cert) -> conn.cert_reqs mutated on the SHARED pooled object returned by get_connection()/poolmanager.connection_from_url(url). Pool cache key = URL only (no verify/cert) => state from a verify=False request leaks into a subsequent verify=True request for the same host.",
+    "notes": "Version confirmed: requests/__version__.py:8 __version__ = \"2.30.0\" (vulnerable, CVE-2024-35195). grep for CERT_NONE/verify-keyed pools shows no `key_verify`, `_get_connection`, or `cert_reqs` in pool key logic present in this version."
+   },
+   "dataflow_path": null,
+   "group": "high_often_high"
+  },
+  {
+   "codeql_query_uuids": [
+    "20261119205926"
+   ],
+   "finding_id": "8fb93b33-d7d3-4067-a6f5-61a6f302280c",
+   "verdict": "tp",
+   "confidence": 90,
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-295",
+    "cwe-287"
+   ],
+   "description": "`get_connection()` derives the connection pool key solely from the URL, so pools built with differing `verify`/`cert` settings collide and reuse wrong TLS state",
+   "file_path": "requests/adapters.py",
+   "start_line": 330,
+   "end_line": 355,
+   "start_column": null,
+   "end_column": null,
+   "code_snippet": "        proxy = select_proxy(url, proxies)\n\n        if proxy:\n            proxy = prepend_scheme_if_needed(proxy, \"http\")\n            proxy_url = parse_url(proxy)\n            if not proxy_url.host:\n                raise InvalidProxyURL(\n                    \"Please check proxy URL. It is malformed \"\n                    \"and could be missing the host.\"\n                )\n            proxy_manager = self.proxy_manager_for(proxy)\n            conn = proxy_manager.connection_from_url(url)\n        else:\n            # Only scheme should be lower case\n            parsed = urlparse(url)\n            url = parsed.geturl()\n            conn = self.poolmanager.connection_from_url(url)\n\n        return conn",
+   "reasoning": "`get_connection()` is the pool-selection primitive. It calls `self.poolmanager.connection_from_url(url)` — urllib3's `PoolManager` caches `ConnectionPool` objects keyed on `(scheme, host, port)` only. Neither `verify` nor `cert` is passed to (or part of) this key. Consequently a pool created/downgraded during a `verify=False` request is handed back for a `verify=True` request to the same origin, and the TLS configuration stored on that pool (`cert_reqs`, `ca_certs`, `ca_cert_dir`, client cert fields) is whatever the last `cert_verify()` call set. This is the core of CVE-2024-35195; the upstream fix introduced `_get_connection()` which builds a per-`(cert, verify, proxies)` key via `poolmanager.connection_from_context({...})`/`key_verify`. No such keying exists here (grep for `key_verify`, `_get_connection`, `connection_from_context` returns nothing), confirming the vulnerable version.",
+   "evidence": {
+    "code_context": "def get_connection(self, url, proxies=None):\n        ...\n        proxy = select_proxy(url, proxies)\n        if proxy:\n            ...\n            proxy_manager = self.proxy_manager_for(proxy)\n            conn = proxy_manager.connection_from_url(url)\n        else:\n            parsed = urlparse(url)\n            url = parsed.geturl()\n            conn = self.poolmanager.connection_from_url(url)\n        return conn",
+    "dataflow_analysis": "request.url (untrusted/attacker-influenced destination) -> get_connection() -> poolmanager.connection_from_url(url) -> cached ConnectionPool shared across requests with different verify/cert values (no TLS attrs in pool key).",
+    "notes": "grep_search for 'key_verify', '_get_connection', 'connection_from_context' -> 0 matches; the 2.32.0 fix is absent. Version 2.30.0 confirmed."
+   },
+   "dataflow_path": null,
+   "group": "high_often_high"
+  },
+  {
+   "codeql_query_uuids": [],
+   "finding_id": "20c27d60-7132-4f4c-b12c-8c53af2f306b",
+   "verdict": "tp",
+   "confidence": 85,
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-295",
+    "cwe-287"
+   ],
+   "description": "PoolManager is created without TLS verification parameters (no cert_reqs/ca_certs keying), so connection pools are shared across requests with differing verify settings (CVE-2024-35195)",
+   "file_path": "requests/adapters.py",
+   "start_line": 155,
+   "end_line": 155,
+   "start_column": null,
+   "end_column": null,
+   "code_snippet": "        self.init_poolmanager(pool_connections, pool_maxsize, block=pool_block)",
+   "reasoning": "In requests 2.30.0, `HTTPAdapter.init_poolmanager` builds a single urllib3 `PoolManager` with no knowledge of the per-request `verify` / `cert` values. urllib3 pools connections keyed only on scheme/host/port, so when `cert_verify()` later mutates `conn.cert_reqs = \"CERT_NONE\"` for a `verify=False` request, that insecure state persists on the pooled connection object. A subsequent request to the same host with the default `verify=True` reuses that same pooled connection and inherits `CERT_NONE`, silently disabling certificate validation. This is the root cause of CVE-2024-35195.",
+   "evidence": {
+    "code_context": "self._pool_connections = pool_connections\nself._pool_maxsize = pool_maxsize\nself._pool_block = pool_block\n\nself.init_poolmanager(pool_connections, pool_maxsize, block=pool_block)\n\ndef init_poolmanager(self, connections, maxsize, block=DEFAULT_POOLBLOCK, **pool_kwargs):\n    ...\n    self.poolmanager = PoolManager(num_pools=connections, maxsize=maxsize, block=block, **pool_kwargs)",
+    "notes": "No pool_kwargs carrying verify/cert are ever passed; pool manager instance is per-adapter, not per (url, verify) tuple.",
+    "version": "requests/__version__.py -> __version__ = \"2.30.0\""
+   },
+   "dataflow_path": null,
+   "group": "high_often_high"
+  },
+  {
+   "codeql_query_uuids": [],
+   "finding_id": "8144275d-cafd-481c-baa3-751208f16d9c",
+   "verdict": "tp",
+   "confidence": 80,
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-295",
+    "cwe-287"
+   ],
+   "description": "proxy_manager_for caches ProxyManager/SOCKSProxyManager keyed only by proxy URL, ignoring per-request verify/cert TLS settings",
+   "file_path": "requests/adapters.py",
+   "start_line": 350,
+   "end_line": 350,
+   "start_column": null,
+   "end_column": null,
+   "code_snippet": "            proxy_manager = self.proxy_manager_for(proxy)",
+   "reasoning": "`get_connection()` calls `self.proxy_manager_for(proxy)` and `proxy_manager_for()` stores the resulting manager in `self.proxy_manager[proxy]` — keyed *only* on the proxy URL string. The proxy_kwargs computed in `send()` (which include `cert_reqs`, `ca_certs`, `cert_file`, `key_file` derived from `verify`/`cert`) are therefore taken from whichever request first created the manager for that proxy. A later request that uses the same proxy but a different `verify` value (e.g., `verify=False` first, then default `verify=True`) reuses the cached manager with the stale, potentially disabled TLS settings, allowing MITM through the proxy.",
+   "evidence": {
+    "code_context": "if proxy in self.proxy_manager:\n    manager = self.proxy_manager[proxy]\nelif proxy.lower().startswith(\"socks\"):\n    manager = self.proxy_manager[proxy] = SOCKSProxyManager(...)\nelse:\n    manager = self.proxy_manager[proxy] = proxy_from_url(proxy, ...)",
+    "notes": "Cache key is `proxy` string only; verify/cert are not part of the key. Mirrors the main pool-keying flaw (CVE-2024-35195) on the proxy code path.",
+    "version": "requests 2.30.0"
+   },
+   "dataflow_path": null,
+   "group": "high_often_high"
+  },
+  {
+   "codeql_query_uuids": [],
+   "finding_id": "3b481f2c-02db-4b87-93cb-9249aadbd29a",
+   "verdict": "tp",
+   "confidence": 70,
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-295",
+    "cwe-287",
+    "cwe-284"
+   ],
+   "description": "Unpickled HTTPAdapter re-initializes an unscoped PoolManager, so pooled connections are recreated without any per-request TLS verify/ssl_context binding (part of CVE-2024-35195 pool-key class of weakness)",
+   "file_path": "requests/adapters.py",
+   "start_line": 169,
+   "end_line": 171,
+   "start_column": null,
+   "end_column": null,
+   "code_snippet": "    def __setstate__(self, state):\n        # Can't handle by adding 'proxy_manager' to self.__attrs__ because\n        # self.poolmanager uses a lambda function, which isn't pickleable.\n        self.proxy_manager = {}\n        self.config = {}\n\n        for attr, value in state.items():\n            setattr(self, attr, value)\n\n        self.init_poolmanager(\n            self._pool_connections, self._pool_maxsize, block=self._pool_block\n        )",
+   "reasoning": "`__setstate__` rebuilds the PoolManager via `init_poolmanager(...)` without passing any of the TLS-related `pool_kwargs` (`ssl_context`, `cert_reqs`, `ca_certs`) that a custom/subclassed adapter may have set at construction time. Since `get_connection()` (line ~350) resolves connections purely by URL and `cert_verify()` (line ~458) mutates the shared pooled connection's `cert_reqs`/`ca_certs` in place, a deserialized adapter produces a pool whose TLS policy is whatever the previous caller left behind — the same missing-pool-key weakness as CVE-2024-35195. This is the same defect instance surfaced at this location by the query, and the secondary re-init path makes it reachable for object-graph serialization (celery/joblib/multiprocessing workers, cached sessions) in addition to the normal `send()` path. Lower severity than the `cert_verify`/`get_connection` sites because it requires an adapter to be pickled and reused, so confidence and severity are reduced accordingly.",
+   "evidence": {
+    "code_context": "def __init__(...):\n        ...\n        self.init_poolmanager(pool_connections, pool_maxsize, block=pool_block)\n\n    def __setstate__(self, state):\n        self.proxy_manager = {}\n        self.config = {}\n        for attr, value in state.items():\n            setattr(self, attr, value)\n        self.init_poolmanager(\n            self._pool_connections, self._pool_maxsize, block=self._pool_block\n        )\n\n    def init_poolmanager(self, connections, maxsize, block=DEFAULT_POOLBLOCK, **pool_kwargs):\n        self.poolmanager = PoolManager(num_pools=connections, maxsize=maxsize, block=block, **pool_kwargs)",
+    "dataflow_analysis": "Pickled/unpickled HTTPAdapter -> __setstate__ -> init_poolmanager(pool_kwargs omitted) -> PoolManager recreated with default TLS settings -> send() -> get_connection() (URL-only pool key, line 350) -> cert_verify() mutates conn.cert_reqs in place (line 458) -> subsequent request on same host/port inherits mutated verification policy.",
+    "notes": "Version confirmed: requests/__version__.py line 8 = 2.30.0 (vulnerable to CVE-2024-35195; fixed in 2.32.0 by including verify/ssl_context in pool keys). grep for 'ssl_context' / pool-key handling in adapters.py returned no matches, confirming there is no keying on TLS parameters anywhere in the adapter."
+   },
+   "dataflow_path": null,
+   "group": "high_often_high"
+  },
+  {
+   "codeql_query_uuids": [],
+   "finding_id": "6cb4e979-fe81-4796-b812-ae0430089f66",
+   "verdict": "tp",
+   "confidence": 88,
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-522",
+    "cwe-200",
+    "cwe-668"
+   ],
+   "description": "get_netrc_auth derives the netrc machine lookup key from the raw URL netloc split on ':' instead of the validated hostname, so a crafted URL leaks netrc credentials for a trusted host to an attacker-controlled host (CVE-2024-47081)",
+   "file_path": "requests/utils.py",
+   "start_line": 237,
+   "end_line": 243,
+   "start_column": null,
+   "end_column": null,
+   "code_snippet": "        ri = urlparse(url)\n\n        # Strip port numbers from netloc. This weird `if...encode`` dance is\n        # used for Python 3.2, which doesn't support unicode literals.\n        splitstr = b\":\"\n        if isinstance(url, str):\n            splitstr = splitstr.decode(\"ascii\")\n        host = ri.netloc.split(splitstr)[0]\n\n        try:\n            _netrc = netrc(netrc_path).authenticators(host)\n            if _netrc:\n                # Return with login / password\n                login_i = 0 if _netrc[0] else 1\n                return (_netrc[login_i], _netrc[2])",
+   "reasoning": "The host used for the `.netrc` lookup is computed as `ri.netloc.split(\":\")[0]` (line 237) rather than from the validated `ri.hostname`. `netloc` includes the userinfo/credentials component, so for a URL such as `https://internal.example.com:80@evil.attacker.tld/` the netloc is `internal.example.com:80@evil.attacker.tld` and splitting on the first colon yields `internal.example.com`. `netrc(...).authenticators(\"internal.example.com\")` (line 240) therefore returns the credentials stored for the *trusted* machine, and lines 241-243 return them as the HTTP Basic auth tuple. Meanwhile the actual TCP/TLS connection and Host header target `evil.attacker.tld` (urlparse's `hostname` is `evil.attacker.tld`). Result: the `~/.netrc` username/password for the internal host is transmitted to an attacker-controlled endpoint. The defect is reachable from every request path: `Session.prepare_request` (requests/sessions.py:299) and `SessionRedirectMixin.rebuild_auth` (requests/sessions.py:481) call `get_netrc_auth(request.url)` whenever `trust_env` is set (the default) and no explicit auth is supplied. There is no hostname validation, no comparison between the netrc machine that matched and `ri.hostname`, and no lowercasing/IDNA normalization before the lookup, so the mismatch is never detected in this 2.30.0 codebase.",
+   "evidence": {
+    "code_context": "requests/utils.py:230-243 -> host = ri.netloc.split(':')[0]; _netrc = netrc(netrc_path).authenticators(host); return (_netrc[login_i], _netrc[2]). Callers: requests/sessions.py:299 `new_auth = get_netrc_auth(url) if self.trust_env else None` (inside rebuild_auth, on redirect target) and requests/sessions.py:481 `auth = get_netrc_auth(request.url)` (inside prepare_request, used when trust_env and no explicit auth). Version confirmed 2.30.0 in requests/__version__.py:8, i.e. before the 2.32.0 fix that switched to a validated hostname.",
+    "dataflow_analysis": "Untrusted URL string -> urlparse -> ri.netloc (contains userinfo) -> .split(':')[0] -> `host` -> netrc.authenticators(host) -> credential tuple -> PreparedRequest.prepare_auth(auth) -> Authorization: Basic header sent to the real connection host (ri.hostname), which may differ from the matched netrc machine.",
+    "notes": "No sanitizer present: grep for 'ri.hostname' in get_netrc_auth returned no match; the function never reconciles the matched netrc machine with the actual host it will connect to. Exploitation requires the victim to load an attacker-influenced URL (link, redirect, or API-supplied URL) while a matching entry exists in ~/.netrc or $NETRC and trust_env is default True."
+   },
+   "dataflow_path": null,
+   "group": "medium_undetermined_undetermined"
+  },
+  {
+   "codeql_query_uuids": [],
+   "finding_id": "bc5d6e50-6cc8-481b-84cb-3710ec6a479b",
+   "verdict": "tp",
+   "confidence": 75,
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-522",
+    "cwe-200",
+    "cwe-287"
+   ],
+   "description": "On redirect, rebuild_auth re-invokes get_netrc_auth() on the (attacker-chosen) redirect URL and re-applies the resulting credentials, enabling .netrc credential injection to an attacker host after an authenticated cross-host redirect",
+   "file_path": "requests/sessions.py",
+   "start_line": 284,
+   "end_line": 301,
+   "start_column": null,
+   "end_column": null,
+   "code_snippet": "    def rebuild_auth(self, prepared_request, response):\n        \"\"\"When being redirected we may want to strip authentication from the\n        request to avoid leaking credentials. This method intelligently removes\n        and reapplies authentication where possible to avoid credential loss.\n        \"\"\"\n        headers = prepared_request.headers\n        url = prepared_request.url\n\n        if \"Authorization\" in headers and self.should_strip_auth(\n            response.request.url, url\n        ):\n            # If we get redirected to a new host, we should strip out any\n            # authentication headers.\n            del headers[\"Authorization\"]\n\n        # .netrc might have more auth for us on our new host.\n        new_auth = get_netrc_auth(url) if self.trust_env else None\n        if new_auth is not None:\n            prepared_request.prepare_auth(new_auth)",
+   "reasoning": "This is the second exploitation path for the same root cause (requests/utils.py:237). After `should_strip_auth()` correctly removes the Authorization header on a cross-host redirect, lines 299-301 unconditionally look up netrc credentials for the *new* URL — which the remote server/attacker controls — and immediately re-attach them via `prepare_auth`. Because `get_netrc_auth` keys on `ri.netloc.split(':')[0]`, a redirect to `https://trusted-netrc-host:443@attacker.tld/` re-installs the trusted host's Basic credentials onto a request that is actually sent to `attacker.tld`. The credential-stripping defense in lines 291-297 is therefore defeated by the very code that follows it, meaning redirect-based credential protection is not effective in 2.30.0.",
+   "evidence": {
+    "code_context": "sessions.py:291-297 strips Authorization when should_strip_auth() detects a host change; sessions.py:299 then does `new_auth = get_netrc_auth(url) if self.trust_env else None` with the redirect-controlled URL, and :301 `prepared_request.prepare_auth(new_auth)` re-adds Basic auth. resolve_redirects() (sessions.py ~line 252) calls self.rebuild_auth(prepared_request, resp) inside the redirect loop.",
+    "dataflow_analysis": "Server-controlled Location header -> get_redirect_target() -> prepared_request.url (may contain userinfo) -> rebuild_auth() -> get_netrc_auth(url) -> netloc.split(':')[0] matched against .netrc -> (login, password) -> PreparedRequest.prepare_auth() -> Authorization header sent to redirect target.",
+    "notes": "Combines with utils.py:237 defect; the stripping logic at :291-297 provides no real protection because credentials are re-supplied for the new URL without verifying that the matched netrc machine equals the connection hostname."
+   },
+   "dataflow_path": null,
+   "group": "medium_undetermined_undetermined"
+  },
+  {
+   "codeql_query_uuids": [
+    "20261119210015",
+    "20261119210136"
+   ],
+   "finding_id": "8fb8fc7e-cd97-4e3f-9717-cf1f4fa32926",
+   "verdict": "tp",
+   "confidence": 85,
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-522",
+    "cwe-668",
+    "cwe-287"
+   ],
+   "description": "Credential leak: Session.prepare_request applies netrc credentials resolved from an unvalidated URL host (CVE-2024-47081)",
+   "file_path": "requests/sessions.py",
+   "start_line": 481,
+   "end_line": 482,
+   "start_column": null,
+   "end_column": null,
+   "code_snippet": "        auth = request.auth\n        if self.trust_env and not auth and not self.auth:\n            auth = get_netrc_auth(request.url)",
+   "reasoning": "`Session.prepare_request` invokes `get_netrc_auth(request.url)` with a fully attacker-controllable URL when `trust_env` is set (the default). Inside `get_netrc_auth` (requests/utils.py:237) the netrc lookup key is computed as `ri.netloc.split(':')[0]`, so a URL such as `https://internal.corp.example:443@attacker.tld/` yields host `internal.corp.example` and the corresponding netrc login/password is used as Basic auth for a request that is actually delivered to `attacker.tld`. The credentials therefore leave the machine toward an attacker-controlled endpoint. Nothing in this 2.30.0 code validates that the netloc userinfo/authority matches the real connection target (`ri.hostname` is not used here, and the fix for CVE-2024-47081 is absent), so this is a true positive credential-disclosure sink for untrusted URLs.",
+   "evidence": {
+    "code_context": "sessions.py:480-482 -> auth = get_netrc_auth(request.url) when trust_env and no explicit auth; utils.py:230-244 -> ri = urlparse(url); host = ri.netloc.split(':')[0]; _netrc = netrc(netrc_path).authenticators(host); return (_netrc[login_i], _netrc[2])",
+    "dataflow_analysis": "Attacker-influenced URL string -> Session.prepare_request(request.url) -> get_netrc_auth(url) -> urlparse(url).netloc.split(':')[0] (userinfo treated as host) -> netrc().authenticators(host) -> returned (login, password) -> PreparedRequest.prepare_auth() -> Authorization: Basic header sent to the resolved (attacker) host.",
+    "notes": "Version 2.30.0 (requests/__version__.py:8) is prior to the CVE-2024-47081 fix, which switches to ri.hostname and rejects URLs whose userinfo would be misparsed. grep for 'hostname' confirms get_netrc_auth never uses the validated hostname. Two additional sink statements exist at utils.py:240 (authenticators call on derived host) and utils.py:244 (credential return)."
+   },
+   "dataflow_path": null,
+   "group": "medium_undetermined_undetermined"
+  }
+ ],
+ "cache_usage": {
+  "prompt_tokens_total": 399407,
+  "uncached_input_tokens": 44207,
+  "cache_creation_input_tokens": 0,
+  "cache_read_input_tokens": 355200,
+  "output_tokens": 71115,
+  "calls": 37,
+  "caching_enabled": false,
+  "cost_usd_with_cache": 0.050366,
+  "cost_usd_no_cache": 0.10258,
+  "cache_read_share_of_prompt": 0.8893,
+  "prices_per_mtok": {
+   "claude-sonnet-4-5-20250929": {
+    "input": 3.0,
+    "output": 15.0
+   },
+   "claude-haiku-4-5-20251001": {
+    "input": 1.0,
+    "output": 5.0
+   },
+   "deepseek/deepseek-reasoner": {
+    "input": 0.15,
+    "output": 0.6,
+    "cache_read": 0.003,
+    "cache_write_mult": 1.0,
+    "peak_mult": 2.0
+   },
+   "gpt-5.1": {
+    "input": 1.25,
+    "output": 10.0,
+    "cache_read": 0.125,
+    "cache_write_mult": 1.0
+   },
+   "gpt-4.1": {
+    "input": 2.0,
+    "output": 8.0,
+    "cache_read": 0.5,
+    "cache_write_mult": 1.0
+   }
+  },
+  "cache_multipliers": {
+   "write_5m": 1.25,
+   "read": 0.1
+  }
+ }
+}

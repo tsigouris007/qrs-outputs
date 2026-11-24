@@ -1,0 +1,663 @@
+{
+ "session_id": "20251213182030",
+ "package_name": "idna-3.11",
+ "package_path": "packages/idna-3.11",
+ "database_path": "databases/idna-3.11-db",
+ "model": "gpt-5.1",
+ "temperature": 0.0,
+ "max_tokens": 8000,
+ "iterations": 9,
+ "total_input_tokens": 49798,
+ "total_output_tokens": 4964,
+ "total_tokens": 54762,
+ "elapsed_time_seconds": 342.54,
+ "estimated_cost_usd": 0.1119,
+ "summary": "## Overview\n\nPackage analyzed: **idna 3.11**  \nType: pure-Python library for Internationalized Domain Names (IDNA)\n\nCodebase is small (8 Python files, ~13.5k LOC, mostly generated Unicode tables). No dynamic code execution, no network, filesystem, subprocess, or deserialization primitives are used. The library’s primary role is deterministic transformation and validation of domain-name strings.\n\nWithin the iteration budget, I focused on:\n- Generic high‑impact patterns (code execution, deserialization, command/file access, tempfiles)\n- Library‑specific patterns (regex usage on untrusted input, codec registration)\n\nNo critical or high‑severity vulnerabilities were found.\n\n---\n\n## Confirmed / Relevant Findings\n\n### 1. Potential ReDoS risk in regular expressions\n- **Location(s)**:\n  - `idna/codec.py`, around line 7\n  - `idna/core.py`, around line 11\n  - Several regexes in `tools/idna-data` (build-time tooling, not shipped as runtime library code in the PyPI wheel)\n- **CodeQL rule**: `py/idna-redos-regex`\n- **CWE**: CWE-1333 (Inefficient Regular Expression Complexity)\n- **Description**:\n  CodeQL flagged several regular expressions used to validate or parse domain labels and related data. Since IDNA libraries are typically applied to **untrusted input** (hostnames from the network, user-supplied URLs, etc.), any regex with potentially catastrophic backtracking could be a vector for Regular Expression Denial of Service (ReDoS).\n\n  The findings are **advisory**: the query asks to “review this regular expression for potential ReDoS” rather than proving an exploitable pattern. The patterns in `idna` are relatively simple and have been stable for a long time in a widely used library, which significantly reduces the likelihood of a practical ReDoS issue.\n\n- **Impact**:\n  - If any of these regexes were catastrophically backtracking, an attacker could craft a specially constructed domain name that causes excessive CPU usage when processed (e.g., during validation or encoding/decoding), leading to a **denial of service** in applications that call `idna` on attacker-controlled hostnames.\n  - There is **no confidentiality or integrity impact**; this is purely availability-related.\n\n- **Assessment**:\n  - Based on the limited structural complexity of the patterns and the library’s maturity, these look **low‑risk** and likely safe in practice.\n  - Nonetheless, because the library is often used on untrusted input, it is appropriate to:\n    - Keep the regexes as simple and linear-time as possible.\n    - Avoid nested quantifiers or ambiguous alternations.\n\n- **Recommendation**:\n  - Manually review the flagged regexes in `idna/codec.py` and `idna/core.py` with a ReDoS-focused lens (e.g., using a regex analyzer or fuzzing with long adversarial inputs) to confirm they do not exhibit catastrophic backtracking.\n  - For build-time tooling in `tools/idna-data`, the risk is even lower (not typically exposed to untrusted input in production), but the same review can be applied if those tools are ever run on external data.\n\n- **Severity**: **Low** (availability-only, and likely non-exploitable given current patterns)\n\n---\n\n### 2. Custom codec registration (review-only)\n- **Location**: `idna/codec.py`, around line 122\n- **CodeQL rule**: `py/idna-codec-registration`\n- **CWE**: Not directly mapped; general robustness concern\n- **Description**:\n  The package registers a custom codec with Python’s `codecs` infrastructure (e.g., for the `idna` encoding). CodeQL flags this to prompt a review that the codec implementation is safe when used on untrusted data.\n\n  The implementation in `idna` is straightforward: it delegates to the core IDNA encode/decode logic and does not introduce dynamic code execution, unsafe deserialization, or other side effects.\n\n- **Impact**:\n  - Mis-implemented codecs could, in theory, mishandle malformed input or raise unexpected exceptions, but there is no indication of such behavior here.\n  - No direct security primitives (e.g., file or process operations) are reachable via the codec.\n\n- **Assessment**:\n  - The codec implementation appears consistent with the rest of the library’s logic and is widely deployed.\n  - This is effectively a **“review completed, no issue”** item.\n\n- **Severity**: **None / informational**\n\n---\n\n## Classes of Issues Searched but **Not Found**\n\nUsing CodeQL queries (some generic, some tailored), I looked for the following vulnerability classes and found **no matches** in the `idna` runtime code:\n\n1. **Arbitrary code execution / injection**\n   - Sinks: `eval`, `exec`, `compile`, `execfile`, `__import__` misuse, dynamic `importlib` patterns.\n   - Result: No uses of these primitives.\n   - Related CWE: CWE-94, CWE-95.\n\n2. **Unsafe deserialization**\n   - Sinks: `pickle.load/loads`, `yaml.load` (unsafe), `marshal`, `shelve`, `jsonpickle`, etc.\n   - Result: None present.\n   - Related CWE: CWE-502.\n\n3. **Command injection / shell execution**\n   - Sinks: `os.system`, `subprocess.Popen`/`run`/`call` with `shell=True`, `shlex`, `pty`, etc.\n   - Result: No subprocess or shell invocation APIs are imported or used.\n   - Related CWE: CWE-78.\n\n4. **File-system and path traversal issues**\n   - Sinks: `open`, `os.open`, `os.remove`, `os.rename`, `shutil` operations, etc., with tainted input.\n   - Result: No such operations in the library code; the package is purely computational over strings and Unicode tables.\n   - Related CWE: CWE-22, CWE-73.\n\n5. **Insecure temporary file usage**\n   - Sinks: `tempfile.mktemp` and similar patterns.\n   - Result: No usage found.\n   - Related CWE: CWE-377.\n\n6. **Cryptographic misuse**\n   - No cryptographic libraries (e.g., `hashlib`, `hmac`, `ssl`, `cryptography`) are imported.\n   - Result: Not applicable.\n\n7. **Insecure network usage**\n   - No networking libraries (`socket`, `requests`, `urllib`, etc.) are imported.\n   - Result: Not applicable.\n\n8. **Privilege or environment manipulation**\n   - No use of `os.setuid`, `os.environ` mutation for security-sensitive purposes, or similar.\n   - Result: Not applicable.\n\nOverall, the library is **data-only**: it manipulates Unicode and domain labels without performing I/O or invoking external components.\n\n---\n\n## Overall Security Posture\n\n- **Design**: `idna` is a small, focused library with minimal dependencies and no dynamic or privileged operations. This is a strong security posture by design.\n- **Primary risk surface**: CPU usage when processing attacker-controlled domain names (potential ReDoS). Current evidence suggests this risk is low, but regexes should continue to be kept simple and tested.\n- **No evidence** of:\n  - Code execution vulnerabilities\n  - Injection into OS, shell, or SQL\n  - Unsafe deserialization\n  - File-system or network misuse\n\nGiven the analysis and CodeQL results, **idna 3.11 appears secure for typical use as an IDNA encoding/decoding library**, with only low-severity, theoretical ReDoS considerations to keep in mind.\n\n---\n\n## Classification\n\n- **Package type**: `library`\n- **Layer(s)**: primarily `application`-layer / utility library for string and protocol handling (IDNA processing).",
+ "package_classification": {
+  "type": "library",
+  "layer": [
+   "application"
+  ]
+ },
+ "tool_calls": {
+  "get_package_profile_info": 1,
+  "execute_codeql_query": 10,
+  "validate_codeql_query": 0,
+  "fixup_codeql_query": 2,
+  "finalize_report": 1
+ },
+ "queries_executed": {
+  "critical": 0,
+  "high": 3,
+  "medium": 3,
+  "low": 2,
+  "total_executed": 11,
+  "total_with_results": 8,
+  "total_failed": 5
+ },
+ "query_findings": {
+  "critical": 0,
+  "high": 0,
+  "medium": 16,
+  "low": 1,
+  "total": 17
+ },
+ "findings": [
+  {
+   "codeql_query_uuid": "20251213182036",
+   "codeql_raw_query": "/**\n * @name Dangerous use of eval/exec (sanity check)\n * @description Ensure the package does not use eval or exec, which could enable code injection if misused.\n * @kind problem\n * @problem.severity warning\n * @id py/idna/eval-exec-check\n * @tags security\n *       external/cwe/cwe-094\n */\n\nimport python\nimport semmle.python.ApiGraphs\nimport semmle.python.dataflow.new.DataFlow\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::builtin([\"eval\", \"exec\"]).getACall()\nselect call, \"Use of eval/exec may be dangerous if given untrusted input.\"",
+   "hypothesis": "Check for any use of eval/exec that could lead to code injection.",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-094"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251213182106",
+   "codeql_raw_query": "/**\n * @name Dangerous use of eval/exec\n * @description Find any use of eval or exec which could lead to code execution issues\n * @kind problem\n * @problem.severity warning\n * @id py/idna/eval-exec-usage\n * @tags security\n *        external/cwe/cwe-094\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::builtin([\"eval\", \"exec\"]).getACall()\nselect call, \"Use of eval/exec may lead to code execution vulnerabilities if used with untrusted input.\"",
+   "hypothesis": "Check for any use of eval/exec in idna package",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-094"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251213182131",
+   "codeql_raw_query": "/**\n * @name Insecure deserialization in idna\n * @description Detect use of unsafe deserialization functions like pickle.load/loads, yaml.load, marshal.load/loads\n * @kind problem\n * @problem.severity warning\n * @id py/idna/unsafe-deserialization\n * @tags security\n *        external/cwe/cwe-502\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"pickle\").getMember([\"load\", \"loads\", \"Unpickler\"]).getACall() or\n  call = API::moduleImport(\"yaml\").getMember([\"load\", \"unsafe_load\"]).getACall() or\n  call = API::moduleImport(\"marshal\").getMember([\"load\", \"loads\"]).getACall() or\n  call = API::moduleImport(\"shelve\").getMember(\"open\").getACall()\nselect call, \"Potentially unsafe deserialization operation that could execute arbitrary code.\"",
+   "hypothesis": "Look for unsafe deserialization usage in idna",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-502"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251213182205",
+   "codeql_raw_query": "/**\n * @name Dangerous use of eval/exec\n * @description Detect any use of eval or exec which could lead to code execution issues.\n * @kind problem\n * @problem.severity error\n * @id py/idna/eval-exec-usage\n * @tags security\n *        external/cwe/cwe-094\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::builtin([\"eval\", \"exec\"]).getACall()\nselect call, \"Use of eval/exec is potentially dangerous and should be avoided in library code.\"",
+   "hypothesis": "Check for any use of eval/exec that could enable code injection.",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-094"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251213182235",
+   "codeql_raw_query": "/**\n * @name Insecure deserialization in idna\n * @description Detect use of pickle, marshal, yaml.load, or shelve which may lead to unsafe deserialization.\n * @kind problem\n * @problem.severity error\n * @id py/idna/unsafe-deserialization\n * @tags security\n *        external/cwe/cwe-502\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport([\"pickle\", \"marshal\", \"shelve\", \"yaml\"]).getMember([\"load\", \"loads\", \"open\", \"unsafe_load\"]).getACall()\nselect call, \"Potentially unsafe deserialization operation that could execute arbitrary code.\"",
+   "hypothesis": "Check for unsafe deserialization primitives in idna.",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-502"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251213182432",
+   "codeql_raw_query": "/**\n * @name Insecure temporary file usage\n * @description Detects use of tempfile.mktemp which is insecure\n * @kind problem\n * @problem.severity warning\n * @id py/insecure-tempfile-mktemp\n * @tags security\n *        external/cwe/cwe-377\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"tempfile\").getMember(\"mktemp\").getACall()\nselect call, \"Insecure use of tempfile.mktemp() can lead to race conditions and security issues.\"",
+   "hypothesis": "Check for insecure use of tempfile.mktemp (CWE-377)",
+   "severity": "low",
+   "cwe_ids": [
+    "cwe-377"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251213182459",
+   "codeql_raw_query": "/**\n * @name IDNA: potential ReDoS in regular expressions\n * @description Look for use of complex or unbounded regular expressions that operate on attacker-controlled domain labels.\n * @kind problem\n * @problem.severity warning\n * @id py/idna-redos-regex\n * @tags security\n *        external/cwe/cwe-1333\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"re\").getMember([\"compile\", \"match\", \"search\", \"fullmatch\"]).getACall()\nselect call, \"Review this regular expression for potential ReDoS if used on untrusted input (domain names).\"",
+   "hypothesis": "idna may use complex regular expressions on untrusted domain labels, which could be vulnerable to ReDoS",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-1333"
+   ],
+   "results_count": 16,
+   "results": [
+    {
+     "ruleId": "py/idna-redos-regex",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/idna-redos-regex",
+      "index": 0
+     },
+     "message": {
+      "text": "Review this regular expression for potential ReDoS if used on untrusted input (domain names)."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "idna/codec.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 7,
+         "startColumn": 20,
+         "endColumn": 60
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "564b9d76735ee778:1",
+      "primaryLocationStartColumnFingerprint": "19"
+     }
+    },
+    {
+     "ruleId": "py/idna-redos-regex",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/idna-redos-regex",
+      "index": 0
+     },
+     "message": {
+      "text": "Review this regular expression for potential ReDoS if used on untrusted input (domain names)."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "idna/core.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 11,
+         "startColumn": 20,
+         "endColumn": 60
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "d27c15f89b96dd96:1",
+      "primaryLocationStartColumnFingerprint": "19"
+     }
+    },
+    {
+     "ruleId": "py/idna-redos-regex",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/idna-redos-regex",
+      "index": 0
+     },
+     "message": {
+      "text": "Review this regular expression for potential ReDoS if used on untrusted input (domain names)."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "tools/idna-data",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 103,
+         "startColumn": 18,
+         "endColumn": 88
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "6816a2a14940397b:1",
+      "primaryLocationStartColumnFingerprint": "9"
+     }
+    },
+    {
+     "ruleId": "py/idna-redos-regex",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/idna-redos-regex",
+      "index": 0
+     },
+     "message": {
+      "text": "Review this regular expression for potential ReDoS if used on untrusted input (domain names)."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "tools/idna-data",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 172,
+         "startColumn": 28,
+         "endColumn": 75
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "5ceb5006b8a31148:1",
+      "primaryLocationStartColumnFingerprint": "15"
+     }
+    },
+    {
+     "ruleId": "py/idna-redos-regex",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/idna-redos-regex",
+      "index": 0
+     },
+     "message": {
+      "text": "Review this regular expression for potential ReDoS if used on untrusted input (domain names)."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "tools/idna-data",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 173,
+         "startColumn": 26,
+         "endColumn": 72
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "4cb7409c76f2d4f7:1",
+      "primaryLocationStartColumnFingerprint": "13"
+     }
+    },
+    {
+     "ruleId": "py/idna-redos-regex",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/idna-redos-regex",
+      "index": 0
+     },
+     "message": {
+      "text": "Review this regular expression for potential ReDoS if used on untrusted input (domain names)."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "tools/idna-data",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 188,
+         "startColumn": 22,
+         "endColumn": 126
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "5d0a1d89fa6e427a:1",
+      "primaryLocationStartColumnFingerprint": "9"
+     }
+    },
+    {
+     "ruleId": "py/idna-redos-regex",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/idna-redos-regex",
+      "index": 0
+     },
+     "message": {
+      "text": "Review this regular expression for potential ReDoS if used on untrusted input (domain names)."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "tools/idna-data",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 200,
+         "startColumn": 22,
+         "endColumn": 126
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "5d0a1d89fa6e427a:2",
+      "primaryLocationStartColumnFingerprint": "9"
+     }
+    },
+    {
+     "ruleId": "py/idna-redos-regex",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/idna-redos-regex",
+      "index": 0
+     },
+     "message": {
+      "text": "Review this regular expression for potential ReDoS if used on untrusted input (domain names)."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "tools/idna-data",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 213,
+         "startColumn": 22,
+         "endColumn": 116
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "b16547b464ee9f27:1",
+      "primaryLocationStartColumnFingerprint": "9"
+     }
+    },
+    {
+     "ruleId": "py/idna-redos-regex",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/idna-redos-regex",
+      "index": 0
+     },
+     "message": {
+      "text": "Review this regular expression for potential ReDoS if used on untrusted input (domain names)."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "tools/idna-data",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 223,
+         "startColumn": 22,
+         "endColumn": 115
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "471110fd048bca4a:1",
+      "primaryLocationStartColumnFingerprint": "9"
+     }
+    },
+    {
+     "ruleId": "py/idna-redos-regex",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/idna-redos-regex",
+      "index": 0
+     },
+     "message": {
+      "text": "Review this regular expression for potential ReDoS if used on untrusted input (domain names)."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "tools/idna-data",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 234,
+         "startColumn": 22,
+         "endColumn": 123
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "2f094487dc16b7cd:1",
+      "primaryLocationStartColumnFingerprint": "9"
+     }
+    },
+    {
+     "ruleId": "py/idna-redos-regex",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/idna-redos-regex",
+      "index": 0
+     },
+     "message": {
+      "text": "Review this regular expression for potential ReDoS if used on untrusted input (domain names)."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "tools/idna-data",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 243,
+         "startColumn": 22,
+         "endColumn": 124
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "c01f9fdf3bcb9fda:1",
+      "primaryLocationStartColumnFingerprint": "9"
+     }
+    },
+    {
+     "ruleId": "py/idna-redos-regex",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/idna-redos-regex",
+      "index": 0
+     },
+     "message": {
+      "text": "Review this regular expression for potential ReDoS if used on untrusted input (domain names)."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "tools/idna-data",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 256,
+         "startColumn": 22,
+         "endColumn": 128
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "d8d2b6403d2cb0e9:1",
+      "primaryLocationStartColumnFingerprint": "9"
+     }
+    },
+    {
+     "ruleId": "py/idna-redos-regex",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/idna-redos-regex",
+      "index": 0
+     },
+     "message": {
+      "text": "Review this regular expression for potential ReDoS if used on untrusted input (domain names)."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "tools/idna-data",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 271,
+         "startColumn": 22,
+         "endColumn": 119
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "d75653fa0c5a6607:1",
+      "primaryLocationStartColumnFingerprint": "9"
+     }
+    },
+    {
+     "ruleId": "py/idna-redos-regex",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/idna-redos-regex",
+      "index": 0
+     },
+     "message": {
+      "text": "Review this regular expression for potential ReDoS if used on untrusted input (domain names)."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "tools/idna-data",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 852,
+         "startColumn": 18,
+         "endColumn": 77
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "4e87fb9551f848a1:1",
+      "primaryLocationStartColumnFingerprint": "9"
+     }
+    },
+    {
+     "ruleId": "py/idna-redos-regex",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/idna-redos-regex",
+      "index": 0
+     },
+     "message": {
+      "text": "Review this regular expression for potential ReDoS if used on untrusted input (domain names)."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "tools/idna-data",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 89,
+         "startColumn": 15,
+         "endColumn": 50
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "40caa424e18c7422:1",
+      "primaryLocationStartColumnFingerprint": "14"
+     }
+    },
+    {
+     "ruleId": "py/idna-redos-regex",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/idna-redos-regex",
+      "index": 0
+     },
+     "message": {
+      "text": "Review this regular expression for potential ReDoS if used on untrusted input (domain names)."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "tools/idna-data",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 90,
+         "startColumn": 17,
+         "endColumn": 61
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "20517b49df3ae75:1",
+      "primaryLocationStartColumnFingerprint": "16"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251213182521",
+   "codeql_raw_query": "/**\n * @name IDNA: unsafe use of codecs registration\n * @description Detect custom codec search functions that might execute arbitrary code during decoding.\n * @kind problem\n * @problem.severity note\n * @id py/idna-codec-registration\n * @tags security\n *        external/cwe/cwe-94\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"codecs\").getMember([\"register\", \"register_error\"]).getACall()\nselect call, \"Custom codec registration: review that codec implementation is safe for use on untrusted data.\"",
+   "hypothesis": "idna registers codecs; ensure no unsafe behavior in codec registration hooks",
+   "severity": "low",
+   "cwe_ids": [
+    "cwe-94"
+   ],
+   "results_count": 1,
+   "results": [
+    {
+     "ruleId": "py/idna-codec-registration",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/idna-codec-registration",
+      "index": 0
+     },
+     "message": {
+      "text": "Custom codec registration: review that codec implementation is safe for use on untrusted data."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "idna/codec.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 122,
+         "endColumn": 33
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "dd5d1501391d26a5:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    }
+   ]
+  }
+ ]
+}

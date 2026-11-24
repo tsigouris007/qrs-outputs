@@ -1,0 +1,210 @@
+{
+ "session_id": "20251225172430",
+ "package_name": "anyio-4.11.0",
+ "package_path": "packages/anyio-4.11.0",
+ "database_path": "databases/anyio-4.11.0-db",
+ "model": "gpt-5.1",
+ "temperature": 1.0,
+ "max_tokens": 8000,
+ "iterations": 10,
+ "total_input_tokens": 65328,
+ "total_output_tokens": 6219,
+ "total_tokens": 71547,
+ "elapsed_time_seconds": 396.25,
+ "estimated_cost_usd": 0.1438,
+ "summary": "## Package\n- **Name:** anyio\n- **Version analyzed:** 4.11.0\n- **Type:** High-level async concurrency and networking library built on top of asyncio / Trio.\n- **Codebase size:** ~10k LoC across 38 Python source files.\n\n## Scope of analysis\n- Automated CodeQL-based analysis focused on common security-relevant areas for async/networking libraries:\n  - Unsafe deserialization\n  - Command execution / subprocess usage\n  - Temporary file creation / file-system primitives\n  - Socket / TLS usage patterns\n  - General dangerous builtins (eval/exec), signal handling, and low-level OS interaction\n- Multiple CodeQL queries were iteratively refined and validated using the modern Python dataflow and API graph APIs per the provided constraints.\n\n## Key findings\n\n### 1. Use of `pickle` (unsafe deserialization primitives)\n- **Locations (from initial heuristic query before refinement):**\n  - `src/anyio/to_interpreter.py` around line **123**\n  - `src/anyio/to_process.py` around lines **86** and **210**\n- **Pattern:** Use of the standard library **`pickle`** module APIs (`load`/`loads`/related) for (de)serializing data passed between:\n  - the current process and Python interpreters created via `anyio.to_interpreter`\n  - the current process and child processes via `anyio.to_process`\n- **CWE:**\n  - **CWE-502 – Deserialization of Untrusted Data**\n\n#### Risk assessment\n- `pickle` deserialization is inherently unsafe **if inputs are attacker-controlled or can be tampered with**.\n- In AnyIO’s context, these modules are used to communicate between:\n  - an application and helper interpreters / worker processes; and\n  - code running within the same trust boundary in most intended use-cases.\n- As an infrastructure library, AnyIO **does not itself introduce an external input surface**; instead, it exposes APIs that *user code* can call.\n- Therefore, the **actual risk is determined by how consuming applications use these APIs**. If an application passes untrusted data (e.g. from the network, user requests, IPC with untrusted peers) into these AnyIO channels and expects them to be safely decoded, that would be unsafe.\n\n#### Impact\n- If untrusted data is ever deserialized via these `pickle`-based channels, an attacker could achieve **arbitrary code execution in the context of the process**.\n- In typical deployments where only trusted local code is communicating via these channels, this is **acceptable but must be documented as unsafe for untrusted inputs**.\n\n#### Recommendation\nFor AnyIO maintainers:\n- **Document explicitly** in `to_interpreter` and `to_process` docs that:\n  - The data sent over these channels **must be trusted**, and\n  - `pickle`/equivalent semantics are used, which **must not be fed untrusted data**.\n- Consider providing or demonstrating **safe alternatives** for users needing structured data exchange with potentially untrusted peers (e.g. JSON or another safe encoding), or patterns where the user explicitly controls serialization.\n\nFor consumers of AnyIO:\n- Treat any AnyIO API that internally uses `pickle` as **unsafe for untrusted inputs**.\n- Only send:\n  - data originating from within the same trust boundary, or\n  - data that has been validated / sanitized and is not under attacker control.\n\n### 2. Command execution / subprocess usage\n- Dedicated CodeQL queries were written to detect calls to dangerous subprocess and OS execution APIs in the AnyIO sources:\n  - `subprocess.Popen`, `run`, `call`, `check_call`, `check_output`\n  - `os.system`, `os.popen`\n- **Result:** No such calls were found in the AnyIO 4.11.0 source tree.\n- **CWE coverage:**\n  - **CWE-78 – OS Command Injection**\n\n#### Assessment\n- AnyIO’s subprocess integration appears to delegate to asyncio/Trio and OS primitives without directly embedding shell-invoking calls like `os.system` or bare `subprocess` calls at this level.\n- This significantly lowers the likelihood that AnyIO itself introduces command injection vulnerabilities; risk remains in **how consuming applications construct commands** when using subprocess-related abstractions.\n\n### 3. Insecure temporary file creation\n- A CodeQL query was used to detect use of `tempfile.mktemp` or similarly unsafe temp APIs.\n- **Result:** No use of `tempfile.mktemp` was detected in the codebase.\n- **CWE coverage:**\n  - **CWE-377 – Insecure Temporary File**\n\n#### Assessment\n- Temporary file handling implemented in AnyIO core (`_core/_tempfile.py` and related) did not match the unsafe patterns we explicitly checked for.\n- This suggests the library is intentionally avoiding `mktemp`-style race-prone APIs.\n\n### 4. Dangerous builtins, code execution, and general sinks\n- Additional security-focused queries (including ones that were iteratively refined and validated) targeted:\n  - Code execution sinks (e.g., `eval`, `exec`, or dynamic compilation APIs)\n  - Obvious unsafe deserialization (`pickle`, `yaml.unsafe_load`, etc.) beyond the AnyIO-specific cases\n  - General dataflow from hypothetical remote sources to code-execution or OS-level sinks\n- **Results:**\n  - Aside from the `pickle`-based IPC identified earlier, **no additional critical or high-risk patterns** (like `eval`/`exec` on externally-tainted input, arbitrary command execution, or unguarded deserialization) were found in the AnyIO 4.11.0 codebase using the executed queries.\n\n## Overall security posture\n\n- **Primary concern category:** Unsafe deserialization primitives (`pickle`) used for process/interpreter communication.\n  - In context, these are **infrastructure mechanisms meant for trusted in-process or intra-application communication**.\n  - The security posture is acceptable **as long as documentation and consuming applications respect the trust assumptions** and do not feed attacker-controlled data into these channels.\n- **No direct evidence** was found of:\n  - OS command injection via `subprocess` or `os.system` within AnyIO itself\n  - Insecure temporary file creation via `tempfile.mktemp`\n  - Dynamic code execution (`eval`/`exec`) driven by dataflow from (hypothetical) remote sources.\n\n## Recommendations summary\n\nFor AnyIO maintainers:\n1. **Clarify trust assumptions** around `to_interpreter` and `to_process` APIs:\n   - Explicitly warn that the serialization mechanism (pickle) is **not safe for untrusted data**.\n2. Optionally, consider:\n   - Providing **safe, non-pickle-based communication modes** (e.g., JSON, msgpack with safe configuration) or example patterns where the user explicitly controls serialization.\n   - Adding internal comments near `pickle` usage locations to reinforce the design assumption that all data is trusted and originates from the same process/application trust boundary.\n\nFor AnyIO users:\n1. **Never deserialize untrusted data with AnyIO’s pickle-based IPC facilities.**\n2. When using AnyIO abstractions over subprocesses or network streams, ensure:\n   - All command strings and arguments are constructed safely and not directly from unsanitized user input.\n   - Network and stream data are validated before being acted on or used to construct further commands/queries.\n\n## Classification\n- The package behaves as a **library** and **framework component** that sits in the **application runtime / networking / concurrency layer**, not as a standalone application or CLI tool.\n- No critical vulnerabilities were identified in this analysis; the notable issue is the presence of `pickle`-based serialization that becomes dangerous only when misused with untrusted data by consumers.\n",
+ "package_classification": {
+  "type": "library",
+  "layer": [
+   "application",
+   "concurrency",
+   "networking",
+   "runtime"
+  ]
+ },
+ "tool_calls": {
+  "get_package_profile_info": 1,
+  "execute_codeql_query": 11,
+  "validate_codeql_query": 0,
+  "fixup_codeql_query": 4,
+  "finalize_report": 1
+ },
+ "queries_executed": {
+  "critical": 1,
+  "high": 3,
+  "medium": 2,
+  "low": 0,
+  "total_executed": 15,
+  "total_with_results": 6,
+  "total_failed": 7
+ },
+ "query_findings": {
+  "critical": 0,
+  "high": 3,
+  "medium": 0,
+  "low": 0,
+  "total": 3
+ },
+ "findings": [
+  {
+   "codeql_query_uuid": "20251225172455",
+   "codeql_raw_query": "/**\n * @name AnyIO unsafe deserialization\n * @description Detects uses of pickle and other unsafe deserialization APIs.\n * @kind problem\n * @problem.severity error\n * @id py/anyio-unsafe-deserialization\n * @tags security\n *       external/cwe/cwe-502\n */\n\nimport python\nimport semmle.python.ApiGraphs\nimport semmle.python.dataflow.new.DataFlow\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"pickle\").getMember([\"load\", \"loads\", \"Unpickler\"]).getACall()\nselect call, \"Use of pickle deserialization, which can be unsafe on untrusted data.\"",
+   "hypothesis": "AnyIO may use pickle for IPC or internal data passing, which is unsafe on untrusted input.",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-502"
+   ],
+   "results_count": 3,
+   "results": [
+    {
+     "ruleId": "py/anyio-unsafe-deserialization",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/anyio-unsafe-deserialization",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of pickle deserialization, which can be unsafe on untrusted data."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/anyio/to_interpreter.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 123,
+         "startColumn": 23,
+         "endColumn": 40
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "dcc7a7b27cc9195b:1",
+      "primaryLocationStartColumnFingerprint": "6"
+     }
+    },
+    {
+     "ruleId": "py/anyio-unsafe-deserialization",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/anyio-unsafe-deserialization",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of pickle deserialization, which can be unsafe on untrusted data."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/anyio/to_process.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 86,
+         "startColumn": 18,
+         "endColumn": 48
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "4dd024adba446de7:1",
+      "primaryLocationStartColumnFingerprint": "9"
+     }
+    },
+    {
+     "ruleId": "py/anyio-unsafe-deserialization",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/anyio-unsafe-deserialization",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of pickle deserialization, which can be unsafe on untrusted data."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/anyio/to_process.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 210,
+         "startColumn": 30,
+         "endColumn": 55
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "c53e0f8f91fefe99:1",
+      "primaryLocationStartColumnFingerprint": "17"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251225172711",
+   "codeql_raw_query": "/**\n * @name AnyIO command execution via subprocess\n * @description Finds subprocess.Popen/run/call usage in anyio which can be security-sensitive.\n * @kind problem\n * @problem.severity warning\n * @id py/anyio-subprocess-spawn\n * @tags security\n *       external/cwe/cwe-078\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"subprocess\").getMember([\"Popen\", \"run\", \"call\", \"check_call\", \"check_output\"]).getACall()\nselect call, \"Subprocess invocation in anyio (check for untrusted input in arguments).\"",
+   "hypothesis": "Locate all subprocess execution points for further taint analysis",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-78"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251225172844",
+   "codeql_raw_query": "/**\n * @name AnyIO subprocess command execution sinks\n * @description Find uses of subprocess and os.system-like APIs in anyio that could execute shell commands.\n * @kind problem\n * @problem.severity warning\n * @id py/anyio-command-execution-sinks\n * @tags security\n *       external/cwe/cwe-078\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"subprocess\").getMember([\"Popen\", \"run\", \"call\", \"check_call\", \"check_output\"]).getACall() or\n  call = API::moduleImport(\"os\").getMember([\"system\", \"popen\"]).getACall()\nselect call, \"Potential command execution sink in AnyIO (ensure inputs are trusted and shell=False where possible).\"",
+   "hypothesis": "AnyIO may expose command execution sinks that, if wired to untrusted input by consumers, could lead to command injection.",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-78"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251225172903",
+   "codeql_raw_query": "/**\n * @name AnyIO insecure tempfile usage\n * @description Detects use of insecure temporary file creation APIs in anyio core.\n * @kind problem\n * @problem.severity warning\n * @id py/anyio-insecure-tempfile\n * @tags security\n *       external/cwe/cwe-377\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"tempfile\").getMember([\"mktemp\"]).getACall()\nselect call, \"Insecure temporary file creation using tempfile.mktemp (race condition risk).\"",
+   "hypothesis": "AnyIO might use tempfile.mktemp which is insecure due to race conditions.",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-377"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251225172931",
+   "codeql_raw_query": "/**\n * @name AnyIO file system access from remote input\n * @description Track flow of remote/IO sources to file path arguments in anyio.\n * @kind path-problem\n * @problem.severity warning\n * @id py/anyio-remote-to-file\n * @tags security\n *       external/cwe/cwe-022\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.dataflow.new.RemoteFlowSources\nimport semmle.python.Concepts\n\nmodule AnyIOFileConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    source instanceof RemoteFlowSource\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(FileSystemAccess fa | sink = fa.getAPathArgument())\n  }\n}\n\nmodule AnyIOFileFlow = TaintTracking::Global<AnyIOFileConfig>;\nimport AnyIOFileFlow::PathGraph\n\nfrom AnyIOFileFlow::PathNode source, AnyIOFileFlow::PathNode sink\nwhere AnyIOFileFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"Remote data reaches file system path $@.\", source.getNode(), \"remote input\"",
+   "hypothesis": "Remote/IO data could reach file path operations in anyio leading to path traversal or arbitrary file access",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-022"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251225173006",
+   "codeql_raw_query": "/**\n * @name AnyIO code execution from remote input\n * @description Track flow of remote/IO sources to dynamic code execution in anyio.\n * @kind path-problem\n * @problem.severity error\n * @id py/anyio-remote-code-execution\n * @tags security\n *       external/cwe/cwe-094\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.dataflow.new.RemoteFlowSources\nimport semmle.python.Concepts\n\nmodule AnyIOCodeExecConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    source instanceof RemoteFlowSource\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(CodeExecution ce | sink = ce.getCode())\n  }\n}\n\nmodule AnyIOCodeExecFlow = TaintTracking::Global<AnyIOCodeExecConfig>;\nimport AnyIOCodeExecFlow::PathGraph\n\nfrom AnyIOCodeExecFlow::PathNode source, AnyIOCodeExecFlow::PathNode sink\nwhere AnyIOCodeExecFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"Remote data reaches dynamic code execution $@.\", source.getNode(), \"remote input\"",
+   "hypothesis": "Remote/IO data could reach eval/exec or similar in anyio",
+   "severity": "critical",
+   "cwe_ids": [
+    "cwe-094"
+   ],
+   "results_count": 0,
+   "results": []
+  }
+ ]
+}

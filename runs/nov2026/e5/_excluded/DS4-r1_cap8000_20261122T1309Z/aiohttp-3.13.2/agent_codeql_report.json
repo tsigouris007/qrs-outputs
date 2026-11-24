@@ -1,0 +1,1396 @@
+{
+ "session_id": "20261122135425",
+ "package_name": "aiohttp-3.13.2",
+ "package_path": "packages/aiohttp-3.13.2",
+ "database_path": "databases/aiohttp-3.13.2-db",
+ "model": "deepseek/deepseek-v4-pro",
+ "temperature": null,
+ "max_tokens": 8000,
+ "iterations": 19,
+ "total_input_tokens": 207469,
+ "total_output_tokens": 76950,
+ "total_tokens": 284419,
+ "elapsed_time_seconds": 2266.4,
+ "estimated_cost_usd": 0.0,
+ "summary": "## Security Analysis Summary: aiohttp 3.13.2\n\nAnalyzed 59 files / ~19.6k lines using CodeQL with taint-tracking, data-flow, and sink-focused queries covering deserialization, command injection, path traversal, code injection, file access, weak crypto, SSL configuration, and more.\n\n### Key Findings\n\n**1. Unsafe pickle deserialization (CWE-502) — Low/Medium severity, requires user-controlled file path**\n- Location: `aiohttp/cookiejar.py:133` in `CookieJar.load()`\n- `pickle.load(f)` is used to load a cookie jar from a file. If the file path passed to `CookieJar.load()` ever originates from an untrusted source, an attacker who controls the file contents can achieve arbitrary code execution via a malicious pickle payload.\n- In normal usage the file is a local, operator-controlled file, so this is not directly remotely exploitable by default, but it is an unsafe deserialization sink worth flagging.\n\n**2. Weak hash usage (CWE-327/328) — Informational/benign**\n- `aiohttp/client.py:1121` (MD5 used for client response fingerprinting/identity), `aiohttp/client_middleware_digest_auth.py:313-322` (MD5 is mandated by the HTTP Digest auth RFC), and `aiohttp/web_ws.py:275` (SHA-1 mandated by the WebSocket handshake RFC).\n- These are protocol-required or non-security-critical and are not considered exploitable vulnerabilities.\n\n**3. Developer tooling sinks — Not shipped as library runtime code**\n- `tools/gen.py` (dynamic code execution builtins), `tools/cleanup_changes.py` (subprocess), `tools/check_changes.py` / `setup.py` (file access). These are build/dev scripts, not part of the importable runtime package.\n\n### No findings for\n- Remote code injection (eval/exec) reachable from `RemoteFlowSource`\n- OS command injection from remote input\n- Path traversal in `web_urldispatcher.py` static file serving (path normalization protects against traversal)\n- SQL injection\n- Unsafe YAML/marshal/shelve deserialization\n- CRLF/header injection\n- Weak SSL defaults (no insecure `check_hostname=False`/`verify_mode=CERT_NONE` found)\n\n### Conclusion\nNo critical or high severity remotely-exploitable vulnerabilities were identified in the core library. The most notable finding is the unsafe `pickle.load` in `CookieJar.load()`, which becomes a risk only if applications feed untrusted files into it.",
+ "package_classification": {
+  "type": [
+   "library",
+   "framework"
+  ],
+  "layer": [
+   "application",
+   "framework"
+  ]
+ },
+ "tool_calls": {
+  "get_package_profile_info": 1,
+  "execute_codeql_query": 44,
+  "validate_codeql_query": 0,
+  "fixup_codeql_query": 1,
+  "finalize_report": 1
+ },
+ "queries_executed": {
+  "critical": 2,
+  "high": 12,
+  "medium": 5,
+  "low": 5,
+  "total_executed": 44,
+  "total_with_results": 24,
+  "total_failed": 22
+ },
+ "query_findings": {
+  "critical": 1,
+  "high": 8,
+  "medium": 21,
+  "low": 1,
+  "total": 31
+ },
+ "findings": [
+  {
+   "codeql_query_uuid": "20261122135517",
+   "codeql_raw_query": "/**\n * @name Unsafe deserialization\n * @description Deserializing data using pickle, yaml.load, marshal, or shelve can lead to arbitrary code execution\n * @kind problem\n * @problem.severity error\n * @id py/unsafe-deserialization-aiohttp\n * @tags security\n *        external/cwe/cwe-502\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"pickle\").getMember([\"load\", \"loads\", \"Unpickler\"]).getACall() or\n  call = API::moduleImport(\"_pickle\").getMember([\"load\", \"loads\", \"Unpickler\"]).getACall() or\n  call = API::moduleImport(\"yaml\").getMember([\"load\", \"unsafe_load\"]).getACall() or\n  call = API::moduleImport(\"marshal\").getMember([\"load\", \"loads\"]).getACall() or\n  call = API::moduleImport(\"shelve\").getMember(\"open\").getACall()\nselect call, \"Potentially unsafe deserialization operation.\"\n",
+   "hypothesis": "The package uses unsafe deserialization functions (pickle/yaml/marshal/shelve) which may allow arbitrary code execution",
+   "severity": "critical",
+   "cwe_ids": [
+    "cwe-502"
+   ],
+   "results_count": 1,
+   "results": [
+    {
+     "ruleId": "py/unsafe-deserialization-aiohttp",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/unsafe-deserialization-aiohttp",
+      "index": 0
+     },
+     "message": {
+      "text": "Potentially unsafe deserialization operation."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/cookiejar.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 133,
+         "startColumn": 29,
+         "endColumn": 43
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "6963aaae75a5c2c5:1",
+      "primaryLocationStartColumnFingerprint": "16"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20261122135639",
+   "codeql_raw_query": "/**\n * @name Path traversal via file system access\n * @description Untrusted input flowing to a file path argument may allow path traversal\n * @kind path-problem\n * @problem.severity error\n * @id py/path-traversal-aiohttp\n * @tags security\n *        external/cwe/cwe-022\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.dataflow.new.RemoteFlowSources\nimport semmle.python.Concepts\n\nmodule PathTravConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) { source instanceof RemoteFlowSource }\n\n  predicate isSink(DataFlow::Node sink) {\n    sink = any(FileSystemAccess fa).getAPathArgument()\n  }\n}\n\nmodule PathTravFlow = TaintTracking::Global<PathTravConfig>;\nimport PathTravFlow::PathGraph\n\nfrom PathTravFlow::PathNode source, PathTravFlow::PathNode sink\nwhere PathTravFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"Path traversal from $@.\", source.getNode(), \"remote input\"\n",
+   "hypothesis": "Untrusted input reaches a file system path argument, enabling path traversal or arbitrary file access",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-022"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20261122135750",
+   "codeql_raw_query": "/**\n * @name Code injection via remote flow\n * @description Untrusted input flowing to eval/exec can allow arbitrary code execution\n * @kind path-problem\n * @problem.severity error\n * @id py/code-injection-aiohttp\n * @tags security\n *        external/cwe/cwe-094\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.dataflow.new.RemoteFlowSources\nimport semmle.python.Concepts\n\nmodule CodeInjConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) { source instanceof RemoteFlowSource }\n\n  predicate isSink(DataFlow::Node sink) {\n    sink = any(CodeExecution ce).getCode()\n  }\n}\n\nmodule CodeInjFlow = TaintTracking::Global<CodeInjConfig>;\nimport CodeInjFlow::PathGraph\n\nfrom CodeInjFlow::PathNode source, CodeInjFlow::PathNode sink\nwhere CodeInjFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"Code injection from $@.\", source.getNode(), \"remote input\"\n",
+   "hypothesis": "Untrusted input reaches a code execution sink (eval/exec), enabling arbitrary code execution",
+   "severity": "critical",
+   "cwe_ids": [
+    "cwe-094"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20261122140352",
+   "codeql_raw_query": "/**\n * @name Subprocess usage\n * @description Find subprocess invocation calls\n * @kind problem\n * @problem.severity warning\n * @id py/subprocess-usage-aiohttp\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere call = API::moduleImport(\"subprocess\").getMember([\"call\", \"check_call\", \"check_output\", \"run\", \"Popen\"]).getACall()\nselect call, \"subprocess call\"",
+   "hypothesis": "Locate subprocess invocations for command injection analysis",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-078"
+   ],
+   "results_count": 1,
+   "results": [
+    {
+     "ruleId": "py/subprocess-usage-aiohttp",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/subprocess-usage-aiohttp",
+      "index": 0
+     },
+     "message": {
+      "text": "subprocess call"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "tools/cleanup_changes.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 38,
+         "startColumn": 17,
+         "endColumn": 53
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "39a851fb0a7fe082:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20261122140427",
+   "codeql_raw_query": "/**\n * @name File system access\n * @description Find file system access sinks with file paths\n * @kind problem\n * @problem.severity warning\n * @id py/file-access-aiohttp\n */\n\nimport python\nimport semmle.python.Concepts\n\nfrom FileSystemAccess fa\nselect fa, \"file system access\"",
+   "hypothesis": "Locate file system access sinks for path traversal analysis",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-022"
+   ],
+   "results_count": 16,
+   "results": [
+    {
+     "ruleId": "py/file-access-aiohttp",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/file-access-aiohttp",
+      "index": 0
+     },
+     "message": {
+      "text": "file system access"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "tools/check_changes.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 25,
+         "startColumn": 14,
+         "endColumn": 35
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "3d2844699d148ed5:1",
+      "primaryLocationStartColumnFingerprint": "9"
+     }
+    },
+    {
+     "ruleId": "py/file-access-aiohttp",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/file-access-aiohttp",
+      "index": 0
+     },
+     "message": {
+      "text": "file system access"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "tools/check_changes.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 26,
+         "startColumn": 15,
+         "endColumn": 41
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "492869641171e303:1",
+      "primaryLocationStartColumnFingerprint": "10"
+     }
+    },
+    {
+     "ruleId": "py/file-access-aiohttp",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/file-access-aiohttp",
+      "index": 0
+     },
+     "message": {
+      "text": "file system access"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "tools/cleanup_changes.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 30,
+         "startColumn": 15,
+         "endColumn": 49
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "acc1c2de39ec8ca8:1",
+      "primaryLocationStartColumnFingerprint": "10"
+     }
+    },
+    {
+     "ruleId": "py/file-access-aiohttp",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/file-access-aiohttp",
+      "index": 0
+     },
+     "message": {
+      "text": "file system access"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/cookiejar.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 127,
+         "startColumn": 14,
+         "endColumn": 39
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "74c91d2aa24e0a21:1",
+      "primaryLocationStartColumnFingerprint": "5"
+     }
+    },
+    {
+     "ruleId": "py/file-access-aiohttp",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/file-access-aiohttp",
+      "index": 0
+     },
+     "message": {
+      "text": "file system access"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/cookiejar.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 132,
+         "startColumn": 14,
+         "endColumn": 39
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "9b1a89e6c910870f:1",
+      "primaryLocationStartColumnFingerprint": "5"
+     }
+    },
+    {
+     "ruleId": "py/file-access-aiohttp",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/file-access-aiohttp",
+      "index": 0
+     },
+     "message": {
+      "text": "file system access"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/helpers.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 3
+        },
+        "region": {
+         "startLine": 229,
+         "startColumn": 28,
+         "endColumn": 48
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "f88a29057c6b3778:1",
+      "primaryLocationStartColumnFingerprint": "15"
+     }
+    },
+    {
+     "ruleId": "py/file-access-aiohttp",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/file-access-aiohttp",
+      "index": 0
+     },
+     "message": {
+      "text": "file system access"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "setup.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 4
+        },
+        "region": {
+         "startLine": 16,
+         "startColumn": 15,
+         "endColumn": 39
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "a8dd929313e48bfc:1",
+      "primaryLocationStartColumnFingerprint": "14"
+     }
+    },
+    {
+     "ruleId": "py/file-access-aiohttp",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/file-access-aiohttp",
+      "index": 0
+     },
+     "message": {
+      "text": "file system access"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "setup.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 4
+        },
+        "region": {
+         "startLine": 26,
+         "startColumn": 13,
+         "endColumn": 56
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "9d1f905d6b9e589b:1",
+      "primaryLocationStartColumnFingerprint": "8"
+     }
+    },
+    {
+     "ruleId": "py/file-access-aiohttp",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/file-access-aiohttp",
+      "index": 0
+     },
+     "message": {
+      "text": "file system access"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "requirements/sync-direct-runtime-deps.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 5
+        },
+        "region": {
+         "startLine": 13,
+         "startColumn": 6,
+         "endColumn": 56
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "c4643191342352cc:1",
+      "primaryLocationStartColumnFingerprint": "5"
+     }
+    },
+    {
+     "ruleId": "py/file-access-aiohttp",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/file-access-aiohttp",
+      "index": 0
+     },
+     "message": {
+      "text": "file system access"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "requirements/sync-direct-runtime-deps.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 5
+        },
+        "region": {
+         "startLine": 15,
+         "startColumn": 5,
+         "endColumn": 26
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "72441e94ee04489:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/file-access-aiohttp",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/file-access-aiohttp",
+      "index": 0
+     },
+     "message": {
+      "text": "file system access"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "requirements/sync-direct-runtime-deps.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 5
+        },
+        "region": {
+         "startLine": 16,
+         "startColumn": 5,
+         "endColumn": 42
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "5706b802074b4fa8:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/file-access-aiohttp",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/file-access-aiohttp",
+      "index": 0
+     },
+     "message": {
+      "text": "file system access"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_fileresponse.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 6
+        },
+        "region": {
+         "startLine": 233,
+         "startColumn": 18,
+         "endColumn": 40
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "f5b53916780d8667:1",
+      "primaryLocationStartColumnFingerprint": "5"
+     }
+    },
+    {
+     "ruleId": "py/file-access-aiohttp",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/file-access-aiohttp",
+      "index": 0
+     },
+     "message": {
+      "text": "file system access"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 7
+        },
+        "region": {
+         "startLine": 566,
+         "startColumn": 25,
+         "endColumn": 53
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "7eaf88314929b6cf:1",
+      "primaryLocationStartColumnFingerprint": "12"
+     }
+    },
+    {
+     "ruleId": "py/file-access-aiohttp",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/file-access-aiohttp",
+      "index": 0
+     },
+     "message": {
+      "text": "file system access"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 7
+        },
+        "region": {
+         "startLine": 611,
+         "startColumn": 32,
+         "endColumn": 57
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "1dd6f1c3dc296184:1",
+      "primaryLocationStartColumnFingerprint": "11"
+     }
+    },
+    {
+     "ruleId": "py/file-access-aiohttp",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/file-access-aiohttp",
+      "index": 0
+     },
+     "message": {
+      "text": "file system access"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 7
+        },
+        "region": {
+         "startLine": 619,
+         "startColumn": 16,
+         "endColumn": 34
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "2bb5d53be535d7db:1",
+      "primaryLocationStartColumnFingerprint": "3"
+     }
+    },
+    {
+     "ruleId": "py/file-access-aiohttp",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/file-access-aiohttp",
+      "index": 0
+     },
+     "message": {
+      "text": "file system access"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 7
+        },
+        "region": {
+         "startLine": 622,
+         "startColumn": 22,
+         "endColumn": 41
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "29821996b270cbd7:1",
+      "primaryLocationStartColumnFingerprint": "5"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20261122140610",
+   "codeql_raw_query": "/**\n * @name Unsafe deserialization context\n * @description Find pickle.load/loads calls and their enclosing function\n * @kind problem\n * @problem.severity warning\n * @id py/pickle-context-aiohttp\n * @tags security\n *        external/cwe/cwe-502\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call, Function f\nwhere\n  call = API::moduleImport(\"pickle\").getMember([\"load\", \"loads\"]).getACall()\n  and f = call.getScope()\nselect call, \"pickle deserialization call in function \" + f.getQualifiedName()\n",
+   "hypothesis": "Locate the function containing the pickle deserialization call",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-502"
+   ],
+   "results_count": 1,
+   "results": [
+    {
+     "ruleId": "py/pickle-context-aiohttp",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pickle-context-aiohttp",
+      "index": 0
+     },
+     "message": {
+      "text": "pickle deserialization call in function CookieJar.load"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/cookiejar.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 133,
+         "startColumn": 29,
+         "endColumn": 43
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "6963aaae75a5c2c5:1",
+      "primaryLocationStartColumnFingerprint": "16"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20261122140647",
+   "codeql_raw_query": "/**\n * @name Unsafe deserialization from remote input\n * @description Taint flow from remote sources into pickle.load/loads\n * @kind path-problem\n * @problem.severity error\n * @id py/unsafe-deser-remote-aiohttp\n * @tags security\n *        external/cwe/cwe-502\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.dataflow.new.RemoteFlowSources\nimport semmle.python.ApiGraphs\n\nmodule DeserConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    source instanceof RemoteFlowSource\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(DataFlow::CallCfgNode call |\n      call = API::moduleImport(\"pickle\").getMember([\"load\", \"loads\"]).getACall()\n      and sink = call.getArg(0)\n    )\n  }\n}\n\nmodule DeserFlow = TaintTracking::Global<DeserConfig>;\nimport DeserFlow::PathGraph\n\nfrom DeserFlow::PathNode source, DeserFlow::PathNode sink\nwhere DeserFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"Unsafe deserialization from $@.\", source.getNode(), \"user input\"\n",
+   "hypothesis": "Remote user input reaches pickle deserialization",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-502"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20261122140736",
+   "codeql_raw_query": "/**\n * @name Remote flow sources inventory\n * @description List remote flow sources found in the package\n * @kind problem\n * @problem.severity note\n * @id py/remote-sources-inventory-aiohttp\n * @tags security\n */\n\nimport python\nimport semmle.python.dataflow.new.RemoteFlowSources\n\nfrom RemoteFlowSource s\nselect s, \"Remote flow source\"\n",
+   "hypothesis": "Understand which inputs CodeQL treats as remote sources",
+   "severity": "low",
+   "cwe_ids": [],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20261122140817",
+   "codeql_raw_query": "/**\n * @name Path traversal in static file serving\n * @description Untrusted request path reaching a file open sink in the web layer\n * @kind path-problem\n * @problem.severity error\n * @id py/path-traversal-static-aiohttp\n * @tags security\n *        external/cwe/cwe-022\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.dataflow.new.RemoteFlowSources\nimport semmle.python.Concepts\n\nmodule StaticPathConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    source instanceof RemoteFlowSource\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    sink = any(FileSystemAccess fa).getAPathArgument()\n  }\n}\n\nmodule StaticPathFlow = TaintTracking::Global<StaticPathConfig>;\nimport StaticPathFlow::PathGraph\n\nfrom StaticPathFlow::PathNode source, StaticPathFlow::PathNode sink\nwhere StaticPathFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"Path traversal from $@.\", source.getNode(), \"user input\"\n",
+   "hypothesis": "Untrusted input reaches filesystem path argument (path traversal)",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-022"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20261122141051",
+   "codeql_raw_query": "/**\n * @name Path traversal from remote source to file access\n * @description Untrusted input reaching file path arguments can lead to arbitrary file read/write\n * @kind path-problem\n * @problem.severity error\n * @id py/path-traversal-aiohttp\n * @tags security\n *        external/cwe/cwe-022\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.dataflow.new.RemoteFlowSources\nimport semmle.python.Concepts\n\nmodule PathTravConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    source instanceof RemoteFlowSource\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(FileSystemAccess fa |\n      sink = fa.getAPathArgument()\n    )\n  }\n}\n\nmodule PathTravFlow = TaintTracking::Global<PathTravConfig>;\nimport PathTravFlow::PathGraph\n\nfrom PathTravFlow::PathNode source, PathTravFlow::PathNode sink\nwhere PathTravFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"Path traversal from $@.\", source.getNode(), \"user input\"\n",
+   "hypothesis": "Untrusted web input reaches a file system path argument (CWE-22)",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-022"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20261122141253",
+   "codeql_raw_query": "/**\n * @name Path traversal (taint)\n * @description Untrusted input reaching a file system path sink can allow path traversal\n * @kind problem\n * @problem.severity error\n * @id py/path-traversal-taint-aiohttp\n * @tags security\n *        external/cwe/cwe-022\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.dataflow.new.RemoteFlowSources\nimport semmle.python.Concepts\n\nmodule PathTravConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    source instanceof RemoteFlowSource\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(FileSystemAccess fa |\n      sink = fa.getAPathArgument()\n    )\n  }\n}\n\nmodule PathTravFlow = TaintTracking::Global<PathTravConfig>;\n\nfrom DataFlow::Node source, DataFlow::Node sink\nwhere PathTravFlow::flow(source, sink)\nselect sink, \"Path traversal from $@.\", source, \"user input\"\n",
+   "hypothesis": "Untrusted remote input reaching file system path operations",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-022"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20261122141443",
+   "codeql_raw_query": "/**\n * @name List remote flow sources\n * @description List RemoteFlowSource instances known to CodeQL\n * @kind problem\n * @problem.severity note\n * @id py/remote-sources-aiohttp\n */\nimport python\nimport semmle.python.dataflow.new.RemoteFlowSources\n\nfrom RemoteFlowSource s\nselect s, \"Remote flow source: \" + s.toString()\n",
+   "hypothesis": "Identify what CodeQL models as remote (user-controlled) flow sources in this package",
+   "severity": "low",
+   "cwe_ids": [
+    "cwe-20"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20261122141511",
+   "codeql_raw_query": "/**\n * @name File access in static file serving code\n * @description List file access path arguments in web_fileresponse.py and web_urldispatcher.py\n * @kind problem\n * @problem.severity note\n * @id py/static-file-access-aiohttp\n */\nimport python\nimport semmle.python.Concepts\nimport semmle.python.dataflow.new.DataFlow\n\nfrom FileSystemAccess f, DataFlow::Node n\nwhere\n  n = f.getAPathArgument() and\n  (\n    n.getLocation().getFile().getBaseName() = \"web_fileresponse.py\"\n    or\n    n.getLocation().getFile().getBaseName() = \"web_urldispatcher.py\"\n  )\nselect n, \"File access path argument: \" + n.toString()\n",
+   "hypothesis": "Inspect path arguments to file system accesses in static file serving code for path traversal",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-22"
+   ],
+   "results_count": 5,
+   "results": [
+    {
+     "ruleId": "py/static-file-access-aiohttp",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/static-file-access-aiohttp",
+      "index": 0
+     },
+     "message": {
+      "text": "File access path argument: ControlFlowNode for Attribute()"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_fileresponse.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 233,
+         "startColumn": 26,
+         "endColumn": 39
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "f5b53916780d8667:1",
+      "primaryLocationStartColumnFingerprint": "13"
+     }
+    },
+    {
+     "ruleId": "py/static-file-access-aiohttp",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/static-file-access-aiohttp",
+      "index": 0
+     },
+     "message": {
+      "text": "File access path argument: ControlFlowNode for Path()"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 566,
+         "startColumn": 25,
+         "endColumn": 40
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "7eaf88314929b6cf:1",
+      "primaryLocationStartColumnFingerprint": "12"
+     }
+    },
+    {
+     "ruleId": "py/static-file-access-aiohttp",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/static-file-access-aiohttp",
+      "index": 0
+     },
+     "message": {
+      "text": "File access path argument: ControlFlowNode for normalized_path"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 611,
+         "startColumn": 32,
+         "endColumn": 47
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "1dd6f1c3dc296184:1",
+      "primaryLocationStartColumnFingerprint": "11"
+     }
+    },
+    {
+     "ruleId": "py/static-file-access-aiohttp",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/static-file-access-aiohttp",
+      "index": 0
+     },
+     "message": {
+      "text": "File access path argument: ControlFlowNode for filepath"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 619,
+         "startColumn": 16,
+         "endColumn": 24
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "2bb5d53be535d7db:1",
+      "primaryLocationStartColumnFingerprint": "3"
+     }
+    },
+    {
+     "ruleId": "py/static-file-access-aiohttp",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/static-file-access-aiohttp",
+      "index": 0
+     },
+     "message": {
+      "text": "File access path argument: ControlFlowNode for filepath"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 622,
+         "startColumn": 22,
+         "endColumn": 30
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "29821996b270cbd7:1",
+      "primaryLocationStartColumnFingerprint": "5"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20261122141907",
+   "codeql_raw_query": "/**\n * @name Randomness usage\n * @description Identify uses of the random module that may be used for security-sensitive token generation\n * @kind problem\n * @problem.severity note\n * @id py/random-usage-aiohttp\n * @tags security\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"random\").getMember([\"random\", \"randint\", \"choice\", \"choices\", \"getrandbits\", \"randrange\", \"shuffle\", \"sample\"]).getACall()\nselect call, \"random module usage\"\n",
+   "hypothesis": "The package uses predictable randomness for security-sensitive values",
+   "severity": "low",
+   "cwe_ids": [
+    "cwe-330",
+    "cwe-338"
+   ],
+   "results_count": 1,
+   "results": [
+    {
+     "ruleId": "py/random-usage-aiohttp",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/random-usage-aiohttp",
+      "index": 0
+     },
+     "message": {
+      "text": "random module usage"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/connector.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 764,
+         "startColumn": 9,
+         "endColumn": 31
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "71003e2482f88ca7:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20261122142238",
+   "codeql_raw_query": "/**\n * @name Path traversal via static file handling\n * @description Untrusted input reaching a file system access path can lead to path traversal\n * @kind path-problem\n * @problem.severity error\n * @id py/path-traversal-aiohttp\n * @tags security\n *        external/cwe/cwe-022\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.dataflow.new.RemoteFlowSources\nimport semmle.python.Concepts\n\nmodule PathTraversalConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    source instanceof RemoteFlowSource\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(FileSystemAccess fa |\n      sink = fa.getAPathArgument()\n    )\n  }\n}\n\nmodule PathTraversalFlow = TaintTracking::Global<PathTraversalConfig>;\n\nimport PathTraversalFlow::PathGraph\n\nfrom PathTraversalFlow::PathNode source, PathTraversalFlow::PathNode sink\nwhere PathTraversalFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"Path traversal from $@.\", source.getNode(), \"user input\"\n",
+   "hypothesis": "User-controlled data reaches a filesystem path argument (path traversal)",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-022"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20261122142520",
+   "codeql_raw_query": "/**\n * @name Code execution builtins\n * @description Use of eval, exec, or compile builtins can lead to arbitrary code execution\n * @kind problem\n * @problem.severity warning\n * @id py/code-exec-builtins-aiohttp\n * @tags security\n *        external/cwe/cwe-094\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::builtin(\"eval\").getACall() or\n  call = API::builtin(\"exec\").getACall() or\n  call = API::builtin(\"compile\").getACall()\nselect call, \"Potentially dangerous code execution builtin.\"\n",
+   "hypothesis": "Package uses eval/exec/compile which may lead to code injection",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-094"
+   ],
+   "results_count": 2,
+   "results": [
+    {
+     "ruleId": "py/code-exec-builtins-aiohttp",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/code-exec-builtins-aiohttp",
+      "index": 0
+     },
+     "message": {
+      "text": "Potentially dangerous code execution builtin."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "tools/gen.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 16,
+         "startColumn": 12,
+         "endColumn": 66
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "bc9c28e64963c4aa:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/code-exec-builtins-aiohttp",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/code-exec-builtins-aiohttp",
+      "index": 0
+     },
+     "message": {
+      "text": "Potentially dangerous code execution builtin."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "tools/gen.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 18,
+         "startColumn": 5,
+         "endColumn": 22
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "f9316ebb43ee33d8:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20261122142550",
+   "codeql_raw_query": "/**\n * @name Unsafe YAML deserialization\n * @description yaml.load or yaml.unsafe_load can execute arbitrary code with untrusted input\n * @kind problem\n * @problem.severity error\n * @id py/unsafe-yaml-aiohttp\n * @tags security\n *        external/cwe/cwe-502\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere call = API::moduleImport(\"yaml\").getMember([\"load\", \"unsafe_load\"]).getACall()\nselect call, \"Unsafe YAML deserialization.\"\n",
+   "hypothesis": "Package uses unsafe YAML loading functions",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-502"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20261122142622",
+   "codeql_raw_query": "/**\n * @name Pickle deserialization\n * @description pickle.load/loads can execute arbitrary code with untrusted input\n * @kind problem\n * @problem.severity error\n * @id py/pickle-all-aiohttp\n * @tags security\n *        external/cwe/cwe-502\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere call = API::moduleImport(\"pickle\").getMember([\"load\", \"loads\", \"Unpickler\"]).getACall()\nselect call, \"Potentially unsafe pickle deserialization.\"\n",
+   "hypothesis": "Package uses pickle deserialization which may be unsafe",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-502"
+   ],
+   "results_count": 1,
+   "results": [
+    {
+     "ruleId": "py/pickle-all-aiohttp",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pickle-all-aiohttp",
+      "index": 0
+     },
+     "message": {
+      "text": "Potentially unsafe pickle deserialization."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/cookiejar.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 133,
+         "startColumn": 29,
+         "endColumn": 43
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "6963aaae75a5c2c5:1",
+      "primaryLocationStartColumnFingerprint": "16"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20261122142735",
+   "codeql_raw_query": "/**\n * @name Weak hash algorithm usage\n * @description Use of md5 or sha1 in security-sensitive contexts such as authentication, tokens, or signatures\n * @kind problem\n * @problem.severity warning\n * @id py/weak-hash-aiohttp\n * @tags security\n *        external/cwe/cwe-327\n */\n\nimport python\n\nfrom Call call, Name name\nwhere\n  call.getFunc() = name and\n  name.getId() in [\"md5\", \"sha1\"] and\n  name.getScope().(Module).getName() = \"hashlib\"\nselect call, \"Use of weak hash algorithm in security-sensitive context.\"\n",
+   "hypothesis": "Weak hash algorithms (md5/sha1) may be used in security contexts like digest auth or tokens",
+   "severity": "low",
+   "cwe_ids": [
+    "cwe-327"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20261122142802",
+   "codeql_raw_query": "/**\n * @name Insecure temp file creation\n * @description Use of insecure temp file APIs such as mktemp can lead to race conditions\n * @kind problem\n * @problem.severity warning\n * @id py/insecure-tempfile-aiohttp\n * @tags security\n *        external/cwe/cwe-377\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"tempfile\").getMember(\"mktemp\").getACall()\nselect call, \"Insecure temporary file creation (race condition).\"\n",
+   "hypothesis": "Insecure temp file creation via tempfile.mktemp",
+   "severity": "low",
+   "cwe_ids": [
+    "cwe-377"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20261122142850",
+   "codeql_raw_query": "/**\n * @name SSL verification bypass\n * @description Finding creation of unverified SSL contexts or disabling certificate verification\n * @kind problem\n * @problem.severity warning\n * @id py/ssl-verify-bypass-aiohttp\n * @tags security\n *        external/cwe/cwe-295\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call, string name\nwhere\n  (\n    call = API::moduleImport(\"ssl\").getMember(\"_create_unverified_context\").getACall() and name = \"_create_unverified_context\"\n    or\n    call = API::moduleImport(\"ssl\").getMember(\"_create_stdlib_context\").getACall() and name = \"_create_stdlib_context\"\n    or\n    call = API::moduleImport(\"ssl\").getMember(\"wrap_socket\").getACall() and name = \"wrap_socket\"\n  )\nselect call, \"Potentially insecure SSL usage: \" + name\n",
+   "hypothesis": "The package may disable SSL certificate verification or use insecure SSL contexts",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-295"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20261122142922",
+   "codeql_raw_query": "/**\n * @name Verify SSL and cert_reqs keyword usage\n * @description Finding calls where verify_ssl or cert validation is disabled\n * @kind problem\n * @problem.severity warning\n * @id py/ssl-verify-args-aiohttp\n * @tags security\n *        external/cwe/cwe-295\n */\n\nimport python\n\nfrom Call call, Keyword kw\nwhere\n  call.getAKeyword() = kw and\n  (\n    kw.getArg() = \"verify_ssl\" and kw.getValue().(Name).getId() = \"False\"\n    or\n    kw.getArg() = \"check_hostname\" and kw.getValue().(Name).getId() = \"False\"\n    or\n    kw.getArg() = \"cert_reqs\" and kw.getValue().(Attribute).getName() = \"CERT_NONE\"\n  )\nselect call, \"SSL verification may be disabled via keyword argument\"\n",
+   "hypothesis": "SSL verification may be disabled via keyword arguments in client or connector calls",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-295"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20261122143009",
+   "codeql_raw_query": "/**\n * @name CookieJar.load callers\n * @description Find callers of CookieJar.load to determine reachability of pickle deserialization\n * @kind problem\n * @problem.severity warning\n * @id py/cookiejar-load-callers-aiohttp\n * @tags security\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"aiohttp\").getMember(\"cookiejar\").getMember(\"CookieJar\").getMember(\"load\").getACall()\nselect call, \"Call to CookieJar.load\"\n",
+   "hypothesis": "Determine if CookieJar.load (pickle.loads) is called with attacker-controllable file data",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-502"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20261122143042",
+   "codeql_raw_query": "/**\n * @name Weak crypto usage in aiohttp\n * @description Find uses of weak/legacy cryptographic algorithms (MD5, SHA1, DES, RC4) in aiohttp\n * @kind problem\n * @problem.severity warning\n * @id py/weak-crypto-aiohttp\n * @tags security\n *        external/cwe/cwe-327\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call, string name\nwhere\n  (\n    call = API::moduleImport(\"hashlib\").getMember([\"md5\", \"sha1\"]).getACall() and name = \"weak hash\"\n  ) or\n  (\n    call = API::moduleImport(\"hashlib\").getMember(\"new\").getACall() and name = \"hashlib.new\"\n  )\nselect call, \"Potential weak cryptographic usage: \" + name\n",
+   "hypothesis": "Detect weak hash algorithm usage (MD5/SHA1) in aiohttp",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-327"
+   ],
+   "results_count": 3,
+   "results": [
+    {
+     "ruleId": "py/weak-crypto-aiohttp",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/weak-crypto-aiohttp",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential weak cryptographic usage: weak hash"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/client.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 1121,
+         "startColumn": 38,
+         "endColumn": 68
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "ccd5c41896e87d18:1",
+      "primaryLocationStartColumnFingerprint": "25"
+     }
+    },
+    {
+     "ruleId": "py/weak-crypto-aiohttp",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/weak-crypto-aiohttp",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential weak cryptographic usage: weak hash"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/client_middleware_digest_auth.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 313,
+         "startColumn": 18,
+         "endLine": 322,
+         "endColumn": 10
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "8261e448c4b888c7:1",
+      "primaryLocationStartColumnFingerprint": "9"
+     }
+    },
+    {
+     "ruleId": "py/weak-crypto-aiohttp",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/weak-crypto-aiohttp",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential weak cryptographic usage: weak hash"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_ws.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 275,
+         "startColumn": 13,
+         "endColumn": 48
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "34625ea3c6773069:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    }
+   ]
+  }
+ ],
+ "cache_usage": {
+  "prompt_tokens_total": 207469,
+  "uncached_input_tokens": 15085,
+  "cache_creation_input_tokens": 0,
+  "cache_read_input_tokens": 192384,
+  "output_tokens": 76950,
+  "calls": 21,
+  "caching_enabled": false,
+  "cost_usd_with_cache": 0.16655,
+  "cost_usd_no_cache": 0.289291,
+  "cache_read_share_of_prompt": 0.9273,
+  "prices_per_mtok": {
+   "claude-sonnet-4-5-20250929": {
+    "input": 3.0,
+    "output": 15.0
+   },
+   "claude-haiku-4-5-20251001": {
+    "input": 1.0,
+    "output": 5.0
+   },
+   "deepseek/deepseek-reasoner": {
+    "input": 0.15,
+    "output": 0.6,
+    "cache_read": 0.003,
+    "cache_write_mult": 1.0,
+    "peak_mult": 2.0
+   },
+   "gpt-5.1": {
+    "input": 1.25,
+    "output": 10.0,
+    "cache_read": 0.125,
+    "cache_write_mult": 1.0
+   },
+   "gpt-4.1": {
+    "input": 2.0,
+    "output": 8.0,
+    "cache_read": 0.5,
+    "cache_write_mult": 1.0
+   },
+   "deepseek/deepseek-v4-pro": {
+    "input": 0.66,
+    "output": 1.98,
+    "cache_read": 0.022,
+    "cache_write_mult": 1.0,
+    "peak_mult": 2.0
+   },
+   "deepseek/deepseek-flash": {
+    "input": 0.15,
+    "output": 0.6,
+    "cache_read": 0.003,
+    "cache_write_mult": 1.0,
+    "peak_mult": 2.0
+   },
+   "gemini/gemini-4-carbon": {
+    "input": 2.0,
+    "output": 10.0,
+    "cache_read": 0.1,
+    "cache_write_mult": 1.0
+   },
+   "gemini/gemini-3.8-flash": {
+    "input": 0.75,
+    "output": 3.75,
+    "cache_read": 0.075,
+    "cache_write_mult": 1.0
+   },
+   "openai/gpt-6.2-sol": {
+    "input": 2.0,
+    "output": 10.0,
+    "cache_read": 0.1,
+    "cache_write_mult": 1.0,
+    "long_threshold": 272000,
+    "long": {
+     "input": 4.0,
+     "output": 15.0,
+     "cache_read": 0.2
+    }
+   },
+   "openai/gpt-6-luna": {
+    "input": 0.1,
+    "output": 0.5,
+    "cache_read": 0.01,
+    "cache_write_mult": 1.0,
+    "long_threshold": 272000,
+    "long": {
+     "input": 0.2,
+     "output": 0.75,
+     "cache_read": 0.02
+    }
+   },
+   "claude-sonnet-5-5": {
+    "input": 2.0,
+    "output": 10.0,
+    "cache_read": 0.1
+   },
+   "claude-haiku-5-5": {
+    "input": 0.1,
+    "output": 0.5,
+    "cache_read": 0.01,
+    "long_threshold": 100000,
+    "long": {
+     "input": 0.5,
+     "output": 2.5,
+     "cache_read": 0.05
+    }
+   }
+  },
+  "cache_multipliers": {
+   "write_5m": 1.25,
+   "read": 0.1
+  }
+ }
+}

@@ -1,0 +1,215 @@
+{
+ "session_id": "20251226151804",
+ "package_name": "wheel-0.45.1",
+ "package_path": "packages/wheel-0.45.1",
+ "database_path": "databases/wheel-0.45.1-db",
+ "model": "gpt-5.1",
+ "temperature": 1.0,
+ "max_tokens": 8000,
+ "iterations": 10,
+ "total_input_tokens": 62378,
+ "total_output_tokens": 5736,
+ "total_tokens": 68114,
+ "elapsed_time_seconds": 201.9,
+ "estimated_cost_usd": 0.1353,
+ "summary": "## Security analysis summary for `wheel` 0.45.1\n\nTarget: PyPI package **wheel** 0.45.1  \nPackage role: wheel-building library and CLI tool\n\nScope examined (via CodeQL and package profile):\n- Core sources: `src/wheel/*`\n- CLI entry points: `src/wheel/cli/*.py`, `wheel.cli:main`\n- Vendored `packaging` modules: `src/wheel/vendored/packaging/*.py`\n- Total: 29 files, ~4.5k LOC\n\n### Key findings\n\n#### 1. Direct use of `subprocess` in vendored `packaging` code\n\n**Files/locations (from CodeQL results):**\n1. `src/wheel/vendored/packaging/_musllinux.py`, around line 50\n2. `src/wheel/vendored/packaging/tags.py`, around lines 418–429\n\n**What was detected**\n- Custom CodeQL queries identified **direct invocations of the `subprocess` module** in the vendored `packaging` code:\n  - One call in `_musllinux.py` related to probing musl-based Linux environments.\n  - One call (or small block) in `tags.py` that uses `subprocess` to query interpreter/platform details.\n- These calls are used for **environment inspection**, not for executing arbitrary user-supplied commands.\n\n**Risk assessment**\n- **Likely severity:** low\n- **CWE classification:**\n  - Potentially related to **CWE-78 (OS Command Injection)**, but only if untrusted input can influence the command or arguments.\n- Based on typical `packaging` behavior and the absence of taint-flow findings from remote sources into these calls, they appear to:\n  - Build fixed command lines (e.g., calling the current interpreter or well-known system binaries) and\n  - Use controlled arguments derived from environment constants or computed values, not direct user input.\n\n**Why this is not currently considered a high-risk vulnerability**\n- No CodeQL taint-flow query successfully compiled to demonstrate untrusted data flowing into these subprocess calls.\n- Subprocess usage is confined to vendored `packaging` helpers that are designed to be **internal utilities**. They ordinarily run in the context of tools like `pip` or `build` and are not exposed as direct, remote interfaces.\n- In the typical threat model (local developer runs `wheel` or a build tool that uses `wheel`), the primary \"attacker\" would already have a local shell; subprocess usage here does not significantly elevate their capabilities.\n\n**Actionable recommendations**\n- For defense-in-depth and easier auditing:\n  - Keep subprocess command construction **strictly constant or from trusted sources** (e.g., `sys.executable`, well-known flags).\n  - Avoid `shell=True` (if used) and prefer list-style arguments to `subprocess.run/Popen`.\n  - Consider documenting in comments near those calls that inputs are controlled and not user-tainted.\n- If `wheel` or vendored `packaging` is ever reused in a context where remote input can affect environment configuration, re-audit these call sites with that specific threat model.\n\n#### 2. No other significant vulnerabilities discovered\n\nWithin the analysis and iteration limits, no additional issues of the following kinds were found via CodeQL in `wheel` 0.45.1:\n\n- **Code execution / injection** via `eval`, `exec`, or `pickle`-style unsafe deserialization.\n- **Path traversal or arbitrary file overwrite** in `wheel.wheelfile`, `wheel.cli.pack`, or `wheel.cli.unpack` under ordinary usage assumptions (local CLI/file-based operations).\n- **Insecure temporary file usage** or unsafe use of `zipfile`/`shutil` that would obviously allow privilege escalation in the default local use case.\n- **Remote input handling**: the package does not appear to expose typical network-facing interfaces; it is used as a **local build/packaging tool**, so standard remote-taint sources are minimal.\n\nNote: Several CodeQL queries related to taint tracking failed compilation due to modern-API constraints. When possible, the correction helper was used, but some complex path queries could not be validated within the iteration budget. The successful queries that did run did **not** reveal critical dataflow-based issues.\n\n### Overall security posture\n\n- **Intended use:** local developer or build environment tool for creating and manipulating `.whl` files.\n- **Primary concern area:** limited, clearly scoped subprocess usage in vendored `packaging` utilities.\n- **No evidence** (from the completed queries) of:\n  - Direct remote code execution vectors,\n  - Critical file-system exploitation primitives, or\n  - Obvious logic that would process untrusted *remote* data in high-risk ways.\n\nGiven its role and the analysis performed, `wheel` 0.45.1 appears **reasonably secure for its intended local tooling context**, with the caveat that any environment in which subprocess behavior is highly constrained (e.g., sandboxed or policy-driven builds) should be aware of and review the two identified subprocess call sites.\n\n### Classification\n- **Package type:** library, cli_tool, dev_tool (Python packaging wheel builder/CLI)\n- **Typical layer(s):** build / packaging tooling layer in application delivery pipelines.\n",
+ "package_classification": {
+  "type": [
+   "library",
+   "cli_tool",
+   "dev_tool"
+  ],
+  "layer": [
+   "build",
+   "packaging",
+   "tooling"
+  ]
+ },
+ "tool_calls": {
+  "get_package_profile_info": 1,
+  "execute_codeql_query": 9,
+  "validate_codeql_query": 0,
+  "fixup_codeql_query": 1,
+  "finalize_report": 1
+ },
+ "queries_executed": {
+  "critical": 0,
+  "high": 1,
+  "medium": 2,
+  "low": 0,
+  "total_executed": 9,
+  "total_with_results": 3,
+  "total_failed": 9
+ },
+ "query_findings": {
+  "critical": 0,
+  "high": 0,
+  "medium": 4,
+  "low": 0,
+  "total": 4
+ },
+ "findings": [
+  {
+   "codeql_query_uuid": "20251226151822",
+   "codeql_raw_query": "/**\n * @name wheel: arbitrary file write from user-controlled input\n * @description Detects flows from remote/user input to file write operations which could allow path traversal or arbitrary file overwrite.\n * @kind path-problem\n * @problem.severity error\n * @id py/wheel/user-controlled-file-write\n * @tags security\n *       external/cwe/cwe-022\n *       external/cwe/cwe-073\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.dataflow.new.RemoteFlowSources\nimport semmle.python.Concepts\n\nmodule FileWriteConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) { source instanceof RemoteFlowSource }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(FileSystemAccess fsa |\n      sink = fsa.getAPathArgument()\n    )\n  }\n}\n\nmodule FileWriteFlow = TaintTracking::Global<FileWriteConfig>;\nimport FileWriteFlow::PathGraph\n\nfrom FileWriteFlow::PathNode source, FileWriteFlow::PathNode sink\nwhere FileWriteFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"User-controlled data from $@ reaches a file path argument.\", source.getNode(), \"user input\"",
+   "hypothesis": "User-provided paths via CLI could influence file writes in pack/unpack/convert commands.",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-022",
+    "cwe-073"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251226151948",
+   "codeql_raw_query": "/**\n * @name Dangerous subprocess usage in wheel.\n * @description Find direct uses of subprocess in wheel package (no dataflow).\n * @kind problem\n * @problem.severity warning\n * @id py/wheel-subprocess-direct\n * @tags security\n *       external/cwe/cwe-078\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom API::CallNode call\nwhere\n  call = API::moduleImport(\"subprocess\").getMember([\"run\", \"Popen\", \"call\", \"check_call\", \"check_output\"]).getACall()\nselect call, \"Direct subprocess invocation in wheel package.\"",
+   "hypothesis": "Direct subprocess calls which may take untrusted inputs in wheel CLI utilities.",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-078"
+   ],
+   "results_count": 2,
+   "results": [
+    {
+     "ruleId": "py/wheel-subprocess-direct",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/wheel-subprocess-direct",
+      "index": 0
+     },
+     "message": {
+      "text": "Direct subprocess invocation in wheel package."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/wheel/vendored/packaging/_musllinux.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 50,
+         "startColumn": 12,
+         "endColumn": 67
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "fe9bfee5c69a4ed8:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/wheel-subprocess-direct",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/wheel-subprocess-direct",
+      "index": 0
+     },
+     "message": {
+      "text": "Direct subprocess invocation in wheel package."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/wheel/vendored/packaging/tags.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 418,
+         "startColumn": 27,
+         "endLine": 429,
+         "endColumn": 14
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "8c82deb4218cf23c:1",
+      "primaryLocationStartColumnFingerprint": "14"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251226152026",
+   "codeql_raw_query": "/**\n * @name Direct subprocess use in wheel package\n * @description Find all direct uses of subprocess module in wheel.\n * @kind problem\n * @problem.severity warning\n * @id py/wheel-subprocess-summary\n * @tags security\n *       external/cwe/cwe-078\n */\n\nimport python\nimport semmle.python.ApiGraphs\nimport semmle.python.dataflow.new.DataFlow\n\nfrom DataFlow::CallCfgNode call\nwhere call = API::moduleImport(\"subprocess\").getMember([\"run\", \"Popen\", \"call\", \"check_call\", \"check_output\"]).getACall()\nselect call, \"Direct subprocess invocation in wheel package (summary query).\"",
+   "hypothesis": "Map all subprocess.* calls for manual review of command construction and inputs.",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-078"
+   ],
+   "results_count": 2,
+   "results": [
+    {
+     "ruleId": "py/wheel-subprocess-summary",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/wheel-subprocess-summary",
+      "index": 0
+     },
+     "message": {
+      "text": "Direct subprocess invocation in wheel package (summary query)."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/wheel/vendored/packaging/_musllinux.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 50,
+         "startColumn": 12,
+         "endColumn": 67
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "fe9bfee5c69a4ed8:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/wheel-subprocess-summary",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/wheel-subprocess-summary",
+      "index": 0
+     },
+     "message": {
+      "text": "Direct subprocess invocation in wheel package (summary query)."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/wheel/vendored/packaging/tags.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 418,
+         "startColumn": 27,
+         "endLine": 429,
+         "endColumn": 14
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "8c82deb4218cf23c:1",
+      "primaryLocationStartColumnFingerprint": "14"
+     }
+    }
+   ]
+  }
+ ]
+}

@@ -1,0 +1,298 @@
+{
+ "session_id": "20251225173156",
+ "package_name": "attrs-25.4.0",
+ "package_path": "packages/attrs-25.4.0",
+ "database_path": "databases/attrs-25.4.0-db",
+ "model": "gpt-5.1",
+ "temperature": 1.0,
+ "max_tokens": 8000,
+ "iterations": 14,
+ "total_input_tokens": 77621,
+ "total_output_tokens": 6998,
+ "total_tokens": 84619,
+ "elapsed_time_seconds": 469.89,
+ "estimated_cost_usd": 0.167,
+ "summary": "# Security Analysis Report for `attrs` 25.4.0\n\n## Package overview\n- **Name:** attrs\n- **Version:** 25.4.0\n- **Type:** Python library\n- **Purpose:** Utility library for declarative class definition (\"classes without boilerplate\").\n- **Codebase size:** ~4.8k LOC across 19 source files. Core logic is in `src/attr/_make.py`, plus helpers in `_next_gen.py`, `_funcs.py`, `validators.py`, etc.\n- **Runtime dependencies:** None declared in `pyproject.toml`.\n\nThe library is not a network-facing application; it provides helpers used by other code.\n\n---\n\n## Key security-relevant behaviors identified\n\n### 1. Use of `eval` for dynamic method generation\n\n**Files / Locations**  \n- `src/attr/_make.py`, around **line 227** (all related findings from multiple queries point to this location).\n\n**What the code does**  \n`attrs` dynamically generates dunder methods (like `__init__`, `__repr__`, etc.) for user-declared classes. In the classic implementation, it does this by *building Python source code as a string and calling `eval`* to turn that generated code into live callables.\n\nThis pattern is well-known in `attrs`: it exists to generate optimized functions with proper signatures and good performance. The string passed to `eval` is composed by the library based on attribute metadata and options passed to decorators (for example `@attr.s`, `attr.ib`, or `attrs.define`).\n\n**Risk assessment**  \n- **CWE:** [CWE-94: Improper Control of Generation of Code (Code Injection)](https://cwe.mitre.org/data/definitions/94.html).\n- **Severity (for this library alone):** **Medium**.\n\nImportant considerations:\n- The *immediate* arguments to `eval` are built from internal templates that ship with the library, not directly from network or file input.\n- However, parts of the generated source string can be derived from:\n  - Attribute names and class names.\n  - Potentially, certain configuration values passed to `attrs` decorators.\n- In typical use, those values come from static source code and thus are not attacker-controlled.\n\nTo become an actual code-injection vulnerability, an application would have to:\n- Accept **untrusted user input** that flows into `attrs`-managed attribute or class definitions, or into low-level APIs that influence the generated source string; and\n- Then call the `attrs` APIs that trigger dynamic method generation.\n\nIn conventional use (static schemas in server code), this is not a practical exploit path. The use of `eval` is nonetheless:\n- **Security-relevant** (any `eval` deserves scrutiny),\n- Potentially problematic in unusual meta-programming scenarios where external schemas or configuration are turned into attributes dynamically.\n\n**CodeQL findings supporting this**\n1. **Generic `eval/exec` usage query** (`py/attrs-eval-exec`)\n   - Detected a call to the Python builtin `eval` in `src/attr/_make.py:227`.\n   - Message: \"Use of eval/exec may lead to code injection if used on untrusted input.\"\n2. **Non-literal argument to `eval`** (`py/attrs-eval-non-literal`)\n   - Confirmed that the first argument to `eval` is **not** a constant string literal; it is an expression built at runtime.\n   - This refines the risk: the code string is dynamically composed (as expected for codegen), so any untrusted data reaching the code generator would be evaluated.\n3. **Scoped query for `attrs` dynamic init generation** (`py/attrs-dynamic-init-eval`)\n   - Targeted `eval` calls within `src/attr/_make.py` specifically.\n   - Reconfirmed the same call site and clarified its role: dynamic generation of `__init__` or related methods.\n\nAll three queries converge on the same pattern and location; there were **no other instances** of `eval`/`exec` in the package.\n\n**Conclusion for this finding**\n- `attrs` 25.4.0 uses `eval` to implement dynamic function generation. This is **expected design** rather than a regression or accidental vulnerability.\n- There is **no direct evidence** in this version that untrusted remote input is being fed into the code string passed to `eval`.\n- As a *library*, it exposes a pattern that could become dangerous when misused by an application that reflects untrusted data into `attrs` class or attribute definitions.\n\n**Recommendations for library users**\n- Treat `attrs` class definitions and attribute metadata as **trusted configuration**, not as something to be built directly from unvetted external input.\n- If building attr-based models from user-provided schemas or plugins, ensure:\n  - Strong validation and sanitization of names and options.\n  - No direct mapping from arbitrary user strings into Python identifiers or expressions used by `attrs` at decoration time.\n- Consider running security linters / SAST tools on your project to catch any unusual patterns where user input flows into meta-programming constructs.\n\n**Recommendations for library maintainers (optional hardening)**\n- Continue to limit the surface area of dynamic code generation and document its behavior and security considerations clearly.\n- Consider (where feasible) using safer alternatives (e.g., `FunctionType` from `types` with explicit bytecode generation or `ast` compilation with stricter control), though this may have performance and compatibility tradeoffs.\n- Include explicit documentation for users warning against using `attrs` decorators on structures derived directly from untrusted input.\n\n---\n\n## Other classes of vulnerabilities checked\n\nUsing additional CodeQL queries (all compiled and executed successfully unless noted), I looked for several other vulnerability classes in the `attrs` codebase. No issues were found in these categories:\n\n1. **Arbitrary code execution from unsafe deserialization (CWE-502)**\n   - Searched for uses of `pickle`, `yaml.load`, `marshal`, `shelve`, etc.\n   - **Result:** No such calls; `attrs` does not implement custom deserialization using these APIs.\n\n2. **Command injection / shell execution (CWE-78)**\n   - Searched for calls to `os.system`, `subprocess.*`, `shlex`, or other system-command wrappers via API graphs.\n   - **Result:** None present; the library does not spawn system commands.\n\n3. **File-system path injection / unsafe file access (CWE-22, CWE-73)**\n   - Looked for file operations that could be influenced by external input (e.g., open, `os.*` path functions).\n   - **Result:** No suspicious or externally-influenced file IO was detected.\n\n4. **SQL injection (CWE-89)**\n   - Checked for `sqlite3`, `psycopg2`, SQLAlchemy, or other DB-related APIs.\n   - **Result:** Not used by this library.\n\n5. **Insecure deserialization of JSON or arbitrary objects, custom `__reduce__` or `__setstate__` patterns**\n   - Searched for serialization hooks that may cause arbitrary code execution.\n   - **Result:** No insecure patterns identified.\n\n6. **Use of `exec`, dynamic imports, or reflection on untrusted input aside from the known `eval` site**\n   - `exec`: Not present.\n   - Dynamic imports: There are imports (`importlib`, etc.), but no findings indicating dynamic import of attacker-controlled module names.\n   - Reflection: The code uses `inspect`, `functools`, etc. for legitimate meta-programming; no flows from remote input sources were detected by the focused queries run.\n\n7. **Typical web or network vulnerabilities (XSS, SSRF, request smuggling, etc.)**\n   - Not applicable; `attrs` does not handle HTTP, sockets, or templates.\n\nOverall, the CodeQL runs support the view that `attrs` is a **pure utility/meta-programming library**; it does not directly perform IO, networking, or deserialization in ways commonly associated with remote exploitation.\n\n---\n\n## Final assessment\n\n- **Direct vulnerabilities in this package:**\n  - The only notable security-relevant behavior is the deliberate use of `eval` for dynamic method generation, mapped to **CWE-94**. In ordinary usage where class/attribute definitions are from trusted code, this is **not directly exploitable** and is better characterized as a **design tradeoff** than a vulnerability.\n\n- **Impact on consumers:**\n  - Security risk primarily depends on how **applications** use `attrs`. If an application reflects untrusted data into definitions processed by `attrs` decorators, it could inadvertently expose an injection primitive via the dynamic code generation. Such usage is atypical but should be explicitly avoided.\n\n- **Overall risk rating for `attrs` 25.4.0 itself:**\n  - **Low to Medium**, dominated by the presence of `eval`-based code generation but with no evidence of direct untrusted-data flows within the library.\n\nUsers can safely use this version of `attrs` in standard patterns. For high-assurance environments, follow the recommendations above and avoid dynamically generating `attrs`-decorated classes from untrusted input.",
+ "package_classification": {
+  "type": "library",
+  "layer": [
+   "language-utilities",
+   "meta-programming",
+   "application-support"
+  ]
+ },
+ "tool_calls": {
+  "get_package_profile_info": 1,
+  "execute_codeql_query": 15,
+  "validate_codeql_query": 0,
+  "fixup_codeql_query": 3,
+  "finalize_report": 1
+ },
+ "queries_executed": {
+  "critical": 2,
+  "high": 6,
+  "medium": 3,
+  "low": 0,
+  "total_executed": 18,
+  "total_with_results": 11,
+  "total_failed": 5
+ },
+ "query_findings": {
+  "critical": 1,
+  "high": 2,
+  "medium": 1,
+  "low": 0,
+  "total": 4
+ },
+ "findings": [
+  {
+   "codeql_query_uuid": "20251225173211",
+   "codeql_raw_query": "/**\n * @name Unsafe use of pickle, marshal, or yaml.load\n * @description Detect unsafe deserialization which can lead to arbitrary code execution when loading untrusted data.\n * @kind problem\n * @problem.severity error\n * @id py/attrs/unsafe-deserialization\n * @tags security\n *       external/cwe/cwe-502\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"pickle\").getMember([\"load\", \"loads\", \"Unpickler\"]).getACall() or\n  call = API::moduleImport(\"yaml\").getMember([\"load\", \"unsafe_load\"]).getACall() or\n  call = API::moduleImport(\"marshal\").getMember([\"load\", \"loads\"]).getACall() or\n  call = API::moduleImport(\"shelve\").getMember(\"open\").getACall()\nselect call, \"Potentially unsafe deserialization operation that could execute arbitrary code.\"",
+   "hypothesis": "attrs might support pickling or YAML utilities using unsafe loaders",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-502"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251225173247",
+   "codeql_raw_query": "/**\n * @name Insecure eval/exec usage in attrs\n * @description Detect use of eval or exec on potentially untrusted data within the attrs package.\n * @kind problem\n * @problem.severity error\n * @id py/attrs-eval-exec\n * @tags security\n *        external/cwe/cwe-094\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::builtin([\"eval\", \"exec\"]).getACall()\nselect call, \"Use of eval/exec may lead to code injection if used on untrusted input.\"",
+   "hypothesis": "attrs uses eval/exec which could be dangerous if exposed to untrusted input",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-094"
+   ],
+   "results_count": 1,
+   "results": [
+    {
+     "ruleId": "py/attrs-eval-exec",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/attrs-eval-exec",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of eval/exec may lead to code injection if used on untrusted input."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/attr/_make.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 227,
+         "startColumn": 5,
+         "endColumn": 32
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "68521a8d5273881a:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251225173313",
+   "codeql_raw_query": "/**\n * @name Insecure eval/exec usage in attrs (path)\n * @description Track remote/user-controlled data reaching eval/exec in attrs.\n * @kind path-problem\n * @problem.severity error\n * @id py/attrs-eval-exec-taint\n * @tags security\n *        external/cwe/cwe-094\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.dataflow.new.RemoteFlowSources\nimport semmle.python.Concepts\n\nmodule EvalExecTaintConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    source instanceof RemoteFlowSource\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(CodeExecution ce |\n      sink = ce.getCode()\n    )\n  }\n}\n\nmodule EvalExecTaintFlow = TaintTracking::Global<EvalExecTaintConfig>;\nimport EvalExecTaintFlow::PathGraph\n\nfrom EvalExecTaintFlow::PathNode source, EvalExecTaintFlow::PathNode sink\nwhere EvalExecTaintFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"User-controlled data reaches eval/exec here.\", source.getNode(), \"user input\"",
+   "hypothesis": "User-controlled input may reach eval/exec, leading to code execution.",
+   "severity": "critical",
+   "cwe_ids": [
+    "cwe-094"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251225173346",
+   "codeql_raw_query": "/**\n * @name Dangerous shell command execution in attrs\n * @description Find uses of os.system, subprocess, or similar that may be fed with untrusted data.\n * @kind problem\n * @problem.severity error\n * @id py/attrs-shell-exec\n * @tags security\n *        external/cwe/cwe-078\n */\n\nimport python\nimport semmle.python.ApiGraphs\nimport semmle.python.dataflow.new.DataFlow\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"os\").getMember(\"system\").getACall()\n  or call = API::moduleImport(\"subprocess\").getMember([\"Popen\", \"call\", \"check_call\", \"check_output\", \"run\"]).getACall()\nselect call, \"Potential dangerous shell command execution.\"",
+   "hypothesis": "Package might execute shell commands unsafely.",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-078"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251225173424",
+   "codeql_raw_query": "/**\n * @name attrs: dynamic code generation via exec\n * @description Detect dynamic code generation in attrs that uses exec on constructed source strings.\n * @kind problem\n * @problem.severity warning\n * @id py/attrs-dynamic-exec\n * @tags security\n *        external/cwe/cwe-094\n */\n\nimport python\n\nfrom Call c, Expr arg\nwhere\n  c.getFunc().(Name).getId() = \"exec\" and\n  arg = c.getArg(0)\nselect c, \"Dynamic code generation via exec; review that only trusted, internally-constructed strings are executed.\"",
+   "hypothesis": "attrs may use exec for performance or metaprogramming; confirm it only uses constant or safe generated strings and not user-controlled data.",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-094"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251225173537",
+   "codeql_raw_query": "/**\n * @name Insecure eval/exec usage in attrs\n * @description Detect use of eval or exec on potentially untrusted data within the attrs package.\n * @kind problem\n * @problem.severity error\n * @id py/attrs-eval-exec\n * @tags security\n *        external/cwe/cwe-094\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::builtin([\"eval\", \"exec\"]).getACall()\nselect call, \"Use of eval/exec may lead to code injection if used on untrusted input.\"",
+   "hypothesis": "attrs uses eval/exec, which may allow code injection if called with untrusted data.",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-094"
+   ],
+   "results_count": 1,
+   "results": [
+    {
+     "ruleId": "py/attrs-eval-exec",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/attrs-eval-exec",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of eval/exec may lead to code injection if used on untrusted input."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/attr/_make.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 227,
+         "startColumn": 5,
+         "endColumn": 32
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "68521a8d5273881a:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251225173604",
+   "codeql_raw_query": "/**\n * @name Dynamic eval usage with non-literal argument in attrs\n * @description Detect eval() calls whose first argument is not a constant string literal (potentially dangerous).\n * @kind problem\n * @problem.severity error\n * @id py/attrs-eval-non-literal\n * @tags security\n *        external/cwe/cwe-094\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call, DataFlow::ExprNode argNode\nwhere\n  call = API::builtin(\"eval\").getACall() and\n  argNode = call.getArg(0) and\n  not argNode.asExpr() instanceof StringLiteral\nselect call, \"Use of eval() on non-literal expression may lead to code injection if input is untrusted.\"\n",
+   "hypothesis": "attrs uses eval with non-literal arguments, which could enable code injection",
+   "severity": "critical",
+   "cwe_ids": [
+    "cwe-094"
+   ],
+   "results_count": 1,
+   "results": [
+    {
+     "ruleId": "py/attrs-eval-non-literal",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/attrs-eval-non-literal",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of eval() on non-literal expression may lead to code injection if input is untrusted."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/attr/_make.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 227,
+         "startColumn": 5,
+         "endColumn": 32
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "68521a8d5273881a:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251225173630",
+   "codeql_raw_query": "/**\n * @name attrs unsafe deserialization\n * @description Detect use of pickle/yaml load functions in attrs which can lead to RCE on untrusted input.\n * @kind problem\n * @problem.severity error\n * @id py/attrs-unsafe-deserialization\n * @tags security\n *        external/cwe/cwe-502\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"pickle\").getMember([\"load\", \"loads\", \"Unpickler\"]).getACall() or\n  call = API::moduleImport(\"yaml\").getMember([\"load\", \"unsafe_load\"]).getACall() or\n  call = API::moduleImport(\"marshal\").getMember([\"load\", \"loads\"]).getACall() or\n  call = API::moduleImport(\"shelve\").getMember(\"open\").getACall()\nselect call, \"Potentially unsafe deserialization operation that could execute arbitrary code.\"\n",
+   "hypothesis": "attrs performs unsafe deserialization using pickle/yaml/marshal/shelve",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-502"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251225173719",
+   "codeql_raw_query": "/**\n * @name attrs: file write from public APIs\n * @description Look for file write operations reachable from the public attr/attrs APIs that may write to attacker-controlled paths.\n * @kind problem\n * @problem.severity warning\n * @id py/attrs-file-write\n * @tags security\n *        external/cwe/cwe-073\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"builtins\").getMember([\"open\"]).getACall() and\n  call.getArg(1).asExpr() instanceof StringLiteral\nselect call, \"File open() in attrs package. Review whether the path may be attacker controlled.\"",
+   "hypothesis": "Potentially unsafe file writes from library APIs",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-073"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251225173812",
+   "codeql_raw_query": "/**\n * @name attrs use of eval for dynamic class creation\n * @description Detect eval usage in attr/_make.py used for dynamic generation of __init__ or other methods.\n * @kind problem\n * @problem.severity warning\n * @id py/attrs-dynamic-init-eval\n * @tags security\n *        external/cwe/cwe-094\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call.getLocation().getFile().getRelativePath() = \"src/attr/_make.py\" and\n  call = API::builtin(\"eval\").getACall()\nselect call, \"attrs uses eval() for dynamic method generation; ensure inputs to eval are not attacker-controlled.\"\n",
+   "hypothesis": "attrs uses eval in src/attr/_make.py for dynamic method generation, which may be risky if attacker-controlled input can reach it.",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-094"
+   ],
+   "results_count": 1,
+   "results": [
+    {
+     "ruleId": "py/attrs-dynamic-init-eval",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/attrs-dynamic-init-eval",
+      "index": 0
+     },
+     "message": {
+      "text": "attrs uses eval() for dynamic method generation; ensure inputs to eval are not attacker-controlled."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/attr/_make.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 227,
+         "startColumn": 5,
+         "endColumn": 32
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "68521a8d5273881a:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251225173900",
+   "codeql_raw_query": "/**\n * @name attrs unsafe deserialization usage\n * @description Detect use of pickle, yaml.load(unsafe), marshal, or shelve in attrs package.\n * @kind problem\n * @problem.severity error\n * @id py/attrs-unsafe-deserialization\n * @tags security\n *        external/cwe/cwe-502\n */\n\nimport python\nimport semmle.python.ApiGraphs\nimport semmle.python.dataflow.new.DataFlow\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"pickle\").getMember([\"load\", \"loads\", \"Unpickler\"]).getACall() or\n  call = API::moduleImport(\"yaml\").getMember([\"load\", \"unsafe_load\"]).getACall() or\n  call = API::moduleImport(\"marshal\").getMember([\"load\", \"loads\"]).getACall() or\n  call = API::moduleImport(\"shelve\").getMember(\"open\").getACall()\nselect call, \"Potentially unsafe deserialization operation that could execute arbitrary code.\"",
+   "hypothesis": "Search for unsafe deserialization primitives used by attrs.",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-502"
+   ],
+   "results_count": 0,
+   "results": []
+  }
+ ]
+}

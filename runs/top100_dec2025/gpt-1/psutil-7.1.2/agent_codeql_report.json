@@ -1,0 +1,554 @@
+{
+ "session_id": "20251226031716",
+ "package_name": "psutil-7.1.2",
+ "package_path": "packages/psutil-7.1.2",
+ "database_path": "databases/psutil-7.1.2-db",
+ "model": "gpt-5.1",
+ "temperature": 1.0,
+ "max_tokens": 8000,
+ "iterations": 16,
+ "total_input_tokens": 145714,
+ "total_output_tokens": 12757,
+ "total_tokens": 158471,
+ "elapsed_time_seconds": 675.95,
+ "estimated_cost_usd": 0.3097,
+ "summary": "## Overview\n\nSecurity analysis was performed on the `psutil-7.1.2` package (library plus assorted example/utility scripts and internal maintenance tools) using CodeQL-based queries focused on common vulnerability classes: code execution, subprocess spawning, filesystem access, network usage, TLS configuration, and temporary file handling.\n\nThe core runtime package (`psutil` itself: `_pslinux.py`, `_pswindows.py`, `_psosx.py`, `_psbsd.py`, `_pssunos.py`, `_psposix.py`, `_common.py`, `__init__.py`) did **not** show critical or high-severity injection vulnerabilities in this analysis.\n\nFindings relate mainly to **auxiliary scripts** under `scripts/` and packaging/maintenance helpers under `scripts/internal/` and `setup.py`. These scripts are primarily for development, installation, or release workflows, and are not typically imported as part of normal library use. Still, they matter for environments that execute them directly (e.g., CI, release automation, or users invoking the bundled scripts).\n\n---\n\n## Key Findings\n\n### 1. Insecure TLS configuration in `install_pip.py`\n\n**Location**\n- `scripts/internal/install_pip.py`, around line 27.\n\n**Issue**\n- A CodeQL query targeting insecure TLS usage (`py/psutil/insecure-tls`) flagged a call pattern matching `ssl._create_unverified_context()` or equivalent behavior.\n- This disables certificate verification when creating TLS connections.\n\n**Security Impact**\n- **Severity**: Medium (CWE-295: Improper Certificate Validation)\n- If this script downloads Python packages or other resources over HTTPS with certificate verification disabled, it becomes vulnerable to man-in-the-middle (MITM) attacks. An attacker who can intercept traffic could tamper with downloaded artifacts (e.g., malicious wheels or scripts).\n- Given that this is an *internal helper* script presumably used for development or CI to ensure `pip` is available, the primary risk is to environments that run this helper unattended or in untrusted networks.\n\n**Mitigation Guidance**\n- Avoid using `_create_unverified_context`. Prefer the default SSL context or an explicitly secure one:\n  - Ensure `ssl.create_default_context()` is used.\n  - Do **not** set `verify=False` when using `requests` or other HTTP clients.\n- Where TLS verification must be customized (corporate CA, pinning, etc.), do so by:\n  - Supplying a CA bundle path.\n  - Using `cert`/`verify` parameters pointing to trusted CA certs rather than disabling verification entirely.\n- If this helper is only meant for fully trusted, isolated environments, clearly document that assumption and consider gating insecure behavior behind a command-line flag that is **off by default**.\n\n---\n\n### 2. Potentially insecure use of temporary files\n\n**Locations**\n- `scripts/internal/install_pip.py`, around line 31.\n- `setup.py`, around lines 248–250.\n- `setup.py`, around line 253.\n\nThese were reported by two related queries:\n- `py/psutil/insecure-tempfile`\n- `py/psutil/insecure-tempfile-details`\n\n**Issue**\n- The flagged lines use temporary file or directory APIs in a way that warrants review:\n  - `tempfile` functions (or equivalent) are used as part of installation or packaging workflows.\n  - The analysis could not confirm safe settings regarding automatic deletion, secure randomness, and permissions.\n\n**Security Impact**\n- **Severity**: Low to Medium (CWE-377: Insecure Temporary File, CWE-379: Creation of Temporary File in Directory with Insecure Permissions)\n- If temporary files are created in a shared directory with predictable names or unsafe flags, an attacker on the same system could:\n  - Pre-create a file/symlink to influence where data is written.\n  - Read sensitive content left behind in world-readable temp files.\n- Given these usages are in `install_pip.py` and `setup.py`, this primarily affects environments building or installing psutil from source where the scripts are executed on multi-user systems.\n\n**Mitigation Guidance**\n- Prefer `tempfile.NamedTemporaryFile`, `TemporaryDirectory`, or `mkstemp` with secure defaults:\n  - Use `delete=True` where possible so files are removed automatically.\n  - Avoid constructing temp file paths via string concatenation or predictable names.\n- Ensure `dir` is a trusted location (e.g. default system temp) and not user-controlled.\n- Ensure file permissions are restrictive (e.g., mode 0o600) if the temp file may contain sensitive data.\n- In `setup.py`, consider whether simple in-memory constructs (e.g., `io.BytesIO`) could replace temp files for transient build artifacts.\n\n---\n\n### 3. Use of `requests` HTTP client in internal scripts\n\n**Locations**\n- `scripts/internal/download_wheels.py`\n  - Around lines 38–40.\n  - Around lines 48–50.\n- `scripts/internal/find_broken_links.py`\n  - Around line 191.\n  - Around line 195.\n\n**Issue**\n- A query (`py/psutil/requests-usage`) flagged general use of the `requests` library to perform HTTP requests.\n- The rule is advisory: it does **not** prove a vulnerability but prompts review of:\n  - URL construction (user input vs static URLs).\n  - TLS settings (e.g., `verify=False`).\n  - Error handling and timeouts.\n\n**Security Impact**\n- **Severity**: Informational / Low\n- These scripts appear to be internal tooling:\n  - `download_wheels.py` likely fetches prebuilt wheels from known URLs.\n  - `find_broken_links.py` likely checks documentation URLs.\n- Risks include:\n  - Using unvalidated user-provided URLs (potential SSRF, if deployed in shared/internal networks).\n  - Disabling TLS verification (CWE-295), or not validating redirects.\n  - Missing timeouts leading to hangs.\n\n**Mitigation Guidance**\n- Ensure URLs are derived from trusted constants or whitelisted domains.\n- Confirm that all `requests` calls:\n  - Use default certificate verification (`verify=True`).\n  - Have reasonable timeouts, e.g. `requests.get(url, timeout=10)`.\n- If these scripts ever accept user input for URLs, validate against an allowlist or pattern.\n\n---\n\n## Not Observed / Areas with No Findings\n\nWithin the limits of the CodeQL queries run:\n\n- **No evidence** of:\n  - Direct code injection via `eval`, `exec`, or `pickle`/unsafe YAML deserialization from remote input.\n  - User-controlled data flowing into subprocess/OS command invocations in a way that created command injection risks (CWE-78) in the core library or shipped scripts.\n  - Remote-controlled data flowing into file write paths (CWE-73) in a way that was detected by the taint-tracking query.\n- The main `psutil` library modules focus on system inspection and process information and did not show obvious high-risk sinks connected to remote sources under the executed queries.\n\nNote: Absence of findings does not prove absence of vulnerabilities; it indicates that the specific CodeQL checks used did not identify problems of those classes.\n\n---\n\n## Risk Summary by Component\n\n- **Core psutil library (imported as `psutil`)**\n  - Intended use: system/process inspection library.\n  - Findings: None of critical/high severity in this analysis.\n  - Residual risk: Standard for a mature, widely used library; future changes and environment-specific behaviors should still be monitored.\n\n- **Packaging / internal maintenance scripts (`scripts/internal/*.py`, `setup.py`)**\n  - Findings:\n    - Insecure TLS context usage (`install_pip.py`).\n    - Potentially unsafe temporary file usage (`install_pip.py`, `setup.py`).\n    - Advisory: HTTP requests usage requiring review.\n  - Risk is concentrated around **environments that run these helpers automatically**, especially in shared or untrusted networks.\n\n- **Example / utility scripts under `scripts/`**\n  - Not specifically flagged by the executed queries for severe issues.\n  - As many of these are command-line monitoring tools (e.g., `top.py`, `nettop.py`, `ps.py`), they should still be treated as privileged tooling: avoid feeding untrusted input unless reviewed for argument parsing and output handling.\n\n---\n\n## Recommendations for Maintainers\n\n1. **Harden TLS usage in internal installers**\n   - Replace any `_create_unverified_context()` or equivalent with secure defaults.\n   - Only relax verification via an explicit opt-in flag for fully trusted, offline CI scenarios, and clearly document the risk.\n\n2. **Review and modernize temporary file handling**\n   - Audit the flagged temp-file usages in `install_pip.py` and `setup.py`.\n   - Ensure use of `tempfile` with secure defaults, automatic cleanup, and restrictive permissions.\n\n3. **Document trust assumptions for internal scripts**\n   - Clarify in documentation that scripts under `scripts/internal/` are intended for maintainers/CI and may assume a trusted environment.\n   - Encourage downstream distributions to avoid exposing these helpers as user-facing commands without additional hardening.\n\n4. **Ongoing security hygiene**\n   - Integrate CodeQL and similar static analysis into CI to catch regressions.\n   - Periodically review network and filesystem interactions when adding new internal helpers.\n\n---\n\n## Conclusion\n\n`psutil-7.1.2`’s core library appears reasonably robust from the perspective of the CodeQL checks executed, with identified risks largely confined to **internal packaging and maintenance scripts**, particularly around **TLS verification** and **temporary file usage**. Addressing these issues would further reduce the attack surface for environments that execute those scripts during installation or release processes, while typical consumers of `psutil` as an imported library are unlikely to be directly affected by the identified findings.",
+ "package_classification": {
+  "type": "library",
+  "layer": [
+   "system",
+   "observability",
+   "devops",
+   "tooling"
+  ]
+ },
+ "tool_calls": {
+  "get_package_profile_info": 1,
+  "execute_codeql_query": 17,
+  "validate_codeql_query": 0,
+  "fixup_codeql_query": 4,
+  "finalize_report": 1
+ },
+ "queries_executed": {
+  "critical": 0,
+  "high": 3,
+  "medium": 9,
+  "low": 2,
+  "total_executed": 18,
+  "total_with_results": 14,
+  "total_failed": 13
+ },
+ "query_findings": {
+  "critical": 0,
+  "high": 0,
+  "medium": 7,
+  "low": 4,
+  "total": 11
+ },
+ "findings": [
+  {
+   "codeql_query_uuid": "20251226031744",
+   "codeql_raw_query": "/**\n * @name Insecure temporary file usage in psutil\n * @description Detect use of tempfile.mktemp or predictable temp file patterns.\n * @kind problem\n * @problem.severity warning\n * @id py/psutil/insecure-tempfile\n * @tags security\n *       external/cwe/cwe-377\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"tempfile\").getMember(\"mktemp\").getACall()\nselect call, \"Insecure temporary file creation using tempfile.mktemp().\"",
+   "hypothesis": "Use of insecure temporary file creation APIs like tempfile.mktemp may lead to race conditions or privilege escalation.",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-377"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251226031958",
+   "codeql_raw_query": "/**\n * @name Dangerous use of eval/exec in psutil\n * @description Flags any use of eval() or exec() which could lead to code injection if given untrusted input.\n * @kind problem\n * @problem.severity warning\n * @id py/psutil/eval-exec-usage\n * @tags security\n *       external/cwe/cwe-094\n */\n\nimport python\nimport semmle.python.ApiGraphs\nimport semmle.python.dataflow.new.DataFlow\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::builtin(\"eval\").getACall() or\n  call = API::builtin(\"exec\").getACall()\nselect call, \"Use of eval/exec may allow code execution if passed untrusted input.\"",
+   "hypothesis": "psutil scripts or library code might use eval/exec on dynamic input",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-094"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251226032030",
+   "codeql_raw_query": "/**\n * @name Insecure temporary file usage in psutil\n * @description Detects use of tempfile functions without safe patterns (e.g., mktemp) that may lead to race conditions.\n * @kind problem\n * @problem.severity warning\n * @id py/psutil/insecure-tempfile\n * @tags security\n *       external/cwe/cwe-377\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"tempfile\").getMember([\"mktemp\"]).getACall()\nselect call, \"Insecure temporary file creation using tempfile.mktemp(), which is prone to race conditions.\"",
+   "hypothesis": "psutil scripts may use insecure temporary file creation (tempfile.mktemp).",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-377"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251226032053",
+   "codeql_raw_query": "/**\n * @name Use of eval/exec in psutil\n * @description Detects any use of eval() or exec() which can lead to code execution if fed with untrusted input.\n * @kind problem\n * @problem.severity warning\n * @id py/psutil/eval-exec-usage\n * @tags security\n *       external/cwe/cwe-094\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::builtin(\"eval\").getACall() or\n  call = API::builtin(\"exec\").getACall()\nselect call, \"Use of eval/exec detected. Ensure that inputs are not controlled by an attacker.\"",
+   "hypothesis": "psutil may use eval/exec in its large __init__ or utility scripts.",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-094"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251226032122",
+   "codeql_raw_query": "/**\n * @name Insecure use of pickle / unsafe YAML loaders\n * @description Detects uses of pickle, marshal, shelve, or unsafe YAML loaders in psutil codebase.\n * @kind problem\n * @problem.severity warning\n * @id py/psutil/unsafe-deserialization\n * @tags security\n *       external/cwe/cwe-502\n */\n\nimport python\nimport semmle.python.ApiGraphs\nimport semmle.python.dataflow.new.DataFlow\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"pickle\").getMember([\"load\", \"loads\", \"Unpickler\"]).getACall()\n  or call = API::moduleImport(\"yaml\").getMember([\"load\", \"unsafe_load\"]).getACall()\n  or call = API::moduleImport(\"marshal\").getMember([\"load\", \"loads\"]).getACall()\n  or call = API::moduleImport(\"shelve\").getMember(\"open\").getACall()\nselect call, \"Potentially unsafe deserialization operation that could execute arbitrary code.\"",
+   "hypothesis": "psutil scripts or helpers may use unsafe deserialization (pickle / yaml.load)",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-502"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251226032140",
+   "codeql_raw_query": "/**\n * @name Insecure temporary file creation\n * @description Detects use of mktemp and predictable temporary files, which can lead to race conditions.\n * @kind problem\n * @problem.severity warning\n * @id py/psutil/insecure-tempfile\n * @tags security\n *       external/cwe/cwe-377\n */\n\nimport python\nimport semmle.python.ApiGraphs\nimport semmle.python.dataflow.new.DataFlow\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"tempfile\").getMember(\"mktemp\").getACall()\n  or call = API::moduleImport(\"os\").getMember(\"tmpnam\").getACall()\n  or call = API::moduleImport(\"os\").getMember(\"tempnam\").getACall()\nselect call, \"Insecure temporary file creation may lead to race conditions or symlink attacks.\"",
+   "hypothesis": "psutil or its scripts may use insecure temporary file creation (tempfile.mktemp, os.tmpnam)",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-377"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251226032208",
+   "codeql_raw_query": "/**\n * @name Insecure temporary file and directory usage in psutil\n * @description Detects use of tempfile APIs without secure patterns (e.g., delete=False, predictable names).\n * @kind problem\n * @problem.severity warning\n * @id py/psutil/insecure-tempfile\n * @tags security\n *       external/cwe/cwe-377\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"tempfile\").getMember([\"NamedTemporaryFile\", \"mkstemp\", \"mkdtemp\", \"TemporaryFile\"]).getACall()\nselect call, \"Potentially insecure use of temporary file or directory API. Review parameters and usage for security issues.\"\n",
+   "hypothesis": "Insecure or unsafe tempfile usage (e.g., predictable names, improper flags) in psutil or bundled scripts.",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-377"
+   ],
+   "results_count": 3,
+   "results": [
+    {
+     "ruleId": "py/psutil/insecure-tempfile",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/psutil/insecure-tempfile",
+      "index": 0
+     },
+     "message": {
+      "text": "Potentially insecure use of temporary file or directory API. Review parameters and usage for security issues."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "scripts/internal/install_pip.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 31,
+         "startColumn": 10,
+         "endColumn": 51
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "68f097d55967347a:1",
+      "primaryLocationStartColumnFingerprint": "5"
+     }
+    },
+    {
+     "ruleId": "py/psutil/insecure-tempfile",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/psutil/insecure-tempfile",
+      "index": 0
+     },
+     "message": {
+      "text": "Potentially insecure use of temporary file or directory API. Review parameters and usage for security issues."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "setup.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 248,
+         "startColumn": 10,
+         "endLine": 250,
+         "endColumn": 6
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "6b94f59a831a48b3:1",
+      "primaryLocationStartColumnFingerprint": "5"
+     }
+    },
+    {
+     "ruleId": "py/psutil/insecure-tempfile",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/psutil/insecure-tempfile",
+      "index": 0
+     },
+     "message": {
+      "text": "Potentially insecure use of temporary file or directory API. Review parameters and usage for security issues."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "setup.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 253,
+         "startColumn": 15,
+         "endColumn": 33
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "5687105445772d59:1",
+      "primaryLocationStartColumnFingerprint": "10"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251226032232",
+   "codeql_raw_query": "/**\n * @name Use of weak or hard-coded cryptographic keys or hashes\n * @description Detects use of hashlib / base64 potentially for custom auth or integrity without salting or key management.\n * @kind problem\n * @problem.severity warning\n * @id py/psutil/crypto-misuse\n * @tags security\n *       external/cwe/cwe-321\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"hashlib\").getMember([\"md5\", \"sha1\"]).getACall()\nselect call, \"Use of weak hash function (MD5/SHA1). Ensure this is not used for security-sensitive purposes.\"\n",
+   "hypothesis": "Weak hash usage for any security-relevant functionality in psutil scripts.",
+   "severity": "low",
+   "cwe_ids": [
+    "cwe-327",
+    "cwe-321"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251226032301",
+   "codeql_raw_query": "/**\n * @name Insecure use of temporary files and directories in psutil\n * @description Flags usages of tempfile.mktemp and other insecure temporary-file patterns in psutil package and scripts.\n * @kind problem\n * @problem.severity warning\n * @id py/psutil/insecure-tempfile\n * @tags security\n *       external/cwe/cwe-377\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"tempfile\").getMember([\"mktemp\"]).getACall()\nselect call, \"Potentially insecure use of temporary file or directory API. Review parameters and usage for security issues.\"\n",
+   "hypothesis": "Insecure temporary file creation using tempfile.mktemp or similar APIs.",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-377"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251226032320",
+   "codeql_raw_query": "/**\n * @name Network calls in psutil using requests\n * @description Finds all uses of the requests library in psutil internal scripts (e.g., download_wheels) for manual security review.\n * @kind problem\n * @problem.severity note\n * @id py/psutil/requests-usage\n * @tags security\n *       external/cwe/cwe-829\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"requests\").getMember([\"get\", \"post\", \"put\", \"delete\", \"head\", \"options\"]).getACall()\nselect call, \"Use of requests HTTP client in psutil scripts; review URL construction, TLS verification, and error handling.\"\n",
+   "hypothesis": "Use of requests in internal scripts that may download code or resources insecurely.",
+   "severity": "low",
+   "cwe_ids": [
+    "cwe-829"
+   ],
+   "results_count": 4,
+   "results": [
+    {
+     "ruleId": "py/psutil/requests-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/psutil/requests-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of requests HTTP client in psutil scripts; review URL construction, TLS verification, and error handling."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "scripts/internal/download_wheels.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 38,
+         "startColumn": 11,
+         "endLine": 40,
+         "endColumn": 6
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "b262b4741fca77e3:1",
+      "primaryLocationStartColumnFingerprint": "6"
+     }
+    },
+    {
+     "ruleId": "py/psutil/requests-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/psutil/requests-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of requests HTTP client in psutil scripts; review URL construction, TLS verification, and error handling."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "scripts/internal/download_wheels.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 48,
+         "startColumn": 11,
+         "endLine": 50,
+         "endColumn": 6
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "b262b4741fca77e3:2",
+      "primaryLocationStartColumnFingerprint": "6"
+     }
+    },
+    {
+     "ruleId": "py/psutil/requests-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/psutil/requests-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of requests HTTP client in psutil scripts; review URL construction, TLS verification, and error handling."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "scripts/internal/find_broken_links.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 191,
+         "startColumn": 15,
+         "endColumn": 58
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "3475e5111767b8e0:1",
+      "primaryLocationStartColumnFingerprint": "6"
+     }
+    },
+    {
+     "ruleId": "py/psutil/requests-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/psutil/requests-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of requests HTTP client in psutil scripts; review URL construction, TLS verification, and error handling."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "scripts/internal/find_broken_links.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 195,
+         "startColumn": 19,
+         "endColumn": 61
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "337bcf4a9698f687:1",
+      "primaryLocationStartColumnFingerprint": "6"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251226032353",
+   "codeql_raw_query": "/**\n * @name Insecure use of temporary files and directories in psutil\n * @description Finds uses of tempfile APIs that may be insecure (e.g., predictable names, world-readable, not deleted).\n * @kind problem\n * @problem.severity warning\n * @id py/psutil/insecure-tempfile-details\n * @tags security\n *       external/cwe/cwe-377\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"tempfile\").getMember([\n    \"NamedTemporaryFile\",\n    \"mkstemp\",\n    \"mkdtemp\",\n    \"TemporaryFile\",\n    \"SpooledTemporaryFile\"\n  ]).getACall()\nselect call, \"Review this tempfile usage for secure configuration (delete, permissions, randomness).\"",
+   "hypothesis": "psutil internal and setup scripts may use tempfile APIs insecurely (CWE-377).",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-377"
+   ],
+   "results_count": 3,
+   "results": [
+    {
+     "ruleId": "py/psutil/insecure-tempfile-details",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/psutil/insecure-tempfile-details",
+      "index": 0
+     },
+     "message": {
+      "text": "Review this tempfile usage for secure configuration (delete, permissions, randomness)."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "scripts/internal/install_pip.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 31,
+         "startColumn": 10,
+         "endColumn": 51
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "68f097d55967347a:1",
+      "primaryLocationStartColumnFingerprint": "5"
+     }
+    },
+    {
+     "ruleId": "py/psutil/insecure-tempfile-details",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/psutil/insecure-tempfile-details",
+      "index": 0
+     },
+     "message": {
+      "text": "Review this tempfile usage for secure configuration (delete, permissions, randomness)."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "setup.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 248,
+         "startColumn": 10,
+         "endLine": 250,
+         "endColumn": 6
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "6b94f59a831a48b3:1",
+      "primaryLocationStartColumnFingerprint": "5"
+     }
+    },
+    {
+     "ruleId": "py/psutil/insecure-tempfile-details",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/psutil/insecure-tempfile-details",
+      "index": 0
+     },
+     "message": {
+      "text": "Review this tempfile usage for secure configuration (delete, permissions, randomness)."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "setup.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 253,
+         "startColumn": 15,
+         "endColumn": 33
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "5687105445772d59:1",
+      "primaryLocationStartColumnFingerprint": "10"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251226032514",
+   "codeql_raw_query": "/**\n * @name Remote input to filesystem write operations\n * @description Detect flows from RemoteFlowSource into write-mode file open calls within psutil package.\n * @kind path-problem\n * @problem.severity error\n * @id py/psutil/remote-to-file-write\n * @tags security\n *       external/cwe/cwe-073\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.dataflow.new.RemoteFlowSources\n\nmodule PsutilFsWriteConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) { source instanceof RemoteFlowSource }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(Call call, Expr arg, Expr modeArg |\n      call = sink.asExpr() and\n      call.getFunc().(Name).getId() = \"open\" and\n      // first argument is the path\n      arg = call.getArg(0) and\n      // ensure mode suggests writing if present\n      (\n        not exists(call.getArg(1)) or\n        modeArg = call.getArg(1) and\n        modeArg.toString().regexpMatch(\".*[wax].*\")\n      )\n    )\n  }\n}\n\nmodule PsutilFsWriteFlow = TaintTracking::Global<PsutilFsWriteConfig>;\nimport PsutilFsWriteFlow::PathGraph\n\nfrom PsutilFsWriteFlow::PathNode source, PsutilFsWriteFlow::PathNode sink\nwhere PsutilFsWriteFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"Remote-controlled data reaches a file path used for writing $@.\", source.getNode(), \"remote input\"\n",
+   "hypothesis": "Remote input flowing into file write paths may allow path traversal or unauthorized file overwrite.",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-73"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251226032559",
+   "codeql_raw_query": "/**\n * @name Use of dangerous eval/exec\n * @description Find any use of eval() or exec() in psutil package and scripts.\n * @kind problem\n * @problem.severity error\n * @id py/psutil/eval-exec-usage\n * @tags security\n *       external/cwe/cwe-094\n */\n\nimport python\n\nfrom Call call\nwhere\n  call.getFunc().(Name).getId() = \"eval\" or\n  call.getFunc().(Name).getId() = \"exec\"\nselect call, \"Use of potentially dangerous \" + call.getFunc().(Name).getId() + \"().\"",
+   "hypothesis": "psutil or its helper scripts may use eval/exec dangerously",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-094"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251226032720",
+   "codeql_raw_query": "/**\n * @name Insecure use of ssl or requests with disabled certificate verification\n * @description Find uses of the ssl or requests libraries that disable TLS certificate verification.\n * @kind problem\n * @problem.severity warning\n * @id py/psutil/insecure-tls\n * @tags security\n *       external/cwe/cwe-295\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom API::CallNode call\nwhere\n  // ssl._create_unverified_context()\n  call = API::moduleImport(\"ssl\").getMember(\"_create_unverified_context\").getACall()\nselect call, \"Potential insecure TLS usage; certificate verification is disabled or bypassed.\"\n",
+   "hypothesis": "psutil or its helper scripts may disable TLS certificate verification via ssl._create_unverified_context or similar, weakening HTTPS security.",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-295"
+   ],
+   "results_count": 1,
+   "results": [
+    {
+     "ruleId": "py/psutil/insecure-tls",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/psutil/insecure-tls",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential insecure TLS usage; certificate verification is disabled or bypassed."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "scripts/internal/install_pip.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 27,
+         "startColumn": 9,
+         "endColumn": 41
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "80b85e39cc5d0804:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    }
+   ]
+  }
+ ]
+}

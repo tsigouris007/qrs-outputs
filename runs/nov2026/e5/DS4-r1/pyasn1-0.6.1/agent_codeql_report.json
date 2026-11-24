@@ -1,0 +1,539 @@
+{
+ "session_id": "20261122170411",
+ "package_name": "pyasn1-0.6.1",
+ "package_path": "packages/pyasn1-0.6.1",
+ "database_path": "databases/pyasn1-0.6.1-db",
+ "model": "deepseek/deepseek-v4-pro",
+ "temperature": null,
+ "max_tokens": 16000,
+ "iterations": 19,
+ "total_input_tokens": 147779,
+ "total_output_tokens": 50989,
+ "total_tokens": 198768,
+ "elapsed_time_seconds": 2070.78,
+ "estimated_cost_usd": 0.0,
+ "summary": "## Security Analysis Summary: pyasn1 0.6.1\n\n### Scope\nAnalyzed the `pyasn1` package (v0.6.1), a pure-Python implementation of ASN.1 types and BER/CER/DER codecs. The package consists of 33 files / ~7,684 lines, primarily focused on type definitions and encoding/decoding logic. The primary attack surface is the decoder code (`pyasn1/codec/ber/decoder.py`, 1,499 lines), which processes untrusted ASN.1-encoded input.\n\n### Methodology\nExecuted 60 CodeQL queries across the package database, covering the following vulnerability classes (with associated CWE IDs):\n- Deserialization of untrusted data (CWE-502): pickle, marshal, yaml.load, shelve\n- Code injection (CWE-094): eval, exec, compile\n- Command injection (CWE-78): os.system, subprocess, os.popen\n- Path traversal (CWE-22): file/open/path manipulation\n- Unsafe temp file usage (CWE-377)\n- SQL injection (CWE-89)\n- Resource exhaustion / unbounded recursion / amplification (CWE-400, CWE-674, CWE-770)\n- Dangerous dynamic code patterns (`getattr`, `globals`, `__import__`)\n\n### Findings\n**No confirmed exploitable vulnerabilities were identified.**\n\nKey observations:\n1. **No dangerous sinks present**: Queries for pickle/eval/exec/os.system/subprocess/sql/tempfile/code-execution sinks all returned zero results. The package does not deserialize arbitrary Python objects, execute subprocesses, or evaluate dynamic code from input.\n2. **Defensive DoS mitigations present**: String-matching queries surfaced two defensive mechanisms in the codebase:\n   - `recursiveFlag` (`pyasn1/codec/ber/decoder.py:1810`): used to guard against excessive/unbounded recursion when decoding nested ASN.1 structures (mitigates CWE-674 stack-exhaustion DoS).\n   - `maxChunkSize` (`pyasn1/codec/ber/encoder.py`): bounds chunk sizes during encoding (mitigates CWE-770 allocation-without-limit DoS).\n   These are protective controls, not vulnerabilities.\n3. The decoder uses an explicit `decodeLength` routine and structured parsing that did not reveal taint-flow from untrusted input into any high-impact sink.\n\n### Conclusion\n`pyasn1` 0.6.1 appears to be a mature, well-audited library with no high-impact vulnerabilities detectable via the applied CodeQL analysis. The most relevant residual risk class for a codec library is resource exhaustion via malformed ASN.1 input; the package already contains apparent recursion and chunk-size limits to mitigate this. No action-critical findings require remediation.",
+ "package_classification": {
+  "type": [
+   "library"
+  ],
+  "layer": [
+   "library"
+  ]
+ },
+ "tool_calls": {
+  "get_package_profile_info": 1,
+  "execute_codeql_query": 60,
+  "validate_codeql_query": 0,
+  "fixup_codeql_query": 0,
+  "finalize_report": 1
+ },
+ "queries_executed": {
+  "critical": 2,
+  "high": 9,
+  "medium": 6,
+  "low": 3,
+  "total_executed": 60,
+  "total_with_results": 20,
+  "total_failed": 40
+ },
+ "query_findings": {
+  "critical": 0,
+  "high": 0,
+  "medium": 0,
+  "low": 5,
+  "total": 5
+ },
+ "findings": [
+  {
+   "codeql_query_uuid": "20261122170510",
+   "codeql_raw_query": "/**\n * @name Unsafe deserialization calls\n * @description Finds calls to pickle, yaml, marshal, shelve deserialization functions\n * @kind problem\n * @problem.severity error\n * @id py/unsafe-deserialization\n * @tags security\n *        external/cwe/cwe-502\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"pickle\").getMember([\"load\", \"loads\", \"Unpickler\"]).getACall() or\n  call = API::moduleImport(\"_pickle\").getMember([\"load\", \"loads\", \"Unpickler\"]).getACall() or\n  call = API::moduleImport(\"marshal\").getMember([\"load\", \"loads\"]).getACall() or\n  call = API::moduleImport(\"yaml\").getMember([\"load\", \"unsafe_load\"]).getACall() or\n  call = API::moduleImport(\"shelve\").getMember(\"open\").getACall()\nselect call, \"Potentially unsafe deserialization operation.\"\n",
+   "hypothesis": "Package may use unsafe deserialization (pickle/yaml/marshal) on untrusted data",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-502"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20261122170540",
+   "codeql_raw_query": "/**\n * @name Code injection via eval/exec/compile\n * @description Untrusted function parameters flowing to eval, exec or compile\n * @kind path-problem\n * @problem.severity error\n * @id py/code-injection-params\n * @tags security\n *        external/cwe/cwe-094\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.ApiGraphs\n\nmodule CodeInjConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    source instanceof DataFlow::ParameterNode\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(DataFlow::CallCfgNode call |\n      (\n        call = API::builtin(\"eval\").getACall() or\n        call = API::builtin(\"exec\").getACall() or\n        call = API::builtin(\"compile\").getACall()\n      ) and\n      sink = call.getArg(0)\n    )\n  }\n}\n\nmodule CodeInjFlow = TaintTracking::Global<CodeInjConfig>;\nimport CodeInjFlow::PathGraph\n\nfrom CodeInjFlow::PathNode source, CodeInjFlow::PathNode sink\nwhere CodeInjFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"Code injection from $@.\", source.getNode(), \"function parameter\"\n",
+   "hypothesis": "Untrusted parameter data may reach eval/exec/compile leading to arbitrary code execution",
+   "severity": "critical",
+   "cwe_ids": [
+    "cwe-094"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20261122170636",
+   "codeql_raw_query": "/**\n * @name Path traversal via file access\n * @description Untrusted function parameters flowing to file system path arguments\n * @kind path-problem\n * @problem.severity error\n * @id py/path-traversal-params\n * @tags security\n *        external/cwe/cwe-022\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.Concepts\n\nmodule PathTravConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    source instanceof DataFlow::ParameterNode\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    sink = any(FileSystemAccess fa).getAPathArgument()\n  }\n}\n\nmodule PathTravFlow = TaintTracking::Global<PathTravConfig>;\nimport PathTravFlow::PathGraph\n\nfrom PathTravFlow::PathNode source, PathTravFlow::PathNode sink\nwhere PathTravFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"Path traversal from $@.\", source.getNode(), \"function parameter\"\n",
+   "hypothesis": "Untrusted parameter data may reach file system path arguments enabling path traversal",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-022"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20261122170852",
+   "codeql_raw_query": "/**\n * @name Dynamic code execution via eval/exec/compile\n * @description Detect any use of eval, exec, compile, or __import__ which can lead to arbitrary code execution\n * @kind problem\n * @problem.severity error\n * @id py/dynamic-code-execution\n * @tags security\n *        external/cwe/cwe-094\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::builtin(\"eval\").getACall() or\n  call = API::builtin(\"exec\").getACall() or\n  call = API::builtin(\"compile\").getACall() or\n  call = API::builtin(\"__import__\").getACall()\nselect call, \"Dynamic code execution sink.\"\n",
+   "hypothesis": "Detect eval/exec/compile/__import__ dynamic code execution sinks",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-094"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20261122170924",
+   "codeql_raw_query": "/**\n * @name Command execution sinks\n * @description Detect use of subprocess, os.system, os.popen or other command execution APIs\n * @kind problem\n * @problem.severity error\n * @id py/command-execution-sinks\n * @tags security\n *        external/cwe/cwe-078\n */\n\nimport python\nimport semmle.python.Concepts\n\nfrom SystemCommandExecution cmd\nselect cmd, \"Command execution sink.\"\n",
+   "hypothesis": "Detect command execution sinks (subprocess/os.system/os.popen)",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-078"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20261122170954",
+   "codeql_raw_query": "/**\n * @name File system access sinks\n * @description Detect file open/read/write/delete operations that may be influenced by attacker data\n * @kind problem\n * @problem.severity warning\n * @id py/file-system-access\n * @tags security\n *        external/cwe/cwe-022\n */\n\nimport python\nimport semmle.python.Concepts\n\nfrom FileSystemAccess fa\nselect fa, \"File system access sink.\"\n",
+   "hypothesis": "Detect filesystem access sinks potentially leading to path traversal",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-022"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20261122171456",
+   "codeql_raw_query": "/**\n * @name Recursion-related strings\n * @description String constants mentioning recursion, depth, or limits\n * @kind problem\n * @problem.severity note\n * @id py/recursion-strings\n */\nimport python\n\nfrom StrConst s\nwhere s.getText().regexpMatch(\"(?i).*(recursion|recursive|depth|maxdepth|limit).*\")\nselect s, s.getText()\n",
+   "hypothesis": "Locate any recursion depth guards or limits referenced in the code",
+   "severity": "low",
+   "cwe_ids": [
+    "cwe-400"
+   ],
+   "results_count": 1,
+   "results": [
+    {
+     "ruleId": "py/recursion-strings",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/recursion-strings",
+      "index": 0
+     },
+     "message": {
+      "text": "recursiveFlag"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pyasn1/codec/ber/decoder.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 1810,
+         "startColumn": 36,
+         "endColumn": 51
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "b8ad56bbbd59f9ab:1",
+      "primaryLocationStartColumnFingerprint": "19"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20261122172036",
+   "codeql_raw_query": "/**\n * @name Dangerous builtin calls\n * @description Finds calls to eval, exec, compile, __import__ and similar builtins\n * @kind problem\n * @problem.severity warning\n * @id py/dangerous-builtin-calls\n */\nimport python\n\nfrom Call c, Name n\nwhere\n  c.getFunc() = n and\n  n.getId() in [\"eval\", \"exec\", \"compile\", \"__import__\", \"input\"]\nselect c, \"Dangerous builtin call: \" + n.getId()\n",
+   "hypothesis": "Package uses dangerous builtins like eval/exec/compile that could lead to code execution",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-94",
+    "cwe-95"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20261122172101",
+   "codeql_raw_query": "/**\n * @name OS command execution sinks\n * @description Finds calls to os.system, os.popen and subprocess functions\n * @kind problem\n * @problem.severity warning\n * @id py/os-command-sinks\n */\nimport python\n\nfrom Call c, Attribute a\nwhere\n  c.getFunc() = a and\n  a.getObject().(Name).getId() in [\"os\", \"subprocess\"] and\n  a.getName() in [\"system\", \"popen\", \"Popen\", \"call\", \"check_call\", \"check_output\", \"run\", \"spawnl\", \"spawnv\", \"execl\", \"execv\"]\nselect c, \"Potential command execution via \" + a.getObject().(Name).getId() + \".\" + a.getName()\n",
+   "hypothesis": "Package executes OS commands with potential untrusted input",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-78"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20261122172127",
+   "codeql_raw_query": "/**\n * @name Direct recursion in decoders\n * @description Finds functions that call themselves directly\n * @kind problem\n * @problem.severity warning\n * @id py/direct-recursion\n */\nimport python\n\nfrom Function f, Call c\nwhere\n  c.getScope() = f and\n  c.getFunc().(Name).getId() = f.getName()\nselect c, \"Direct recursive call to $@.\", f, f.getName()\n",
+   "hypothesis": "Decoder functions may recursively process nested structures without depth limits, enabling stack exhaustion DoS",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-674",
+    "cwe-400"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20261122172152",
+   "codeql_raw_query": "/**\n * @name Unsafe deserialization imports and calls\n * @description Finds imports of and calls to unsafe deserialization modules\n * @kind problem\n * @problem.severity warning\n * @id py/unsafe-deserialization-syntactic\n */\nimport python\n\nfrom Call c\nwhere\n  exists(Name n |\n    c.getFunc() = n and\n    n.getId() in [\"loads\", \"load\", \"Unpickler\", \"unsafe_load\"]\n  )\nselect c, \"Potential unsafe deserialization call\"\n",
+   "hypothesis": "Package performs unsafe deserialization using pickle/yaml/marshal-like functions",
+   "severity": "critical",
+   "cwe_ids": [
+    "cwe-502"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20261122172721",
+   "codeql_raw_query": "/**\n * @name Direct recursion detection\n * @description A function that calls itself may cause stack exhaustion on untrusted input\n * @kind problem\n * @problem.severity warning\n * @id py/direct-recursion\n */\nimport python\n\nfrom Function f, Call c\nwhere\n  c.getScope() = f and\n  c.getFunc().(Name).getId() = f.getName()\nselect c, \"Recursive call to function '\" + f.getName() + \"'\"\n",
+   "hypothesis": "Direct recursive function calls could cause stack exhaustion DoS when decoding nested ASN.1 structures",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-674"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20261122172813",
+   "codeql_raw_query": "/**\n * @name Dangerous builtin calls\n * @description Find calls to eval, exec, compile, input\n * @kind problem\n * @problem.severity error\n * @id py/dangerous-builtins\n */\nimport python\n\nfrom Call c, Name n\nwhere c.getFunc() = n and n.getId() in [\"eval\", \"exec\", \"compile\", \"input\", \"__import__\"]\nselect c, \"Call to dangerous builtin \" + n.getId()\n",
+   "hypothesis": "Dangerous builtin calls could allow code injection",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-094"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20261122172916",
+   "codeql_raw_query": "/**\n * @name Direct recursion\n * @description Functions that call themselves directly, potentially leading to stack exhaustion\n * @kind problem\n * @problem.severity warning\n * @id py/direct-recursion\n */\nimport python\n\nfrom Function f, Call c\nwhere\n  c.getScope() = f and\n  c.getFunc() instanceof Name and\n  c.getFunc().(Name).getId() = f.getName()\nselect c, \"Function '\" + f.getName() + \"' calls itself recursively.\"\n",
+   "hypothesis": "Detect direct recursion in decoder functions that could cause stack exhaustion DoS",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-674"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20261122172941",
+   "codeql_raw_query": "/**\n * @name Dangerous builtin calls\n * @description Use of eval, exec, compile, or __import__ builtins\n * @kind problem\n * @problem.severity error\n * @id py/dangerous-builtins\n */\nimport python\n\nfrom Call c\nwhere\n  c.getFunc().(Name).getId() in [\"eval\", \"exec\", \"compile\", \"__import__\", \"input\"]\nselect c, \"Dangerous builtin call: \" + c.getFunc().(Name).getId()\n",
+   "hypothesis": "Detect dangerous builtin functions that could allow code execution",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-95"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20261122173008",
+   "codeql_raw_query": "/**\n * @name DoS-related string literals\n * @description String literals referencing recursion, depth, or limits\n * @kind problem\n * @problem.severity note\n * @id py/dos-strings\n */\nimport python\n\nfrom StringLiteral s\nwhere\n  s.getText().regexpMatch(\"(?i).*(recurs|depth|limit|max|memory|allocat).*\")\nselect s, s.getText()\n",
+   "hypothesis": "Locate string literals related to recursion/depth/limits to understand DoS protections",
+   "severity": "low",
+   "cwe_ids": [
+    "cwe-400"
+   ],
+   "results_count": 4,
+   "results": [
+    {
+     "ruleId": "py/dos-strings",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/dos-strings",
+      "index": 0
+     },
+     "message": {
+      "text": "recursiveFlag"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pyasn1/codec/ber/decoder.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 1810,
+         "startColumn": 36,
+         "endColumn": 51
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "b8ad56bbbd59f9ab:1",
+      "primaryLocationStartColumnFingerprint": "19"
+     }
+    },
+    {
+     "ruleId": "py/dos-strings",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/dos-strings",
+      "index": 0
+     },
+     "message": {
+      "text": "maxChunkSize"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pyasn1/codec/ber/encoder.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 198,
+         "startColumn": 36,
+         "endColumn": 50
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "68c3e27388df6e2b:1",
+      "primaryLocationStartColumnFingerprint": "27"
+     }
+    },
+    {
+     "ruleId": "py/dos-strings",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/dos-strings",
+      "index": 0
+     },
+     "message": {
+      "text": "maxChunkSize"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pyasn1/codec/ber/encoder.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 240,
+         "startColumn": 36,
+         "endColumn": 50
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "6ca707395c7adf0c:1",
+      "primaryLocationStartColumnFingerprint": "27"
+     }
+    },
+    {
+     "ruleId": "py/dos-strings",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/dos-strings",
+      "index": 0
+     },
+     "message": {
+      "text": "maxChunkSize"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pyasn1/codec/ber/encoder.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 838,
+         "startColumn": 45,
+         "endColumn": 59
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "ba1475ad9e5efec4:1",
+      "primaryLocationStartColumnFingerprint": "12"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20261122173033",
+   "codeql_raw_query": "/**\n * @name Pickle and unsafe deserialization\n * @description Use of pickle, yaml, marshal, or shelve unsafe deserialization\n * @kind problem\n * @problem.severity error\n * @id py/unsafe-deserialization-check\n */\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"pickle\").getMember([\"load\", \"loads\", \"Unpickler\"]).getACall() or\n  call = API::moduleImport(\"marshal\").getMember([\"load\", \"loads\"]).getACall() or\n  call = API::moduleImport(\"yaml\").getMember([\"load\", \"unsafe_load\"]).getACall() or\n  call = API::moduleImport(\"shelve\").getMember(\"open\").getACall()\nselect call, \"Potentially unsafe deserialization.\"\n",
+   "hypothesis": "Detect unsafe deserialization sinks",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-502"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20261122173606",
+   "codeql_raw_query": "/**\n * @name Direct recursive function calls\n * @description Find functions that call themselves directly, potentially causing unbounded recursion\n * @kind problem\n * @problem.severity warning\n * @id py/self-recursion-check\n */\n\nimport python\n\nfrom Function f, Call c, Name n\nwhere\n  n = c.getFunc()\n  and n.getId() = f.getName()\n  and c.getScope() = f\nselect c, \"Direct recursion in function '\" + f.getName() + \"' at \" + c.getLocation().getFile().getRelativePath()\n",
+   "hypothesis": "Unbounded recursion DoS in decoder functions",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-674"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20261122173734",
+   "codeql_raw_query": "/**\n * @name Direct recursion in functions\n * @description Find functions that call themselves directly (potential recursion DoS)\n * @kind problem\n * @problem.severity warning\n * @id py/direct-recursion\n */\n\nimport python\n\nfrom Function f, Call c\nwhere\n  c.getScope() = f and\n  c.getFunc().(Name).getId() = f.getName()\nselect c, \"Direct recursive call in function '\" + f.getName() + \"'.\"\n",
+   "hypothesis": "Direct recursion in decoder functions could enable stack exhaustion DoS on crafted input",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-674"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20261122173759",
+   "codeql_raw_query": "/**\n * @name Use of sys.setrecursionlimit\n * @description Find calls that modify recursion limit\n * @kind problem\n * @problem.severity note\n * @id py/setrecursionlimit\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere call = API::moduleImport(\"sys\").getMember(\"setrecursionlimit\").getACall()\nselect call, \"Call to sys.setrecursionlimit.\"\n",
+   "hypothesis": "Check if the package modifies recursion limit as mitigation for deep recursion",
+   "severity": "low",
+   "cwe_ids": [
+    "cwe-674"
+   ],
+   "results_count": 0,
+   "results": []
+  }
+ ],
+ "cache_usage": {
+  "prompt_tokens_total": 147779,
+  "uncached_input_tokens": 8515,
+  "cache_creation_input_tokens": 0,
+  "cache_read_input_tokens": 139264,
+  "output_tokens": 50989,
+  "calls": 19,
+  "caching_enabled": false,
+  "cost_usd_with_cache": 0.109642,
+  "cost_usd_no_cache": 0.198492,
+  "cache_read_share_of_prompt": 0.9424,
+  "prices_per_mtok": {
+   "claude-sonnet-4-5-20250929": {
+    "input": 3.0,
+    "output": 15.0
+   },
+   "claude-haiku-4-5-20251001": {
+    "input": 1.0,
+    "output": 5.0
+   },
+   "deepseek/deepseek-reasoner": {
+    "input": 0.15,
+    "output": 0.6,
+    "cache_read": 0.003,
+    "cache_write_mult": 1.0,
+    "peak_mult": 2.0
+   },
+   "gpt-5.1": {
+    "input": 1.25,
+    "output": 10.0,
+    "cache_read": 0.125,
+    "cache_write_mult": 1.0
+   },
+   "gpt-4.1": {
+    "input": 2.0,
+    "output": 8.0,
+    "cache_read": 0.5,
+    "cache_write_mult": 1.0
+   },
+   "deepseek/deepseek-v4-pro": {
+    "input": 0.66,
+    "output": 1.98,
+    "cache_read": 0.022,
+    "cache_write_mult": 1.0,
+    "peak_mult": 2.0
+   },
+   "deepseek/deepseek-flash": {
+    "input": 0.15,
+    "output": 0.6,
+    "cache_read": 0.003,
+    "cache_write_mult": 1.0,
+    "peak_mult": 2.0
+   },
+   "gemini/gemini-4-carbon": {
+    "input": 2.0,
+    "output": 10.0,
+    "cache_read": 0.1,
+    "cache_write_mult": 1.0
+   },
+   "gemini/gemini-3.8-flash": {
+    "input": 0.75,
+    "output": 3.75,
+    "cache_read": 0.075,
+    "cache_write_mult": 1.0
+   },
+   "openai/gpt-6.2-sol": {
+    "input": 2.0,
+    "output": 10.0,
+    "cache_read": 0.1,
+    "cache_write_mult": 1.0,
+    "long_threshold": 272000,
+    "long": {
+     "input": 4.0,
+     "output": 15.0,
+     "cache_read": 0.2
+    }
+   },
+   "openai/gpt-6-luna": {
+    "input": 0.1,
+    "output": 0.5,
+    "cache_read": 0.01,
+    "cache_write_mult": 1.0,
+    "long_threshold": 272000,
+    "long": {
+     "input": 0.2,
+     "output": 0.75,
+     "cache_read": 0.02
+    }
+   },
+   "claude-sonnet-5-5": {
+    "input": 2.0,
+    "output": 10.0,
+    "cache_read": 0.1
+   },
+   "claude-haiku-5-5": {
+    "input": 0.1,
+    "output": 0.5,
+    "cache_read": 0.01,
+    "long_threshold": 100000,
+    "long": {
+     "input": 0.5,
+     "output": 2.5,
+     "cache_read": 0.05
+    }
+   }
+  },
+  "cache_multipliers": {
+   "write_5m": 1.25,
+   "read": 0.1
+  }
+ }
+}

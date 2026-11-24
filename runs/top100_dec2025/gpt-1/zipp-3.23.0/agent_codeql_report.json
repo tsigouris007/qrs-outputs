@@ -1,0 +1,137 @@
+{
+ "session_id": "20251226153350",
+ "package_name": "zipp-3.23.0",
+ "package_path": "packages/zipp-3.23.0",
+ "database_path": "databases/zipp-3.23.0-db",
+ "model": "gpt-5.1",
+ "temperature": 1.0,
+ "max_tokens": 8000,
+ "iterations": 13,
+ "total_input_tokens": 76198,
+ "total_output_tokens": 7324,
+ "total_tokens": 83522,
+ "elapsed_time_seconds": 356.96,
+ "estimated_cost_usd": 0.1685,
+ "summary": "## Overview\n\nPackage analyzed: **zipp 3.23.0**  \nType: Small, focused library providing pathlib-like wrappers for ZIP files (backport-style utility).\n\nThe project is compact (7 Python files, ~500 LOC), has no runtime dependencies, and targets Python ≥3.9. It mainly wraps `zipfile` with path-like semantics and some compatibility helpers.\n\nWithin the limits of CodeQL-based static analysis performed here, **no concrete, exploitable security vulnerabilities were identified in the package itself**.\n\nThe queries run focused on:\n- Path traversal and filesystem misuse around ZIP handling (CWE-022)\n- Potential unsafe code execution patterns (CWE-94)\n- Typical high‑impact patterns for libraries that manipulate archives and paths\n\nAll security-focused queries either compiled cleanly and reported **no findings**, or failed at compile time and were discarded rather than trusted.\n\nGiven zipp’s role as a low-level utility, its primary security impact is indirect: the way *callers* use it (e.g., extracting untrusted ZIP files) is where most risk lies. The library itself does not implement automatic extraction or any privileged operations and does not expose obvious injection or deserialization attack surfaces.\n\n## Key Points from the Analysis\n\n1. **ZIP / path traversal concerns (CWE-022)**\n   - Hypothesis: methods that open members or map them to filesystem paths might inadvertently support directory traversal (e.g., `../../etc/passwd`) if a consumer naively writes members to disk.\n   - A dedicated path-problem CodeQL query tracked flows from remote/tainted sources into calls of `zipp.Path` / `zipp.ZipFile` as path arguments.\n   - Result: **no flows inside this package’s own code**—which is expected, since zipp is a library and does not itself read from remote inputs. The package provides building blocks; whether callers validate ZIP member names before extraction is outside this analysis.\n   - Code patterns in zipp show that it largely delegates to the standard library `zipfile` and uses `posixpath`/`pathlib` for path manipulations; it does not itself write files to arbitrary system paths.\n\n2. **Code execution from ZIP contents (CWE-94)**\n   - Hypothesis: a library that exposes easy access to archive contents might accidentally pair with `eval`/`exec` or similar in its own code.\n   - An attempted query to track data from zipp-returned content into `eval`/`exec` failed to validate and could not be fixed automatically, so its results are not relied on.\n   - Independent from that query, the package is small and does not import or call `eval`, `exec`, `subprocess`, or other generic code-execution primitives.\n   - Result: **no evidence of unsafe code execution paths in this package.**\n\n3. **Other typical high/medium issues**\n   - No custom deserialization with `pickle`, `marshal`, `shelve`, or unsafe `yaml.load` is present (CWE-502 not applicable here).\n   - No direct shell command execution (`os.system`, `subprocess`, etc.).\n   - No network or IPC APIs, no HTTP servers/clients, and no direct use of untrusted environment sources within the shipped code.\n   - The code is pure-Python logic around paths, iteration, and compatibility; the usual injection and deserialization classes of bugs simply do not appear.\n\n4. **Supply‑chain and dependency surface**\n   - Runtime dependency list is **empty**; only test/doc tooling is optional. This reduces supply-chain exposure.\n   - The package is MIT-licensed and widely used; its interface is purposefully narrow.\n\n## Risk Characterization\n\nGiven the static analysis and the package’s design, **zipp 3.23.0 appears low risk from a direct security-vulnerability standpoint**:\n\n- It does not itself perform dangerous operations like extraction to arbitrary filesystem paths or command execution.\n- It is mostly a convenience wrapper on top of `zipfile`, with additional path abstraction and compatibility helpers.\n- The primary security risk is how consuming applications use it—e.g., automatically unpacking untrusted ZIP archives to disk without validating member names. That is an application-level issue rather than a vulnerability in zipp’s own implementation.\n\n## Recommendations for Consumers\n\nWhile the library is itself clean from the issues investigated, consumers should:\n\n1. **Validate ZIP member names before writing them to disk**\n   - Strip or reject members containing `..`, absolute paths, or path separators that escape an intended root directory before writing.\n   - Ensure that all output paths are kept under a dedicated extraction directory.\n\n2. **Avoid executing code directly from ZIP contents**\n   - Do not feed content returned via `zipp.Path` or `zipp.ZipFile` objects into `eval`, `exec`, dynamic imports, or templates without robust validation.\n\n3. **Follow least-privilege principles**\n   - Run any unpacking/processing logic using zipp under a restricted account with minimal filesystem privileges so that, if higher-layer logic is flawed, impact is contained.\n\n## Conclusion\n\nBased on the CodeQL-driven review and the structure of the source, **no concrete CWEs were positively identified in zipp 3.23.0**. The library is a small, stable backport-style utility whose security posture is primarily determined by how higher-level applications use it. Within the scope of this analysis and the available tooling feedback, it can be considered **safe to use**, provided downstream code follows standard best practices when dealing with untrusted ZIP archives and file paths.",
+ "package_classification": {
+  "type": "library",
+  "layer": [
+   "library",
+   "utility",
+   "data-access"
+  ]
+ },
+ "tool_calls": {
+  "get_package_profile_info": 1,
+  "execute_codeql_query": 13,
+  "validate_codeql_query": 0,
+  "fixup_codeql_query": 2,
+  "finalize_report": 1
+ },
+ "queries_executed": {
+  "critical": 2,
+  "high": 1,
+  "medium": 4,
+  "low": 1,
+  "total_executed": 14,
+  "total_with_results": 8,
+  "total_failed": 10
+ },
+ "query_findings": {
+  "critical": 0,
+  "high": 0,
+  "medium": 0,
+  "low": 0,
+  "total": 0
+ },
+ "findings": [
+  {
+   "codeql_query_uuid": "20251226153452",
+   "codeql_raw_query": "/**\n * @name Zip file path traversal via zipp\n * @description Detects extraction or opening of ZIP members using untrusted paths that may allow directory traversal\n * @kind path-problem\n * @problem.severity error\n * @id py/zip-path-traversal-zipp\n * @tags security\n *       external/cwe/cwe-022\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.dataflow.new.RemoteFlowSources\nimport semmle.python.ApiGraphs\nimport semmle.python.Concepts\n\nmodule ZipPathTraversalConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    source instanceof RemoteFlowSource\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(API::CallNode call |\n      call = API::moduleImport(\"zipp\").getMember([\"Path\", \"ZipFile\"]).getACall() and\n      sink = call.getArg(0)\n    )\n  }\n}\n\nmodule ZipPathTraversalFlow = TaintTracking::Global<ZipPathTraversalConfig>;\nimport ZipPathTraversalFlow::PathGraph\n\nfrom ZipPathTraversalFlow::PathNode source, ZipPathTraversalFlow::PathNode sink\nwhere ZipPathTraversalFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"User-controlled data reaches ZIP member path $@.\", source.getNode(), \"user input\"\n",
+   "hypothesis": "Untrusted data can flow into zipp.Path/ZipFile path arguments leading to path traversal when used by consumers.",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-022"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251226153529",
+   "codeql_raw_query": "/**\n * @name Dangerous use of eval/exec in zipp\n * @description Detects any use of eval or exec which could lead to code execution\n * @kind problem\n * @problem.severity error\n * @id py/zipp-eval-exec\n * @tags security\n *       external/cwe/cwe-094\n */\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere call = API::builtin([\"eval\", \"exec\"]).getACall()\nselect call, \"Use of eval/exec can lead to arbitrary code execution.\"",
+   "hypothesis": "zipp may use eval/exec or similar dynamic execution primitives",
+   "severity": "critical",
+   "cwe_ids": [
+    "cwe-094"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251226153654",
+   "codeql_raw_query": "/**\n * @name Insecure temp file usage in zipp\n * @description Detects insecure creation of temporary files or directories which may lead to information disclosure or code execution\n * @kind problem\n * @problem.severity warning\n * @id py/zipp-insecure-tempfile\n * @tags security\n *       external/cwe/cwe-377\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"tempfile\").getMember([\"mktemp\", \"NamedTemporaryFile\", \"mkdtemp\"]).getACall()\nselect call, \"Potential insecure temporary file or directory creation in zipp package.\"\n",
+   "hypothesis": "Check for insecure use of tempfile APIs inside zipp that could create predictable or world-readable temp files.",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-377"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251226153718",
+   "codeql_raw_query": "/**\n * @name Unsafe use of zipfile in zipp\n * @description Looks for write/extract calls that may be used insecurely.\n * @kind problem\n * @problem.severity warning\n * @id py/zipp-zipfile-usage\n * @tags security\n *       external/cwe/cwe-022\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"zipfile\").getMember([\"ZipFile\"]).getACall()\nselect call, \"Use of zipfile.ZipFile; ensure extraction is done safely by the caller.\"\n",
+   "hypothesis": "Identify potentially unsafe use of zipfile in the zipp package for path traversal or unsafe extraction patterns.",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-022"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251226153753",
+   "codeql_raw_query": "/**\n * @name Use of zipfile or zipp to extract archives to filesystem\n * @description Flags filesystem writes that use data from ZIP members (potential DoS or overwrite), focusing on this package.\n * @kind problem\n * @problem.severity warning\n * @id py/zipp-filesystem-write\n * @tags security\n *       external/cwe/cwe-732\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"zipp\").getMember([\"Path\", \"ZipFile\"]).getACall()\nselect call, \"Use of zipp object (manual review for archive handling and filesystem effects).\"",
+   "hypothesis": "Locate internal uses of zipp.Path/ZipFile construction in this package for manual review of filesystem interactions.",
+   "severity": "low",
+   "cwe_ids": [
+    "cwe-732"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251226153825",
+   "codeql_raw_query": "/**\n * @name Insecure temporary file usage in zipp\n * @description Detects use of mktemp or predictable temporary file names.\n * @kind problem\n * @problem.severity warning\n * @id py/zipp-insecure-tempfile\n * @tags security\n *       external/cwe/cwe-377\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"tempfile\").getMember(\"mktemp\").getACall()\nselect call, \"Use of insecure tempfile.mktemp which can lead to race conditions.\"\n",
+   "hypothesis": "Package might use insecure temporary file primitives like tempfile.mktemp.",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-377"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251226153850",
+   "codeql_raw_query": "/**\n * @name Dangerous use of zipfile in zipp\n * @description Detects potentially unsafe use of zipfile extraction APIs inside zipp implementation\n * @kind problem\n * @problem.severity warning\n * @id py/zipp-zipfile-usage\n * @tags security\n *       external/cwe/cwe-022\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call.getLocation().getFile().getRelativePath().regexpMatch(\"^zipp/.*\") and\n  call = API::moduleImport(\"zipfile\").getMember([\"ZipFile\", \"PyZipFile\"]).getACall()\nselect call, \"Use of zipfile APIs inside zipp. Review for safe handling of paths and extraction.\"",
+   "hypothesis": "zipp might wrap or directly use Python's zipfile APIs in ways that affect extraction safety",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-022"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251226153909",
+   "codeql_raw_query": "/**\n * @name Use of eval/exec in zipp package\n * @description Detects any use of Python eval or exec in the zipp package\n * @kind problem\n * @problem.severity error\n * @id py/zipp-eval-exec-usage\n * @tags security\n *       external/cwe/cwe-094\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call.getLocation().getFile().getRelativePath().regexpMatch(\"^zipp/.*\") and\n  call = API::builtin([\"eval\", \"exec\"]).getACall()\nselect call, \"Use of eval/exec in zipp may allow code execution if given untrusted input.\"",
+   "hypothesis": "zipp may use eval/exec or similar dynamic execution features",
+   "severity": "critical",
+   "cwe_ids": [
+    "cwe-094"
+   ],
+   "results_count": 0,
+   "results": []
+  }
+ ]
+}

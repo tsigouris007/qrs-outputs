@@ -1,0 +1,657 @@
+{
+ "session_id": "20261122125354",
+ "original_report": "reports/_nov2026/e5/DS4-r1/filelock-3.20.0/agent_codeql_report.json",
+ "package_name": "filelock-3.20.0",
+ "package_path": "packages/filelock-3.20.0",
+ "database_path": "databases/filelock-3.20.0-db",
+ "package_classification": {
+  "type": [
+   "library"
+  ],
+  "layer": [
+   "library"
+  ]
+ },
+ "model": "deepseek/deepseek-flash",
+ "temperature": null,
+ "max_tokens": 8000,
+ "iterations": 27,
+ "total_input_tokens": 224250,
+ "total_output_tokens": 35060,
+ "total_tokens": 259310,
+ "elapsed_time_seconds": 252.97,
+ "estimated_cost_usd": 0.0,
+ "total_findings_submitted": 18,
+ "manual_review": 2,
+ "review_groups": {
+  "medium_undetermined_medium": 1,
+  "low_undetermined_medium": 2,
+  "low_often_high": 3,
+  "low_undetermined_undetermined": 1
+ },
+ "tool_calls": {
+  "extract_code_snippet": 23,
+  "grep_search": 18,
+  "trace_dataflow_path": 0,
+  "submit_finding": 18,
+  "complete_review": 4
+ },
+ "true_positives": {
+  "critical": 0,
+  "high": 0,
+  "medium": 0,
+  "low": 2,
+  "total": 2
+ },
+ "false_positives": {
+  "critical": 0,
+  "high": 0,
+  "medium": 0,
+  "low": 14,
+  "total": 14
+ },
+ "findings": [
+  {
+   "codeql_query_uuids": [
+    "20261122122637"
+   ],
+   "finding_id": "9f9bc426-b631-4679-bc19-4e319723e403",
+   "verdict": "mr",
+   "confidence": 60,
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-59",
+    "cwe-367",
+    "cwe-362"
+   ],
+   "description": "UnixFileLock opens the lock file with O_RDWR|O_TRUNC (plus O_CREAT after a non-atomic Path.exists() check) without O_NOFOLLOW, so a symlink planted at the lock path is followed and its target truncated/chmod'ed",
+   "file_path": "src/filelock/_unix.py",
+   "start_line": 44,
+   "end_line": 47,
+   "start_column": null,
+   "end_column": null,
+   "code_snippet": "        def _acquire(self) -> None:\n            ensure_directory_exists(self.lock_file)\n            open_flags = os.O_RDWR | os.O_TRUNC\n            if not Path(self.lock_file).exists():\n                open_flags |= os.O_CREAT\n            fd = os.open(self.lock_file, open_flags, self._context.mode)\n            with suppress(PermissionError):  # This locked is not owned by this UID\n                os.fchmod(fd, self._context.mode)",
+   "reasoning": "The only difference from the safe SoftFileLock path is that UnixFileLock does NOT pass O_CREAT|O_EXCL, so the \"file exists\" case is satisfied by an attacker-controlled symlink. os.open() follows the symlink and O_TRUNC truncates the symlink target; os.fchmod(fd, mode) then re-permissions the target. The lock_file value comes directly from the caller through BaseFileLock.__init__ (self._context.lock_file = os.fspath(lock_file)) with no validation, no lstat check, no O_NOFOLLOW and no realpath normalization. The path from Path.exists() to os.open() is also a TOCTOU window. Severity is bounded because the attacker must be able to write a symlink into the directory containing the lock file (e.g. a lock in a world-writable /tmp, /var/tmp, or shared CI/workspace dir) and the library's contract is that the caller chooses the path — this is a hardening/defense-in-depth issue rather than an unauthenticated remote RCE. Hence manual review rather than a hard true positive.",
+   "evidence": {
+    "code_context": "open_flags = os.O_RDWR | os.O_TRUNC; if not Path(self.lock_file).exists(): open_flags |= os.O_CREAT; fd = os.open(self.lock_file, open_flags, self._context.mode); os.fchmod(fd, self._context.mode)",
+    "dataflow_analysis": "BaseFileLock.__init__ -> kwargs['lock_file'] = os.fspath(lock_file) -> FileLockContext.lock_file -> self.lock_file property -> UnixFileLock._acquire -> os.open(). No sanitization (no realpath, no O_NOFOLLOW, no lstat/O_EXCL) anywhere on the path. grep for O_NOFOLLOW / lstat returned no matches in the package.",
+    "notes": "Contrast with _soft.py which uses O_CREAT|O_EXCL and therefore fails with EEXIST if a symlink/file already exists at the path; _unix.py deliberately supports pre-existing lock files (flock semantics, see comment referencing py-filelock issue #31) and therefore cannot use O_EXCL — O_NOFOLLOW would be the correct mitigation."
+   },
+   "dataflow_path": null,
+   "group": "medium_undetermined_medium"
+  },
+  {
+   "codeql_query_uuids": [
+    "20261122122637"
+   ],
+   "finding_id": "6951aa34-6879-4d91-b453-f0ce6d1c9587",
+   "verdict": "fp",
+   "confidence": 85,
+   "severity": "low",
+   "cwe_ids": [
+    "cwe-59",
+    "cwe-367"
+   ],
+   "description": "SoftFileLock os.open uses O_CREAT|O_EXCL, which refuses to follow/open a pre-existing file or symlink (EEXIST), so no symlink-following or truncation primitive exists here",
+   "file_path": "src/filelock/_soft.py",
+   "start_line": 27,
+   "end_line": 27,
+   "start_column": null,
+   "end_column": null,
+   "code_snippet": "            file_handler = os.open(self.lock_file, flags, self._context.mode)",
+   "reasoning": "flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_TRUNC. Per POSIX, with O_CREAT|O_EXCL, open() fails with EEXIST if the path names an existing file *or symbolic link* — the symlink is not followed and no truncation of the target occurs. The handler explicitly swallows EEXIST as the normal \"lock already held\" signal, so the code path continues to _release() only when it genuinely created the file itself. The remaining os.stat-based pre-check (raise_on_not_writable_file) is documented as best-effort and cannot be leveraged because the atomic open refuses pre-existing entries. No attacker-controlled symlink can therefore be exploited; the enumeration query result is a pattern match on os.open only.",
+   "evidence": {
+    "code_context": "flags = (os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_TRUNC); try: file_handler = os.open(self.lock_file, flags, self._context.mode) except OSError as exception: if not (exception.errno == EEXIST or (exception.errno == EACCES and sys.platform == 'win32')): raise",
+    "dataflow_analysis": "lock_file is caller-supplied but the O_EXCL guard is enforced atomically by the kernel at open time, so the TOCTOU window between os.stat() in raise_on_not_writable_file and os.open() has no security consequence (worst case an unexpected OSError/EEXIST handled as 'lock exists').",
+    "notes": "Also _release() unlinks the path via Path(self.lock_file).unlink() wrapped in suppress(OSError): a symlink planted later would only be removed (unlink does not follow symlinks) — no write to the target."
+   },
+   "dataflow_path": null,
+   "group": "medium_undetermined_medium"
+  },
+  {
+   "codeql_query_uuids": [
+    "20261122122637"
+   ],
+   "finding_id": "781cee2b-8c8e-46c7-a89c-e9e06faa3e24",
+   "verdict": "fp",
+   "confidence": 80,
+   "severity": "low",
+   "cwe_ids": [
+    "cwe-59",
+    "cwe-367"
+   ],
+   "description": "os.stat call in raise_on_not_writable_file is a read-only pre-check that can be raced, but no write/privileged operation depends on its result",
+   "file_path": "src/filelock/_util.py",
+   "start_line": 22,
+   "end_line": 22,
+   "start_column": null,
+   "end_column": null,
+   "code_snippet": "    try:  # use stat to do exists + can write to check without race condition\n        file_stat = os.stat(filename)  # noqa: PTH116\n    except OSError:\n        return  # swallow does not exist or other errors",
+   "reasoning": "The CodeQL query flags every os.stat/os.open in the filelock package as a potential symlink/TOCTOU primitive. In this case the flagged call is `os.stat(filename)` inside `raise_on_not_writable_file`. Its only purpose is to produce a nicer error message (PermissionError / IsADirectoryError) before the real open happens. The result of the stat is used exclusively to decide whether to raise an exception; it is never used to construct a path, decide permissions, or perform a subsequent privileged write. Any race merely changes which exception type the caller sees, and the actual open that follows (`os.open` in _soft.py/_unix.py/_windows.py) is what governs behaviour. There is no security impact from the stat itself, so this result is a false positive. The genuine (much weaker) TOCTOU concerns live at the sibling os.open sites, which are reported separately.",
+   "evidence": {
+    "code_context": "raise_on_not_writable_file() does:\n    file_stat = os.stat(filename)   # line 22\n    if file_stat.st_mtime != 0:\n        if not (file_stat.st_mode & stat.S_IWUSR):\n            raise PermissionError(EACCES, 'Permission denied', filename)\n        if stat.S_ISDIR(file_stat.st_mode):\n            raise IsADirectoryError(EISDIR, ...)\nThe function's sole effect is raising an exception; there is no fd returned and no write performed based on the stat data.",
+    "dataflow_analysis": "No dataflow to a write sink: file_stat is only compared against stat flags and used for exception raising. filename comes from the caller-supplied lock_file path (BaseFileLock.__init__ -> os.fspath(lock_file)), so the library never derives the path from an untrusted second source.",
+    "notes": "CodeQL rule 'filelock/enum-os-file-ops' is an enumeration rule that reports all file-system manipulation primitives; this entry is informational only."
+   },
+   "dataflow_path": null,
+   "group": "medium_undetermined_medium"
+  },
+  {
+   "codeql_query_uuids": [
+    "20261122122637"
+   ],
+   "finding_id": "e23282f0-e807-45e8-8bf1-a5fa5b9ed1f9",
+   "verdict": "mr",
+   "confidence": 50,
+   "severity": "low",
+   "cwe_ids": [
+    "cwe-59",
+    "cwe-367",
+    "cwe-362"
+   ],
+   "description": "WindowsFileLock._acquire opens the lock file with O_RDWR|O_CREAT|O_TRUNC without O_NOFOLLOW; a pre-existing symlink at the lock path would be followed and truncated, and the fd is then used for msvcrt.locking",
+   "file_path": "src/filelock/_windows.py",
+   "start_line": 28,
+   "end_line": 34,
+   "start_column": null,
+   "end_column": null,
+   "code_snippet": "            flags = (\n                os.O_RDWR  # open for read and write\n                | os.O_CREAT  # create file if not exists\n                | os.O_TRUNC  # truncate file if not empty\n            )\n            try:\n                fd = os.open(self.lock_file, flags, self._context.mode)",
+   "reasoning": "WindowsFileLock._acquire performs `os.open(self.lock_file, O_RDWR|O_CREAT|O_TRUNC, mode)` and then `msvcrt.locking(fd, LK_NBLCK, 1)`. Because there is no O_NOFOLLOW/O_EXCL and no reparse-point check, if the lock path already exists as a symlink/junction (created by another local user who can write in the lock directory — Windows 10+ allows unprivileged symlink creation when Developer Mode is enabled), the open follows the link and O_TRUNC truncates the link target before any locking semantics apply. The subsequent msvcrt.locking/close/unlink in _release then operate on the target rather than the lock file. This is exploitable only when (a) the process runs on win32, (b) an attacker can pre-create the lock path in a directory the victim process will use, and (c) the victim's process has write permission on the symlink target. Since the lock path is entirely caller-supplied (BaseFileLock.__init__ stores os.fspath(lock_file)) and filelock is a generic library used by privileged tools, the pattern is worth flagging, but the practical impact and prerequisites are unclear, so manual review is warranted rather than an outright true positive.",
+   "evidence": {
+    "code_context": "def _acquire(self) -> None:\n    raise_on_not_writable_file(self.lock_file)\n    ensure_directory_exists(self.lock_file)\n    flags = os.O_RDWR | os.O_CREAT | os.O_TRUNC\n    try:\n        fd = os.open(self.lock_file, flags, self._context.mode)\n    except OSError as exception:\n        if exception.errno != EACCES: raise\n    else:\n        try: msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)\n        ...\n        self._context.lock_file_fd = fd",
+    "dataflow_analysis": "self.lock_file originates from the public API: BaseFileLock.__init__(lock_file: str | os.PathLike[str]) -> os.fspath(lock_file) -> self._context.lock_file -> lock_file property -> used directly as the path argument of os.open. No sanitisation of symlinks/reparse points anywhere between constructor and sink.",
+    "notes": "Contrast with _soft.py which uses O_CREAT|O_EXCL|O_TRUNC: with O_EXCL the open fails with EEXIST for an existing symlink, so that path does not follow links. The Windows hard-lock path lacks an equivalent guard. Windows path only (guarded by sys.platform == 'win32'), which lowers real-world severity. msvcrt.locking plus unlink in _release compound the effect on a hijacked link target."
+   },
+   "dataflow_path": null,
+   "group": "medium_undetermined_medium"
+  },
+  {
+   "codeql_query_uuids": [
+    "20261122123400",
+    "20261122123510"
+   ],
+   "finding_id": "f78d6b8b-dffc-4f24-8b4b-e14a59c3cfa2",
+   "verdict": "tp",
+   "confidence": 80,
+   "severity": "low",
+   "cwe_ids": [
+    "cwe-59",
+    "cwe-706"
+   ],
+   "description": "Symlink-following file truncation in UnixFileLock._acquire (os.open with O_TRUNC and no O_NOFOLLOW)",
+   "file_path": "src/filelock/_unix.py",
+   "start_line": 41,
+   "end_line": 44,
+   "start_column": null,
+   "end_column": null,
+   "code_snippet": "            open_flags = os.O_RDWR | os.O_TRUNC\n            if not Path(self.lock_file).exists():\n                open_flags |= os.O_CREAT\n            fd = os.open(self.lock_file, open_flags, self._context.mode)",
+   "reasoning": "UnixFileLock._acquire() builds `open_flags = os.O_RDWR | os.O_TRUNC` (plus O_CREAT when the path is missing) and calls os.open() directly on self.lock_file without O_NOFOLLOW and without any lstat/symlink check. A grep for \"NOFOLLOW\" / \"is_symlink\" / \"lstat\" across the package returns zero matches, so nothing in this code path refuses to follow a symlink. The path existence check (`Path(self.lock_file).exists()`) itself follows symlinks, so it does not mitigate anything.\n\nBecause O_TRUNC is set and O_EXCL is absent, if an attacker can create (or pre-create) a symbolic link at the lock file path pointing to a file the victim process can write to, os.open() resolves the link and truncates the *target* to zero bytes. The lock path is fully caller-controlled (`FileLock(lock_file=...)` in _api.py stores os.fspath(lock_file) into the context), and lock files are commonly placed in shared/temporary directories (e.g. /tmp, shared caches, CI work dirs), which is exactly the scenario where a low-privileged local user can plant a symlink. The consequence is silent data destruction of an arbitrary victim file owned by the locking user, plus file-descriptor hijacking of the flock semantics (the lock is then taken on the attacker-chosen file). The correct fix is to add os.O_NOFOLLOW (when available) or open with O_CREAT|O_EXCL first and fall back to an fstat/fstat-vs-lstat inode comparison. Severity is low because it requires local write access to the lock directory and victim-writable target, but the data-loss impact is real.",
+   "evidence": {
+    "code_context": "src/filelock/_unix.py:38-44\n    class UnixFileLock(BaseFileLock):\n        def _acquire(self) -> None:\n            ensure_directory_exists(self.lock_file)\n            open_flags = os.O_RDWR | os.O_TRUNC\n            if not Path(self.lock_file).exists():\n                open_flags |= os.O_CREAT\n            fd = os.open(self.lock_file, open_flags, self._context.mode)",
+    "dataflow_analysis": "lock path source: BaseFileLock.__init__ stores os.fspath(lock_file) in _FileLockContext.lock_file (src/filelock/_api.py:184); sink: os.open(self.lock_file, open_flags, mode) at _unix.py:44 with O_RDWR|O_TRUNC and no O_NOFOLLOW. No symlink checks anywhere on the path (grep for 'NOFOLLOW', 'is_symlink', 'lstat', 'O_EXCL' in _unix.py returned no matches).",
+    "notes": "grep_search for 'O_NOFOLLOW' and 'is_symlink'/'lstat' returned 0 matches package-wide. O_EXCL is only used in _soft.py, not here."
+   },
+   "dataflow_path": null,
+   "group": "low_undetermined_medium"
+  },
+  {
+   "codeql_query_uuids": [
+    "20261122123400",
+    "20261122123510"
+   ],
+   "finding_id": "faa79218-ed5b-40f0-8467-5c377cc71dc4",
+   "verdict": "tp",
+   "confidence": 65,
+   "severity": "low",
+   "cwe_ids": [
+    "cwe-59",
+    "cwe-706"
+   ],
+   "description": "Symlink/junction-following truncation in WindowsFileLock._acquire (os.open with O_CREAT|O_TRUNC, no O_NOFOLLOW)",
+   "file_path": "src/filelock/_windows.py",
+   "start_line": 23,
+   "end_line": 28,
+   "start_column": null,
+   "end_column": null,
+   "code_snippet": "            flags = (\n                os.O_RDWR  # open for read and write\n                | os.O_CREAT  # create file if not exists\n                | os.O_TRUNC  # truncate file if not empty\n            )\n            try:\n                fd = os.open(self.lock_file, flags, self._context.mode)",
+   "reasoning": "WindowsFileLock._acquire() opens the caller-supplied lock path with os.O_RDWR|os.O_CREAT|os.O_TRUNC and no O_NOFOLLOW / no O_EXCL. The only guard is raise_on_not_writable_file(), which uses os.stat() (which follows links) purely to produce nicer errors, and ensure_directory_exists(). Neither rejects a reparse point.\n\nConsequently, if a reparse point (symlink, directory junction, or hardlink to a same-volume file that the user can write) already exists at the lock path, the truncating open resolves it and zeroes the target file rather than failing. O_CREAT without O_EXCL also means the existing link is reused instead of erroring. On Windows this is normally harder to arrange than on Unix (symlink creation requires SeCreateSymbolicLinkPrivilege or Developer Mode, hardlinks require write access to the directory), which is why likelihood and severity are low, but the code path is the same class of defect as CWE-59 and the package offers no O_NOFOLLOW equivalent or link rejection at all. Fix: open with O_CREAT|O_EXCL and fall back to a non-truncating open only after verifying the file is not a reparse point (os.lstat st_file_attributes & FILE_ATTRIBUTE_REPARSE_POINT), and drop the unnecessary O_TRUNC.",
+   "evidence": {
+    "code_context": "src/filelock/_windows.py:16-41\n        def _acquire(self) -> None:\n            raise_on_not_writable_file(self.lock_file)\n            ensure_directory_exists(self.lock_file)\n            flags = (\n                os.O_RDWR  # open for read and write\n                | os.O_CREAT  # create file if not exists\n                | os.O_TRUNC  # truncate file if not empty\n            )\n            try:\n                fd = os.open(self.lock_file, flags, self._context.mode)\n            except OSError as exception:\n                if exception.errno != EACCES:\n                    raise\n            else:\n                try:\n                    msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)",
+    "dataflow_analysis": "lock path source: _api.py:184 stores os.fspath(lock_file) in the context; sink: os.open(self.lock_file, flags, mode) at _windows.py:28. Between them only os.stat() based checks (src/filelock/_util.py raise_on_not_writable_file) that follow symlinks.",
+    "notes": "Code is under `if sys.platform == \"win32\":` so it only runs on Windows. No O_EXCL and no reparse-point validation anywhere."
+   },
+   "dataflow_path": null,
+   "group": "low_undetermined_medium"
+  },
+  {
+   "codeql_query_uuids": [
+    "20261122123400",
+    "20261122123510"
+   ],
+   "finding_id": "c8167622-deaa-477f-92ba-efd3a269df45",
+   "verdict": "fp",
+   "confidence": 85,
+   "severity": "low",
+   "cwe_ids": [
+    "cwe-59"
+   ],
+   "description": "SoftFileLock os.open with O_TRUNC — mitigated by O_CREAT|O_EXCL, cannot follow a pre-existing symlink",
+   "file_path": "src/filelock/_soft.py",
+   "start_line": 20,
+   "end_line": 27,
+   "start_column": null,
+   "end_column": null,
+   "code_snippet": "        flags = (\n            os.O_WRONLY  # open for writing only\n            | os.O_CREAT\n            | os.O_EXCL  # together with above raise EEXIST if the file specified by filename exists\n            | os.O_TRUNC  # truncate the file to zero byte\n        )\n        try:\n            file_handler = os.open(self.lock_file, flags, self._context.mode)",
+   "reasoning": "The query flags O_TRUNC without O_NOFOLLOW here, but O_EXCL is combined with O_CREAT in the same flag word. POSIX (and CPython's os.open) guarantees that O_CREAT|O_EXCL fails with EEXIST if the pathname already exists *including when it is a symbolic link, regardless of where the link points* (open(2): \"If O_EXCL and O_CREAT are set, and path names a symbolic link, open() fails with EEXIST\"). The trailing comment in the code says exactly this. That EEXIST is caught below and deliberately swallowed (treated as \"lock already exists\"), so no descriptor is obtained and no truncation of the symlink target can occur. O_TRUNC is therefore only ever applied to a file this call just created (and is dead weight). Symlink-following/truncation is not reachable in this path, so this CodeQL hit is a false positive.",
+   "evidence": {
+    "code_context": "src/filelock/_soft.py:19-35\n        flags = (\n            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_TRUNC\n        )\n        try:\n            file_handler = os.open(self.lock_file, flags, self._context.mode)\n        except OSError as exception:\n            if not (\n                exception.errno == EEXIST\n                or (exception.errno == EACCES and sys.platform == \"win32\")\n            ):\n                raise\n        else:\n            self._context.lock_file_fd = file_handler",
+    "dataflow_analysis": "os.open(..., O_CREAT|O_EXCL|O_TRUNC) at _soft.py:27 -> EEXIST is caught at line 29 and swallowed, so fd is never assigned when the path (or a symlink at it) already exists. No truncation of an attacker-chosen target is possible.",
+    "notes": "This is the only os.open site in the package that uses O_EXCL, which is precisely the documented mitigation for the symlink-truncation variant of CWE-59."
+   },
+   "dataflow_path": null,
+   "group": "low_undetermined_medium"
+  },
+  {
+   "codeql_query_uuids": [
+    "20261122123434",
+    "20261122124839"
+   ],
+   "finding_id": "b083b796-cac1-42f6-979c-a0c7082fdd65",
+   "verdict": "fp",
+   "confidence": 90,
+   "severity": "low",
+   "cwe_ids": [
+    "cwe-732"
+   ],
+   "description": "os.open used with user-configurable lock file mode (default 0o644) in SoftFileLock._acquire - not an insecure permission assignment",
+   "file_path": "src/filelock/_soft.py",
+   "start_line": 27,
+   "end_line": 27,
+   "start_column": null,
+   "end_column": null,
+   "code_snippet": "            file_handler = os.open(self.lock_file, flags, self._context.mode)",
+   "reasoning": "The mode argument to os.open is `self._context.mode`, which comes from the documented public constructor parameter `mode: int = 0o644` (see src/filelock/_api.py:86 and :156, asyncio.py:77 and :110, all defaulting to 0o644). 0o644 is the standard default creation mode (owner rw, group/other r) and is further restricted by the process umask. The flags used are O_WRONLY|O_CREAT|O_EXCL|O_TRUNC; O_EXCL means the call fails with EEXIST if the path already exists (including a symlink), so there is no symlink-following or pre-existing-file permission widening here. Lock files are created empty/truncated and contain no sensitive data, so world-readability leaks nothing. The mode is caller-controlled, so applications needing 0o600 can pass it. This is a heuristic enumeration result rather than a vulnerability.",
+   "evidence": {
+    "code_context": "flags = (os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_TRUNC)\nfile_handler = os.open(self.lock_file, flags, self._context.mode)",
+    "dataflow_analysis": "mode originates from constructor default `mode: int = 0o644` in FileLockMeta.__call__/_api.py:86 and BaseFileLock.__init__/_api.py:156; no attacker-controlled path, no privilege boundary crossed.",
+    "notes": "CWE-732 heuristic enumeration of os.open mode arguments; 0o644 is a conventional default and O_EXCL is used."
+   },
+   "dataflow_path": null,
+   "group": "low_often_high"
+  },
+  {
+   "codeql_query_uuids": [
+    "20261122123434",
+    "20261122124839"
+   ],
+   "finding_id": "c78b7f68-db91-4655-ae78-921c3d43e35f",
+   "verdict": "fp",
+   "confidence": 85,
+   "severity": "low",
+   "cwe_ids": [
+    "cwe-732"
+   ],
+   "description": "UnixFileLock creates lock file via os.open with default 0o644 mode and fchmod to same documented mode - conventional default, not a vulnerability",
+   "file_path": "src/filelock/_unix.py",
+   "start_line": 44,
+   "end_line": 46,
+   "start_column": null,
+   "end_column": null,
+   "code_snippet": "            fd = os.open(self.lock_file, open_flags, self._context.mode)\n            with suppress(PermissionError):  # This locked is not owned by this UID\n                os.fchmod(fd, self._context.mode)",
+   "reasoning": "The mode passed to os.open and to os.fchmod is `self._context.mode`, the documented, user-settable `mode` constructor parameter defaulting to 0o644. Os.open flags are O_RDWR|O_TRUNC (plus O_CREAT when the file does not yet exist). 0o644 is the standard default file permission and does not grant write access to other users, so it cannot be used to modify the lock file; lock files hold no sensitive content (they are emptied by O_TRUNC). Applications requiring stricter permissions simply pass mode=0o600. No world-writable (0o666/0o777) constant is used anywhere in the codebase (grep for mode literals returns only 0o644). It is worth noting the theoretical symlink-following/TOCTOU concern with O_TRUNC on an attacker-controlled path in a shared writable directory (CWE-59/367), but that requires an attacker-controlled lock directory and is not what this permission-mode query reports; the permission value itself is not insecure.",
+   "evidence": {
+    "code_context": "open_flags = os.O_RDWR | os.O_TRUNC\nif not Path(self.lock_file).exists():\n    open_flags |= os.O_CREAT\nfd = os.open(self.lock_file, open_flags, self._context.mode)\nwith suppress(PermissionError):\n    os.fchmod(fd, self._context.mode)",
+    "dataflow_analysis": "mode flows from the public constructor default 0o644 (src/filelock/_api.py:86,156) into FileLockContext.mode and then into os.open/os.fchmod.",
+    "notes": "grep for 0o644 shows only documented default parameters; no 0o777/0o666 anywhere."
+   },
+   "dataflow_path": null,
+   "group": "low_often_high"
+  },
+  {
+   "codeql_query_uuids": [
+    "20261122123434",
+    "20261122124839"
+   ],
+   "finding_id": "7abf79ec-a800-465d-a707-4513b1c2458e",
+   "verdict": "fp",
+   "confidence": 90,
+   "severity": "low",
+   "cwe_ids": [
+    "cwe-732"
+   ],
+   "description": "WindowsFileLock os.open uses documented default mode 0o644 for lock file creation - not insecure",
+   "file_path": "src/filelock/_windows.py",
+   "start_line": 28,
+   "end_line": 28,
+   "start_column": null,
+   "end_column": null,
+   "code_snippet": "                fd = os.open(self.lock_file, flags, self._context.mode)",
+   "reasoning": "On Windows, POSIX mode bits are largely ignored by os.open (Python maps them to read-only attribute semantics), and the value passed is the same documented, user-overridable `mode` parameter defaulting to 0o644. The flags are O_RDWR|O_CREAT|O_TRUNC on a lock file that is intentionally left in place and contains no sensitive data. There is no world-writable permission and no privilege boundary crossed, so the enumerated mode argument does not constitute CWE-732.",
+   "evidence": {
+    "code_context": "flags = (os.O_RDWR | os.O_CREAT | os.O_TRUNC)\nfd = os.open(self.lock_file, flags, self._context.mode)",
+    "dataflow_analysis": "mode = FileLockContext.mode, defaulted from constructor parameter mode=0o644.",
+    "notes": "Windows ignores most POSIX mode bits; lock file content is non-sensitive."
+   },
+   "dataflow_path": null,
+   "group": "low_often_high"
+  },
+  {
+   "codeql_query_uuids": [
+    "20261122124913"
+   ],
+   "finding_id": "0c119b1a-c2ff-4c0a-908e-ea648959e046",
+   "verdict": "fp",
+   "confidence": 92,
+   "severity": "low",
+   "cwe_ids": [
+    "cwe-732"
+   ],
+   "description": "Default lock file permission mode literal 0o644 (420) declared as public, documented, overridable parameter - conventional default, not a vulnerability",
+   "file_path": "src/filelock/_api.py",
+   "start_line": 86,
+   "end_line": 86,
+   "start_column": null,
+   "end_column": null,
+   "code_snippet": "        mode: int = 0o644,",
+   "reasoning": "This is the `mode` keyword parameter of FileLockMeta.__call__ with a default of 0o644. It is an intentional, documented API surface (`:param mode: file permissions for the lockfile`) that callers can set to e.g. 0o600 for private lock files. 0o644 grants other users read-only access to an empty lock file and no write access, so there is no privilege escalation or sensitive data exposure. Use of a plain 0o644 default is exactly what os.open/Python's default creation mode would produce anyway; flagging it as CWE-732 is a false positive from the literal-enumeration heuristic.",
+   "evidence": {
+    "code_context": "def __call__(cls, lock_file, timeout: float = -1, mode: int = 0o644, thread_local: bool = True, *, blocking: bool = True, is_singleton: bool = False) -> BaseFileLock:",
+    "dataflow_analysis": "Literal 420 == 0o644 is a default argument value propagated to FileLockContext.mode → os.open/os.fchmod in _soft.py:27, _unix.py:44/46, _windows.py:28.",
+    "notes": "No 0o777/0o666 or world-writable permissions exist in the package."
+   },
+   "dataflow_path": null,
+   "group": "low_often_high"
+  },
+  {
+   "codeql_query_uuids": [
+    "20261122124913"
+   ],
+   "finding_id": "4f99fc9b-10f5-431c-af64-2a6abb93ffff",
+   "verdict": "fp",
+   "confidence": 92,
+   "severity": "low",
+   "cwe_ids": [
+    "cwe-732"
+   ],
+   "description": "Default lock-file permission mode literal 0o644 in BaseFileLock.__init__ is a documented, non-world-writable default, not an insecure permission assignment",
+   "file_path": "src/filelock/_api.py",
+   "start_line": 156,
+   "end_line": 156,
+   "start_column": null,
+   "end_column": null,
+   "code_snippet": "        mode: int = 0o644,",
+   "reasoning": "This is the `mode` keyword argument of `BaseFileLock.__init__`, defaulting to 0o644 (owner rw, group/other r). It is a user-overridable, documented parameter (\"file permissions for the lockfile\") that is merely forwarded to `os.open(..., mode)`. 0o644 grants no write access to group or other, so it does not constitute CWE-732 insecure permissions; the process umask further restricts it. Lock files also hold no sensitive content (they are truncated/empty marker files). No attacker-controlled input reaches this literal, and there is no privilege-widening compared to the standard Python/library default.",
+   "evidence": {
+    "code_context": "class BaseFileLock(contextlib.ContextDecorator, metaclass=FileLockMeta):\n    def __init__(\n        self,\n        lock_file: str | os.PathLike[str],\n        timeout: float = -1,\n        mode: int = 0o644,\n        thread_local: bool = True,\n        *,\n        blocking: bool = True,\n        is_singleton: bool = False,\n    ) -> None:\n        ...\n        :param mode: file permissions for the lockfile",
+    "dataflow_analysis": "No dataflow from untrusted sources; the literal is a default value for a public constructor parameter, passed by callers into os.open(path, flags, mode) and os.fchmod(fd, mode). Values are restricted to what the caller explicitly supplies.",
+    "notes": "grep confirms the only mode literals are 0o644 (420). No 0o666/0o777 or world-writable modes appear in src/. Tests also use 0o644. Downstream consumers (virtualenv, tox) rely on this default."
+   },
+   "dataflow_path": null,
+   "group": "low_often_high"
+  },
+  {
+   "codeql_query_uuids": [
+    "20261122124913"
+   ],
+   "finding_id": "1af644d5-1aed-4bd5-8085-dc0537fcd873",
+   "verdict": "fp",
+   "confidence": 92,
+   "severity": "low",
+   "cwe_ids": [
+    "cwe-732"
+   ],
+   "description": "Default async lock-file permission mode 0o644 in AsyncFileLockMeta.__call__ is a documented non-world-writable default, not an insecure permission assignment",
+   "file_path": "src/filelock/asyncio.py",
+   "start_line": 77,
+   "end_line": 77,
+   "start_column": null,
+   "end_column": null,
+   "code_snippet": "        mode: int = 0o644,",
+   "reasoning": "This is the `mode` default in `AsyncFileLockMeta.__call__`, which forwards `mode=mode` unchanged into `BaseAsyncFileLock.__init__` (and ultimately to the platform lock implementation's `os.open`). 0o644 is owner-rw / group-other-read only; it is not world-writable and is further constrained by umask. The value is a user-supplied, documented API parameter, not derived from untrusted input. This is a benign default, not CWE-732.",
+   "evidence": {
+    "code_context": "class AsyncFileLockMeta(FileLockMeta):\n    def __call__(  # type: ignore[override]\n        cls,\n        lock_file: str | os.PathLike[str],\n        timeout: float = -1,\n        mode: int = 0o644,\n        thread_local: bool = False,\n        *,\n        blocking: bool = True,\n        is_singleton: bool = False,\n        loop: asyncio.AbstractEventLoop | None = None,\n        run_in_executor: bool = True,\n        executor: futures.Executor | None = None,\n    ) -> BaseAsyncFileLock:\n        ...\n        instance = super().__call__(\n            lock_file=lock_file, timeout=timeout, mode=mode, ...)",
+    "dataflow_analysis": "mode is a keyword argument explicitly forwarded to super().__call__ and then to BaseAsyncFileLock.__init__; no untrusted source flows into it. Not exploitable.",
+    "notes": "Only 0o644 literals exist in src/filelock (grep confirmed); no 0o666/0o777 usages. Lock files are empty marker files with no sensitive contents."
+   },
+   "dataflow_path": null,
+   "group": "low_often_high"
+  },
+  {
+   "codeql_query_uuids": [
+    "20261122124913"
+   ],
+   "finding_id": "e5af6c3b-1936-4029-aacd-865dd9e029fe",
+   "verdict": "fp",
+   "confidence": 88,
+   "severity": "low",
+   "cwe_ids": [
+    "cwe-732"
+   ],
+   "description": "Default file permission literal 0o644 (420) used for the async lock file mode in BaseAsyncFileLock.__init__ — standard, non-world-writable default, not a vulnerability",
+   "file_path": "src/filelock/asyncio.py",
+   "start_line": 110,
+   "end_line": 110,
+   "start_column": null,
+   "end_column": null,
+   "code_snippet": "        mode: int = 0o644,",
+   "reasoning": "This is the `mode` parameter default in `BaseAsyncFileLock.__init__`, mirroring the synchronous `BaseFileLock` default. 0o644 means owner read/write and group/other read-only — it does not grant write access to other users, so it is not an insecure permission (CWE-732 requires world-writable or otherwise over-privileged permissions such as 0o666/0o777). The value is only a default; callers may pass a stricter mode, and the actual file creation is additionally constrained by the process umask. Lock files created by this library contain no sensitive data (the UNIX soft-lock variant truncates the file and the hard-lock variants create an empty file), so even the read bits for group/other do not disclose anything meaningful. This is a heuristic enumeration of mode literals rather than a real vulnerability. Note: lock files created at a default of 0o644 in a shared/world-writable directory (e.g. /tmp) could be pre-created by another user and cause a denial of service or symlink confusion, but that is a separate, pre-existing design consideration and not what this result expresses. Verdict: false positive.",
+   "evidence": {
+    "code_context": "class BaseAsyncFileLock(BaseFileLock, metaclass=AsyncFileLockMeta):\n    def __init__(\n        self,\n        lock_file: str | os.PathLike[str],\n        timeout: float = -1,\n        mode: int = 0o644,\n        thread_local: bool = False,\n        *,\n        blocking: bool = True,\n        is_singleton: bool = False,\n        loop: asyncio.AbstractEventLoop | None = None,\n        run_in_executor: bool = True,\n        executor: futures.Executor | None = None,\n    ) -> None:\n        ...\n        \"\"\":param mode: file permissions for the lockfile\"\"\"",
+    "notes": "grep_search for '= 0o644' showed only 0o644 defaults (src/filelock/_api.py:86,156 and src/filelock/asyncio.py:77,110) plus test files; no 0o666/0o777 or world-writable literals exist in the source tree. The mode is a documented, user-overridable constructor parameter applied via os.open(..., mode) and os.fchmod(). No insecure permission is granted."
+   },
+   "dataflow_path": null,
+   "group": "low_often_high"
+  },
+  {
+   "codeql_query_uuids": [
+    "20261122124717"
+   ],
+   "finding_id": "f023da10-04c3-498f-af0a-ddc520cad784",
+   "verdict": "fp",
+   "confidence": 95,
+   "severity": "low",
+   "cwe_ids": [],
+   "description": "Audit-only flag: legitimate fcntl.flock(LOCK_EX|LOCK_NB) acquire call in UnixFileLock._acquire",
+   "file_path": "src/filelock/_unix.py",
+   "start_line": 48,
+   "end_line": 48,
+   "start_column": null,
+   "end_column": null,
+   "code_snippet": "                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)",
+   "reasoning": "This is the core functionality of the `filelock` library: acquiring an exclusive non-blocking advisory lock on a file descriptor it already opened. The query rule is `filelock/fcntl-flock-audit`, an informational audit rule that fires on any use of locking syscalls, not a security detection. The fd comes from `os.open(self.lock_file, open_flags, self._context.mode)` where lock_file is library-controlled configuration (not untrusted input), flags contain no shell/exec/path-traversal sink, and the lock mode is constant LOCK_EX|LOCK_NB. Error handling correctly closes the fd on failure and raises NotImplementedError for ENOSYS rather than silently continuing in an unlocked state. There is no injection, privilege escalation, TOCTOU-to-privilege, or cryptographic weakness indicated. Correct, intentional syscall usage.",
+   "evidence": {
+    "code_context": "fd = os.open(self.lock_file, open_flags, self._context.mode)\nwith suppress(PermissionError):\n    os.fchmod(fd, self._context.mode)\ntry:\n    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)\nexcept OSError as exception:\n    os.close(fd)\n    if exception.errno == ENOSYS:\n        msg = \"FileSystem does not appear to support flock; use SoftFileLock instead\"\n        raise NotImplementedError(msg) from exception\nelse:\n    self._context.lock_file_fd = fd",
+    "dataflow_analysis": "No dataflow from any external/untrusted source. `self.lock_file` is caller-supplied lock path configuration (the library's documented purpose); the constant LOCK_EX|LOCK_NB modes are fixed. No tainted value reaches the flock call.",
+    "notes": "Rule id 'filelock/fcntl-flock-audit' with message 'File locking syscall usage.' is an informational audit rule. Proper error handling ensures fail-closed behaviour."
+   },
+   "dataflow_path": null,
+   "group": "low_undetermined_undetermined"
+  },
+  {
+   "codeql_query_uuids": [
+    "20261122124717"
+   ],
+   "finding_id": "aecf8458-df3d-4830-84df-6b136752611c",
+   "verdict": "fp",
+   "confidence": 95,
+   "severity": "low",
+   "cwe_ids": [],
+   "description": "Audit-only flag: legitimate fcntl.flock(LOCK_UN) release call in UnixFileLock._release",
+   "file_path": "src/filelock/_unix.py",
+   "start_line": 63,
+   "end_line": 64,
+   "start_column": null,
+   "end_column": null,
+   "code_snippet": "            fcntl.flock(fd, fcntl.LOCK_UN)\n            os.close(fd)",
+   "reasoning": "Symmetrical counterpart to the acquire path: releasing an advisory lock with a constant LOCK_UN flag on the fd stored in the lock context, then closing the fd. There is no attacker-controlled input, no dangerous flag combination, and no path to memory corruption or privilege escalation. The commented rationale (do not unlink the lock file, referencing py-filelock#31 and the known flock-unlink race) shows the maintainers deliberately avoid the classic unlink race. This is exactly the intended, safe implementation of release semantics.",
+   "evidence": {
+    "code_context": "fd = cast(\"int\", self._context.lock_file_fd)\nself._context.lock_file_fd = None\nfcntl.flock(fd, fcntl.LOCK_UN)\nos.close(fd)",
+    "dataflow_analysis": "fd originates from the internal lock context set during _acquire; mode is the constant fcntl.LOCK_UN. No untrusted input.",
+    "notes": "Deliberately does not unlink the lock file, avoiding the documented flock-unlink race condition (tox-dev/py-filelock#31)."
+   },
+   "dataflow_path": null,
+   "group": "low_undetermined_undetermined"
+  },
+  {
+   "codeql_query_uuids": [
+    "20261122124717"
+   ],
+   "finding_id": "e7026199-85d1-4d4f-bd1f-b5443d6fdd6a",
+   "verdict": "fp",
+   "confidence": 95,
+   "severity": "low",
+   "cwe_ids": [],
+   "description": "Audit-only flag: legitimate msvcrt.locking(LK_NBLCK, 1) acquire call in WindowsFileLock._acquire",
+   "file_path": "src/filelock/_windows.py",
+   "start_line": 34,
+   "end_line": 34,
+   "start_column": null,
+   "end_column": null,
+   "code_snippet": "                    msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)",
+   "reasoning": "Standard Windows advisory locking: a 1-byte non-blocking lock (LK_NBLCK) on a descriptor opened with O_RDWR|O_CREAT|O_TRUNC. The byte count is a fixed constant (1) and the mode is a constant; no attacker-controlled data influences the syscall. Error handling closes the fd and distinguishes EACCES (already locked / no access — expected, non-fatal) from other errors, which are re-raised. This matches the documented Windows behaviour of the library and shows no injection or resource-leak path.",
+   "evidence": {
+    "code_context": "try:\n    fd = os.open(self.lock_file, flags, self._context.mode)\nexcept OSError as exception:\n    if exception.errno != EACCES:\n        raise\nelse:\n    try:\n        msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)\n    except OSError as exception:\n        os.close(fd)\n        if exception.errno != EACCES:\n            raise\n    else:\n        self._context.lock_file_fd = fd",
+    "dataflow_analysis": "Constants only: msvcrt.LK_NBLCK and byte count 1. fd from os.open on a configured lock path. No untrusted data reaches the syscall.",
+    "notes": "Failure path closes the descriptor before returning, so no fd leak; EACCES is treated as the expected 'already locked' condition."
+   },
+   "dataflow_path": null,
+   "group": "low_undetermined_undetermined"
+  },
+  {
+   "codeql_query_uuids": [
+    "20261122124717"
+   ],
+   "finding_id": "ed0d66de-f1fe-4dcf-908e-43bdf7968f21",
+   "verdict": "fp",
+   "confidence": 95,
+   "severity": "low",
+   "cwe_ids": [],
+   "description": "Audit-only flag: legitimate msvcrt.locking(LK_UNLCK, 1) release call in WindowsFileLock._release",
+   "file_path": "src/filelock/_windows.py",
+   "start_line": 45,
+   "end_line": 49,
+   "start_column": null,
+   "end_column": null,
+   "code_snippet": "            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)\n            os.close(fd)\n\n            with suppress(OSError):\n                Path(self.lock_file).unlink()",
+   "reasoning": "Windows release path using the constant LK_UNLCK mode and fixed 1-byte range on the fd stored in the lock context. The subsequent unlink is wrapped in suppress(OSError) with a comment acknowledging another instance may hold the lock, which is the correct defensive pattern on Windows (where unlinking a locked file fails). No unvalidated input, no dangerous capability, and no exploitable behaviour — this is the library's intended lock-release implementation flagged only because the rule is an audit heuristic over locking syscalls (rule id filelock/fcntl-flock-audit, message \"File locking syscall usage.\").",
+   "evidence": {
+    "code_context": "def _release(self) -> None:\n    fd = cast(\"int\", self._context.lock_file_fd)\n    self._context.lock_file_fd = None\n    msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)\n    os.close(fd)\n\n    with suppress(OSError):\n        Path(self.lock_file).unlink()",
+    "dataflow_analysis": "Constants only (LK_UNLCK, 1). fd from internal lock context. The unlink target is the library's own configured lock file, not attacker-influenced path concatenation.",
+    "notes": "suppress(OSError) around unlink is intentional to tolerate races with other lock holders; no unsafe deserialization, path traversal or command execution involved."
+   },
+   "dataflow_path": null,
+   "group": "low_undetermined_undetermined"
+  }
+ ],
+ "cache_usage": {
+  "prompt_tokens_total": 224250,
+  "uncached_input_tokens": 29178,
+  "cache_creation_input_tokens": 0,
+  "cache_read_input_tokens": 195072,
+  "output_tokens": 35060,
+  "calls": 27,
+  "caching_enabled": false,
+  "cost_usd_with_cache": 0.025998,
+  "cost_usd_no_cache": 0.054673,
+  "cache_read_share_of_prompt": 0.8699,
+  "prices_per_mtok": {
+   "claude-sonnet-4-5-20250929": {
+    "input": 3.0,
+    "output": 15.0
+   },
+   "claude-haiku-4-5-20251001": {
+    "input": 1.0,
+    "output": 5.0
+   },
+   "deepseek/deepseek-reasoner": {
+    "input": 0.15,
+    "output": 0.6,
+    "cache_read": 0.003,
+    "cache_write_mult": 1.0,
+    "peak_mult": 2.0
+   },
+   "gpt-5.1": {
+    "input": 1.25,
+    "output": 10.0,
+    "cache_read": 0.125,
+    "cache_write_mult": 1.0
+   },
+   "gpt-4.1": {
+    "input": 2.0,
+    "output": 8.0,
+    "cache_read": 0.5,
+    "cache_write_mult": 1.0
+   },
+   "deepseek/deepseek-v4-pro": {
+    "input": 0.66,
+    "output": 1.98,
+    "cache_read": 0.022,
+    "cache_write_mult": 1.0,
+    "peak_mult": 2.0
+   },
+   "deepseek/deepseek-flash": {
+    "input": 0.15,
+    "output": 0.6,
+    "cache_read": 0.003,
+    "cache_write_mult": 1.0,
+    "peak_mult": 2.0
+   },
+   "gemini/gemini-4-carbon": {
+    "input": 2.0,
+    "output": 10.0,
+    "cache_read": 0.1,
+    "cache_write_mult": 1.0
+   },
+   "gemini/gemini-3.8-flash": {
+    "input": 0.75,
+    "output": 3.75,
+    "cache_read": 0.075,
+    "cache_write_mult": 1.0
+   },
+   "openai/gpt-6.2-sol": {
+    "input": 2.0,
+    "output": 10.0,
+    "cache_read": 0.1,
+    "cache_write_mult": 1.0,
+    "long_threshold": 272000,
+    "long": {
+     "input": 4.0,
+     "output": 15.0,
+     "cache_read": 0.2
+    }
+   },
+   "openai/gpt-6-luna": {
+    "input": 0.1,
+    "output": 0.5,
+    "cache_read": 0.01,
+    "cache_write_mult": 1.0,
+    "long_threshold": 272000,
+    "long": {
+     "input": 0.2,
+     "output": 0.75,
+     "cache_read": 0.02
+    }
+   },
+   "claude-sonnet-5-5": {
+    "input": 2.0,
+    "output": 10.0,
+    "cache_read": 0.1
+   },
+   "claude-haiku-5-5": {
+    "input": 0.1,
+    "output": 0.5,
+    "cache_read": 0.01,
+    "long_threshold": 100000,
+    "long": {
+     "input": 0.5,
+     "output": 2.5,
+     "cache_read": 0.05
+    }
+   }
+  },
+  "cache_multipliers": {
+   "write_5m": 1.25,
+   "read": 0.1
+  }
+ }
+}

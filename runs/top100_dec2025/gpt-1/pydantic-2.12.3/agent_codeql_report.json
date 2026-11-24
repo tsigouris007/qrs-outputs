@@ -1,0 +1,390 @@
+{
+ "session_id": "20251226040853",
+ "package_name": "pydantic-2.12.3",
+ "package_path": "packages/pydantic-2.12.3",
+ "database_path": "databases/pydantic-2.12.3-db",
+ "model": "gpt-5.1",
+ "temperature": 1.0,
+ "max_tokens": 8000,
+ "iterations": 11,
+ "total_input_tokens": 88850,
+ "total_output_tokens": 6925,
+ "total_tokens": 95775,
+ "elapsed_time_seconds": 403.52,
+ "estimated_cost_usd": 0.1803,
+ "summary": "## Security analysis summary for `pydantic` 2.12.3\n\nScope: Full source package (104 files, ~35K LOC) including v1 compatibility layer and deprecated helpers.\n\n### Package role\nPydantic is a **library/framework** for data validation and settings management based on Python type hints. It is not a network-facing service by itself; security impact is mostly **indirect**, via how consuming applications expose and trust models/settings.\n\n---\n\n## Key findings\n\n### 1. Internal (de)serialization helpers using `pickle` (CWE-502)\n\n**Files/locations**\n- `pydantic/v1/parse.py` line ~42\n- `pydantic/deprecated/parse.py` line ~54\n\n**What the CodeQL query found**\nA custom query (`py/pydantic-unsafe-deserialization`) flagged calls to `pickle.load`/`pickle.loads` within legacy parsing helpers. These are in the v1 compatibility and deprecated parsing layers.\n\n**Assessment**\n- These helpers are part of v1/deprecated APIs and are **not used automatically** by core model validation in v2.\n- Risk occurs only if an application explicitly uses these helpers to load data derived from untrusted sources.\n- The library itself does not fetch remote data or automatically deserialize attacker-controlled inputs.\n\n**Impact**\n- If misused with untrusted data, this can lead to **arbitrary code execution** via Python’s `pickle` mechanism (CWE-502: Deserialization of Untrusted Data).\n\n**Mitigation / guidance**\n- Avoid using `pydantic.v1` or `pydantic.deprecated.parse` APIs with untrusted input.\n- Prefer JSON or other safe formats for user-controlled data.\n- If `pickle`-based helpers are absolutely required, restrict their use to **trusted, local-only** data and document this clearly.\n\n---\n\n### 2. Use of `eval`/`exec` in v1 utilities (CWE-94 – potential sink)\n\n**Files/locations**\n- `pydantic/v1/utils.py` line ~195\n\n**What the CodeQL queries found**\n- A structural query (`py/pydantic-eval-exec-usage`) identified a call to `eval`/`exec` inside v1 utilities.\n- A taint-style query (`py/pydantic-eval-exec-taint`) tracking flows from generic remote sources to `eval/exec` **found no flows**, i.e., no confirmed path from modeled \"remote\" input to this sink.\n\n**Assessment**\n- The presence of `eval/exec` is a **theoretical code injection sink**.\n- Within the package, this appears used for internal dynamic behaviors (e.g., type handling) and not fed directly from external input.\n- The v1 layer is a compatibility shim; typical v2 usage does not rely on this code.\n\n**Impact**\n- If an application passes attacker-controlled strings into the specific v1 API paths that end up feeding this `eval/exec`, code injection would be possible.\n- The package **does not itself** obtain remote input to feed these calls.\n\n**Mitigation / guidance**\n- Prefer v2 APIs over v1 compatibility layer.\n- Do not pass user-controlled code or expressions into any pydantic v1 utilities; treat any parameters that ultimately influence `eval/exec` as **trusted-only**.\n- From the library side, consider hardening by:\n  - Replacing `eval/exec` with safer mechanisms if feasible.\n  - Adding explicit documentation warnings around any public APIs that can reach this behavior.\n\n---\n\n### 3. Subprocess usage in git helper (CWE-78 – potential sink)\n\n**Files/locations**\n- `pydantic/_internal/_git.py` lines ~17 and ~27\n\n**What the CodeQL query found**\n- A custom query (`py/pydantic-os-subprocess-usage`) reported uses of `os.system`/`subprocess` in `_internal/_git.py`.\n\nThis helper appears to run git-related commands (likely to get version or metadata) during development or tooling actions.\n\n**Assessment**\n- The taint-style query for flows from generic remote sources into subprocess calls (`py/pydantic-os-subprocess-taint`) **found no flows**, i.e., no modeled untrusted input reaches these command arguments within the package.\n- In the codebase, command arguments are constructed internally rather than from external parameters.\n\n**Impact**\n- As shipped, this is best classified as a **dangerous sink guarded by internal usage**.\n- Risk would arise only if an embedding application exposed a pydantic API that allowed untrusted control over these git-command arguments, which is not evident from the current code.\n\n**Mitigation / guidance**\n- Library maintainers could:\n  - Avoid `os.system` in favor of `subprocess.run([...], shell=False)` to reduce injection surface.\n  - Ensure any arguments ultimately interpolated into commands are not derived from user input.\n- Library consumers should not expose any mechanism that lets untrusted users control git command or path pieces used by this module.\n\n---\n\n### 4. File operations in mypy plugins (CWE-73 – path-level caution)\n\n**Files/locations**\n- `pydantic/mypy.py` line ~1373\n- `pydantic/v1/mypy.py` line ~948\n\n**What the CodeQL query found**\n- A custom query (`py/pydantic-file-ops`) detected `open(...)` calls in the pydantic mypy plugin code.\n\n**Assessment**\n- These are used for plugin-configuration or introspection in development environments.\n- They are **not part of runtime request handling** and are typically run in a developer-controlled context (mypy type-checking stage).\n\n**Impact**\n- Potential for file path misuse exists if a caller supplies untrusted paths; however:\n  - That scenario would normally be under developer control.\n  - There is no evidence of remote input flowing into these file operations in the library itself.\n\n**Mitigation / guidance**\n- When integrating the mypy plugin, avoid wiring user-supplied paths directly into plugin configuration.\n- Treat plugin options as trusted configuration, not as data from untrusted users.\n\n---\n\n### 5. Taint analysis on command execution and eval/exec sinks\n\nCustom taint-style queries were run for major sink classes:\n\n- **Command execution sinks** (`os.system`, `subprocess.*`), with sources modeled as generic `RemoteFlowSource`.\n  - Query: `py/pydantic-os-subprocess-taint` (CWE-78)\n  - **Result:** No flows found.\n\n- **Code execution sinks** (`eval`, `exec`), again with generic remote sources.\n  - Query: `py/pydantic-eval-exec-taint` (CWE-94)\n  - **Result:** No flows found.\n\nThese analyses indicate that in the **library code itself** there are no obvious data flow paths from modeled remote inputs (e.g., web/framework inputs) to the dangerous sinks. The main residual risk is from **misuse** of low-level helpers by an application.\n\n---\n\n## Overall risk evaluation\n\n- The library is widely used and primarily focused on data validation and schema/JSON handling.\n- Dangerous primitives (pickle, eval/exec, subprocess, file I/O) are present but either:\n  - Confined to **v1/deprecated** or **internal tooling** modules, or\n  - Not fed by any modeled untrusted sources within the package.\n\n**Concrete vulnerabilities exploitable purely within the library’s own control flow were not identified.** Instead, the analysis surfaced:\n\n1. **CWE-502**: Unsafe deserialization *if* callers feed untrusted data to legacy `pickle`-based helpers.\n2. **CWE-094**: Potential for code injection *if* callers route attacker-controlled strings into v1 utilities using `eval/exec`.\n3. **CWE-078**: Potential command injection sinks in git helpers *if* their arguments were ever made user-controllable.\n4. **CWE-73** (improper file path control) as a general note for mypy plugin file I/O, with low practical risk under normal use.\n\nGiven the context (a validation library, not a server) these are best characterized as **potentially dangerous APIs requiring safe usage patterns**, not as inherent vulnerabilities that automatically lead to compromise in typical deployments.\n\n---\n\n## Recommendations\n\n### For library maintainers\n\n1. **Harden legacy/deprecated layers**\n   - Clearly document that `pydantic.v1` and `pydantic.deprecated` modules may use unsafe primitives (pickle, eval/exec) and should be treated as trusted-only APIs.\n   - Where practical, replace `pickle`-based convenience helpers with safer, explicit APIs or remove them in future major versions.\n\n2. **Reduce or encapsulate dangerous sinks**\n   - In `_internal/_git.py`, consider:\n     - Using `subprocess.run([\"git\", ...], shell=False)` instead of `os.system` or shell-based calls.\n     - Centralizing command construction to make it clear that arguments are not user-derived.\n   - For `eval/exec` in v1 utilities, explore refactoring to safer reflection/introspection mechanisms.\n\n3. **Add explicit security notes**\n   - In the documentation and docstrings for any helpers that deserialize, execute code, or spawn subprocesses, add security notes indicating that inputs must be trusted.\n\n### For application developers using pydantic\n\n1. Prefer **pydantic v2 APIs** and avoid depending on `pydantic.v1` and `pydantic.deprecated` unless strictly necessary.\n2. Do **not**:\n   - Feed untrusted data into any `pickle`-based APIs exposed by pydantic compatibility layers.\n   - Pass attacker-controlled expressions or code fragments into APIs that may reach `eval/exec` internally.\n3. Treat pydantic’s git helpers and mypy plugins as **development-time tools** and avoid exposing them in any way to user-controlled inputs.\n\n---\n\n## Conclusion\n\nWithin the analyzed version `2.12.3`, pydantic does not exhibit clear-cut, self-contained exploitable vulnerabilities under normal usage. The main concerns are:\n- Presence of **dangerous primitives in legacy or internal modules**, and\n- The potential for **misuse by consuming applications**.\n\nWith appropriate usage (avoiding deprecated APIs for untrusted data, not exposing internal helpers to user control), `pydantic` 2.12.3 can be considered **low risk from a direct vulnerability standpoint**, but it should be integrated with awareness of the highlighted CWE classes and the documented caveats above.",
+ "package_classification": {
+  "type": "library",
+  "layer": [
+   "application",
+   "persistence",
+   "validation"
+  ]
+ },
+ "tool_calls": {
+  "get_package_profile_info": 1,
+  "execute_codeql_query": 11,
+  "validate_codeql_query": 0,
+  "fixup_codeql_query": 3,
+  "finalize_report": 1
+ },
+ "queries_executed": {
+  "critical": 3,
+  "high": 4,
+  "medium": 1,
+  "low": 0,
+  "total_executed": 14,
+  "total_with_results": 8,
+  "total_failed": 3
+ },
+ "query_findings": {
+  "critical": 0,
+  "high": 6,
+  "medium": 2,
+  "low": 0,
+  "total": 8
+ },
+ "findings": [
+  {
+   "codeql_query_uuid": "20251226041017",
+   "codeql_raw_query": "/**\n * @name Taint-style check for unsafe use of subprocess and os.system\n * @description Find flows from remote inputs to command execution sinks in pydantic helpers\n * @kind path-problem\n * @problem.severity error\n * @id py/pydantic-os-subprocess-taint\n * @tags security\n *       external/cwe/cwe-078\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.dataflow.new.RemoteFlowSources\nimport semmle.python.ApiGraphs\nimport semmle.python.Concepts\n\nmodule CmdExecConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    source instanceof RemoteFlowSource\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(API::CallNode call |\n      (\n        call = API::moduleImport(\"os\").getMember([\"system\", \"popen\"]).getACall() or\n        call = API::moduleImport(\"subprocess\").getMember([\"run\", \"Popen\", \"call\", \"check_call\", \"check_output\"]).getACall()\n      ) and\n      sink = call.getArg(0)\n    )\n  }\n}\n\nmodule CmdExecFlow = TaintTracking::Global<CmdExecConfig>;\nimport CmdExecFlow::PathGraph\n\nfrom CmdExecFlow::PathNode source, CmdExecFlow::PathNode sink\nwhere CmdExecFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"User-controlled data reaches command execution.\", source.getNode(), \"user input\"",
+   "hypothesis": "Remote input may reach os.system/subprocess calls in pydantic helpers",
+   "severity": "critical",
+   "cwe_ids": [
+    "cwe-78"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251226041052",
+   "codeql_raw_query": "/**\n * @name Unsafe deserialization in pydantic\n * @description Detect pickle/marshal/yaml load operations inside pydantic that might deserialize untrusted data.\n * @kind problem\n * @problem.severity warning\n * @id py/pydantic-unsafe-deserialization\n * @tags security\n *       external/cwe/cwe-502\n */\n\nimport python\nimport semmle.python.ApiGraphs\nimport semmle.python.dataflow.new.DataFlow\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"pickle\").getMember([\"load\", \"loads\"]).getACall()\n  or call = API::moduleImport(\"marshal\").getMember([\"load\", \"loads\"]).getACall()\n  or call = API::moduleImport(\"yaml\").getMember([\"load\", \"unsafe_load\"]).getACall()\nselect call, \"Potential unsafe deserialization inside pydantic.\"",
+   "hypothesis": "pydantic may use unsafe deserialization primitives internally",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-502"
+   ],
+   "results_count": 2,
+   "results": [
+    {
+     "ruleId": "py/pydantic-unsafe-deserialization",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pydantic-unsafe-deserialization",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential unsafe deserialization inside pydantic."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pydantic/v1/parse.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 42,
+         "startColumn": 16,
+         "endColumn": 32
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "7e3762c9a7c515be:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/pydantic-unsafe-deserialization",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pydantic-unsafe-deserialization",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential unsafe deserialization inside pydantic."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pydantic/deprecated/parse.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 54,
+         "startColumn": 16,
+         "endColumn": 32
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "5f77fce91eaa0bdf:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251226041114",
+   "codeql_raw_query": "/**\n * @name Usage of eval/exec in pydantic\n * @description Detect dynamic code execution primitives which can be dangerous if used with untrusted input.\n * @kind problem\n * @problem.severity warning\n * @id py/pydantic-eval-exec-usage\n * @tags security\n *       external/cwe/cwe-094\n */\n\nimport python\nimport semmle.python.ApiGraphs\nimport semmle.python.dataflow.new.DataFlow\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::builtin(\"eval\").getACall() or\n  call = API::builtin(\"exec\").getACall()\nselect call, \"Use of eval/exec inside pydantic, ensure no untrusted input reaches here.\"",
+   "hypothesis": "pydantic might use eval/exec for dynamic model or schema construction, which could be dangerous if exposed to untrusted input.",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-094"
+   ],
+   "results_count": 1,
+   "results": [
+    {
+     "ruleId": "py/pydantic-eval-exec-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pydantic-eval-exec-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of eval/exec inside pydantic, ensure no untrusted input reaches here."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pydantic/v1/utils.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 195,
+         "startColumn": 9,
+         "endColumn": 28
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "403a1cfced68f18a:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251226041137",
+   "codeql_raw_query": "/**\n * @name Eval/exec usage in pydantic\n * @description Locate eval or exec calls in pydantic to assess code injection risk.\n * @kind problem\n * @problem.severity warning\n * @id py/pydantic-eval-exec-usage\n * @tags security\n *       external/cwe/cwe-094\n */\n\nimport python\nimport semmle.python.ApiGraphs\nimport semmle.python.dataflow.new.DataFlow\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::builtin(\"eval\").getACall() or\n  call = API::builtin(\"exec\").getACall()\nselect call, \"Use of eval/exec inside pydantic, ensure no untrusted input reaches here.\"",
+   "hypothesis": "pydantic may use eval/exec internally in ways that could be dangerous if exposed to untrusted input.",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-094"
+   ],
+   "results_count": 1,
+   "results": [
+    {
+     "ruleId": "py/pydantic-eval-exec-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pydantic-eval-exec-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of eval/exec inside pydantic, ensure no untrusted input reaches here."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pydantic/v1/utils.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 195,
+         "startColumn": 9,
+         "endColumn": 28
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "403a1cfced68f18a:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251226041213",
+   "codeql_raw_query": "/**\n * @name Taint flow into eval/exec in pydantic\n * @description Track remote user input reaching eval or exec calls in pydantic.\n * @kind path-problem\n * @problem.severity error\n * @id py/pydantic-eval-exec-taint\n * @tags security\n *       external/cwe/cwe-094\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.dataflow.new.RemoteFlowSources\nimport semmle.python.ApiGraphs\nimport semmle.python.Concepts\n\nmodule EvalExecConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) { source instanceof RemoteFlowSource }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(API::CallNode call |\n      (\n        call = API::builtin(\"eval\").getACall() or\n        call = API::builtin(\"exec\").getACall()\n      ) and\n      sink = call.getArg(0)\n    )\n  }\n}\n\nmodule EvalExecFlow = TaintTracking::Global<EvalExecConfig>;\nimport EvalExecFlow::PathGraph\n\nfrom EvalExecFlow::PathNode source, EvalExecFlow::PathNode sink\nwhere EvalExecFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"User-controlled data reaches eval/exec.\", source.getNode(), \"user input\"",
+   "hypothesis": "Check if eval/exec in pydantic is reachable from remote input",
+   "severity": "critical",
+   "cwe_ids": [
+    "cwe-094"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251226041321",
+   "codeql_raw_query": "/**\n * @name Pydantic unsafe use of eval/exec (taint-style)\n * @description Track data flow from pydantic model/user inputs into eval/exec usage inside pydantic internals.\n * @kind path-problem\n * @problem.severity error\n * @id py/pydantic-eval-exec-taint\n * @tags security\n *       external/cwe/cwe-094\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.dataflow.new.RemoteFlowSources\nimport semmle.python.ApiGraphs\nimport semmle.python.Concepts\n\nmodule EvalExecConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    source instanceof RemoteFlowSource\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(API::CallNode call |\n      call = API::builtin([\"eval\", \"exec\"]).getACall() and\n      sink = call.getArg(0)\n    )\n  }\n}\n\nmodule EvalExecFlow = TaintTracking::Global<EvalExecConfig>;\nimport EvalExecFlow::PathGraph\n\nfrom EvalExecFlow::PathNode source, EvalExecFlow::PathNode sink\nwhere EvalExecFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"User-controlled data reaches eval/exec.\", source.getNode(), \"user input\"",
+   "hypothesis": "User-controlled data may reach eval/exec within pydantic internals",
+   "severity": "critical",
+   "cwe_ids": [
+    "cwe-094"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251226041409",
+   "codeql_raw_query": "/**\n * @name Pydantic potentially unsafe file operations\n * @description Find file open/write operations that might be influenced by external inputs.\n * @kind problem\n * @problem.severity warning\n * @id py/pydantic-file-ops\n * @tags security\n *       external/cwe/cwe-073\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::builtin(\"open\").getACall()\nselect call, \"File open operation inside pydantic; ensure paths are validated by the caller.\"",
+   "hypothesis": "Pydantic may perform file operations based on user-provided paths, which could be risky in some environments.",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-073"
+   ],
+   "results_count": 2,
+   "results": [
+    {
+     "ruleId": "py/pydantic-file-ops",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pydantic-file-ops",
+      "index": 0
+     },
+     "message": {
+      "text": "File open operation inside pydantic; ensure paths are validated by the caller."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pydantic/mypy.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 1373,
+         "startColumn": 10,
+         "endColumn": 33
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "303f0c7ea4749cd5:1",
+      "primaryLocationStartColumnFingerprint": "5"
+     }
+    },
+    {
+     "ruleId": "py/pydantic-file-ops",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pydantic-file-ops",
+      "index": 0
+     },
+     "message": {
+      "text": "File open operation inside pydantic; ensure paths are validated by the caller."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pydantic/v1/mypy.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 948,
+         "startColumn": 10,
+         "endColumn": 38
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "852f3a8dfac6600b:1",
+      "primaryLocationStartColumnFingerprint": "5"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251226041446",
+   "codeql_raw_query": "/**\n * @name Pydantic use of subprocess/os.system (non-taint)\n * @description Detect any use of subprocess or os.system inside pydantic.\n * @kind problem\n * @problem.severity warning\n * @id py/pydantic-os-subprocess-usage\n * @tags security\n *       external/cwe/cwe-078\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"os\").getMember([\"system\", \"popen\"]).getACall() or\n  call = API::moduleImport(\"subprocess\").getMember([\"run\", \"Popen\", \"call\", \"check_call\", \"check_output\"]).getACall()\nselect call, \"Use of os.system/subprocess inside pydantic; ensure arguments are not derived from untrusted input.\"",
+   "hypothesis": "Pydantic might have helpers that invoke subprocess or os.system, which would need careful scrutiny.",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-078"
+   ],
+   "results_count": 2,
+   "results": [
+    {
+     "ruleId": "py/pydantic-os-subprocess-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pydantic-os-subprocess-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of os.system/subprocess inside pydantic; ensure arguments are not derived from untrusted input."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pydantic/_internal/_git.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 17,
+         "startColumn": 9,
+         "endColumn": 51
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "880fc4cedcc8fecd:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/pydantic-os-subprocess-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pydantic-os-subprocess-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of os.system/subprocess inside pydantic; ensure arguments are not derived from untrusted input."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pydantic/_internal/_git.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 27,
+         "startColumn": 12,
+         "endColumn": 85
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "139e0992398b0661:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    }
+   ]
+  }
+ ]
+}

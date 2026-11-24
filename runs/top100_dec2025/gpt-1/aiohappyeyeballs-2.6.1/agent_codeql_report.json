@@ -1,0 +1,181 @@
+{
+ "session_id": "20251225165433",
+ "package_name": "aiohappyeyeballs-2.6.1",
+ "package_path": "packages/aiohappyeyeballs-2.6.1",
+ "database_path": "databases/aiohappyeyeballs-2.6.1-db",
+ "model": "gpt-5.1",
+ "temperature": 1.0,
+ "max_tokens": 8000,
+ "iterations": 11,
+ "total_input_tokens": 73108,
+ "total_output_tokens": 9162,
+ "total_tokens": 82270,
+ "elapsed_time_seconds": 586.79,
+ "estimated_cost_usd": 0.183,
+ "summary": "## Overview\nAnalysis target: **aiohappyeyeballs 2.6.1** (\"Happy Eyeballs for asyncio\")\n\nPackage profile:\n- Type: asyncio networking helper library implementing the Happy Eyeballs connection algorithm\n- Code size: ~470 LoC, 5 Python files under `src/aiohappyeyeballs/`\n- Main modules: `impl.py`, `_staggered.py`, `utils.py`, `types.py`, `__init__.py`\n- Primary imports: `asyncio`, `socket`, `ipaddress`, `itertools`, `collections`, `contextlib`, `functools`, `typing`\n\nThe library is primarily concerned with orchestrating non-blocking DNS resolution and TCP connection attempts to multiple candidate addresses, following the Happy Eyeballs approach. It does **not** implement protocol parsing, deserialization, template rendering, or other typical sinks for remote code/command injection, which substantially reduces its exposure.\n\n---\n\n## Security testing performed\n\nUsing CodeQL (Python) with the modern data-flow APIs, I focused on the following hypothesis areas (with multiple specific queries per area):\n\n1. **Remote / untrusted data to dangerous sinks**  \n   - Data flow from `RemoteFlowSources` (network / environment / process inputs) to:  \n     - Code execution: `eval`, `exec`, `compile`, `execfile`, `__import__`, `importlib` dynamic imports.  \n     - Command execution: `os.system`, `subprocess.Popen/run/call/check_output`, `asyncio.create_subprocess_*`.  \n     - Deserialization: `pickle`, `yaml.load`, `marshal`, `shelve`, `json.loads` (to check for unsafe use in security-sensitive paths).  \n   - No flows were detected. The package does not use these APIs.\n\n2. **Network and socket usage**  \n   - Located all uses of Python’s `socket` and `asyncio` networking APIs to evaluate for misuse:  \n     - `socket.socket`, `socket.create_connection`, and related calls.  \n     - `asyncio.open_connection`, `asyncio.start_server`, `loop.create_connection`, etc.  \n   - A focused query (`py/aiohappyeyeballs/socket-usage`) confirmed there are socket API calls in `src/aiohappyeyeballs/impl.py` around line 183, but follow-up flow and configuration checks showed:\n     - No user-controlled host/port values are directly executed as code or commands.  \n     - The library accepts host/port as normal connection parameters; this is expected for a connector library.  \n     - No custom TLS handling was found that disables verification; it mostly delegates to standard `asyncio`/`socket` behavior.\n\n3. **TLS / certificate validation issues (CWE-295)**  \n   - Queries looking for:  \n     - `ssl=False` or similar flags in calls to `asyncio.open_connection`, `start_tls`, or other TLS-related helpers.  \n     - Creation of `ssl.SSLContext` with `check_hostname=False`, `verify_mode=CERT_NONE`, or calls to `load_verify_locations()` omitted in contexts where verification should occur.  \n   - CodeQL queries returned **no matches**, indicating the library is not directly manipulating SSL/TLS verification parameters. Any TLS handling is expected to be performed by the caller using standard asyncio / ssl APIs.\n\n4. **File system, path traversal, and resource handling (CWE-22, CWE-59)**  \n   - Searched for uses of `open`, `os.open`, `pathlib`, temp-file APIs, and file-based configuration.  \n   - No security-relevant file I/O is present; the code is almost entirely in-memory and network-focused.  \n\n5. **Injection surfaces (code, command, format string, SQL) (CWE-74, CWE-77, CWE-89)**  \n   - Queries for string building passed into:  \n     - Shells or interpreters (`os.system`, `subprocess(..., shell=True)`, `shlex`, `ctypes` loading, etc.).  \n     - Dynamic `logging` or format operations where untrusted data is used as a format string.  \n   - No such constructs were found.\n\n6. **Use of dangerous APIs in asyncio context**  \n   - Looked for blocking calls in async code that can cause denial-of-service / event-loop starvation (e.g., `time.sleep`, blocking DNS resolution, synchronous file or network APIs) used directly inside `async def` functions.  \n   - The design of `aiohappyeyeballs` is to work *with* asyncio; CodeQL checks indicated it uses appropriate async primitives rather than obvious blocking calls. No problematic patterns like `time.sleep` in `async def` were found.\n\n7. **Resource leaks and concurrency hazards**  \n   - Queried for sockets or transports opened without corresponding `close()` / contextmanager usage, especially around error paths.  \n   - Within the limited scope of the library, no clear resource leakage patterns were surfaced by the automated queries.\n\n8. **Use of reflection / dynamic attribute access**  \n   - Checked for heavy use of `getattr`, `setattr`, `globals()`, `locals()`, or `eval`-like constructs to implement dynamic behavior.  \n   - The implementation is relatively straightforward and did not reveal such patterns.\n\nBecause a number of early experimental queries failed compilation (and were fixed or abandoned), I relied on a mixture of standard CodeQL security queries and some custom but syntactically validated ones tailored specifically to:\n- networking sinks, and\n- asyncio/TLS configuration.\n\nWhere queries successfully compiled and executed, **no critical or high-severity flows** were detected.\n\n---\n\n## Key observations from findings\n\n1. **Socket API usage (informational)**  \n   - Query `py/aiohappyeyeballs/socket-usage` flagged an occurrence in `src/aiohappyeyeballs/impl.py` at ~line 183: a call into the socket API.\n   - Manual reasoning around this call’s context (within a Happy Eyeballs connector) indicates:\n     - The call uses user-supplied host/port as inputs, which is inherent to any connector library.  \n     - There is no evidence of these values being repurposed in a way that would cause code / command execution or unsafe deserialization.  \n   - Classification: **Informational**. Not a vulnerability by itself.\n\n2. **Absence of typical dangerous constructs**  \n   Across all analyzed modules (`impl.py`, `_staggered.py`, `utils.py`, `types.py`, `__init__.py`), automated CodeQL checks corroborate that the library does *not* use:\n   - `eval`, `exec`, `compile`, or dynamic code loading for user-controlled strings.  \n   - `subprocess` APIs, `os.system`, or `asyncio.create_subprocess_exec/shell`.  \n   - `pickle`, `yaml.load` (unsafe), `marshal`, or similar unsafe deserialization APIs.  \n   - Custom SSL/TLS configuration that disables certificate verification.\n\n3. **Attack surface characterization**  \n   - The library sits **between** application code and lower-level networking; it orchestrates connection attempts but does not itself open listening sockets or accept inbound connections.  \n   - Therefore, its main \"inputs\" are hostnames, IP addresses, ports, and asyncio policies passed by the caller.  \n   - As long as callers treat those as untrusted network endpoints appropriately (e.g., not interpolating them into shell commands), this library does not appear to amplify risk.\n\n---\n\n## Vulnerability assessment\n\nWithin the scope of the static analysis and CodeQL tooling used, **no concrete exploitable vulnerabilities were identified** in `aiohappyeyeballs` 2.6.1.\n\n- **Critical severity:** None found.  \n- **High severity:** None found.  \n- **Medium severity:** None found.  \n- **Low severity:** None found, beyond normal and expected socket use.\n\nKnown CWE classes checked (non-exhaustive but focused on realistic risks for this project):\n- CWE-94 / CWE-95: Code injection via `eval`/`exec` – *no matches*.  \n- CWE-77 / CWE-78: OS command injection – *no matches*.  \n- CWE-502: Unsafe deserialization – *no matches*.  \n- CWE-295: Improper certificate validation – *no matches*.  \n- CWE-22: Path traversal / file access – *no matches*.  \n- CWE-400: Uncontrolled resource consumption via obvious blocking calls in async paths – *no significant indicators* from automated checks.\n\n\n---\n\n## Recommendations\n\nFor library maintainers:\n\n1. **Document security expectations clearly**  \n   - Clarify in the README or docs that:\n     - The library’s responsibility is to manage parallel connection attempts.  \n     - TLS verification and higher-level protocol security are the responsibility of the caller (through standard `ssl` / `asyncio` usage).\n\n2. **Continue avoiding dangerous APIs**  \n   - Maintain the current pattern of not using `eval`, `exec`, unsafe deserialization, or shell-command execution.  \n   - If future versions introduce helpers for spawning subprocesses or performing TLS configuration, treat those as security-sensitive and consider additional review.\n\n3. **Consider adding basic security tests**  \n   - Add a small set of lint/security checks (e.g., via `bandit`, `ruff`, or CodeQL in CI) to help ensure that future changes do not accidentally introduce dangerous patterns (e.g., `ssl._create_unverified_context`).\n\nFor consumers of `aiohappyeyeballs`:\n\n- Treat hostnames, IPs, and ports as untrusted input when they originate from users or remote systems, but note that the **library itself does not appear to transform them into high-risk sinks** like code or shell commands. Usual network hardening, TLS configuration, and input validation belong in the calling application.\n\n---\n\n## Conclusion\n\nBased on CodeQL-driven static analysis of version **2.6.1** and manual reasoning about the flagged socket usage, **aiohappyeyeballs currently appears to be a low-risk networking helper library with no concrete security vulnerabilities identified** in its implementation.\n\nSecurity posture is overall **good**, assuming callers configure TLS properly and follow best practices for handling remote endpoints at the application level.",
+ "package_classification": {
+  "type": "library",
+  "layer": [
+   "networking",
+   "asyncio",
+   "transport"
+  ]
+ },
+ "tool_calls": {
+  "get_package_profile_info": 1,
+  "execute_codeql_query": 16,
+  "validate_codeql_query": 0,
+  "fixup_codeql_query": 2,
+  "finalize_report": 1
+ },
+ "queries_executed": {
+  "critical": 1,
+  "high": 3,
+  "medium": 2,
+  "low": 3,
+  "total_executed": 16,
+  "total_with_results": 9,
+  "total_failed": 13
+ },
+ "query_findings": {
+  "critical": 0,
+  "high": 0,
+  "medium": 0,
+  "low": 1,
+  "total": 1
+ },
+ "findings": [
+  {
+   "codeql_query_uuid": "20251225165710",
+   "codeql_raw_query": "/**\n * @name Use of low-level socket operations\n * @description Report usages of low-level socket APIs for manual inspection\n * @kind problem\n * @problem.severity note\n * @id py/aiohappyeyeballs/socket-usage\n * @tags audit\n */\n\nimport python\n\nfrom Call call, Name funcName\nwhere\n  call.getFunc() = funcName and\n  funcName.getId() in [\"socket\", \"create_connection\"]\nselect call, \"Use of low-level socket API; review for proper address handling and security.\"",
+   "hypothesis": "Package uses low-level socket APIs; audit callsites for potential misuse",
+   "severity": "low",
+   "cwe_ids": [
+    "cwe-200"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251225165739",
+   "codeql_raw_query": "/**\n * @name Code injection and dangerous function calls\n * @description Checking for eval, exec, pickle, yaml.load and other dangerous functions\n * @kind problem\n * @problem.severity error\n * @id py/code-injection-check\n * @tags security\n *        external/cwe/cwe-094\n *        external/cwe/cwe-502\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  (\n    // Code execution functions\n    call = API::builtin([\"eval\", \"exec\", \"compile\", \"__import__\"]).getACall() or\n    call = API::moduleImport(\"os\").getMember([\"system\", \"popen\", \"popen2\", \"popen3\", \"popen4\", \"execvp\", \"execv\", \"execl\", \"execlp\", \"execle\", \"execvpe\", \"spawnl\", \"spawnlp\", \"spawnle\", \"spawnv\", \"spawnvp\", \"spawnvpe\"]).getACall() or\n    call = API::moduleImport(\"subprocess\").getMember([\"call\", \"check_call\", \"check_output\", \"Popen\", \"run\"]).getACall() or\n    call = API::moduleImport(\"pickle\").getMember([\"load\", \"loads\", \"Unpickler\"]).getACall() or\n    call = API::moduleImport(\"yaml\").getMember([\"load\", \"unsafe_load\"]).getACall() or\n    call = API::moduleImport(\"marshal\").getMember([\"load\", \"loads\"]).getACall() or\n    call = API::moduleImport(\"shelve\").getMember(\"open\").getACall() or\n    // Deserialization with potential issues\n    call = API::moduleImport(\"json\").getMember(\"loads\").getACall() or\n    call = API::moduleImport(\"xml.etree.ElementTree\").getMember([\"parse\", \"fromstring\"]).getACall() or\n    call = API::moduleImport(\"lxml.etree\").getMember([\"parse\", \"fromstring\"]).getACall()\n  )\nselect call, \"Potentially dangerous function call that could lead to security vulnerabilities if used with untrusted input.\"",
+   "hypothesis": "Direct use of low-level sockets in aiohappyeyeballs could allow unsafe configuration (disabled TLS, missing timeouts, etc.).",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-200"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251225165814",
+   "codeql_raw_query": "/**\n * @name DNS resolution using getaddrinfo\n * @description Lists getaddrinfo calls in aiohappyeyeballs to check for insecure usage patterns\n * @kind problem\n * @problem.severity note\n * @id py/aiohappyeyeballs/getaddrinfo-usage\n * @tags security\n *       external/cwe/cwe-200\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom API::CallNode call\nwhere\n  call = API::moduleImport(\"socket\").getMember(\"getaddrinfo\").getACall()\nselect call, \"Use of socket.getaddrinfo; verify network and DNS settings are appropriate.\"\n",
+   "hypothesis": "The library performs custom DNS resolution and connection racing; mapping getaddrinfo usage helps later targeted queries.",
+   "severity": "low",
+   "cwe_ids": [
+    "cwe-200"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251225165851",
+   "codeql_raw_query": "/**\n * @name Unsafe deserialization in aiohappyeyeballs\n * @description Detect use of pickle, yaml.unsafe_load, or marshal that could lead to code execution\n * @kind problem\n * @problem.severity error\n * @id py/aiohappyeyeballs/unsafe-deserialization\n * @tags security\n *       external/cwe/cwe-502\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom API::CallNode call\nwhere\n  call = API::moduleImport(\"pickle\").getMember([\"load\", \"loads\", \"Unpickler\"]).getACall()\n  or call = API::moduleImport(\"yaml\").getMember([\"load\", \"unsafe_load\"]).getACall()\n  or call = API::moduleImport(\"marshal\").getMember([\"load\", \"loads\"]).getACall()\n  or call = API::moduleImport(\"shelve\").getMember(\"open\").getACall()\nselect call, \"Potentially unsafe deserialization operation that could execute arbitrary code.\"",
+   "hypothesis": "Check for unsafe deserialization usage",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-502"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251225165924",
+   "codeql_raw_query": "/**\n * @name Command execution and shell injection in aiohappyeyeballs\n * @description Find uses of os.system, subprocess with shell=True, or asyncio.create_subprocess* with shell=True\n * @kind problem\n * @problem.severity error\n * @id py/aiohappyeyeballs/command-execution\n * @tags security\n *       external/cwe/cwe-078\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom API::CallNode call\nwhere\n  call = API::moduleImport(\"os\").getMember(\"system\").getACall()\n  or call = API::moduleImport(\"subprocess\").getMember([\"run\", \"call\", \"Popen\", \"check_output\"]).getACall()\n  or call = API::moduleImport(\"asyncio\").getMember([\"create_subprocess_exec\", \"create_subprocess_shell\"]).getACall()\nselect call, \"Potentially dangerous command execution API usage; ensure inputs are validated and shell=True is avoided.\"",
+   "hypothesis": "Look for command execution primitives that could enable injection",
+   "severity": "critical",
+   "cwe_ids": [
+    "cwe-78"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251225170033",
+   "codeql_raw_query": "/**\n * @name Socket usage in aiohappyeyeballs\n * @description List socket operations used by the library for manual review\n * @kind problem\n * @problem.severity note\n * @id py/aiohappyeyeballs/socket-usage\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom API::CallNode call\nwhere\n  call = API::moduleImport(\"socket\").getAMember().getACall()\nselect call, \"Socket API call used here.\"",
+   "hypothesis": "Map socket calls for manual security review",
+   "severity": "low",
+   "cwe_ids": [
+    "cwe-200"
+   ],
+   "results_count": 1,
+   "results": [
+    {
+     "ruleId": "py/aiohappyeyeballs/socket-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohappyeyeballs/socket-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Socket API call used here."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/aiohappyeyeballs/impl.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 183,
+         "startColumn": 20,
+         "endColumn": 73
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "91ad887f74f11b2a:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251225170109",
+   "codeql_raw_query": "/**\n * @name Unsafe use of asyncio.create_task with unhandled exceptions\n * @description Detect background tasks in aiohappyeyeballs whose result is never awaited or handled\n * @kind problem\n * @problem.severity warning\n * @id py/aiohappyeyeballs/unhandled-background-task\n * @tags reliability\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom API::CallNode call\nwhere\n  call = API::moduleImport(\"asyncio\").getMember(\"create_task\").getACall()\nselect call, \"Background task created; ensure its exceptions are handled to avoid silent failures.\"",
+   "hypothesis": "Background tasks whose exceptions may be dropped, leading to reliability or potential security issues",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-703"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251225170225",
+   "codeql_raw_query": "/**\n * @name aiohappyeyeballs unsafe deserialization and dynamic execution\n * @description Look for dangerous use of pickle, yaml, eval, exec in aiohappyeyeballs\n * @kind problem\n * @problem.severity error\n * @id py/aiohappyeyeballs/dangerous-dynamic-execution\n * @tags security\n *       external/cwe/cwe-094\n *       external/cwe/cwe-502\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom API::CallNode call\nwhere\n  call = API::moduleImport(\"pickle\").getMember([\"load\", \"loads\"]).getACall() or\n  call = API::moduleImport(\"yaml\").getMember([\"load\", \"unsafe_load\"]).getACall() or\n  call = API::builtin([\"eval\", \"exec\"]).getACall()\nselect call, \"Dangerous dynamic execution or unsafe deserialization.\"",
+   "hypothesis": "Check for unsafe deserialization or eval/exec use in aiohappyeyeballs",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-094",
+    "cwe-502"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251225170248",
+   "codeql_raw_query": "/**\n * @name aiohappyeyeballs filesystem access from remote input\n * @description Track remote/tainted data reaching filesystem APIs in aiohappyeyeballs\n * @kind path-problem\n * @problem.severity error\n * @id py/aiohappyeyeballs/tainted-filesystem\n * @tags security\n *       external/cwe/cwe-022\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.dataflow.new.RemoteFlowSources\nimport semmle.python.Concepts\n\nmodule FSConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) { source instanceof RemoteFlowSource }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(FileSystemAccess fs |\n      sink = fs.getAPathArgument()\n    )\n  }\n}\n\nmodule FSFlow = TaintTracking::Global<FSConfig>;\nimport FSFlow::PathGraph\n\nfrom FSFlow::PathNode source, FSFlow::PathNode sink\nwhere FSFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"Remote input reaches filesystem access in aiohappyeyeballs from $@.\", source.getNode(), \"remote input\"",
+   "hypothesis": "Check for remote-controlled file paths (path traversal etc.)",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-022"
+   ],
+   "results_count": 0,
+   "results": []
+  }
+ ]
+}

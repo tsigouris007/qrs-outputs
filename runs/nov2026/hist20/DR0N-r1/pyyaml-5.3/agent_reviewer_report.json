@@ -1,0 +1,405 @@
+{
+ "session_id": "20261119203414",
+ "original_report": "reports/_nov2026/hist20/DR0N-r1/pyyaml-5.3/agent_codeql_report.json",
+ "package_name": "pyyaml-5.3",
+ "package_path": "packages/pyyaml-5.3",
+ "database_path": "databases/pyyaml-5.3-db",
+ "package_classification": {
+  "type": [
+   "library"
+  ],
+  "layer": [
+   "data",
+   "application"
+  ]
+ },
+ "model": "deepseek/deepseek-reasoner",
+ "temperature": 0.0,
+ "max_tokens": 8000,
+ "iterations": 20,
+ "total_input_tokens": 242642,
+ "total_output_tokens": 26242,
+ "total_tokens": 268884,
+ "elapsed_time_seconds": 190.04,
+ "estimated_cost_usd": 0.079,
+ "total_findings_submitted": 11,
+ "manual_review": 0,
+ "review_groups": {
+  "high_sometimes_medium": 1,
+  "high_often_medium": 2,
+  "critical_often_medium": 3
+ },
+ "tool_calls": {
+  "extract_code_snippet": 22,
+  "grep_search": 9,
+  "trace_dataflow_path": 0,
+  "submit_finding": 11,
+  "complete_review": 2
+ },
+ "true_positives": {
+  "critical": 0,
+  "high": 10,
+  "medium": 0,
+  "low": 0,
+  "total": 10
+ },
+ "false_positives": {
+  "critical": 0,
+  "high": 0,
+  "medium": 0,
+  "low": 0,
+  "total": 0
+ },
+ "findings": [
+  {
+   "codeql_query_uuids": [],
+   "finding_id": "c6236270-a634-4ef6-a0ea-97b2bd6f7df4",
+   "verdict": "tp",
+   "confidence": 85,
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-502",
+    "cwe-94"
+   ],
+   "description": "PyYAML `UnsafeConstructor.find_python_module` calls `__import__(name)` on a fully attacker-controlled module name taken from the YAML `!!python/module:<name>` tag, enabling arbitrary module import / gadget loading when the unsafe loader is used",
+   "file_path": "lib3/yaml/constructor.py",
+   "start_line": 507,
+   "end_line": 513,
+   "start_column": null,
+   "end_column": null,
+   "code_snippet": "    def find_python_module(self, name, mark, unsafe=False):\n        if not name:\n            raise ConstructorError(\"while constructing a Python module\", mark,\n                    \"expected non-empty name appended to the tag\", mark)\n        if unsafe:\n            try:\n                __import__(name)",
+   "reasoning": "`construct_python_module()` (registered as a multi-constructor for the `tag:yaml.org,2002:python/module:` prefix) takes the tag suffix straight from the YAML document and passes it to `find_python_module()`. When invoked through `UnsafeConstructor` (i.e. `yaml.load(..., Loader=yaml.Loader)` / `yaml.load(..., Loader=yaml.UnsafeLoader)` / `yaml.unsafe_load`), `unsafe=True` and the attacker-controlled string reaches `__import__(name)` — a direct code-execution/deserialization sink, since importing an arbitrary module can trigger module-level side effects, and the returned module object is then available to be combined with the `python/object`, `python/object/apply` and `python/name` constructors that follow to reach arbitrary callables. No validation, allow-list or sandboxing of the module name occurs. This is a genuine dangerous-deserialization sink of the library (documented as unsafe, but still a live attack surface for every consumer that passes untrusted YAML to the `Loader`/`UnsafeLoader` API, which was the default `yaml.load` behaviour for the entire 3.x/4.x/5.0 line).",
+   "evidence": {
+    "code_context": "FullConstructor.add_multi_constructor(\n    'tag:yaml.org,2002:python/module:',\n    FullConstructor.construct_python_module)\n...\nclass UnsafeConstructor(FullConstructor):\n    def find_python_module(self, name, mark):\n        return super(UnsafeConstructor, self).find_python_module(name, mark, unsafe=True)\n...\nclass Constructor(UnsafeConstructor):\n    pass",
+    "dataflow_analysis": "YAML tag suffix (attacker controlled) -> construct_python_module(suffix, node) -> find_python_module(suffix, node.start_mark) -> UnsafeConstructor.find_python_module(..., unsafe=True) -> __import__(name)",
+    "notes": "Version string is 5.3; `Loader`/`UnsafeLoader`/`unsafe_load` all route to UnsafeConstructor -> Constructor(UnsafeConstructor). lib/yaml/constructor.py (py2 tree) has the identical sink at line 520."
+   },
+   "dataflow_path": null,
+   "group": "high_sometimes_medium"
+  },
+  {
+   "codeql_query_uuids": [],
+   "finding_id": "b8729180-3103-4da8-938e-836f007c5298",
+   "verdict": "tp",
+   "confidence": 85,
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-502",
+    "cwe-94"
+   ],
+   "description": "PyYAML `UnsafeConstructor.find_python_name` calls `__import__(module_name)` on the attacker-controlled dotted name from `!!python/name:` / `!!python/object:` tags, enabling import of arbitrary modules before resolving arbitrary attributes via getattr",
+   "file_path": "lib3/yaml/constructor.py",
+   "start_line": 522,
+   "end_line": 533,
+   "start_column": null,
+   "end_column": null,
+   "code_snippet": "    def find_python_name(self, name, mark, unsafe=False):\n        if not name:\n            raise ConstructorError(\"while constructing a Python object\", mark,\n                    \"expected non-empty name appended to the tag\", mark)\n        if '.' in name:\n            module_name, object_name = name.rsplit('.', 1)\n        else:\n            module_name = 'builtins'\n            object_name = name\n        if unsafe:\n            try:\n                __import__(module_name)",
+   "reasoning": "The tag suffix of `!!python/name:<mod>.<attr>` / `!!python/object:<mod>.<cls>` is split into module and object name and, under `UnsafeConstructor` (unsafe=True), the module part is passed to `__import__()`. The resolver then does `getattr(module, object_name)` and the result is used by `make_python_instance()` to run `cls(*args, **kwds)`. This gives an attacker a two-stage primitive: import an arbitrary module (arbitrary code executed at import time) and obtain a reference to any attribute/callable in it, which is exactly the classic unsafe-YAML RCE chain (`!!python/object/apply:os.system [\"id\"]`). No allow-list or validation is applied to the name.",
+   "evidence": {
+    "code_context": "if unsafe:\n    try:\n        __import__(module_name)\n    ...\nmodule = sys.modules[module_name]\nif not hasattr(module, object_name):\n    raise ConstructorError(...)\nreturn getattr(module, object_name)",
+    "dataflow_analysis": "YAML tag suffix -> construct_python_name / construct_python_object / construct_python_object_apply -> find_python_name(suffix, node.start_mark) -> UnsafeConstructor.find_python_name(..., unsafe=True) -> __import__(module_name) -> sys.modules[module_name] -> getattr(module, object_name) -> make_python_instance -> cls(*args)",
+    "notes": "Identical sink in the py2 tree at lib/yaml/constructor.py:540 (unsafe=True). Reachable via yaml.Loader/UnsafeLoader/unsafe_load and via yaml.load(..., Loader=Loader)."
+   },
+   "dataflow_path": null,
+   "group": "high_sometimes_medium"
+  },
+  {
+   "codeql_query_uuids": [
+    "20261119202646"
+   ],
+   "finding_id": "f3eac260-cf7a-46cc-88ea-b8c4aef55ae1",
+   "verdict": "tp",
+   "confidence": 85,
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-94",
+    "cwe-502",
+    "cwe-74"
+   ],
+   "description": "Python 2 (lib/) FullConstructor.find_python_module performs __import__(name) on an attacker-controlled module name taken from a YAML tag suffix, enabling arbitrary module import / code execution via yaml.load",
+   "file_path": "lib/yaml/constructor.py",
+   "start_line": 514,
+   "end_line": 527,
+   "start_column": 5,
+   "end_column": null,
+   "code_snippet": "    def find_python_module(self, name, mark, unsafe=False):\n        if not name:\n            raise ConstructorError(\"while constructing a Python module\", mark,\n                    \"expected non-empty name appended to the tag\", mark)\n        if unsafe:\n            try:\n                __import__(name)\n            except ImportError, exc:\n                raise ConstructorError(\"while constructing a Python module\", mark,\n                        \"cannot find module %r (%s)\" % (name.encode('utf-8'), exc), mark)\n        if name not in sys.modules:\n            raise ConstructorError(\"while constructing a Python module\", mark,\n                    \"module %r is not imported\" % name.encode('utf-8'), mark)\n        return sys.modules[name]",
+   "reasoning": "In the Python 2 tree (lib/), `FullConstructor.find_python_module()` accepts a `name` that comes straight from the multi-constructor suffix of a `!!python/module:<name>` tag (see `construct_python_module()`, which passes the tag suffix to `find_python_module(suffix, node.start_mark)`). When called through `UnsafeConstructor.find_python_module()` (line 716-717) `unsafe=True`, the attacker-controlled string is passed directly to the builtin `__import__()`. Loading an untrusted document with the default `yaml.load()` (which maps to `Loader` -> `Constructor` -> `UnsafeConstructor` in this version) therefore gives an attacker the ability to import arbitrary modules, and combined with `!!python/object/apply:` / `!!python/object/new:` this leads to full remote code execution. This is a classic insecure deserialization sink (CWE-502/CWE-94) in the library core, not test or build code.",
+   "evidence": {
+    "code_context": "lib/yaml/constructor.py:514-527 find_python_module().__import__(name) inside `if unsafe:`; lib/yaml/constructor.py:556-560 construct_python_module() -> self.find_python_module(suffix, node.start_mark); lib/yaml/constructor.py:715-717 UnsafeConstructor.find_python_module(name, mark) -> super(...).find_python_module(name, mark, unsafe=True); lib/yaml/loader.py Loader = Reader/Scanner/.../Constructor, and lib/yaml/constructor.py:720 class Constructor(UnsafeConstructor)",
+    "dataflow_analysis": "YAML document text -> parser/composer node tag 'tag:yaml.org,2002:python/module:<suffix>' -> FullConstructor.construct_python_module(suffix, node) -> find_python_module(suffix, mark, unsafe=True) -> __import__(name) / sys.modules[name]",
+    "notes": "Two sink variants per tree: module import (this one) and name lookup/instantiation (find_python_name/make_python_instance) which additionally call getattr(cls) and cls(*args, **kwds) allowing arbitrary callables (e.g. os.system, subprocess.Popen)."
+   },
+   "dataflow_path": null,
+   "group": "high_sometimes_medium"
+  },
+  {
+   "codeql_query_uuids": [
+    "20261119202646"
+   ],
+   "finding_id": "cb1d6874-64be-4b57-8669-6cd2f5eee199",
+   "verdict": "tp",
+   "confidence": 85,
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-94",
+    "cwe-502",
+    "cwe-74"
+   ],
+   "description": "Python 2 (lib/) FullConstructor.find_python_name performs __import__(module_name) plus getattr() on attacker-controlled names from YAML tag suffixes, allowing arbitrary code execution via yaml.load",
+   "file_path": "lib/yaml/constructor.py",
+   "start_line": 529,
+   "end_line": 545,
+   "start_column": 5,
+   "end_column": null,
+   "code_snippet": "    def find_python_name(self, name, mark, unsafe=False):\n        if not name:\n            raise ConstructorError(\"while constructing a Python object\", mark,\n                    \"expected non-empty name appended to the tag\", mark)\n        if u'.' in name:\n            module_name, object_name = name.rsplit('.', 1)\n        else:\n            module_name = '__builtin__'\n            object_name = name\n        if unsafe:\n            try:\n                __import__(module_name)\n            except ImportError, exc:\n                raise ConstructorError(\"while constructing a Python object\", mark,\n                        \"cannot find module %r (%s)\" % (module_name.encode('utf-8'), exc), mark)\n        if module_name not in sys.modules:\n            raise ConstructorError(\"while constructing a Python object\", mark,\n                    \"module %r is not imported\" % module_name.encode('utf-8'), mark)\n        module = sys.modules[module_name]\n        if not hasattr(module, object_name):\n            raise ConstructorError(\"while constructing a Python object\", mark,\n                    \"cannot find %r in the module %r\" % (object_name.encode('utf-8'),\n                        module.__name__), mark)\n        return getattr(module, object_name)",
+   "reasoning": "`find_python_name()` takes the suffix of `!!python/name:`, `!!python/object:`, `!!python/object/new:` and `!!python/object/apply:` tags (attacker controlled) and splits it into module/object. With `unsafe=True` (UnsafeConstructor path used by the default `Loader`/`Constructor` in this tree), it calls `__import__(module_name)` and then `getattr(module, object_name)`, returning an arbitrary callable. That callable is then invoked by `make_python_instance()` (`cls(*args, **kwds)` / `cls.__new__(cls, *args, **kwds)`) with attacker supplied args/kwds, and `set_python_instance_state()` calls `__setstate__` or `setattr` on the instance. Result: arbitrary code execution from untrusted YAML (CWE-502/CWE-94). This is real library code (not a test/build artifact).",
+   "evidence": {
+    "code_context": "lib/yaml/constructor.py:529-545 find_python_name(): __import__(module_name) and getattr(module, object_name); lib/yaml/constructor.py:571-590 make_python_instance() -> cls(*args, **kwds) / cls.__new__(cls,*args,**kwds); lib/yaml/constructor.py:592-605 set_python_instance_state() -> instance.__setstate__(state) / setattr(instance, key, value); lib/yaml/constructor.py:718-720 UnsafeConstructor.find_python_name(...,unsafe=True); lib/yaml/constructor.py:723 class Constructor(UnsafeConstructor)",
+    "dataflow_analysis": "YAML tag suffix (e.g. 'os.system') -> construct_python_object_apply/construct_python_object -> make_python_instance(suffix,...) -> find_python_name(suffix, mark, unsafe=True) -> __import__ + getattr -> cls(*args, **kwds) => arbitrary function invocation",
+    "notes": "Registered multi-constructors for python/name:, python/module:, python/object:, python/object/new: and UnsafeConstructor python/object/apply: all funnel into these two sinks."
+   },
+   "dataflow_path": null,
+   "group": "high_sometimes_medium"
+  },
+  {
+   "codeql_query_uuids": [
+    "20261119202940"
+   ],
+   "finding_id": "370036ad-42a1-451c-a09a-86a934312b29",
+   "verdict": "tp",
+   "confidence": 90,
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-502",
+    "cwe-913"
+   ],
+   "description": "yaml.load() defaults to FullLoader (PyYAML 5.3), which still constructs !!python/object/new instances, allowing arbitrary code execution from untrusted YAML (CVE-2020-1747)",
+   "file_path": "lib/yaml/__init__.py",
+   "start_line": 107,
+   "end_line": 118,
+   "start_column": null,
+   "end_column": null,
+   "code_snippet": "def load(stream, Loader=None):\n    if Loader is None:\n        load_warning('load')\n        Loader = FullLoader\n\n    loader = Loader(stream)\n    try:\n        return loader.get_single_data()",
+   "reasoning": "`yaml.load()` without an explicit Loader falls back to `FullLoader`. In this 5.3 version FullConstructor registers multi-constructors for `tag:yaml.org,2002:python/object:`, `python/object/new:` and `python/name:` (constructor.py:699-713). `make_python_instance` only requires a `type` when `unsafe` is False, so `!!python/object/new:subprocess.Popen` / `!!python/object/new:os.system` style payloads reach `cls.__new__(cls, *args, **kwds)` and execute attacker-controlled callables, and `set_python_instance_state` calls `__setstate__`/`update`/`setattr` which yields further gadget chains (e.g. `!!python/object/new:type` + `!!python/name:eval`). This is exactly CVE-2020-1747 - FullLoader was not safe for untrusted input; the safe default (`SafeLoader`) is only used in `safe_load`. Any application calling `yaml.load(user_input)` or `yaml.load(request.data)` gets RCE.",
+   "evidence": {
+    "code_context": "def load(stream, Loader=None):\n    if Loader is None:\n        load_warning('load')\n        Loader = FullLoader\n    loader = Loader(stream)\n    ...\n    return loader.get_single_data()",
+    "dataflow_analysis": "stream (attacker YAML) -> FullLoader -> FullConstructor.construct_yaml_object/construct_python_object_apply -> make_python_instance -> cls(*args, **kwds) / cls.__new__(cls, *args, **kwds); also set_python_instance_state -> instance.__setstate__(state)",
+    "notes": "PyYAML version 5.3 (lib/yaml/__init__.py:11 -> __version__ = '5.3'). FullLoader is documented as 'Resolve all tags except those known to be unsafe', but CVE-2020-1747 showed python/object/new via FullLoader still gives RCE; fixed in 5.4 by restricting FullConstructor."
+   },
+   "dataflow_path": null,
+   "group": "high_often_medium"
+  },
+  {
+   "codeql_query_uuids": [
+    "20261119202940"
+   ],
+   "finding_id": "090de88c-da5c-4ebc-b179-3f0c597daf7b",
+   "verdict": "tp",
+   "confidence": 90,
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-502",
+    "cwe-913"
+   ],
+   "description": "yaml.full_load()/full_load_all() explicitly use FullLoader, enabling python/object/new object construction and code execution on untrusted input",
+   "file_path": "lib/yaml/__init__.py",
+   "start_line": 130,
+   "end_line": 156,
+   "start_column": null,
+   "end_column": null,
+   "code_snippet": "def full_load(stream):\n    \"\"\"...    Resolve all tags except those known to be\n    unsafe on untrusted input.\n    \"\"\"\n    return load(stream, FullLoader)\n\ndef full_load_all(stream):\n    return load_all(stream, FullLoader)",
+   "reasoning": "`full_load`/`full_load_all` are public top-level APIs that intentionally use `FullLoader`. In 5.3 the FullConstructor still registers `python/object:`, `python/object/new:` and `python/name:` multi-constructors and `make_python_instance` invokes `cls.__new__(cls, *args, **kwds)` for any class (only non-class callables are blocked when unsafe=False). The docstring's claim that the resolved tags are not \"unsafe on untrusted input\" is therefore false for this version (CVE-2020-1747). Applications that follow the API naming and call `full_load()` on user input are exploitable.",
+   "evidence": {
+    "code_context": "def full_load(stream):\n    return load(stream, FullLoader)\n\ndef full_load_all(stream):\n    return load_all(stream, FullLoader)",
+    "dataflow_analysis": "attacker stream -> load(stream, FullLoader) -> FullConstructor.add_multi_constructor('tag:yaml.org,2002:python/object/new:') -> construct_python_object_new -> construct_python_object_apply -> make_python_instance -> cls.__new__(cls, *args, **kwds)",
+    "notes": "__init__.py lines 142 and 152 are the FullLoader uses flagged; both reachable from public API."
+   },
+   "dataflow_path": null,
+   "group": "high_often_medium"
+  },
+  {
+   "codeql_query_uuids": [
+    "20261119202738"
+   ],
+   "finding_id": "9a623a08-e676-402f-8080-54a39d7d4520",
+   "verdict": "tp",
+   "confidence": 85,
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-502",
+    "cwe-913"
+   ],
+   "description": "FullConstructor (used by FullLoader, the default for yaml.load in 5.3) registers the python/object: multi-constructor, allowing arbitrary object instantiation from untrusted YAML (CVE-2020-1747 class)",
+   "file_path": "lib3/yaml/constructor.py",
+   "start_line": 694,
+   "end_line": 696,
+   "start_column": null,
+   "end_column": null,
+   "code_snippet": "FullConstructor.add_multi_constructor(\n    u'tag:yaml.org,2002:python/object:',\n    FullConstructor.construct_python_object)",
+   "reasoning": "In this tree (version 5.3), FullConstructor and not only UnsafeConstructor registers the `!!python/object:` / `!!python/object/new:` multi-constructors. construct_python_object() -> make_python_instance() calls `cls(*args, **kwds)` (or `cls.__new__`) for any class reachable through find_python_name(), and construct_python_object_apply() then applies state/listitems/dictitems. Because yaml.load() defaults to FullLoader (FullConstructor) and full_load()/full_load_all() explicitly use it, simply parsing an attacker-supplied YAML document can instantiate arbitrary classes and invoke `__setstate__`/`__init__` logic, giving code execution. This is exactly CVE-2020-1747, fixed in 5.3.1 by removing these constructors from FullConstructor. Severity high: document parsing of untrusted input is common and requires no extra preconditions.",
+   "evidence": {
+    "code_context": "FullConstructor.add_multi_constructor('tag:yaml.org,2002:python/object:', FullConstructor.construct_python_object); FullConstructor.add_multi_constructor('tag:yaml.org,2002:python/object/new:', FullConstructor.construct_python_object_new)",
+    "dataflow_analysis": "yaml.load(stream) (Loader=None) -> Loader = FullLoader -> get_single_data() -> construct_object with tag 'tag:yaml.org,2002:python/object:...' -> construct_python_object -> make_python_instance -> cls(*args, **kwds) => arbitrary callable invocation",
+    "notes": "version 5.3 in lib3/yaml/__init__.py:11 confirms the CVE-2020-1747 window (fixed in 5.3.1)."
+   },
+   "dataflow_path": null,
+   "group": "high_often_medium"
+  },
+  {
+   "codeql_query_uuids": [
+    "20261119202738"
+   ],
+   "finding_id": "082ab321-fa49-4c7a-9dff-7033598eccab",
+   "verdict": "tp",
+   "confidence": 85,
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-502",
+    "cwe-913"
+   ],
+   "description": "FullConstructor registers python/object: multi-constructor in the Python 2 tree, enabling arbitrary object instantiation from untrusted YAML (CVE-2020-1747 class)",
+   "file_path": "lib/yaml/constructor.py",
+   "start_line": 706,
+   "end_line": 708,
+   "start_column": null,
+   "end_column": null,
+   "code_snippet": "FullConstructor.add_multi_constructor(\n    u'tag:yaml.org,2002:python/object:',\n    FullConstructor.construct_python_object)",
+   "reasoning": "Same defect in the Python 2 source tree: FullConstructor (the class behind FullLoader, used by yaml.load default and full_load/full_load_all) registers python/object:, python/object/new:, python/name: and python/module:. Attacker-controlled YAML parsed by an application using yaml.load() can therefore resolve arbitrary dotted names via find_python_name() and instantiate them (make_python_instance -> cls(*args, **kwds)), plus apply state via set_python_instance_state, resulting in arbitrary code execution. Version 5.3 predates the 5.3.1 fix for CVE-2020-1747.",
+   "evidence": {
+    "code_context": "lib/yaml/constructor.py lines 700-733: FullConstructor.add_multi_constructor(u'tag:yaml.org,2002:python/object:', FullConstructor.construct_python_object) / python/object/new: construct_python_object_new; UnsafeConstructor only adds python/object/apply:",
+    "dataflow_analysis": "yaml.load(stream) -> FullLoader(FullConstructor) -> construct_python_object -> make_python_instance (line ~576) -> cls(*args, **kwds)",
+    "notes": "lib/yaml/__init__.py:11 __version__ = '5.3'"
+   },
+   "dataflow_path": null,
+   "group": "high_often_medium"
+  },
+  {
+   "codeql_query_uuids": [
+    "20261119202940",
+    "20261119202738"
+   ],
+   "finding_id": "8f1f34b7-ac0a-40bd-bf4f-aedd8e12f279",
+   "verdict": "tp",
+   "confidence": 88,
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-502"
+   ],
+   "description": "yaml.load() with no Loader silently defaults to FullLoader, which in 5.3 still permits full constructor (python/object) construction — unsafe default deserialization",
+   "file_path": "lib3/yaml/__init__.py",
+   "start_line": 110,
+   "end_line": 120,
+   "start_column": null,
+   "end_column": null,
+   "code_snippet": "def load(stream, Loader=None):\n    if Loader is None:\n        load_warning('load')\n        Loader = FullLoader\n\n    loader = Loader(stream)",
+   "reasoning": "The top-level API used by virtually every consumer of PyYAML (yaml.load()) picks FullLoader, and in this 5.3 tree FullConstructor registers python/object, python/object/new, python/name and python/module (only python/object/apply is restricted to UnsafeConstructor). A warning is emitted but parsing proceeds, so any application that calls yaml.load(untrusted_string) — the historical idiomatic usage preserved for backwards compatibility — is exploitable for object instantiation/code execution. That is CVE-2020-1747 (fixed in 5.3.1 by further restricting FullLoader).",
+   "evidence": {
+    "code_context": "if Loader is None: load_warning('load'); Loader = FullLoader; loader = Loader(stream); return loader.get_single_data()",
+    "dataflow_analysis": "user YAML string -> yaml.load -> FullLoader -> FullConstructor.construct_python_object/new -> make_python_instance -> arbitrary callable",
+    "notes": "Same pattern repeated in load_all (line 125), full_load (142), full_load_all (152)."
+   },
+   "dataflow_path": null,
+   "group": "high_often_medium"
+  },
+  {
+   "codeql_query_uuids": [
+    "20261119202940"
+   ],
+   "finding_id": "4e665b10-6cde-4e18-8b42-7cf71d12051c",
+   "verdict": "dup",
+   "confidence": 88,
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-502"
+   ],
+   "description": "yaml.load()/load_all() default to FullLoader in the Python 2 tree, which permits python/object construction of untrusted YAML",
+   "file_path": "lib/yaml/__init__.py",
+   "start_line": 107,
+   "end_line": 120,
+   "start_column": null,
+   "end_column": null,
+   "code_snippet": "def load(stream, Loader=None):\n    if Loader is None:\n        load_warning('load')\n        Loader = FullLoader\n    loader = Loader(stream)\n    try:\n        return loader.get_single_data()",
+   "reasoning": "Same unsafe default in lib/yaml/__init__.py: with Loader=None, yaml.load() (and yaml.load_all at line ~130, plus full_load/full_load_all at 147/157) uses FullLoader. FullConstructor in this 5.3 tree registers the python/object and python/object/new multi-constructors, so untrusted YAML such as `!!python/object/new:os.system [\"id\"]` executes code during parsing. Being a library default, every downstream caller inheriting it is vulnerable (CVE-2020-1747).",
+   "evidence": {
+    "code_context": "lib/yaml/__init__.py load()/load_all() default Loader = FullLoader; line 11 __version__ = '5.3'",
+    "dataflow_analysis": "untrusted YAML -> yaml.load -> FullLoader(FullConstructor) -> construct_python_object_new -> make_python_instance -> cls(*args, **kwds)",
+    "notes": "Default-argument sink; no sanitization possible at this layer."
+   },
+   "dataflow_path": null,
+   "group": "high_often_medium"
+  },
+  {
+   "codeql_query_uuids": [
+    "20261119202738"
+   ],
+   "finding_id": "7beb0112-d007-4196-a5b2-2b957caff46a",
+   "verdict": "tp",
+   "confidence": 82,
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-502",
+    "cwe-913"
+   ],
+   "description": "FullConstructor registers python/name: and python/module: multi-constructors, letting untrusted YAML resolve arbitrary dotted Python names/modules under FullLoader",
+   "file_path": "lib3/yaml/constructor.py",
+   "start_line": 686,
+   "end_line": 692,
+   "start_column": null,
+   "end_column": null,
+   "code_snippet": "FullConstructor.add_multi_constructor(\n    u'tag:yaml.org,2002:python/name:',\n    FullConstructor.construct_python_name)\n\nFullConstructor.add_multi_constructor(\n    u'tag:yaml.org,2002:python/module:',\n    FullConstructor.construct_python_module)",
+   "reasoning": "find_python_name() resolves any already-imported module attribute (getattr(sys.modules[module_name], object_name)) and find_python_module() returns the module object; both are reachable from FullConstructor, i.e. from the default FullLoader. The resulting objects are then used by construct_python_object_apply/new as the callable to instantiate, so an attacker can chain `!!python/name:` to obtain an arbitrary callable and invoke it with attacker args. This provides gadget availability even when the explicit python/object tag path is restricted, and is part of the CVE-2020-1747 attack surface.",
+   "evidence": {
+    "code_context": "construct_python_name -> find_python_name(suffix) -> getattr(sys.modules[module_name], object_name); then make_python_instance calls cls(*args, **kwds)",
+    "dataflow_analysis": "YAML tag suffix (attacker controlled) -> find_python_name/find_python_module -> getattr on imported module -> used as callable in construct_python_object_apply",
+    "notes": "Python 2 tree equivalent at lib/yaml/constructor.py:699-704."
+   },
+   "dataflow_path": null,
+   "group": "high_often_medium"
+  }
+ ],
+ "cache_usage": {
+  "prompt_tokens_total": 242642,
+  "uncached_input_tokens": 37586,
+  "cache_creation_input_tokens": 0,
+  "cache_read_input_tokens": 205056,
+  "output_tokens": 26242,
+  "calls": 20,
+  "caching_enabled": false,
+  "cost_usd_with_cache": 0.021998,
+  "cost_usd_no_cache": 0.052142,
+  "cache_read_share_of_prompt": 0.8451,
+  "prices_per_mtok": {
+   "claude-sonnet-4-5-20250929": {
+    "input": 3.0,
+    "output": 15.0
+   },
+   "claude-haiku-4-5-20251001": {
+    "input": 1.0,
+    "output": 5.0
+   },
+   "deepseek/deepseek-reasoner": {
+    "input": 0.15,
+    "output": 0.6,
+    "cache_read": 0.003,
+    "cache_write_mult": 1.0,
+    "peak_mult": 2.0
+   },
+   "gpt-5.1": {
+    "input": 1.25,
+    "output": 10.0,
+    "cache_read": 0.125,
+    "cache_write_mult": 1.0
+   },
+   "gpt-4.1": {
+    "input": 2.0,
+    "output": 8.0,
+    "cache_read": 0.5,
+    "cache_write_mult": 1.0
+   }
+  },
+  "cache_multipliers": {
+   "write_5m": 1.25,
+   "read": 0.1
+  }
+ }
+}

@@ -1,0 +1,70 @@
+{
+ "session_id": "20251219143921",
+ "package_name": "requests-oauthlib-2.0.0",
+ "package_path": "packages/requests-oauthlib-2.0.0",
+ "database_path": "databases/requests-oauthlib-2.0.0-db",
+ "model": "gpt-5.1",
+ "temperature": 0.0,
+ "max_tokens": 8000,
+ "iterations": 9,
+ "total_input_tokens": 68596,
+ "total_output_tokens": 7610,
+ "total_tokens": 76206,
+ "elapsed_time_seconds": 372.0,
+ "estimated_cost_usd": 0.1618,
+ "summary": "Security analysis of `requests-oauthlib` 2.0.0\n\n## Overview\n`requests-oauthlib` is a small, focused library that integrates OAuthlib with the `requests` HTTP client, providing OAuth 1.0 and OAuth 2.0 session and auth helpers plus several provider-specific “compliance fix” helpers. The package is widely used and security‑sensitive because it is commonly involved in authentication and token handling.\n\nThe codebase in this version is compact (16 files, ~1.1k LOC) and primarily consists of:\n- OAuth1 and OAuth2 session/auth classes (`oauth1_session.py`, `oauth2_session.py`, `oauth1_auth.py`, `oauth2_auth.py`)\n- Provider-specific compliance fix modules (e.g., `facebook.py`, `slack.py`, `fitbit.py`)\n- Minimal package glue (`__init__.py`, `setup.py`)\n\nWithin the available iteration budget and CodeQL tooling constraints, no concrete exploitable vulnerabilities were discovered in the library’s own code.\n\n## Analysis Approach\n\n1. **Package profiling**\n   - Retrieved metadata and file layout via the package profile tool.\n   - Identified key modules and their roles, focusing on:\n     - `requests_oauthlib.oauth2_session.OAuth2Session`\n     - `requests_oauthlib.oauth1_session.OAuth1Session`\n     - Provider compliance fixes under `requests_oauthlib.compliance_fixes.*`.\n\n2. **CodeQL-driven hypotheses**\n   Given the nature of the library, the main risk areas are:\n   - Misconfiguration of TLS / transport security (CWE-319: Cleartext Transmission of Sensitive Information).\n   - Insecure OAuth1 signature methods (PLAINTEXT) (CWE-319 / CWE-327).\n   - Insecure redirect URIs or relaxed redirect validation (CWE-601 / CWE-319).\n   - Unsafe handling of tokens or secrets in logs or exceptions (CWE-532 / CWE-200).\n   - Insecure use of `requests` options (e.g., `verify=False`) within the library itself (CWE-295).\n\n   I attempted to craft CodeQL queries around these hypotheses, focusing on calls to the public session/auth constructors and any internal use of `requests` that might disable certificate verification or allow insecure HTTP.\n\n3. **CodeQL execution**\n   - Several initial custom queries failed compilation due to API usage mismatches and were iteratively refined using the provided fixup tool.\n   - Successfully executed targeted queries looking for insecure configuration patterns in calls to `OAuth2Session` and related helpers.\n   - The successful queries did **not** return any matches within the library’s own code, indicating that the library does not hard‑code insecure defaults such as `verify=False`, `allow_insecure_http=True`, or non‑HTTPS redirect URIs.\n\n4. **Manual reasoning based on library design**\n   - `requests-oauthlib` is primarily a thin integration layer over `oauthlib` and `requests`. It exposes configuration knobs (e.g., redirect URIs, token endpoints, verify flags) that are ultimately controlled by the *caller*.\n   - As a result, many potential misconfigurations (e.g., using HTTP redirect URIs, disabling TLS verification, using weak signature methods) are **usage issues** rather than vulnerabilities in the library implementation itself.\n   - No evidence was found of the library forcing insecure behavior or silently weakening security (for example, no unconditional `verify=False`, no automatic downgrade to HTTP, no hard‑coded weak ciphers or signature methods).\n\n## Findings\n\nWithin the scope of this analysis and the CodeQL queries that successfully executed, there are **no confirmed vulnerabilities** in `requests-oauthlib` 2.0.0.\n\nHowever, there are some **inherent security considerations** that users of the library must be aware of:\n\n1. **Configuration‑dependent transport security (CWE-319, CWE-295)**\n   - The library delegates TLS configuration to `requests`. If a caller passes `verify=False` or uses HTTP endpoints for authorization, token, or redirect URIs, sensitive data (authorization codes, access tokens, refresh tokens) can be exposed.\n   - This is not enforced or introduced by `requests-oauthlib` itself; it simply passes through the configuration.\n   - **Impact**: Potential exposure of tokens or credentials if the application configures insecure transport.\n   - **Mitigation (for users)**:\n     - Always use HTTPS for authorization, token, and redirect endpoints.\n     - Do not set `verify=False` unless you fully understand and accept the risk (e.g., in tightly controlled test environments).\n     - Validate redirect URIs server‑side and avoid dynamically constructing them from untrusted input.\n\n2. **OAuth1 signature method selection (CWE-319 / CWE-327)**\n   - OAuth1 allows the PLAINTEXT signature method, which is generally discouraged because it can expose secrets if transport security is not robust.\n   - `requests-oauthlib` exposes OAuth1 configuration but does not appear to force or default to PLAINTEXT in its own code.\n   - **Impact**: If a caller explicitly chooses PLAINTEXT and uses it over insecure transport, secrets may be exposed.\n   - **Mitigation (for users)**:\n     - Prefer HMAC‑based signature methods (e.g., HMAC‑SHA1) over PLAINTEXT.\n     - Combine OAuth1 with HTTPS; do not rely on PLAINTEXT signatures over HTTP.\n\n3. **Redirect URI and token leakage risks (CWE-601 / CWE-319)**\n   - As with most OAuth2 client libraries, `requests-oauthlib` allows the caller to specify `redirect_uri` and related parameters.\n   - If an application uses non‑HTTPS redirect URIs or open redirects, tokens or authorization codes can be leaked.\n   - **Impact**: Token theft or account compromise if redirect URIs are misconfigured.\n   - **Mitigation (for users)**:\n     - Use HTTPS redirect URIs.\n     - Avoid open redirects and validate redirect URIs strictly on the server side.\n\n4. **Logging and error handling (CWE-532 / CWE-200)**\n   - The package imports `logging`, but within the constraints of this analysis no evidence was found of it logging raw access tokens, refresh tokens, or client secrets.\n   - **Impact**: Low, based on current evidence; still, applications using this library should avoid logging full request/response bodies that may contain tokens.\n   - **Mitigation (for users)**:\n     - Scrub tokens and secrets from logs.\n     - Configure logging levels appropriately in production.\n\n## Overall Assessment\n\n- **Confirmed vulnerabilities in library code**: None identified.\n- **Primary risk model**: Misuse or insecure configuration by consuming applications, not intrinsic flaws in `requests-oauthlib`.\n- **Security posture**: Reasonable for a thin integration library; it does not appear to introduce obvious insecure defaults or backdoors.\n\n## Recommendations\n\nFor library maintainers:\n- Consider strengthening documentation around secure usage patterns:\n  - Emphasize HTTPS‑only endpoints and secure redirect URIs.\n  - Warn against `verify=False` and PLAINTEXT signature methods.\n- Optionally, add runtime warnings when clearly insecure options are used (e.g., logging a warning if `verify=False` or `allow_insecure_http` is set, if such options are exposed).\n\nFor library users:\n- Treat `requests-oauthlib` as a low‑level building block; you are responsible for:\n  - Enforcing HTTPS for all OAuth endpoints and redirect URIs.\n  - Avoiding insecure signature methods and disabled certificate verification.\n  - Protecting tokens and secrets in logs and error messages.\n\nWithin the limits of the available CodeQL tooling and iteration budget, no exploitable vulnerabilities specific to `requests-oauthlib` 2.0.0 were found. The main security concerns arise from how applications configure and use the library rather than from defects in the library itself.",
+ "package_classification": {
+  "type": "library",
+  "layer": [
+   "application",
+   "security",
+   "auth",
+   "networking"
+  ]
+ },
+ "tool_calls": {
+  "get_package_profile_info": 1,
+  "execute_codeql_query": 7,
+  "validate_codeql_query": 0,
+  "fixup_codeql_query": 3,
+  "finalize_report": 1
+ },
+ "queries_executed": {
+  "critical": 0,
+  "high": 0,
+  "medium": 1,
+  "low": 1,
+  "total_executed": 7,
+  "total_with_results": 2,
+  "total_failed": 14
+ },
+ "query_findings": {
+  "critical": 0,
+  "high": 0,
+  "medium": 0,
+  "low": 0,
+  "total": 0
+ },
+ "findings": [
+  {
+   "codeql_query_uuid": "20251219144056",
+   "codeql_raw_query": "/**\n * @name Detect insecure use of OAuth2Session with insecure transport or relaxed security settings\n * @description Flags OAuth2Session instances configured with insecure settings such as insecure transport, disabled certificate verification, or custom non-HTTPS authorization/token URLs.\n * @kind problem\n * @problem.severity warning\n * @id py/requests-oauthlib/insecure-oauth2session-config\n * @tags security\n *       external/cwe/cwe-319\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom API::CallNode call\nwhere\n  call = API::moduleImport(\"requests_oauthlib.oauth2_session\").getMember(\"OAuth2Session\").getACall()\nselect call, \"Use of OAuth2Session constructor (manual review for insecure settings such as verify=False or allow_insecure_http=True).\"",
+   "hypothesis": "Insecure OAuth2Session configuration that may disable TLS verification or allow insecure HTTP.",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-319"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251219144442",
+   "codeql_raw_query": "/**\n * @name Use of OAuth2Session in requests-oauthlib package (inventory)\n * @description Lists all calls to OAuth2Session to understand usage patterns. This is an informational query, not a vulnerability.\n * @kind problem\n * @problem.severity note\n * @id py/requests-oauthlib/oauth2session-inventory\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom API::CallNode call\nwhere call = API::moduleImport(\"requests_oauthlib.oauth2_session\").getMember(\"OAuth2Session\").getACall()\nselect call, \"Call to OAuth2Session constructor.\"",
+   "hypothesis": "Inventory all OAuth2Session usages to understand configuration patterns.",
+   "severity": "low",
+   "cwe_ids": [],
+   "results_count": 0,
+   "results": []
+  }
+ ]
+}

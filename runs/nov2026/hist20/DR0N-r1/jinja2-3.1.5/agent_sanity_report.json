@@ -1,0 +1,738 @@
+{
+ "session_id": "20261119040146",
+ "original_report": "reports/_nov2026/hist20/DR0N-r1/jinja2-3.1.5/agent_codeql_report.json",
+ "package_name": "jinja2-3.1.5",
+ "package_path": "packages/jinja2-3.1.5",
+ "database_path": "databases/jinja2-3.1.5-db",
+ "package_classification": {
+  "type": [
+   "library",
+   "framework"
+  ],
+  "layer": [
+   "template-engine",
+   "web",
+   "application-runtime"
+  ]
+ },
+ "model": "deepseek/deepseek-reasoner",
+ "temperature": 0.0,
+ "max_tokens": 8000,
+ "iterations": 26,
+ "total_input_tokens": 226901,
+ "total_output_tokens": 45676,
+ "total_tokens": 272577,
+ "elapsed_time_seconds": 274.01,
+ "estimated_cost_usd": 0.0827,
+ "total_findings_submitted": 15,
+ "manual_review": 3,
+ "review_groups": {
+  "high_often_medium": 1,
+  "critical_sometimes_medium": 1,
+  "high_undetermined_undetermined": 1
+ },
+ "tool_calls": {
+  "extract_code_snippet": 30,
+  "grep_search": 20,
+  "trace_dataflow_path": 0,
+  "submit_finding": 15,
+  "complete_review": 1
+ },
+ "true_positives": {
+  "critical": 1,
+  "high": 0,
+  "medium": 0,
+  "low": 0,
+  "total": 1
+ },
+ "false_positives": {
+  "critical": 0,
+  "high": 0,
+  "medium": 1,
+  "low": 9,
+  "total": 10
+ },
+ "findings": [
+  {
+   "codeql_query_uuids": [],
+   "finding_id": "73c4e3af-6642-485c-a715-cd32133afb46",
+   "verdict": "mr",
+   "confidence": 60,
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-502"
+   ],
+   "description": "Untrusted-deserialization sink: Bucket.load_bytecode calls pickle.load() on bytecode-cache content before any integrity verification",
+   "file_path": "src/jinja2/bccache.py",
+   "start_line": 73,
+   "end_line": 77,
+   "start_column": null,
+   "end_column": null,
+   "code_snippet": "    def load_bytecode(self, f: t.BinaryIO) -> None:\n        \"\"\"Loads bytecode from a file or file like object.\"\"\"\n        # make sure the magic header is correct\n        magic = f.read(len(bc_magic))\n        if magic != bc_magic:\n            self.reset()\n            return\n        # the source code of the file changed, we need to reload\n        checksum = pickle.load(f)",
+   "reasoning": "Bucket.load_bytecode reads cache data from an arbitrary file-like object (FileSystemBytecodeCache opens the file from self.directory, MemcachedBytecodeCache gets it from a memcache server) and immediately calls pickle.load(f) on the remainder of the stream. The only pre-check is a fixed-length byte-prefix comparison against bc_magic (built from constant pickled ints), which provides no integrity or authenticity guarantee — an attacker who controls the cache file / memcache value can supply any pickle stream and get arbitrary code execution via __reduce__ before the checksum is even compared. Exploitability depends entirely on whether an attacker can write into the configured cache directory or the memcache instance; Jinja hardens the default FileSystemBytecodeCache temp dir (0o700, owner/mode validation via _unsafe_dir) which reduces but does not eliminate the risk (shared/attacker-writable cache dirs, misconfigured memcached, cache dir restored from untrusted backups/artifacts). This is a documented trust boundary, so manual review of deployment configuration is needed rather than an unconditional true positive.",
+   "evidence": {
+    "code_context": "bc_magic = b\"j2\" + pickle.dumps(bc_version, 2) + pickle.dumps((sys.version_info[0] << 24) | sys.version_info[1], 2)\n...\n    def load_bytecode(self, f):\n        magic = f.read(len(bc_magic))\n        if magic != bc_magic: ... return\n        checksum = pickle.load(f)   # <-- unpickles attacker-controllable bytes\n        try:\n            self.code = marshal.load(f)  # line 79\n...\nclass FileSystemBytecodeCache: \n    def load_bytecode(self, bucket):\n        filename = self._get_cache_filename(bucket)\n        f = open(filename, \"rb\")\n        with f: bucket.load_bytecode(f)\nclass MemcachedBytecodeCache:\n    def load_bytecode(self, bucket):\n        code = self.client.get(self.prefix + bucket.key)  # remote data\n        bucket.bytecode_from_string(code) -> load_bytecode(BytesIO(code))",
+    "dataflow_analysis": "Source: file contents (FileSystemBytecodeCache.load_bytecode -> open(filename,'rb') -> bucket.load_bytecode(f)) and memcache value (MemcachedBytecodeCache.load_bytecode -> client.get -> bucket.bytecode_from_string -> BytesIO -> load_bytecode). Sink: pickle.load(f) at bccache.py:73, followed by marshal.load(f) at :79 whose result becomes code executed in Template.from_code (environment.py:1228 `exec(code, namespace)`). No verification between source and sink beyond the constant bc_magic prefix.",
+    "notes": "FileSystemBytecodeCache directory creation is hardened (S_IRWXU, uid and mode checks, _unsafe_dir abort) mitigating a local attacker on the default temp dir; no protection at all for a user-supplied directory or a memcache backend controlled by others."
+   },
+   "dataflow_path": null,
+   "group": "high_often_medium",
+   "sanity_check": {
+    "verdict": "mr",
+    "confidence": 68,
+    "recommendation": "review",
+    "concerns": true,
+    "flags": [
+     {
+      "type": "EXPLOITABILITY",
+      "severity": "warning",
+      "message": "Real pickle sink exists, but exploitation requires attacker control of the cache file or memcache value, which presupposes significant access; bytecode cache is opt-in and not enabled by default.",
+      "evidence": "FileSystemBytecodeCache hardens directory (S_IRWXU, uid/mode checks, _unsafe_dir abort) and bytecode cache is only used when explicitly configured (e.g., passing bytecode_cache to Environment). MemcachedBytecodeCache trusts remote values but is user-configured."
+     },
+     {
+      "type": "CODE_SMELL",
+      "severity": "info",
+      "message": "Use of pickle for cache deserialization is a design-level concern; however, this mirrors common bytecode-cache practice and the magic prefix is a format check, not an integrity check.",
+      "evidence": "load_bytecode only verifies constant bc_magic prefix before pickle.load(f) at line 73 and marshal.load(f) at line 79; no authenticity/HMAC verification."
+     }
+    ],
+    "reasoning": "The finding accurately describes real code: Bucket.load_bytecode reads an attacker-influenceable stream and calls pickle.load(f) with only a constant magic-header check. This is a legitimate untrusted-deserialization sink, but exploitability is conditional on an attacker already controlling the cache directory or memcache server, and the default FileSystemBytecodeCache is hardened. This warrants manual review rather than a confirmed high-confidence true positive."
+   }
+  },
+  {
+   "codeql_query_uuids": [],
+   "finding_id": "4975dc88-892c-45fb-b169-8f92bc9b5349",
+   "verdict": "mr",
+   "confidence": 60,
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-502",
+    "cwe-94"
+   ],
+   "description": "marshal.load() of cache-supplied data yields a CodeType that is later exec()'d — attacker-writable bytecode cache leads to arbitrary code execution",
+   "file_path": "src/jinja2/bccache.py",
+   "start_line": 79,
+   "end_line": 83,
+   "start_column": null,
+   "end_column": null,
+   "code_snippet": "        # if marshal_load fails then we need to reload\n        try:\n            self.code = marshal.load(f)\n        except (EOFError, ValueError, TypeError):\n            self.reset()\n            return",
+   "reasoning": "The code object produced by marshal.load() here is stored on the bucket and subsequently exec()'d by Template.from_code (environment.py:1228 `exec(code, namespace)`). marshal is not a safe deserializer: a crafted bytecode blob can forge arbitrary code objects (arbitrary co_code) which are executed with the application's privileges. The only gate is the constant bc_magic prefix and the checksum comparison — but the attacker who can write the cache entry also supplies the pickle stream containing the checksum, so no real validation occurs. Same trust boundary as the pickle.load at line 73; severity depends on cache directory/memcache reachability by an attacker.",
+   "evidence": {
+    "code_context": "def write_bytecode(self, f):\n    f.write(bc_magic); pickle.dump(self.checksum, f, 2); marshal.dump(self.code, f)\n\ndef load_bytecode(self, f):\n    magic = f.read(len(bc_magic))\n    ... checksum = pickle.load(f)\n    self.code = marshal.load(f)\n\n# environment.py:1228\nTemplate.from_code: namespace = {...}; exec(code, namespace)",
+    "dataflow_analysis": "cache file/memcache value -> bucket.load_bytecode -> marshal.load(f) -> bucket.code -> FileSystemBytecodeCache.load_bytecode caller -> Environment._load_template -> Template.from_code(env, bucket.code, ...) -> exec(code, namespace) = code execution.",
+    "notes": "Checksum is read from the same untrusted stream, so it cannot serve as an integrity control against an attacker who controls the cache entry."
+   },
+   "dataflow_path": null,
+   "group": "high_often_medium",
+   "sanity_check": {
+    "verdict": "fp",
+    "confidence": 85,
+    "recommendation": "reject",
+    "concerns": true,
+    "flags": [
+     {
+      "type": "EXPLOITABILITY",
+      "severity": "warning",
+      "message": "Requires attacker to write to the bytecode cache directory or memcached backend, which implies existing significant access; not reachable via untrusted template input.",
+      "evidence": "Bytecode cache is opt-in and documented as needing a secure, non-attacker-writable location. Attackers who can write the cache can already execute code or write arbitrary files."
+     },
+     {
+      "type": "CODE_SMELL",
+      "severity": "info",
+      "message": "Using pickle and marshal for cache serialization is unsafe if the cache is untrusted, but is a known performance trade-off documented in Jinja2.",
+      "evidence": "pickle.load(f) for checksum and marshal.load(f) for code are both used; checksum read from same stream provides no integrity against an attacker who controls the cache."
+     },
+     {
+      "type": "CONTEXT_MISMATCH",
+      "severity": "info",
+      "message": "Library-level design decision with documented security caveat, not a runtime vulnerability in standard deployments.",
+      "evidence": "Jinja2 documentation explicitly warns that the bytecode cache must not be writable by untrusted users; this is a known limitation, not a novel vulnerability."
+     }
+    ],
+    "reasoning": "The code accurately shows marshal.load() and pickle.load() on cache data, which can lead to code execution if the cache is attacker-writable. However, this is a documented security limitation of Jinja2's optional bytecode cache: exploiting it requires write access to the cache directory or memcached backend, which typically already implies code execution capability. It is not a remotely reachable vulnerability via untrusted template input."
+   }
+  },
+  {
+   "codeql_query_uuids": [
+    "20261119035136"
+   ],
+   "finding_id": "2063e5ec-ebbc-49d8-98a6-2683278cdf56",
+   "verdict": "fp",
+   "confidence": 80,
+   "severity": "low",
+   "cwe_ids": [
+    "cwe-502"
+   ],
+   "description": "pickle.dump of bucket checksum while writing bytecode cache (serialization side, not a deserialization sink)",
+   "file_path": "src/jinja2/bccache.py",
+   "start_line": 89,
+   "end_line": 90,
+   "start_column": null,
+   "end_column": null,
+   "code_snippet": "        f.write(bc_magic)\n        pickle.dump(self.checksum, f, 2)\n        marshal.dump(self.code, f)",
+   "reasoning": "This is the write (serialization) side of the bytecode cache. `self.checksum` is a hex string digest produced by `get_cache_key`/`get_source_checksum` from the template source, not attacker-controlled object graph. Serializing data with pickle does not allow code execution; only unpickling untrusted data does. The corresponding deserialization sink (bccache.py:73) is filed separately as manual-review because the cache directory is created with 0o700 and ownership/mode verified (`_unsafe_dir`), meaning exploitation requires an attacker who can already write into the cache directory owned by the same UID.",
+   "evidence": {
+    "code_context": "write_bytecode: f.write(bc_magic); pickle.dump(self.checksum, f, 2); marshal.dump(self.code, f)",
+    "dataflow_analysis": "checksum originates from get_source_checksum/get_cache_key (sha1 of source + filename), never from deserialized input; pickle.dump is a serializer, not a code-execution sink.",
+    "notes": "CodeQL py/sink-inventory flags it merely as 'pickle-serialize'. Not a vulnerability on its own."
+   },
+   "dataflow_path": null,
+   "group": "high_often_medium",
+   "sanity_check": {
+    "verdict": "fp",
+    "confidence": 92,
+    "recommendation": "reject",
+    "concerns": false,
+    "flags": [
+     {
+      "type": "EXPLOITABILITY",
+      "severity": "info",
+      "message": "pickle.dump is a serialization call, not a deserialization sink; CWE-502 only applies to unpickling attacker-controlled data.",
+      "evidence": "write_bytecode: f.write(bc_magic); pickle.dump(self.checksum, f, 2); marshal.dump(self.code, f). self.checksum comes from get_source_checksum/get_cache_key (sha1 hex digest of source + filename), never from a deserialized object graph."
+     },
+     {
+      "type": "CONTEXT_MISMATCH",
+      "severity": "info",
+      "message": "True deserialization risk, if any, resides on the load side (bccache.py:73, bytecode_from_string/load_bytecode), which is reportedly filed separately.",
+      "evidence": "Raw snippet shows marshal.load(f) / load_bytecode; the sibling unpickle path is the relevant sink, not this serializer."
+     }
+    ],
+    "reasoning": "The reported line is the write side of jinja2's bytecode cache and uses pickle only as a serializer for a hex-digest checksum, which cannot cause code execution. CWE-502 requires an unpickling sink on untrusted input; this is a serializer-only call and thus a false positive. The corresponding deserialization path is a separate finding."
+   }
+  },
+  {
+   "codeql_query_uuids": [
+    "20261119035136"
+   ],
+   "finding_id": "cf3ab7d6-9eb6-4645-823b-1b2d9431a180",
+   "verdict": "fp",
+   "confidence": 85,
+   "severity": "low",
+   "cwe_ids": [
+    "cwe-502"
+   ],
+   "description": "pickle.dumps used to build static module-level bc_magic constant, not a deserialization sink",
+   "file_path": "src/jinja2/bccache.py",
+   "start_line": 41,
+   "end_line": 43,
+   "start_column": null,
+   "end_column": null,
+   "code_snippet": "bc_magic = (\n    b\"j2\"\n    + pickle.dumps(bc_version, 2)\n    + pickle.dumps((sys.version_info[0] << 24) | sys.version_info[1], 2)\n)",
+   "reasoning": "`pickle.dumps` here serializes two integers (the cache format version constant 5 and the Python version number) into a module-level magic byte header. There is no attacker-controlled input and serialization cannot lead to code execution. This is inventory noise from the sink-inventory query.",
+   "evidence": {
+    "code_context": "bc_version = 5; bc_magic = b'j2' + pickle.dumps(bc_version, 2) + pickle.dumps((sys.version_info[0] << 24) | sys.version_info[1], 2)",
+    "dataflow_analysis": "Inputs are the literal integer 5 and sys.version_info; entirely trusted constants.",
+    "notes": "Serialization of trusted integers only."
+   },
+   "dataflow_path": null,
+   "group": "high_often_medium",
+   "sanity_check": {
+    "verdict": "fp",
+    "confidence": 98,
+    "recommendation": "reject",
+    "concerns": false,
+    "flags": [
+     {
+      "type": "EXPLOITABILITY",
+      "severity": "warning",
+      "message": "pickle.dumps is serialization of trusted constants, not a deserialization sink, so CWE-502 does not apply.",
+      "evidence": "bc_magic is built at import time from literal integer bc_version=5 and sys.version_info values only; no attacker-controlled input reaches pickle.dumps, and no pickle.loads occurs in this snippet."
+     }
+    ],
+    "reasoning": "The code only serializes trusted integers into a static magic byte header. It is not a deserialization sink and cannot lead to code execution. This is inventory noise rather than a real CWE-502 vulnerability."
+   }
+  },
+  {
+   "codeql_query_uuids": [
+    "20261119035136"
+   ],
+   "finding_id": "78223fca-7fe2-455f-8c7d-0f914a5ae4db",
+   "verdict": "fp",
+   "confidence": 85,
+   "severity": "low",
+   "cwe_ids": [
+    "cwe-94"
+   ],
+   "description": "compile() in fake_traceback builds a fixed string of newlines + 'raise __jinja_exception__'; lineno/filename cannot inject code",
+   "file_path": "src/jinja2/debug.py",
+   "start_line": 104,
+   "end_line": 107,
+   "start_column": null,
+   "end_column": null,
+   "code_snippet": "    code: CodeType = compile(\n        \"\\n\" * (lineno - 1) + \"raise __jinja_exception__\", filename, \"exec\"\n    )",
+   "reasoning": "The compiled source string is composed of a repetition of a newline character (driven by an integer line number) plus a fixed literal statement `raise __jinja_exception__`. `filename` is passed as the compile() filename argument (used only for traceback metadata), not embedded in the source. Even in the pathological case of `lineno` being huge/negative the result is a MemoryError/compile error, not arbitrary code execution. The subsequent exec() runs only this generated bytecode. No injection path exists.",
+   "evidence": {
+    "code_context": "filename comes from `filename = tb.tb_frame.f_code.co_filename` (template traceback) and lineno from template line; neither is concatenated into the exec'd source.",
+    "dataflow_analysis": "source = '\\n'*(lineno-1) + constant; no string interpolation of attacker data into code.",
+    "notes": "Sanitization/parametrization by construction: only newlines are variable in the source text."
+   },
+   "dataflow_path": null,
+   "group": "high_often_medium",
+   "sanity_check": {
+    "verdict": "fp",
+    "confidence": 92,
+    "recommendation": "reject",
+    "concerns": false,
+    "flags": [
+     {
+      "type": "EXPLOITABILITY",
+      "severity": "info",
+      "message": "The compile() source string is not injectable; only an integer-controlled newline repetition is variable.",
+      "evidence": "source = '\\n' * (lineno - 1) + 'raise __jinja_exception__'; filename is passed as compile()'s filename metadata argument, not concatenated into source."
+     },
+     {
+      "type": "CODE_SMELL",
+      "severity": "info",
+      "message": "Using compile/exec with generated source is unconventional but here it is constructed entirely from fixed literals plus newlines.",
+      "evidence": "No string interpolation of attacker-controlled data into the executed source; resulting behavior is limited to raising __jinja_exception__ or a compile/MemoryError."
+     }
+    ],
+    "reasoning": "The code at src/jinja2/debug.py:104 builds a source string solely from newline repetition (driven by an integer lineno) plus the fixed literal 'raise __jinja_exception__'. The filename is passed only as compile()'s filename argument for traceback metadata and is never embedded into the executed source, so no attacker-controlled code can be injected. Therefore this is a false positive for CWE-94."
+   }
+  },
+  {
+   "codeql_query_uuids": [
+    "20261119035136"
+   ],
+   "finding_id": "a8478036-d134-4b37-a7f1-f6a1a25a3f92",
+   "verdict": "fp",
+   "confidence": 85,
+   "severity": "low",
+   "cwe_ids": [
+    "cwe-94"
+   ],
+   "description": "exec() of the traceback-rewriting code object in debug.py runs only code generated by fake_traceback",
+   "file_path": "src/jinja2/debug.py",
+   "start_line": 145,
+   "end_line": 148,
+   "start_column": null,
+   "end_column": null,
+   "code_snippet": "    try:\n        exec(code, globals, locals)\n    except BaseException:\n        return sys.exc_info()[2].tb_next  # type: ignore",
+   "reasoning": "This exec() is the counterpart of the compile() above: the code object only contains a single `raise __jinja_exception__` statement padded with newlines, and its only purpose is to re-raise the handled exception at the right template line so the traceback looks like it came from the template. The `globals` dict only holds `__name__`, `__file__` and the exception instance. There is no path by which an attacker can supply the code object.",
+   "evidence": {
+    "code_context": "globals = {'__name__': filename, '__file__': filename, '__jinja_exception__': exc_value}; exec(code, globals, locals)",
+    "dataflow_analysis": "code is produced locally by compile() from a constant string; locals come from get_template_locals() and are only used as the exec globals/locals namespace, not executed.",
+    "notes": "Part of Jinja's debug traceback rewriting; requires debug extension enabled."
+   },
+   "dataflow_path": null,
+   "group": "high_often_medium",
+   "sanity_check": {
+    "verdict": "fp",
+    "confidence": 95,
+    "recommendation": "reject",
+    "concerns": false,
+    "flags": [
+     {
+      "type": "EXPLOITABILITY",
+      "severity": "info",
+      "message": "The exec() call is not reachable with attacker-controlled code; it executes a locally compiled constant code object used only for traceback rewriting.",
+      "evidence": "The code object is produced by compile() from a constant 'raise __jinja_exception__' statement padded with newlines. The exec globals only contain filename metadata and the handled exception instance; no external input supplies the code object."
+     }
+    ],
+    "reasoning": "The finding correctly identifies a dynamic exec() in Jinja2's debug traceback rewriting, but the executed code object is generated locally from a constant source string and is not attacker-controllable. This is safe runtime debugging code, so the CWE-94 finding is a false positive."
+   }
+  },
+  {
+   "codeql_query_uuids": [
+    "20261119035136"
+   ],
+   "finding_id": "88df8708-de8a-4f90-a7b1-599a3403e0ab",
+   "verdict": "fp",
+   "confidence": 80,
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-94"
+   ],
+   "description": "Environment._compile calls Python compile() on generated template source - documented Jinja2 design (templates are code), not an injected sink",
+   "file_path": "src/jinja2/environment.py",
+   "start_line": 709,
+   "end_line": null,
+   "start_column": null,
+   "end_column": null,
+   "code_snippet": "    def _compile(self, source: str, filename: str) -> CodeType:\n        \"\"\"Internal hook that can be overridden to hook a different compile\n        method in.\n\n        .. versionadded:: 2.5\n        \"\"\"\n        return compile(source, filename, \"exec\")",
+   "reasoning": "compile() here consumes source produced by the code generator from a parsed template AST, not raw untrusted input. Jinja2's security model explicitly states that rendering templates from untrusted sources is equivalent to allowing code execution; sandboxing (SandboxedEnvironment) is the documented mitigation. The template source is supplied by the developer (files/env.from_string), so this is expected functionality rather than an injection sink reached by untrusted data. Classified as false positive for the inventory query; sandbox escapes are a separate concern handled by jinja2/sandbox.py.",
+   "evidence": {
+    "code_context": "def _compile(self, source, filename): return compile(source, filename, \"exec\") - called from Environment.compile() after self._generate() produces code from the template AST",
+    "dataflow_analysis": "Source: template string -> lexer/parser -> AST -> code generator output -> compile(). No path from request data to compile() unless the app itself passes user-controlled template text, which is documented as unsafe usage.",
+    "notes": "Jinja2 docs: 'Rendering untrusted templates is insecure'; mitigation is SandboxedEnvironment."
+   },
+   "dataflow_path": null,
+   "group": "high_often_medium",
+   "sanity_check": {
+    "verdict": "fp",
+    "confidence": 96,
+    "recommendation": "reject",
+    "concerns": true,
+    "flags": [
+     {
+      "type": "EXPLOITABILITY",
+      "severity": "warning",
+      "message": "compile() is an intended internal hook for generated template code, not an untrusted-input sink in normal Jinja2 usage.",
+      "evidence": "_compile consumes source produced by Jinja2's parser/code generator. Exploitation requires the application to render untrusted template source, which Jinja2 documents as equivalent to code execution and mitigates via SandboxedEnvironment."
+     }
+    ],
+    "reasoning": "The finding correctly identifies a compile() call, but this is documented Jinja2 design: templates are compiled to Python code, and _compile is an internal hook over generated source. It is not a real vulnerability in the library unless the caller passes untrusted template text, which is explicitly outside Jinja2's safe usage model and mitigated by SandboxedEnvironment."
+   }
+  },
+  {
+   "codeql_query_uuids": [
+    "20261119035136"
+   ],
+   "finding_id": "fdeb699f-3fd5-4497-852d-330d1dc9b351",
+   "verdict": "mr",
+   "confidence": 60,
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-94",
+    "cwe-502"
+   ],
+   "description": "Template.from_code exec()s an arbitrary code object; if the code object comes from an attacker-controlled bytecode cache, this yields code execution",
+   "file_path": "src/jinja2/environment.py",
+   "start_line": 1228,
+   "end_line": null,
+   "start_column": null,
+   "end_column": null,
+   "code_snippet": "        namespace = {\"environment\": environment, \"__file__\": code.co_filename}\n        exec(code, namespace)\n        rv = cls._from_namespace(environment, namespace, globals)",
+   "reasoning": "from_code() is the public API used by loaders/bytecode caches to instantiate a template from an already-compiled code object. exec() of that code object is inherently full code execution in the host process, with no sandboxing or validation. The trust boundary is whoever produced the CodeType: normally Environment.compile(), but BytecodeCache.load_bytecode() deserializes it via marshal.load from a file/memcached entry keyed by a checksum compared against a value loaded with pickle. If an attacker can write into the bytecode cache directory (see FileSystemBytecodeCache, which opens cache files without running the integrity/permission checks on each read) or into the memcached instance, they control the code object and gain RCE. This is a defense-in-depth review item since exploitation requires cache write access, so classified as manual review rather than a directly reachable true positive.",
+   "evidence": {
+    "code_context": "Template.from_code(environment, code, globals): namespace = {\"environment\": environment, \"__file__\": code.co_filename}; exec(code, namespace)",
+    "dataflow_analysis": "BytecodeCache.load_bytecode() -> marshal.load(f) -> bucket.code -> Environment.template_class.from_code(...) -> exec(code) ; the code object is deserialized from cache storage with no signature/integrity verification beyond a pickled checksum compared to the freshly computed SHA1 of the source.",
+    "notes": "Exploitation requires write access to the bytecode cache directory or memcached; the checksum is read from the same untrusted cache file, so an attacker who can write the cache can also write a matching checksum."
+   },
+   "dataflow_path": null,
+   "group": "high_often_medium",
+   "sanity_check": {
+    "verdict": "mr",
+    "confidence": 62,
+    "recommendation": "review",
+    "concerns": true,
+    "flags": [
+     {
+      "type": "EXPLOITABILITY",
+      "severity": "warning",
+      "message": "The exec() of a CodeType is by-design; attacker control requires write access to the bytecode cache storage, which already implies significant privileges.",
+      "evidence": "BytecodeCache.load_bytecode() -> marshal.load -> from_code -> exec. Exploitation needs cache directory/memcached write access; the checksum is read from the same untrusted cache, so an attacker with write access to the cache is the precondition."
+     },
+     {
+      "type": "CODE_SMELL",
+      "severity": "info",
+      "message": "Template.from_code() is a documented public API that intentionally execs a compiled code object; the real trust boundary is the bytecode cache, not this method.",
+      "evidence": "Docstring: 'Creates a template object from compiled code and the globals. This is used by the loaders and environment.' exec(code, namespace) is the documented behavior."
+     },
+     {
+      "type": "CONTEXT_MISMATCH",
+      "severity": "info",
+      "message": "This is a library trust-boundary design; the caller is responsible for securing the bytecode cache, and Jinja2 documents that cached bytecode must be trusted.",
+      "evidence": "Package context: library/template-engine. Bytecode cache is caller-configured storage (FileSystemBytecodeCache/MemcachedBytecodeCache) and is expected to be protected by the application."
+     }
+    ],
+    "reasoning": "The code trace is accurate: from_code() does exec() the provided CodeType, and the bytecode cache path (marshal.load + pickled checksum) is a genuine deserialization surface. However, exploitation requires write access to cache storage, which is a documented trusted-input boundary and already grants substantial capability; the finding is more a design/code-smell concern about cache trust than a reachable zero-day. This warrants human review rather than blanket acceptance or rejection."
+   }
+  },
+  {
+   "codeql_query_uuids": [
+    "20261119035136"
+   ],
+   "finding_id": "1dd02ac1-6e09-48a2-a5cb-0e129982a0b5",
+   "verdict": "fp",
+   "confidence": 85,
+   "severity": "low",
+   "cwe_ids": [
+    "cwe-829"
+   ],
+   "description": "PackageLoader import_module(package_name) - dynamic import of a developer-supplied package name, not attacker-controlled",
+   "file_path": "src/jinja2/loaders.py",
+   "start_line": 323,
+   "end_line": null,
+   "start_column": null,
+   "end_column": null,
+   "code_snippet": "        # Make sure the package exists. This also makes namespace\n        # packages work, otherwise get_loader returns None.\n        import_module(package_name)\n        spec = importlib.util.find_spec(package_name)",
+   "reasoning": "package_name is a constructor argument chosen by the developer when configuring PackageLoader (e.g. PackageLoader(\"myapp\")). It is not derived from template names or request data. Template names are later sanitized with split_template_path() and joined with posixpath.join/normpath against the resolved template root, preventing traversal outside it. No untrusted input reaches import_module, so this inventory hit is a false positive.",
+   "evidence": {
+    "code_context": "def __init__(self, package_name, package_path=\"templates\", encoding=\"utf-8\"): ... import_module(package_name); spec = importlib.util.find_spec(package_name)",
+    "dataflow_analysis": "No dataflow from request/template input to package_name; get_source() uses split_template_path(template) + posixpath.join/normpath under self._template_root.",
+    "notes": "Documented usage: PackageLoader('yourapplication', 'templates')."
+   },
+   "dataflow_path": null,
+   "group": "high_often_medium",
+   "sanity_check": {
+    "verdict": "fp",
+    "confidence": 95,
+    "recommendation": "reject",
+    "concerns": false,
+    "flags": [
+     {
+      "type": "EXPLOITABILITY",
+      "severity": "info",
+      "message": "The dynamic import uses a developer-configured constructor argument, not attacker-controlled input, so it is not exploitable as described.",
+      "evidence": "PackageLoader.__init__(package_name, package_path='templates', encoding='utf-8') calls import_module(package_name); package_name is provided by the application developer when configuring the loader. Template inputs flow through split_template_path() and posixpath.join/normpath, not into package_name."
+     }
+    ],
+    "reasoning": "The finding correctly identifies an import_module call, but the argument is a trusted developer-supplied configuration value rather than request or template input. This is intended library behavior and not a CWE-829 vulnerability in Jinja2's context, so the false-positive verdict is appropriate."
+   }
+  },
+  {
+   "codeql_query_uuids": [
+    "20261119035136"
+   ],
+   "finding_id": "b4fe8aba-8d31-46dd-98e0-dcc33b425712",
+   "verdict": "dup",
+   "confidence": 90,
+   "severity": "low",
+   "cwe_ids": [
+    "cwe-502"
+   ],
+   "description": "pickle.dumps of bc_version / Python version ints to build the cache magic header - serialization only, no deserialization of untrusted data",
+   "file_path": "src/jinja2/bccache.py",
+   "start_line": 41,
+   "end_line": null,
+   "start_column": null,
+   "end_column": null,
+   "code_snippet": "bc_magic = (\n    b\"j2\"\n    + pickle.dumps(bc_version, 2)\n    + pickle.dumps((sys.version_info[0] << 24) | sys.version_info[1], 2)\n)",
+   "reasoning": "These are pickle.dumps calls on integer constants used to construct the bytecode cache magic header. Serialization of trusted integers cannot execute code; there is no attacker-controlled input. Not a vulnerability.",
+   "evidence": {
+    "code_context": "bc_magic = b\"j2\" + pickle.dumps(bc_version, 2) + pickle.dumps((sys.version_info[0] << 24) | sys.version_info[1], 2)",
+    "dataflow_analysis": "Inputs are module constants (bc_version = 5) and sys.version_info; no external data.",
+    "notes": "Companion pickle.dump(self.checksum, f, 2) at line 89 writes a str checksum - also trusted output."
+   },
+   "dataflow_path": null,
+   "group": "high_often_medium"
+  },
+  {
+   "codeql_query_uuids": [
+    "20261119040005"
+   ],
+   "finding_id": "384cd503-352d-4f1b-8e76-fd3411a1ef6b",
+   "verdict": "tp",
+   "confidence": 85,
+   "severity": "critical",
+   "cwe_ids": [
+    "cwe-693",
+    "cwe-94",
+    "cwe-913"
+   ],
+   "description": "The `|attr` filter (do_attr) returns an attribute's raw value without applying SandboxedEnvironment.wrap_str_format, so a template can obtain a string's un-sandboxed `str.format`/`format_map` bound method and escape the sandbox (CVE-2025-27516 pattern).",
+   "file_path": "src/jinja2/filters.py",
+   "start_line": 1426,
+   "end_line": 1438,
+   "start_column": null,
+   "end_column": null,
+   "code_snippet": "    try:\n        name = str(name)\n    except UnicodeError:\n        pass\n    else:\n        try:\n            value = getattr(obj, name)\n        except AttributeError:\n            pass\n        else:\n            if environment.sandboxed:\n                environment = t.cast(\"SandboxedEnvironment\", environment)\n\n                if not environment.is_safe_attribute(obj, name, value):\n                    return environment.unsafe_undefined(obj, name)\n\n            return value\n\n    return environment.undefined(obj=obj, name=name)",
+   "reasoning": "do_attr() is the implementation of the `|attr` filter. It calls `getattr(obj, name)` directly and returns the resulting value. For sandboxed environments there are two protections applied elsewhere in the codebase:\n1) `SandboxedEnvironment.is_safe_attribute` (present here — blocks underscore/internal attributes), and\n2) `SandboxedEnvironment.wrap_str_format` (see src/jinja2/sandbox.py lines 344-382), which replaces a string's `format`/`format_map` bound method with a wrapper whose `SandboxedFormatter.get_field` re-routes attribute/item lookups through `env.getattr`/`env.getitem`, i.e. through the sandbox.\n\ndo_attr performs check (1) but NOT (2). Because `format` / `format_map` do not start with `_` and are not internal attributes, `is_safe_attribute` returns True and the raw, unwrapped `str.format` bound method is returned to the template. The template can then call it (`SandboxedEnvironment.call` → `is_safe_callable` returns True for a builtin method → `context.call`), and inside the plain `str.format` field resolution all attribute/index traversal (`{0.__class__.__mro__[1].__subclasses__}`) is done by CPython's formatter with NO sandbox interception. That is exactly the CVE-2025-27516 breakout: `|attr(\"format\")` bypasses the str.format sandbox protection added for CVE-2024-56326. The equivalent paths in sandbox.py `getattr` (line 319) and `getitem` (line 302) both correctly call `wrap_str_format`, confirming this omission in `do_attr` is the security-relevant divergence.",
+   "evidence": {
+    "code_context": "src/jinja2/filters.py:1408-1438 do_attr: `value = getattr(obj, name)` then only `is_safe_attribute` check, `return value` (no wrap_str_format).\nsrc/jinja2/sandbox.py:302-310 (getitem) and 319-331 (getattr): `value = getattr(obj, attr)` ... `fmt = self.wrap_str_format(value); if fmt is not None: return fmt` then `is_safe_attribute` check.\nsrc/jinja2/sandbox.py:344-382 wrap_str_format: only returns a sandboxing wrapper for `str.format`/`str.format_map` bound methods; SandboxedFormatter.get_field routes lookups through env.getattr/env.getitem.",
+    "dataflow_analysis": "Template source -> compiler emits getattr/filter call -> Filters['attr'] -> do_attr(environment, obj, name) -> getattr(obj, name) [filters.py:1426] -> returns raw str.format bound method to the template -> template call node -> SandboxedEnvironment.call -> is_safe_callable(str.format) == True -> context.call executes real str.format -> CPython formatter resolves {0.__class__.__mro__[1].__subclasses__} without any is_safe_attribute check => sandbox escape / arbitrary code execution.",
+    "notes": "src/jinja2/__init__.py reports __version__ = 3.1.5. Verified the comparison: sandbox.py getattr/getitem wrap str.format, filters.py do_attr does not. `format` is not underscore-prefixed so is_safe_attribute permits it. Exploitation requires attacker control over template content (untrusted templates) — this is the documented threat model for Jinja's sandbox."
+   },
+   "dataflow_path": null,
+   "group": "critical_sometimes_medium",
+   "sanity_check": {
+    "verdict": "tp",
+    "confidence": 92,
+    "recommendation": "accept",
+    "concerns": false,
+    "flags": [],
+    "reasoning": "The finding accurately describes CVE-2025-27516: in Jinja2 3.1.5, do_attr in filters.py calls getattr(obj, name) and returns the raw value after only an is_safe_attribute check, omitting the wrap_str_format normalization that sandbox.py's getattr/getitem apply. This precisely enables retrieving a string's str.format/format_map bound method through the |attr filter and escaping the sandbox via CPython's formatter resolution of dunder attributes, which is a genuine and critical sandbox escape for the SandboxedEnvironment's documented threat model (untrusted template content). Code snippet, line reference, and 3.1.5 version all corroborate the claim, so the true-positive verdict is well supported."
+   }
+  },
+  {
+   "codeql_query_uuids": [
+    "20261119040005"
+   ],
+   "finding_id": "10b7f93e-b4cd-48e5-8e51-22f0fc6f609a",
+   "verdict": "fp",
+   "confidence": 90,
+   "severity": "low",
+   "cwe_ids": [
+    "cwe-693"
+   ],
+   "description": "getattr(math, method) in do_round — method is validated against a strict whitelist, not attacker controlled.",
+   "file_path": "src/jinja2/filters.py",
+   "start_line": 1183,
+   "end_line": 1184,
+   "start_column": null,
+   "end_column": null,
+   "code_snippet": "    if method not in {\"common\", \"ceil\", \"floor\"}:\n        raise FilterArgumentError(\"method must be common, ceil or floor\")",
+   "reasoning": "The `method` argument is checked against the literal set {\"common\", \"ceil\", \"floor\"} before line 1183 `func = getattr(math, method)`, and the \"common\" branch returns early. Only `ceil`/`floor` can reach getattr, both harmless pure numeric functions. No sandbox-relevant attribute can be reached, so this is not exploitable.",
+   "evidence": {
+    "code_context": "if method not in {\"common\", \"ceil\", \"floor\"}: raise FilterArgumentError(...); if method == \"common\": return round(value, precision); func = getattr(math, method)",
+    "notes": "Whitelist-constrained getattr; canonical false positive of the getattr inventory query."
+   },
+   "dataflow_path": null,
+   "group": "critical_sometimes_medium",
+   "sanity_check": {
+    "verdict": "fp",
+    "confidence": 97,
+    "recommendation": "reject",
+    "concerns": false,
+    "flags": [],
+    "reasoning": "The reported getattr(math, method) is guarded by a strict literal whitelist of 'common', 'ceil', and 'floor', and the 'common' branch returns before getattr. Only safe numeric math functions ceil/floor can reach the call, so the finding is a false positive rather than an exploitable attribute-access issue."
+   }
+  },
+  {
+   "codeql_query_uuids": [],
+   "finding_id": "4faa4b91-3d47-4a3a-9d8c-b8d06de6bd09",
+   "verdict": "fp",
+   "confidence": 90,
+   "severity": "low",
+   "cwe_ids": [
+    "cwe-693"
+   ],
+   "description": "getattr() in SandboxedEnvironment.is_safe_callable reads only the literal attribute names \"unsafe_callable\" and \"alters_data\" on the callable; no user-controlled attribute name reaches it",
+   "file_path": "src/jinja2/sandbox.py",
+   "start_line": 265,
+   "end_line": 267,
+   "start_column": null,
+   "end_column": null,
+   "code_snippet": "        return not (\n            getattr(obj, \"unsafe_callable\", False) or getattr(obj, \"alters_data\", False)\n        )",
+   "reasoning": "This getattr() call uses hard-coded literal attribute names (\"unsafe_callable\", \"alters_data\") with defaults, and is part of the sandbox's own guard check (is_safe_callable). Template-controlled data cannot influence the attribute name, so there is no attribute-access sandbox escape here. It is a defensive check, not an attack surface.",
+   "evidence": {
+    "code_context": "def is_safe_callable(self, obj: t.Any) -> bool:\n    return not (\n        getattr(obj, \"unsafe_callable\", False) or getattr(obj, \"alters_data\", False)\n    )",
+    "dataflow_analysis": "No dataflow from template input: attribute names are string literals. This function is the security check applied by SandboxedEnvironment.call() before invoking an object.",
+    "notes": "No untrusted data reaches the attribute argument; classified as false positive for getattr-inventory."
+   },
+   "dataflow_path": null,
+   "group": "critical_sometimes_medium",
+   "sanity_check": {
+    "verdict": "fp",
+    "confidence": 92,
+    "recommendation": "reject",
+    "concerns": false,
+    "flags": [
+     {
+      "type": "CODE_SMELL",
+      "severity": "info",
+      "message": "getattr() with hard-coded literal attribute names is a defensive guard, not an exploitable vulnerability; this matches a generic 'getattr-inventory' heuristic rather than a real CWE-693 issue.",
+      "evidence": "getattr(obj, \"unsafe_callable\", False) and getattr(obj, \"alters_data\", False) use string literals; no template-controlled data can influence the attribute name. This is the sandbox's own safety check invoked by SandboxedEnvironment.call() before invoking a callable."
+     },
+     {
+      "type": "CONTEXT_MISMATCH",
+      "severity": "info",
+      "message": "Finding does not align with a Protection Mechanism Failure (CWE-693); the code in question *is* part of the protection mechanism, not a failure of it.",
+      "evidence": "is_safe_callable is a guard function that blocks objects marked unsafe_callable/alters_data; flagging it contradicts its defensive purpose."
+     }
+    ],
+    "reasoning": "The code snippet accurately matches the finding, but the getattr() calls use hard-coded literal attribute names with safe defaults, so no untrusted data reaches the attribute argument. This is a defensive sandbox guard (is_safe_callable) and not an attack surface, confirming the false-positive verdict."
+   }
+  },
+  {
+   "codeql_query_uuids": [],
+   "finding_id": "2fa6dea0-8894-4e12-9060-953ce7214ec4",
+   "verdict": "fp",
+   "confidence": 85,
+   "severity": "low",
+   "cwe_ids": [
+    "cwe-693"
+   ],
+   "description": "getattr(obj, attr) inside SandboxedEnvironment.getitem is gated by is_safe_attribute before the value is returned",
+   "file_path": "src/jinja2/sandbox.py",
+   "start_line": 302,
+   "end_line": 313,
+   "start_column": null,
+   "end_column": null,
+   "code_snippet": "                    try:\n                        value = getattr(obj, attr)\n                    except AttributeError:\n                        pass\n                    else:\n                        fmt = self.wrap_str_format(value)\n                        if fmt is not None:\n                            return fmt\n                        if self.is_safe_attribute(obj, argument, value):\n                            return value\n                        return self.unsafe_undefined(obj, argument)",
+   "reasoning": "In getitem(), the result of getattr() is only returned when is_safe_attribute(obj, argument, value) approves it; otherwise unsafe_undefined is returned. Also, str.format/format_map are wrapped through wrap_str_format so the sandboxed formatter applies the environment's getattr/getitem checks. This is the correct, fixed sandbox path, so no bypass exists at this location.",
+   "evidence": {
+    "code_context": "value = getattr(obj, attr)\n...\nfmt = self.wrap_str_format(value)\nif fmt is not None:\n    return fmt\nif self.is_safe_attribute(obj, argument, value):\n    return value\nreturn self.unsafe_undefined(obj, argument)",
+    "dataflow_analysis": "Template-supplied attribute name (argument) reaches getattr, but the returned value passes through is_safe_attribute (blocks underscore-prefixed and internal attributes) before being exposed to the template.",
+    "notes": "Properly guarded branch; fp."
+   },
+   "dataflow_path": null,
+   "group": "critical_sometimes_medium",
+   "sanity_check": {
+    "verdict": "fp",
+    "confidence": 92,
+    "recommendation": "reject",
+    "concerns": false,
+    "flags": [
+     {
+      "type": "CODE_SMELL",
+      "severity": "info",
+      "message": "The reported getattr exposure is properly mitigated by is_safe_attribute before returning the value; this is not a vulnerability.",
+      "evidence": "value = getattr(obj, attr) ... if self.is_safe_attribute(obj, argument, value): return value; return self.unsafe_undefined(obj, argument)"
+     }
+    ],
+    "reasoning": "The code snippet matches the claimed location and is production runtime sandbox code, but every value returned from getattr is gated by is_safe_attribute (and str/format methods are wrapped via wrap_str_format). No bypass or unguarded data flow exists at this site, so the original finding is a false positive."
+   }
+  },
+  {
+   "codeql_query_uuids": [],
+   "finding_id": "9aee504a-c996-45da-bfd5-5faf62fa8cb7",
+   "verdict": "fp",
+   "confidence": 85,
+   "severity": "low",
+   "cwe_ids": [
+    "cwe-693"
+   ],
+   "description": "getattr(obj, attribute) inside SandboxedEnvironment.getattr is gated by is_safe_attribute and str.format wrapping",
+   "file_path": "src/jinja2/sandbox.py",
+   "start_line": 319,
+   "end_line": 332,
+   "start_column": null,
+   "end_column": null,
+   "code_snippet": "        try:\n            value = getattr(obj, attribute)\n        except AttributeError:\n            try:\n                return obj[attribute]\n            except (TypeError, LookupError):\n                pass\n        else:\n            fmt = self.wrap_str_format(value)\n            if fmt is not None:\n                return fmt\n            if self.is_safe_attribute(obj, attribute, value):\n                return value\n            return self.unsafe_undefined(obj, attribute)",
+   "reasoning": "SandboxedEnvironment.getattr() is the runtime path used by compiled templates for attribute access. The value returned by getattr() is either a sandboxed format wrapper (wrap_str_format) or checked via is_safe_attribute, blocking underscore/internal attributes and returning unsafe_undefined otherwise. This is the fixed implementation, so the getattr inventory hit is not exploitable.",
+   "evidence": {
+    "code_context": "value = getattr(obj, attribute)\n...\nfmt = self.wrap_str_format(value)\nif fmt is not None:\n    return fmt\nif self.is_safe_attribute(obj, attribute, value):\n    return value\nreturn self.unsafe_undefined(obj, attribute)",
+    "dataflow_analysis": "Attribute name from template flows into getattr, but exposure is conditional on is_safe_attribute() approval; str.format/format_map results are re-wrapped so nested field access also goes through the sandbox.",
+    "notes": "Guarded; fp. The genuinely vulnerable path is filters.py do_attr (line 1426) which lacks wrap_str_format and uses is_safe_attribute only — already submitted as tp."
+   },
+   "dataflow_path": null,
+   "group": "critical_sometimes_medium",
+   "sanity_check": {
+    "verdict": "fp",
+    "confidence": 93,
+    "recommendation": "reject",
+    "concerns": false,
+    "flags": [],
+    "reasoning": "The cited getattr call is part of Jinja2's intentional SandboxedEnvironment implementation, not an unguarded dangerous sink. Attribute values are either safely wrapped for str.format handling or validated by is_safe_attribute before return, with unsafe attributes converted to unsafe_undefined, so the reported inventory hit is not an exploitable protection-mechanism failure."
+   }
+  }
+ ],
+ "sanity_check_metadata": {
+  "session_id": "20261119040620",
+  "model": "deepseek/deepseek-reasoner",
+  "temperature": 0.0,
+  "max_tokens": 8000,
+  "total_input_tokens": 20190,
+  "total_output_tokens": 18088,
+  "total_tokens": 38278,
+  "estimated_cost_usd": 0.0133,
+  "total_findings_validated": 15,
+  "findings_with_flags": 0,
+  "elapsed_time_seconds": 153.33
+ },
+ "cache_usage": {
+  "prompt_tokens_total": 20190,
+  "uncached_input_tokens": 20190,
+  "cache_creation_input_tokens": 0,
+  "cache_read_input_tokens": 0,
+  "output_tokens": 18088,
+  "calls": 14,
+  "caching_enabled": false,
+  "cost_usd_with_cache": 0.027763,
+  "cost_usd_no_cache": 0.027763,
+  "cache_read_share_of_prompt": 0.0,
+  "prices_per_mtok": {
+   "claude-sonnet-4-5-20250929": {
+    "input": 3.0,
+    "output": 15.0
+   },
+   "claude-haiku-4-5-20251001": {
+    "input": 1.0,
+    "output": 5.0
+   },
+   "deepseek/deepseek-reasoner": {
+    "input": 0.15,
+    "output": 0.6,
+    "cache_read": 0.003,
+    "cache_write_mult": 1.0,
+    "peak_mult": 2.0
+   }
+  },
+  "cache_multipliers": {
+   "write_5m": 1.25,
+   "read": 0.1
+  }
+ }
+}

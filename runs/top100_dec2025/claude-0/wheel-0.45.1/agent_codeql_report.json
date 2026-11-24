@@ -1,0 +1,1162 @@
+{
+ "session_id": "20251221035445",
+ "package_name": "wheel-0.45.1",
+ "package_path": "packages/wheel-0.45.1",
+ "database_path": "databases/wheel-0.45.1-db",
+ "model": "claude-sonnet-4-5-20250929",
+ "temperature": 0.0,
+ "max_tokens": 4000,
+ "iterations": 19,
+ "total_input_tokens": 205448,
+ "total_output_tokens": 9106,
+ "total_tokens": 214554,
+ "elapsed_time_seconds": 399.75,
+ "estimated_cost_usd": 0.7529,
+ "summary": "## Security Analysis Summary: wheel-0.45.1\n\n### Package Overview\nThe `wheel` package (version 0.45.1) is a Python packaging tool that creates and manipulates wheel files (built-package format). It includes CLI tools for packing, unpacking, and converting wheel files, as well as library functionality for building wheels.\n\n### Key Findings\n\n#### 1. **Code Execution via compile() - CRITICAL** (CWE-94)\n- **Location**: `src/wheel/_bdist_wheel.py:39`\n- **Severity**: High\n- **Description**: Found usage of `compile()` function which can execute arbitrary code if provided with untrusted input. This could potentially be exploited if malicious code is passed to the compilation function.\n\n#### 2. **Unsafe File Write Operations - HIGH** (CWE-22, CWE-73)\n- **Count**: 15 instances across multiple files\n- **Severity**: High\n- **Key Locations**:\n  - `src/wheel/_bdist_wheel.py` (7 instances at lines 445, 489, 575, 582, 595, 606, 611)\n  - `src/wheel/wheelfile.py:171`\n  - `src/wheel/cli/pack.py` (lines 41, 61)\n  - `src/wheel/metadata.py` (lines 150, 159)\n  - Vendored packaging files\n- **Description**: Multiple file write operations that may write to arbitrary locations without proper path validation. These could potentially be exploited for path traversal attacks if file paths are derived from untrusted sources (e.g., wheel metadata, archive contents).\n\n#### 3. **Symlink Following Vulnerabilities - MEDIUM** (CWE-59, CWE-61)\n- **Count**: 16 instances\n- **Severity**: Medium\n- **Key Locations**:\n  - `src/wheel/_bdist_wheel.py` (12 instances)\n  - `src/wheel/wheelfile.py:152`\n  - `src/wheel/cli/pack.py:28`\n  - `src/wheel/cli/convert.py:287`\n  - `src/wheel/metadata.py:158`\n- **Description**: File operations using `os.path.exists()`, `os.path.isdir()`, `os.path.isfile()`, and `open()` that may follow symlinks without validation. This could lead to:\n  - Time-of-check-time-of-use (TOCTOU) race conditions\n  - Symlink attacks where malicious symlinks could cause the tool to read/write files outside intended directories\n  - Potential for privilege escalation if the tool is run with elevated permissions\n\n### Risk Assessment\n\n**Overall Risk Level**: **MEDIUM-HIGH**\n\nThe package handles file system operations extensively and processes potentially untrusted input (wheel files, metadata). The main security concerns are:\n\n1. **Path Traversal**: The numerous file write operations without apparent path sanitization could allow malicious wheel files to write outside intended directories\n2. **Symlink Attacks**: TOCTOU vulnerabilities in file operations could be exploited in multi-user or concurrent environments\n3. **Code Execution**: The use of `compile()` requires careful input validation to prevent code injection\n\n### Recommendations\n\n1. **Validate all file paths** extracted from wheel archives to prevent path traversal (check for `..`, absolute paths, symlinks)\n2. **Use secure file operations** that don't follow symlinks (e.g., `os.open()` with `O_NOFOLLOW`)\n3. **Sanitize inputs** to `compile()` and ensure only trusted code is compiled\n4. **Implement atomic file operations** to prevent TOCTOU race conditions\n5. **Add security documentation** warning users about processing untrusted wheel files\n\n### Notes\n- No remote code execution vulnerabilities from network sources were found (package doesn't handle network input directly)\n- No unsafe deserialization (pickle, yaml) was detected\n- No command injection vulnerabilities were found in subprocess calls\n- The vendored packaging library files contain some of the flagged operations but are likely lower risk as they're reading system files",
+ "package_classification": {
+  "type": [
+   "library",
+   "cli_tool",
+   "dev_tool"
+  ],
+  "layer": [
+   "application",
+   "build_system",
+   "packaging"
+  ]
+ },
+ "tool_calls": {
+  "get_package_profile_info": 1,
+  "execute_codeql_query": 12,
+  "validate_codeql_query": 0,
+  "fixup_codeql_query": 2,
+  "finalize_report": 1
+ },
+ "queries_executed": {
+  "critical": 0,
+  "high": 7,
+  "medium": 3,
+  "low": 0,
+  "total_executed": 14,
+  "total_with_results": 10,
+  "total_failed": 4
+ },
+ "query_findings": {
+  "critical": 0,
+  "high": 16,
+  "medium": 16,
+  "low": 0,
+  "total": 32
+ },
+ "findings": [
+  {
+   "codeql_query_uuid": "20251221035602",
+   "codeql_raw_query": "/**\n * @name Path traversal in file operations\n * @description Extracting or writing files without proper path validation can lead to path traversal vulnerabilities\n * @kind path-problem\n * @problem.severity error\n * @id py/path-traversal-wheel\n * @tags security\n *        external/cwe/cwe-022\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.Concepts\nimport semmle.python.ApiGraphs\n\nmodule PathTraversalConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    exists(DataFlow::CallCfgNode call |\n      // ZipFile member names or paths from archives\n      call = API::moduleImport(\"zipfile\").getMember(\"ZipFile\").getReturn().getMember([\"namelist\", \"infolist\"]).getACall() or\n      call = API::moduleImport(\"zipfile\").getMember(\"ZipFile\").getReturn().getMember(\"getinfo\").getACall() or\n      // ZipInfo filename attribute access\n      exists(DataFlow::AttrRead attr |\n        attr.getAttributeName() = \"filename\" and\n        source = attr\n      )\n    |\n      source = call\n    )\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(FileSystemAccess fsa |\n      sink = fsa.getAPathArgument()\n    )\n  }\n}\n\nmodule PathTraversalFlow = TaintTracking::Global<PathTraversalConfig>;\nimport PathTraversalFlow::PathGraph\n\nfrom PathTraversalFlow::PathNode source, PathTraversalFlow::PathNode sink\nwhere PathTraversalFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"Potential path traversal from $@.\", source.getNode(), \"archive member\"",
+   "hypothesis": "Path traversal vulnerability when extracting or writing files from wheel/zip archives without proper path validation",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-022"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251221035637",
+   "codeql_raw_query": "/**\n * @name Unsafe ZIP extraction\n * @description Extracting ZIP files without validating member paths can lead to path traversal\n * @kind problem\n * @problem.severity error\n * @id py/unsafe-zip-extraction\n * @tags security\n *        external/cwe/cwe-022\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  (\n    // ZipFile.extract or extractall without path validation\n    call = API::moduleImport(\"zipfile\").getMember(\"ZipFile\").getReturn().getMember([\"extract\", \"extractall\"]).getACall()\n  )\nselect call, \"ZIP extraction operation that may be vulnerable to path traversal if member paths are not validated.\"\n",
+   "hypothesis": "Unsafe ZIP file extraction without path validation in wheel unpacking operations",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-022"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251221035754",
+   "codeql_raw_query": "/**\n * @name Command injection via subprocess\n * @description Using subprocess with shell=True and untrusted input can lead to command injection\n * @kind path-problem\n * @problem.severity error\n * @id py/command-injection-wheel\n * @tags security\n *        external/cwe/cwe-078\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.Concepts\nimport semmle.python.ApiGraphs\n\nmodule CommandInjectionConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    // User-controlled input from file paths, metadata, or arguments\n    exists(DataFlow::Node node |\n      node = API::moduleImport(\"sys\").getMember(\"argv\").getAValueReachableFromSource() or\n      node = API::moduleImport(\"os\").getMember([\"getenv\", \"environ\"]).getACall()\n    |\n      source = node\n    )\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(SystemCommandExecution cmd |\n      sink = cmd.getCommand()\n    )\n  }\n}\n\nmodule CommandInjectionFlow = TaintTracking::Global<CommandInjectionConfig>;\nimport CommandInjectionFlow::PathGraph\n\nfrom CommandInjectionFlow::PathNode source, CommandInjectionFlow::PathNode sink\nwhere CommandInjectionFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"Command injection from $@.\", source.getNode(), \"user input\"",
+   "hypothesis": "Command injection through subprocess calls with user-controlled input",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-078"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251221035824",
+   "codeql_raw_query": "/**\n * @name Unsafe file write operations\n * @description Writing files without proper path validation can lead to arbitrary file write vulnerabilities\n * @kind problem\n * @problem.severity warning\n * @id py/unsafe-file-write-wheel\n * @tags security\n *        external/cwe/cwe-022\n */\n\nimport python\nimport semmle.python.ApiGraphs\nimport semmle.python.dataflow.new.DataFlow\n\nfrom DataFlow::CallCfgNode call\nwhere\n  (\n    call = API::moduleImport(\"shutil\").getMember([\"copy\", \"copy2\", \"copyfile\", \"copytree\", \"move\"]).getACall() or\n    call = API::moduleImport(\"os\").getMember([\"rename\", \"makedirs\", \"mkdir\"]).getACall() or\n    call = API::builtin(\"open\").getACall()\n  ) and\n  // Check if the path argument comes from potentially untrusted sources\n  exists(DataFlow::Node pathArg |\n    pathArg = call.getArg(0) or pathArg = call.getArg(1)\n  )\nselect call, \"File operation that may write to arbitrary locations without validation.\"\n",
+   "hypothesis": "Unsafe file write operations that could allow writing to arbitrary locations without proper path validation",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-022",
+    "cwe-059"
+   ],
+   "results_count": 15,
+   "results": [
+    {
+     "ruleId": "py/unsafe-file-write-wheel",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/unsafe-file-write-wheel",
+      "index": 0
+     },
+     "message": {
+      "text": "File operation that may write to arbitrary locations without validation."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/wheel/_bdist_wheel.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 445,
+         "startColumn": 13,
+         "endColumn": 39
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "c1b038ed25591263:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/unsafe-file-write-wheel",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/unsafe-file-write-wheel",
+      "index": 0
+     },
+     "message": {
+      "text": "File operation that may write to arbitrary locations without validation."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/wheel/_bdist_wheel.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 489,
+         "startColumn": 14,
+         "endColumn": 40
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "4e3492b16c4803ba:1",
+      "primaryLocationStartColumnFingerprint": "5"
+     }
+    },
+    {
+     "ruleId": "py/unsafe-file-write-wheel",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/unsafe-file-write-wheel",
+      "index": 0
+     },
+     "message": {
+      "text": "File operation that may write to arbitrary locations without validation."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/wheel/_bdist_wheel.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 575,
+         "startColumn": 13,
+         "endColumn": 36
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "8a8a32ebef131e97:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/unsafe-file-write-wheel",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/unsafe-file-write-wheel",
+      "index": 0
+     },
+     "message": {
+      "text": "File operation that may write to arbitrary locations without validation."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/wheel/_bdist_wheel.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 582,
+         "startColumn": 13,
+         "endLine": 591,
+         "endColumn": 14
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "2526e5b2bd3e6e5d:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/unsafe-file-write-wheel",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/unsafe-file-write-wheel",
+      "index": 0
+     },
+     "message": {
+      "text": "File operation that may write to arbitrary locations without validation."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/wheel/_bdist_wheel.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 595,
+         "startColumn": 18,
+         "endColumn": 63
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "b43555b25d9a9c7b:1",
+      "primaryLocationStartColumnFingerprint": "5"
+     }
+    },
+    {
+     "ruleId": "py/unsafe-file-write-wheel",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/unsafe-file-write-wheel",
+      "index": 0
+     },
+     "message": {
+      "text": "File operation that may write to arbitrary locations without validation."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/wheel/_bdist_wheel.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 606,
+         "startColumn": 14,
+         "endColumn": 56
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "450f417d33f1a9ff:1",
+      "primaryLocationStartColumnFingerprint": "5"
+     }
+    },
+    {
+     "ruleId": "py/unsafe-file-write-wheel",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/unsafe-file-write-wheel",
+      "index": 0
+     },
+     "message": {
+      "text": "File operation that may write to arbitrary locations without validation."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/wheel/_bdist_wheel.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 611,
+         "startColumn": 13,
+         "endColumn": 77
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "2c49a7b3ae8c4c28:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/unsafe-file-write-wheel",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/unsafe-file-write-wheel",
+      "index": 0
+     },
+     "message": {
+      "text": "File operation that may write to arbitrary locations without validation."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/wheel/vendored/packaging/_manylinux.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 22,
+         "startColumn": 14,
+         "endColumn": 30
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "9a812bbfcc946b3b:1",
+      "primaryLocationStartColumnFingerprint": "5"
+     }
+    },
+    {
+     "ruleId": "py/unsafe-file-write-wheel",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/unsafe-file-write-wheel",
+      "index": 0
+     },
+     "message": {
+      "text": "File operation that may write to arbitrary locations without validation."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/wheel/vendored/packaging/_musllinux.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 44,
+         "startColumn": 14,
+         "endColumn": 36
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "7752030fa449267:1",
+      "primaryLocationStartColumnFingerprint": "5"
+     }
+    },
+    {
+     "ruleId": "py/unsafe-file-write-wheel",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/unsafe-file-write-wheel",
+      "index": 0
+     },
+     "message": {
+      "text": "File operation that may write to arbitrary locations without validation."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/wheel/macosx_libfile.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 3
+        },
+        "region": {
+         "startLine": 289,
+         "startColumn": 10,
+         "endColumn": 33
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "6dcb9d7271686477:1",
+      "primaryLocationStartColumnFingerprint": "5"
+     }
+    },
+    {
+     "ruleId": "py/unsafe-file-write-wheel",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/unsafe-file-write-wheel",
+      "index": 0
+     },
+     "message": {
+      "text": "File operation that may write to arbitrary locations without validation."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/wheel/metadata.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 4
+        },
+        "region": {
+         "startLine": 150,
+         "startColumn": 10,
+         "endColumn": 46
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "d1362e957c7c1726:1",
+      "primaryLocationStartColumnFingerprint": "5"
+     }
+    },
+    {
+     "ruleId": "py/unsafe-file-write-wheel",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/unsafe-file-write-wheel",
+      "index": 0
+     },
+     "message": {
+      "text": "File operation that may write to arbitrary locations without validation."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/wheel/metadata.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 4
+        },
+        "region": {
+         "startLine": 159,
+         "startColumn": 14,
+         "endColumn": 51
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "c024cea8ba24304d:1",
+      "primaryLocationStartColumnFingerprint": "5"
+     }
+    },
+    {
+     "ruleId": "py/unsafe-file-write-wheel",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/unsafe-file-write-wheel",
+      "index": 0
+     },
+     "message": {
+      "text": "File operation that may write to arbitrary locations without validation."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/wheel/cli/pack.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 5
+        },
+        "region": {
+         "startLine": 41,
+         "startColumn": 10,
+         "endColumn": 37
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "cc182eec384ccb50:1",
+      "primaryLocationStartColumnFingerprint": "5"
+     }
+    },
+    {
+     "ruleId": "py/unsafe-file-write-wheel",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/unsafe-file-write-wheel",
+      "index": 0
+     },
+     "message": {
+      "text": "File operation that may write to arbitrary locations without validation."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/wheel/cli/pack.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 5
+        },
+        "region": {
+         "startLine": 61,
+         "startColumn": 18,
+         "endColumn": 45
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "5db8c648c27cd0f6:1",
+      "primaryLocationStartColumnFingerprint": "5"
+     }
+    },
+    {
+     "ruleId": "py/unsafe-file-write-wheel",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/unsafe-file-write-wheel",
+      "index": 0
+     },
+     "message": {
+      "text": "File operation that may write to arbitrary locations without validation."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/wheel/wheelfile.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 6
+        },
+        "region": {
+         "startLine": 171,
+         "startColumn": 14,
+         "endColumn": 34
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "694ffaa0b5ef7272:1",
+      "primaryLocationStartColumnFingerprint": "5"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251221035848",
+   "codeql_raw_query": "/**\n * @name ZIP slip vulnerability in wheel extraction\n * @description Extracting ZIP files without validating member paths can allow writing outside intended directory\n * @kind problem\n * @problem.severity error\n * @id py/zipslip-wheel\n * @tags security\n *        external/cwe/cwe-022\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  // ZipFile.extract or extractall without path validation\n  (\n    call = API::moduleImport(\"zipfile\").getMember(\"ZipFile\").getReturn().getMember([\"extract\", \"extractall\"]).getACall()\n  )\nselect call, \"ZIP extraction operation that may be vulnerable to path traversal (ZIP slip) if member paths are not validated.\"\n",
+   "hypothesis": "ZIP extraction operations without proper path validation can lead to ZIP slip vulnerabilities",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-022"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251221035910",
+   "codeql_raw_query": "/**\n * @name Code execution via eval/exec/compile\n * @description Using eval, exec, or compile with potentially untrusted input can lead to arbitrary code execution\n * @kind problem\n * @problem.severity error\n * @id py/code-execution-wheel\n * @tags security\n *        external/cwe/cwe-094\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::builtin([\"eval\", \"exec\", \"compile\", \"__import__\"]).getACall()\nselect call, \"Potentially dangerous code execution function that could execute arbitrary code.\"\n",
+   "hypothesis": "Check for use of dangerous code execution functions like eval, exec, compile that could execute arbitrary code",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-094"
+   ],
+   "results_count": 1,
+   "results": [
+    {
+     "ruleId": "py/code-execution-wheel",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/code-execution-wheel",
+      "index": 0
+     },
+     "message": {
+      "text": "Potentially dangerous code execution function that could execute arbitrary code."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/wheel/_bdist_wheel.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 39,
+         "startColumn": 5,
+         "endColumn": 37
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "754de9aa2b02470b:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251221035933",
+   "codeql_raw_query": "/**\n * @name Unsafe deserialization\n * @description Deserializing untrusted data can lead to arbitrary code execution\n * @kind problem\n * @problem.severity error\n * @id py/unsafe-deserialization-wheel\n * @tags security\n *        external/cwe/cwe-502\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  (\n    call = API::moduleImport(\"pickle\").getMember([\"load\", \"loads\", \"Unpickler\"]).getACall() or\n    call = API::moduleImport(\"yaml\").getMember([\"load\", \"unsafe_load\"]).getACall() or\n    call = API::moduleImport(\"marshal\").getMember([\"load\", \"loads\"]).getACall() or\n    call = API::moduleImport(\"shelve\").getMember(\"open\").getACall()\n  )\nselect call, \"Potentially unsafe deserialization operation that could execute arbitrary code.\"\n",
+   "hypothesis": "Check for unsafe deserialization operations using pickle, yaml, marshal, or shelve that could lead to arbitrary code execution",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-502"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251221035957",
+   "codeql_raw_query": "/**\n * @name Symlink following in file operations\n * @description File operations that may follow symlinks without validation can lead to unauthorized file access\n * @kind problem\n * @problem.severity warning\n * @id py/symlink-following-wheel\n * @tags security\n *        external/cwe/cwe-59\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  (\n    // os.path operations that follow symlinks\n    call = API::moduleImport(\"os\").getMember(\"path\").getMember([\"exists\", \"isfile\", \"isdir\", \"getsize\"]).getACall() or\n    // shutil operations that may follow symlinks\n    call = API::moduleImport(\"shutil\").getMember([\"copy\", \"copy2\", \"copytree\", \"move\", \"rmtree\"]).getACall() or\n    // pathlib operations\n    call = API::moduleImport(\"pathlib\").getMember(\"Path\").getReturn().getMember([\"exists\", \"is_file\", \"is_dir\", \"stat\"]).getACall()\n  )\nselect call, \"File operation that may follow symlinks without validation.\"",
+   "hypothesis": "File operations that follow symlinks without proper validation could lead to unauthorized file access or symlink attacks",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-59"
+   ],
+   "results_count": 16,
+   "results": [
+    {
+     "ruleId": "py/symlink-following-wheel",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/symlink-following-wheel",
+      "index": 0
+     },
+     "message": {
+      "text": "File operation that may follow symlinks without validation."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/wheel/_bdist_wheel.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 444,
+         "startColumn": 16,
+         "endColumn": 45
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "9872be8d6b9e61aa:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/symlink-following-wheel",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/symlink-following-wheel",
+      "index": 0
+     },
+     "message": {
+      "text": "File operation that may follow symlinks without validation."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/wheel/_bdist_wheel.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 464,
+         "startColumn": 21,
+         "endColumn": 68
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "201a5adacde01f5:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/symlink-following-wheel",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/symlink-following-wheel",
+      "index": 0
+     },
+     "message": {
+      "text": "File operation that may follow symlinks without validation."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/wheel/_bdist_wheel.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 466,
+         "startColumn": 21,
+         "endColumn": 70
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "cb7eff1a041ca0aa:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/symlink-following-wheel",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/symlink-following-wheel",
+      "index": 0
+     },
+     "message": {
+      "text": "File operation that may follow symlinks without validation."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/wheel/_bdist_wheel.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 536,
+         "startColumn": 42,
+         "endColumn": 62
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "298cdec49755f3f0:1",
+      "primaryLocationStartColumnFingerprint": "25"
+     }
+    },
+    {
+     "ruleId": "py/symlink-following-wheel",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/symlink-following-wheel",
+      "index": 0
+     },
+     "message": {
+      "text": "File operation that may follow symlinks without validation."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/wheel/_bdist_wheel.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 549,
+         "startColumn": 16,
+         "endColumn": 33
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "ec86ab1feabf1fdb:1",
+      "primaryLocationStartColumnFingerprint": "3"
+     }
+    },
+    {
+     "ruleId": "py/symlink-following-wheel",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/symlink-following-wheel",
+      "index": 0
+     },
+     "message": {
+      "text": "File operation that may follow symlinks without validation."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/wheel/_bdist_wheel.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 549,
+         "startColumn": 64,
+         "endColumn": 80
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "ec86ab1feabf1fdb:1",
+      "primaryLocationStartColumnFingerprint": "51"
+     }
+    },
+    {
+     "ruleId": "py/symlink-following-wheel",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/symlink-following-wheel",
+      "index": 0
+     },
+     "message": {
+      "text": "File operation that may follow symlinks without validation."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/wheel/_bdist_wheel.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 550,
+         "startColumn": 17,
+         "endColumn": 33
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "139eea637e281167:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/symlink-following-wheel",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/symlink-following-wheel",
+      "index": 0
+     },
+     "message": {
+      "text": "File operation that may follow symlinks without validation."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/wheel/_bdist_wheel.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 551,
+         "startColumn": 18,
+         "endColumn": 35
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "9bba7c56cdd7cccd:1",
+      "primaryLocationStartColumnFingerprint": "5"
+     }
+    },
+    {
+     "ruleId": "py/symlink-following-wheel",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/symlink-following-wheel",
+      "index": 0
+     },
+     "message": {
+      "text": "File operation that may follow symlinks without validation."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/wheel/_bdist_wheel.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 556,
+         "startColumn": 16,
+         "endColumn": 44
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "633bfe217961c3e3:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/symlink-following-wheel",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/symlink-following-wheel",
+      "index": 0
+     },
+     "message": {
+      "text": "File operation that may follow symlinks without validation."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/wheel/_bdist_wheel.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 572,
+         "startColumn": 12,
+         "endColumn": 40
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "7a49c62db94a6699:1",
+      "primaryLocationStartColumnFingerprint": "3"
+     }
+    },
+    {
+     "ruleId": "py/symlink-following-wheel",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/symlink-following-wheel",
+      "index": 0
+     },
+     "message": {
+      "text": "File operation that may follow symlinks without validation."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/wheel/_bdist_wheel.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 582,
+         "startColumn": 13,
+         "endLine": 591,
+         "endColumn": 14
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "2526e5b2bd3e6e5d:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/symlink-following-wheel",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/symlink-following-wheel",
+      "index": 0
+     },
+     "message": {
+      "text": "File operation that may follow symlinks without validation."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/wheel/_bdist_wheel.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 611,
+         "startColumn": 13,
+         "endColumn": 77
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "2c49a7b3ae8c4c28:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/symlink-following-wheel",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/symlink-following-wheel",
+      "index": 0
+     },
+     "message": {
+      "text": "File operation that may follow symlinks without validation."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/wheel/cli/convert.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 287,
+         "startColumn": 20,
+         "endColumn": 33
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "925a1f36c3096f78:1",
+      "primaryLocationStartColumnFingerprint": "3"
+     }
+    },
+    {
+     "ruleId": "py/symlink-following-wheel",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/symlink-following-wheel",
+      "index": 0
+     },
+     "message": {
+      "text": "File operation that may follow symlinks without validation."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/wheel/metadata.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 158,
+         "startColumn": 8,
+         "endColumn": 37
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "2a829811c2bc512c:1",
+      "primaryLocationStartColumnFingerprint": "3"
+     }
+    },
+    {
+     "ruleId": "py/symlink-following-wheel",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/symlink-following-wheel",
+      "index": 0
+     },
+     "message": {
+      "text": "File operation that may follow symlinks without validation."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/wheel/cli/pack.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 3
+        },
+        "region": {
+         "startLine": 28,
+         "startColumn": 12,
+         "endColumn": 54
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "21a0fd816ad828d1:1",
+      "primaryLocationStartColumnFingerprint": "3"
+     }
+    },
+    {
+     "ruleId": "py/symlink-following-wheel",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/symlink-following-wheel",
+      "index": 0
+     },
+     "message": {
+      "text": "File operation that may follow symlinks without validation."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/wheel/wheelfile.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 4
+        },
+        "region": {
+         "startLine": 152,
+         "startColumn": 20,
+         "endColumn": 40
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "ff407c75b6aa509c:1",
+      "primaryLocationStartColumnFingerprint": "3"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251221040022",
+   "codeql_raw_query": "/**\n * @name Weak cryptographic hash usage\n * @description Using weak hash algorithms like MD5 or SHA1 for security purposes can be vulnerable\n * @kind problem\n * @problem.severity warning\n * @id py/weak-crypto-wheel\n * @tags security\n *        external/cwe/cwe-327\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  (\n    call = API::moduleImport(\"hashlib\").getMember([\"md5\", \"sha1\"]).getACall() or\n    call = API::moduleImport(\"hashlib\").getMember(\"new\").getACall() and\n    exists(DataFlow::Node arg |\n      arg = call.getArg(0) and\n      arg.asExpr().(StringLiteral).getText() in [\"md5\", \"sha1\"]\n    )\n  )\nselect call, \"Use of weak cryptographic hash algorithm that may be vulnerable to collision attacks.\"",
+   "hypothesis": "Checking for use of weak cryptographic hash algorithms (MD5, SHA1) that could be vulnerable to collision attacks",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-327"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251221040047",
+   "codeql_raw_query": "/**\n * @name Insecure temporary file usage\n * @description Using temporary files without proper security measures can lead to race conditions\n * @kind problem\n * @problem.severity warning\n * @id py/insecure-temp-file-wheel\n * @tags security\n *        external/cwe/cwe-377\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  (\n    call = API::moduleImport(\"tempfile\").getMember([\"mktemp\", \"TemporaryFile\", \"NamedTemporaryFile\", \"mkdtemp\"]).getACall() or\n    call = API::moduleImport(\"os\").getMember([\"tmpfile\", \"tempnam\", \"tmpnam\"]).getACall()\n  )\nselect call, \"Temporary file or directory creation that may be vulnerable to race conditions.\"",
+   "hypothesis": "Insecure temporary file usage that could lead to race conditions or symlink attacks",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-377",
+    "cwe-379"
+   ],
+   "results_count": 0,
+   "results": []
+  }
+ ]
+}

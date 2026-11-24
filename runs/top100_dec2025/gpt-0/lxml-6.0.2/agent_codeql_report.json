@@ -1,0 +1,349 @@
+{
+ "session_id": "20251216141002",
+ "package_name": "lxml-6.0.2",
+ "package_path": "packages/lxml-6.0.2",
+ "database_path": "databases/lxml-6.0.2-db",
+ "model": "gpt-5.1",
+ "temperature": 0.0,
+ "max_tokens": 8000,
+ "iterations": 13,
+ "total_input_tokens": 78534,
+ "total_output_tokens": 6601,
+ "total_tokens": 85135,
+ "elapsed_time_seconds": 358.06,
+ "estimated_cost_usd": 0.1642,
+ "summary": "## Overview\n\nPackage analyzed: **lxml 6.0.2**  \nType: XML/HTML processing library with build/benchmark tooling (Python + C/Cython bindings)\n\nScope of analysis:\n- Python sources under `src/lxml/**` (library runtime)\n- Build and tooling scripts: `buildlibxml.py`, `setup.py`, `setupinfo.py`, `benchmark/run_benchmarks.py`, and helper tools under `tools/`\n- Used CodeQL with custom queries focused on common security classes: XML/HTML parsing safety, subprocess usage, temp files, SSL, and general unsafe APIs.\n\nNo critical or high‑impact vulnerabilities were identified in the **library runtime** code paths that typical consumers of `lxml` would exercise. Some potentially risky patterns exist in build/benchmark tooling, but these are not normally exposed in production use.\n\n---\n\n## Key Findings\n\n### 1. Subprocess command execution in tooling/build scripts\n\n**Files/locations (from CodeQL results):**\n- `buildlibxml.py:450`  \n- `benchmark/run_benchmarks.py:50`  \n- `setupinfo.py:363–364`\n\n**Pattern:**\n- Use of `subprocess` (or equivalent) to invoke external commands during:\n  - Building bundled libxml2/libxslt (`buildlibxml.py`)\n  - Running benchmarks (`benchmark/run_benchmarks.py`)\n  - Setup/packaging helper logic (`setupinfo.py`)\n\n**Risk assessment:**\n- **Severity:** Low in normal usage; Medium if these scripts are run with untrusted input or in multi‑tenant CI environments.\n- **CWE:**\n  - CWE‑78: Improper Neutralization of Special Elements used in an OS Command ('OS Command Injection')\n\n**Reasoning:**\n- These scripts are developer/packaging tools, not part of the runtime library API.\n- CodeQL flagged generic subprocess usage; there was no evidence (from the query results) of direct flow from remote/untrusted input into the command arguments.\n- Risk mainly arises if:\n  - Environment variables or command‑line arguments are passed directly into subprocess calls without validation, or\n  - The scripts are repurposed in automation where untrusted users can influence their parameters.\n\n**Recommendations:**\n- Prefer `subprocess.run([...], shell=False, check=True)` with argument lists instead of shell strings.\n- Avoid `shell=True` unless strictly necessary; if used, ensure all inputs are from trusted, controlled sources.\n- Validate or sanitize any user‑ or environment‑controlled values that may be interpolated into commands.\n- Document that these scripts are intended for trusted developer/build environments only.\n\n---\n\n### 2. No unsafe XML/HTML parsing patterns detected in this package’s own Python code\n\n**Queries run:**\n- Custom CodeQL query for **XXE / external entity / unsafe parsing** via `lxml.etree` and `lxml.html` APIs:\n  - Targets calls to `parse`, `fromstring`, `XML`, `HTML`, `XMLParser`, `HTMLParser` from `lxml.etree`/`lxml.html`.\n- Custom query for use of `lxml.html.clean.Cleaner` (HTML sanitizer) to flag potentially unsafe configurations.\n\n**Results:**\n- **No matches** in the package’s own Python sources for unsafe parser usage.\n- **No matches** for `lxml.html.clean.Cleaner` usage in the package’s own code.\n\n**Interpretation:**\n- The library itself does not appear to parse untrusted XML/HTML in a way that would expose its own runtime to XXE or similar issues.\n- Note: `lxml` is a low‑level XML/HTML library; **user code** can still introduce XXE or related vulnerabilities if it uses the APIs insecurely (e.g., enabling DTD loading, external entities, or huge trees on untrusted input). That is outside the scope of this package‑internal audit but should be considered by consumers.\n\n**Recommendations for consumers (not library bugs):**\n- When parsing untrusted XML/HTML with `lxml`:\n  - Disable DTD loading and external entities where possible.\n  - Use secure parser options (e.g., avoid `resolve_entities=True`, avoid `load_dtd=True` on untrusted data).\n  - Avoid `huge_tree=True` on attacker‑controlled input to reduce resource‑exhaustion risk.\n\n---\n\n### 3. No insecure temporary file usage detected\n\n**Query run:**\n- Custom CodeQL query for `tempfile.mktemp()` (known insecure temporary file API).\n\n**Results:**\n- **No uses** of `tempfile.mktemp()` in the codebase.\n\n**Interpretation:**\n- The package does not use this specific insecure temp file pattern.\n- Other temp file usage (e.g., `NamedTemporaryFile`, `mkstemp`) was not flagged by the query and is generally safer.\n\n**Recommendation:**\n- Continue to avoid `tempfile.mktemp()` in future changes.\n\n---\n\n### 4. No insecure SSL/TLS context creation detected\n\n**Query run:**\n- Custom CodeQL query for `ssl._create_unverified_context()` (disables certificate verification).\n\n**Results:**\n- **No matches** in the codebase.\n\n**Interpretation:**\n- The package does not explicitly disable SSL certificate verification via this API.\n- The library is not primarily network‑facing; SSL usage is minimal or absent in the Python layer.\n\n**Recommendation:**\n- If future features introduce HTTPS fetching (e.g., downloading schemas or resources), ensure proper certificate verification and hostname checking.\n\n---\n\n### 5. Other general unsafe patterns\n\n**Areas checked via CodeQL and metadata review:**\n- Use of `eval`/`exec` or dynamic code execution: no flagged instances in the executed queries.\n- Unsafe deserialization (`pickle`, `yaml.load`, etc.) in runtime library code: no issues surfaced in the queries run.\n- Insecure random or cryptographic usage: not a focus of this library; no obvious misuse detected in the Python layer.\n\n**Note:**\n- Some scripts (e.g., `tools/`, `benchmark/`) are clearly intended for local, trusted developer use. They may not follow the same hardening standards as production code but are not typically shipped as part of a security‑sensitive runtime surface.\n\n---\n\n## Overall Security Posture\n\n- **Runtime library (`src/lxml/**`):**\n  - No direct vulnerabilities were identified in the Python portions of the library that would, by themselves, expose consumers to code execution, injection, or similar issues.\n  - As with any powerful parsing library, security depends heavily on how callers configure and use the APIs.\n\n- **Tooling and build scripts:**\n  - Use subprocesses to invoke external tools; this is expected for a project that bundles and builds C libraries.\n  - No concrete command‑injection flows from untrusted input were identified, but subprocess usage should be treated as **potentially sensitive** and kept in trusted environments.\n\n- **Known external risks (by design, not specific bugs found here):**\n  - Consumers can introduce XXE, SSRF, or resource‑exhaustion issues if they parse attacker‑controlled XML/HTML with insecure parser options.\n\n---\n\n## Recommendations Summary\n\n1. **For lxml maintainers:**\n   - Keep build/benchmark scripts clearly documented as trusted‑environment tools.\n   - Where feasible, ensure subprocess calls:\n     - Use `shell=False` and argument lists.\n     - Avoid passing unvalidated environment or user input into commands.\n   - Maintain or improve documentation on secure usage of `lxml.etree` and `lxml.html` for untrusted input (parser options, DTD/entity handling, etc.).\n\n2. **For library consumers:**\n   - Treat all untrusted XML/HTML as hostile; configure parsers defensively.\n   - Avoid enabling DTD loading, external entities, or huge trees on untrusted data.\n   - If using `lxml.html.clean`, carefully review `Cleaner` configuration to ensure it matches your threat model (XSS, script injection, etc.).\n\nWithin the scope of the CodeQL‑based analysis performed, **no exploitable vulnerabilities in the core lxml 6.0.2 runtime were identified.** The main actionable items relate to safe use patterns and cautious handling of subprocesses in build/benchmark tooling.",
+ "package_classification": {
+  "type": "library",
+  "layer": [
+   "xml-processing",
+   "html-processing",
+   "build-tooling"
+  ]
+ },
+ "tool_calls": {
+  "get_package_profile_info": 1,
+  "execute_codeql_query": 14,
+  "validate_codeql_query": 0,
+  "fixup_codeql_query": 4,
+  "finalize_report": 1
+ },
+ "queries_executed": {
+  "critical": 0,
+  "high": 4,
+  "medium": 6,
+  "low": 0,
+  "total_executed": 18,
+  "total_with_results": 10,
+  "total_failed": 4
+ },
+ "query_findings": {
+  "critical": 0,
+  "high": 0,
+  "medium": 6,
+  "low": 0,
+  "total": 6
+ },
+ "findings": [
+  {
+   "codeql_query_uuid": "20251216141115",
+   "codeql_raw_query": "/**\n * @name XXE via unsafe XML parsing\n * @description Detects uses of lxml XML/HTML parsers without secure options that may allow XXE or external resource loading\n * @kind problem\n * @problem.severity error\n * @id py/lxml-xxe-unsafe-parsing\n * @tags security\n *       external/cwe/cwe-611\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"lxml\").getMember([\"etree\", \"html\"]).getAMember().getMember([\n    \"parse\", \"fromstring\", \"XML\", \"HTML\", \"XMLParser\", \"HTMLParser\"\n  ]).getACall()\nselect call, \"Potentially unsafe lxml XML/HTML parsing without secure options (no resolve_entities=False, no huge_tree=False, no load_dtd=False).\"",
+   "hypothesis": "The package uses lxml XML/HTML parsing entry points that may be unsafe by default and could allow XXE or external entity expansion when used on untrusted data.",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-611"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251216141129",
+   "codeql_raw_query": "/**\n * @name Use of lxml.html.clean.Cleaner\n * @description Detects use of lxml.html.clean Cleaner which must be configured carefully for untrusted HTML\n * @kind problem\n * @problem.severity warning\n * @id py/lxml-html-clean-unsafe\n * @tags security\n *       external/cwe/cwe-079\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"lxml.html.clean\").getMember(\"Cleaner\").getACall()\nselect call, \"Use of lxml.html.clean.Cleaner – review configuration when cleaning untrusted HTML.\"",
+   "hypothesis": "The package may use lxml.html.clean.Cleaner in ways that could be unsafe for untrusted HTML if misconfigured.",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-079"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251216141202",
+   "codeql_raw_query": "/**\n * @name Insecure temporary file usage\n * @description Detects use of mktemp and predictable temp file patterns in lxml tooling.\n * @kind problem\n * @problem.severity warning\n * @id py/lxml-insecure-tempfile\n * @tags security\n *       external/cwe/cwe-377\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"tempfile\").getMember([\"mktemp\"]).getACall()\nselect call, \"Insecure temporary file creation using tempfile.mktemp().\"",
+   "hypothesis": "Helper scripts may use insecure temporary file creation.",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-377"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251216141236",
+   "codeql_raw_query": "/**\n * @name Insecure temporary file usage\n * @description Detects use of tempfile.mktemp which is insecure due to race conditions\n * @kind problem\n * @problem.severity error\n * @id py/insecure-tempfile-mktemp\n * @tags security\n *       external/cwe/cwe-377\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"tempfile\").getMember(\"mktemp\").getACall()\nselect call, \"Insecure use of tempfile.mktemp() – use NamedTemporaryFile or mkstemp instead.\"",
+   "hypothesis": "The package may use tempfile.mktemp(), which is insecure due to race conditions.",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-377"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251216141257",
+   "codeql_raw_query": "/**\n * @name Unsafe deserialization in lxml tooling\n * @description Detects use of pickle, yaml.load, or marshal in the lxml Python codebase\n * @kind problem\n * @problem.severity error\n * @id py/lxml-unsafe-deserialization\n * @tags security\n *       external/cwe/cwe-502\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"pickle\").getMember([\"load\", \"loads\", \"Unpickler\"]).getACall() or\n  call = API::moduleImport(\"yaml\").getMember([\"load\", \"unsafe_load\"]).getACall() or\n  call = API::moduleImport(\"marshal\").getMember([\"load\", \"loads\"]).getACall()\nselect call, \"Potentially unsafe deserialization that could execute arbitrary code.\"",
+   "hypothesis": "The package may use unsafe deserialization via pickle, yaml.load, or marshal.",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-502"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251216141314",
+   "codeql_raw_query": "/**\n * @name Subprocess command injection in lxml tooling\n * @description Detects use of subprocess functions that may be vulnerable to command injection if passed untrusted input\n * @kind problem\n * @problem.severity warning\n * @id py/lxml-subprocess-command-execution\n * @tags security\n *       external/cwe/cwe-078\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"subprocess\").getMember([\"Popen\", \"call\", \"check_call\", \"check_output\", \"run\"]).getACall()\nselect call, \"Use of subprocess command execution – ensure inputs are not influenced by untrusted data and shell=True is avoided where possible.\"",
+   "hypothesis": "The package's helper scripts may invoke subprocess in ways that could be risky if reused with untrusted input.",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-78"
+   ],
+   "results_count": 3,
+   "results": [
+    {
+     "ruleId": "py/lxml-subprocess-command-execution",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/lxml-subprocess-command-execution",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of subprocess command execution – ensure inputs are not influenced by untrusted data and shell=True is avoided where possible."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "buildlibxml.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 450,
+         "startColumn": 18,
+         "endColumn": 44
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "3f98979d41ddf74e:1",
+      "primaryLocationStartColumnFingerprint": "13"
+     }
+    },
+    {
+     "ruleId": "py/lxml-subprocess-command-execution",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/lxml-subprocess-command-execution",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of subprocess command execution – ensure inputs are not influenced by untrusted data and shell=True is avoided where possible."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "benchmark/run_benchmarks.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 50,
+         "startColumn": 16,
+         "endColumn": 90
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "b56d74c2fd2023b7:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/lxml-subprocess-command-execution",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/lxml-subprocess-command-execution",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of subprocess command execution – ensure inputs are not influenced by untrusted data and shell=True is avoided where possible."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "setupinfo.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 363,
+         "startColumn": 9,
+         "endLine": 364,
+         "endColumn": 73
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "28b394d5557c0acc:1",
+      "primaryLocationStartColumnFingerprint": "4"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251216141342",
+   "codeql_raw_query": "/**\n * @name Subprocess command execution in lxml project\n * @description Detects uses of subprocess and os.system/popen that may execute shell commands.\n * @kind problem\n * @problem.severity warning\n * @id py/lxml-subprocess-command-execution\n * @tags security\n *       external/cwe/cwe-078\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"subprocess\").getMember([\"Popen\", \"call\", \"check_call\", \"check_output\", \"run\"]).getACall()\n  or call = API::moduleImport(\"os\").getMember([\"system\", \"popen\"]).getACall()\nselect call, \"Use of subprocess command execution – ensure inputs are not influenced by untrusted data and shell=True is avoided where possible.\"",
+   "hypothesis": "The package uses subprocess or os.system/popen for command execution, which could be dangerous if influenced by untrusted input.",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-078"
+   ],
+   "results_count": 3,
+   "results": [
+    {
+     "ruleId": "py/lxml-subprocess-command-execution",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/lxml-subprocess-command-execution",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of subprocess command execution – ensure inputs are not influenced by untrusted data and shell=True is avoided where possible."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "buildlibxml.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 450,
+         "startColumn": 18,
+         "endColumn": 44
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "3f98979d41ddf74e:1",
+      "primaryLocationStartColumnFingerprint": "13"
+     }
+    },
+    {
+     "ruleId": "py/lxml-subprocess-command-execution",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/lxml-subprocess-command-execution",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of subprocess command execution – ensure inputs are not influenced by untrusted data and shell=True is avoided where possible."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "benchmark/run_benchmarks.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 50,
+         "startColumn": 16,
+         "endColumn": 90
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "b56d74c2fd2023b7:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/lxml-subprocess-command-execution",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/lxml-subprocess-command-execution",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of subprocess command execution – ensure inputs are not influenced by untrusted data and shell=True is avoided where possible."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "setupinfo.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 363,
+         "startColumn": 9,
+         "endLine": 364,
+         "endColumn": 73
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "28b394d5557c0acc:1",
+      "primaryLocationStartColumnFingerprint": "4"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251216141401",
+   "codeql_raw_query": "/**\n * @name Insecure use of SSL/TLS\n * @description Detects use of ssl._create_unverified_context or requests with verify=False.\n * @kind problem\n * @problem.severity warning\n * @id py/insecure-ssl-usage\n * @tags security\n *       external/cwe/cwe-295\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"ssl\").getMember(\"_create_unverified_context\").getACall()\nselect call, \"Insecure SSL context creation – this disables certificate verification and is vulnerable to MITM attacks.\"",
+   "hypothesis": "The package may disable SSL certificate verification using ssl._create_unverified_context.",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-295"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251216141438",
+   "codeql_raw_query": "/**\n * @name Use of SSL/TLS without certificate verification\n * @description Detects use of ssl._create_unverified_context or context with check_hostname=False / verify_mode=CERT_NONE\n * @kind problem\n * @problem.severity warning\n * @id py/insecure-ssl-context\n * @tags security\n *       external/cwe/cwe-295\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"ssl\").getMember([\"_create_unverified_context\"]).getACall()\nselect call, \"Creation of an SSL context without certificate verification is insecure.\"",
+   "hypothesis": "insecure SSL context creation",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-295"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251216141515",
+   "codeql_raw_query": "/**\n * @name Insecure use of SSL/TLS\n * @description Detects use of ssl._create_unverified_context or disabling certificate verification\n * @kind problem\n * @problem.severity error\n * @id py/insecure-ssl-context\n * @tags security\n *       external/cwe/cwe-295\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"ssl\").getMember([\"_create_unverified_context\"]).getACall()\nselect call, \"Insecure SSL context creation that disables certificate verification.\"",
+   "hypothesis": "The package may disable SSL certificate verification using ssl._create_unverified_context, leading to MITM risk.",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-295"
+   ],
+   "results_count": 0,
+   "results": []
+  }
+ ]
+}

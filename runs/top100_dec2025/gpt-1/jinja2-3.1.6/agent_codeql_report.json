@@ -1,0 +1,6260 @@
+{
+ "session_id": "20251225215437",
+ "package_name": "jinja2-3.1.6",
+ "package_path": "packages/jinja2-3.1.6",
+ "database_path": "databases/jinja2-3.1.6-db",
+ "model": "gpt-5.1",
+ "temperature": 1.0,
+ "max_tokens": 8000,
+ "iterations": 8,
+ "total_input_tokens": 82256,
+ "total_output_tokens": 6643,
+ "total_tokens": 88899,
+ "elapsed_time_seconds": 254.86,
+ "estimated_cost_usd": 0.1692,
+ "summary": "## Package Overview\n- **Name:** Jinja2 3.1.6\n- **Type:** Python templating library used primarily for web and HTML generation.\n- **Codebase:** ~10.9k LOC across 24 Python files (environment, compiler, loaders, sandbox, filters, utils, etc.).\n- **Key security-relevant areas:** template compilation and rendering, bytecode cache, loaders, sandbox, dynamic importing of extensions and filters.\n\n## Confirmed / Notable Security-Relevant Findings\n\n### 1. Internal use of pickle/marshal for bytecode cache\n- **Location:** `src/jinja2/bccache.py` (lines 73 and 79 flagged)\n- **Pattern:** Calls to `pickle.load` / `pickle.loads` and `marshal.load` / `marshal.loads` used for the bytecode cache.\n- **CodeQL rule:** `py/jinja2-unsafe-deserialization`\n- **CWE:** [CWE-502: Deserialization of Untrusted Data](https://cwe.mitre.org/data/definitions/502.html)\n- **Analysis:**\n  - Jinja2’s bytecode cache uses Python’s `pickle` (and `marshal`) for performance, which is inherently unsafe for untrusted inputs.\n  - In Jinja2’s design, the cache is **local and controlled by the application**; the library does not read serialized data directly from remote users.\n  - As long as the application only points Jinja2’s bytecode cache at a trusted location (not user-controlled files, network shares, or uploads), this is acceptable.\n- **Risk Assessment:**\n  - **Severity:** Medium if an application misconfigures the bytecode cache to read from untrusted storage; otherwise essentially Low within Jinja2 itself.\n  - **Exploitability:** Requires an attacker to be able to write arbitrary pickle/marshal data into the bytecode cache storage and then have Jinja2 load it.\n- **Recommendations for Users:**\n  1) Only configure `FileSystemBytecodeCache` or custom caches to point at directories not writable by untrusted users.\n  2) Do not place bytecode cache files on network locations where integrity is not guaranteed.\n  3) Treat cache files as trusted-only; do not re-use them across mutually untrusted tenants.\n\n### 2. Numerous dynamic attribute / import uses (potential sandbox escape vectors)\n- **Locations (selected):**\n  - `src/jinja2/environment.py` around lines 467–490 (attribute resolution for filters/tests/etc.).\n  - `src/jinja2/ext.py` around lines 275–283 (extension-related dynamic lookup).\n  - `src/jinja2/filters.py` around line 1184 (`getattr` used in filter dispatch / attribute access).\n  - `src/jinja2/loaders.py` around lines 674–680 (dynamic module loading / attribute access for loaders).\n  - `src/jinja2/nodes.py` multiple locations (62, 165, 249, 265, 768) describing AST field/attribute metadata.\n  - `src/jinja2/parser.py` around line 176 (f-strings referencing node/visitor methods by attribute).\n  - `src/jinja2/sandbox.py` around lines 265–302 and 319 (sandbox-specific attribute resolution control).\n  - `src/jinja2/utils.py` around 140–158 (dynamic import of extensions and utilities) and 157–158 (use of `__import__` / `getattr`).\n  - `src/jinja2/visitor.py` around line 33 (visitor pattern using `getattr` based on node type name).\n- **CodeQL rule:** `py/jinja2-sandbox-escape`\n- **CWE:**\n  - [CWE-94: Code Injection](https://cwe.mitre.org/data/definitions/94.html) (if misused to reach dangerous functions)\n  - [CWE-693: Protection Mechanism Failure](https://cwe.mitre.org/data/definitions/693.html) for sandbox bypass potential\n- **What the query found:**\n  - Multiple flows where a value influences `getattr` or module/attribute resolution, including in sandbox-aware code.\n  - These are mostly **intentional framework mechanisms**: dynamic visitor method resolution, extension loading by name, filter/attribute resolution, sandbox policy checks, etc.\n- **Manual Assessment:**\n  - Jinja2 implements its own sandbox (`src/jinja2/sandbox.py`) with explicit logic to restrict attribute access, types, and callables.\n  - The flagged flows mostly represent:\n    - Internal AST/visitor patterns (`visitor.visit_*` resolution),\n    - Dynamic extension / filter loading driven by **configuration** (e.g., strings in `Environment(extensions=[...])`),\n    - Loader logic where template names map to Python modules in controlled ways,\n    - Sandbox attribute checks where `getattr` is used but preceded by policy decisions.\n  - These are not direct vulnerabilities by themselves; risk emerges when **untrusted template code or names are accepted without using the sandbox or without careful configuration**.\n- **Risk Assessment:**\n  - **For Jinja2 itself:** No new specific sandbox escape vulnerability was identified solely from these CodeQL results.\n  - **For Jinja2 integrators:** Misconfiguration can expose:\n    - **Server-side template injection (SSTI)** when untrusted template strings are compiled and executed.\n    - Potential sandbox escapes if untrusted template authors are allowed and the sandbox is not correctly enabled/configured.\n- **Recommendations for Users:**\n  1) **Never treat untrusted template strings as data.** If you take a template body from a user, treat that as code; do not compile/execute it unless you fully trust the user (this avoids SSTI / RCE).\n  2) When providing **template authorship to untrusted users**, use `jinja2.sandbox.SandboxedEnvironment` (or an equivalent sandbox configuration) and stay up to date with Jinja2’s security advisories.\n  3) Restrict which modules / objects are exposed in the template environment (globals, filters, tests, functions). Do not expose powerful objects like `os`, `subprocess`, file system APIs, or arbitrary callable objects from your application layer.\n  4) Use explicit, minimal extension lists instead of accepting extension names from untrusted sources.\n  5) Review any custom filters or tests for injection risks; they may be invoked with attacker-controlled data.\n\n### 3. No direct remote-to-template-flow SSTI patterns found by query\n- **Query run:** `py/jinja2-ssti-env` (path-problem, taint from `RemoteFlowSource` into Jinja2 `Environment` / `Template` / `from_string` calls).\n- **Result:** The query produced **no paths** where CodeQL’s built-in remote sources (e.g., typical web-request handlers) flowed into template compilation/rendering inside the library itself.\n- **Interpretation:**\n  - Jinja2, as a library, does not embed its own HTTP or network handlers; it expects the calling application/framework to supply data and templates.\n  - As a result, vulnerabilities like SSTI or injection are primarily a function of **how an application uses Jinja2**, not the Jinja2 codebase alone.\n\n## Overall Security Posture of Jinja2 3.1.6 (as a library)\n\n- **Core design:** Jinja2 is a powerful template engine where templates are executable code in the Jinja language. This inherently carries risks if untrusted parties can supply templates or influence environment configuration.\n- **Within this package version:**\n  - No novel critical RCE or sandbox-bypass vulnerability was discovered by the automated CodeQL exploration beyond already known classes of risk (templating as code, unsafe deserialization used for local bytecode caches, dynamic attribute resolution).\n  - The use of `pickle` / `marshal` is restricted to performance-related caches and is safe as long as applications do not source cache data from untrusted locations.\n  - Numerous dynamic `getattr` / import patterns exist by design but did not reveal a specific exploitable issue by themselves in this analysis.\n\n## Guidance for Secure Use\n\nFor developers embedding Jinja2 3.1.6:\n\n1. **Treat templates as code, not data**\n   - Do not render arbitrary template strings from untrusted users.\n   - Use Jinja2 for trusted templates that you control, and feed only data (context) from users.\n\n2. **Use the sandbox for untrusted authors**\n   - If you must allow users to author or edit templates, use `SandboxedEnvironment` and audit which filters, tests, and globals it exposes.\n   - Keep your Jinja2 version patched to the latest security release.\n\n3. **Constrain environment and extensions**\n   - Whitelist only the extensions you need.\n   - Avoid dynamic extension lists or environment configuration derived directly from user input.\n   - Limit what application objects are injected into the template globals.\n\n4. **Secure bytecode cache usage**\n   - Configure bytecode cache directories that are writable only by your application user.\n   - Do not use caches on shared/untrusted file systems or across untrusted tenants.\n\n5. **General hardening**\n   - Enable autoescaping when rendering HTML to mitigate XSS (even though this analysis did not focus on XSS specifically).\n   - Review custom filters/tests for command or code execution, OS interaction, or sensitive data exposure.\n\n## Classification\n\n- **Package type:** library\n- **Primary layer(s):**\n  - `runtime` (template execution engine)\n  - `presentation` (HTML/text rendering)\n  - `framework-integration` (via extensions/loaders)\n\nNo immediate changes are strictly required in Jinja2 3.1.6 based on this CodeQL run, but secure integration and configuration by consuming applications are essential to avoid known classes of template-related vulnerabilities.",
+ "package_classification": {
+  "type": "library",
+  "layer": [
+   "runtime",
+   "presentation",
+   "framework-integration"
+  ]
+ },
+ "tool_calls": {
+  "get_package_profile_info": 1,
+  "execute_codeql_query": 6,
+  "validate_codeql_query": 0,
+  "fixup_codeql_query": 3,
+  "finalize_report": 1
+ },
+ "queries_executed": {
+  "critical": 1,
+  "high": 2,
+  "medium": 0,
+  "low": 0,
+  "total_executed": 9,
+  "total_with_results": 3,
+  "total_failed": 5
+ },
+ "query_findings": {
+  "critical": 0,
+  "high": 26,
+  "medium": 0,
+  "low": 0,
+  "total": 26
+ },
+ "findings": [
+  {
+   "codeql_query_uuid": "20251225215617",
+   "codeql_raw_query": "/**\n * @name Templating engine: user-controlled template execution (jinja2.Environment)\n * @description Find flows from remote input into Jinja2 template compilation / rendering APIs, which may indicate server-side template injection (SSTI).\n * @kind path-problem\n * @problem.severity error\n * @id py/jinja2-ssti-env\n * @tags security\n *       external/cwe/cwe-094\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.dataflow.new.RemoteFlowSources\nimport semmle.python.ApiGraphs\n\nmodule SSTIConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) { source instanceof RemoteFlowSource }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(API::CallNode call |\n      call = API::moduleImport(\"jinja2\").getMember(\"Environment\").getACall() and\n      sink = call.getArg(0)\n      or\n      call = API::moduleImport(\"jinja2\").getMember([\"Template\", \"from_string\"]).getACall() and\n      sink = call.getArg(0)\n    )\n  }\n}\n\nmodule SSTIFlow = TaintTracking::Global<SSTIConfig>;\nimport SSTIFlow::PathGraph\n\nfrom SSTIFlow::PathNode source, SSTIFlow::PathNode sink\nwhere SSTIFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"User-controlled data reaches Jinja2 template APIs, which may indicate SSTI.\", source, \"user input\"\n",
+   "hypothesis": "Remote user data flowing into Jinja2 template compilation / rendering APIs could indicate SSTI",
+   "severity": "critical",
+   "cwe_ids": [
+    "cwe-094"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251225215648",
+   "codeql_raw_query": "/**\n * @name Unsafe deserialization in Jinja2 internals\n * @description Detect use of pickle, marshal, or json with object_hook that may deserialize untrusted data.\n * @kind problem\n * @problem.severity warning\n * @id py/jinja2-unsafe-deserialization\n * @tags security\n *       external/cwe/cwe-502\n */\n\nimport python\nimport semmle.python.ApiGraphs\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.RemoteFlowSources\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"pickle\").getMember([\"load\", \"loads\"]).getACall() or\n  call = API::moduleImport(\"marshal\").getMember([\"load\", \"loads\"]).getACall()\nselect call, \"Potentially unsafe use of serialization APIs inside Jinja2 (verify that data is trusted).\"",
+   "hypothesis": "Jinja2 may use unsafe deserialization primitives internally",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-502"
+   ],
+   "results_count": 2,
+   "results": [
+    {
+     "ruleId": "py/jinja2-unsafe-deserialization",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-unsafe-deserialization",
+      "index": 0
+     },
+     "message": {
+      "text": "Potentially unsafe use of serialization APIs inside Jinja2 (verify that data is trusted)."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/bccache.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 73,
+         "startColumn": 20,
+         "endColumn": 34
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "ebf3dcd53e82ba7d:1",
+      "primaryLocationStartColumnFingerprint": "11"
+     }
+    },
+    {
+     "ruleId": "py/jinja2-unsafe-deserialization",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-unsafe-deserialization",
+      "index": 0
+     },
+     "message": {
+      "text": "Potentially unsafe use of serialization APIs inside Jinja2 (verify that data is trusted)."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/bccache.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 79,
+         "startColumn": 25,
+         "endColumn": 40
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "4a6ea71f28fee9ee:1",
+      "primaryLocationStartColumnFingerprint": "12"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251225215754",
+   "codeql_raw_query": "/**\n * @name Jinja2 sandbox escape via getattr / attribute access\n * @description Find flows from template-controlled names into getattr, __import__, or attribute access that may allow sandbox escape.\n * @kind path-problem\n * @problem.severity error\n * @id py/jinja2-sandbox-escape\n * @tags security\n *       external/cwe/cwe-94\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.ApiGraphs\n\nmodule SandboxEscapeConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) { any() }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(API::CallNode call |\n      call = API::builtin(\"getattr\").getACall() and sink = call.getArg(1)\n      or call = API::builtin(\"__import__\").getACall() and sink = call.getArg(0)\n    )\n  }\n}\n\nmodule SandboxEscapeFlow = TaintTracking::Global<SandboxEscapeConfig>;\nimport SandboxEscapeFlow::PathGraph\n\nfrom SandboxEscapeFlow::PathNode source, SandboxEscapeFlow::PathNode sink\nwhere SandboxEscapeFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"Potential sandbox escape: data flows into getattr / __import__.\", source, \"tainted value\"",
+   "hypothesis": "Potential sandbox escape or gadget usage via getattr / __import__ in Jinja2 internals.",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-94"
+   ],
+   "results_count": 24,
+   "results": [
+    {
+     "ruleId": "py/jinja2-sandbox-escape",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-sandbox-escape",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential sandbox escape: data flows into getattr / __import__."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/compiler.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 700,
+         "startColumn": 40,
+         "endColumn": 46
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "357bba10ea6741f2:1",
+      "primaryLocationStartColumnFingerprint": "31"
+     }
+    },
+    {
+     "ruleId": "py/jinja2-sandbox-escape",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-sandbox-escape",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential sandbox escape: data flows into getattr / __import__.\nPotential sandbox escape: data flows into getattr / __import__.\nPotential sandbox escape: data flows into getattr / __import__.\nPotential sandbox escape: data flows into getattr / __import__.\nPotential sandbox escape: data flows into getattr / __import__."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/environment.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 480,
+         "startColumn": 45,
+         "endColumn": 49
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "75c1be91f4c66f49:1",
+      "primaryLocationStartColumnFingerprint": "20"
+     },
+     "codeFlows": [
+      {
+       "threadFlows": [
+        {
+         "locations": [
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/environment.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 1
+             },
+             "region": {
+              "startLine": 467,
+              "startColumn": 27,
+              "endColumn": 35
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for argument"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/environment.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 1
+             },
+             "region": {
+              "startLine": 475,
+              "startColumn": 21,
+              "endColumn": 25
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for attr"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/environment.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 1
+             },
+             "region": {
+              "startLine": 480,
+              "startColumn": 45,
+              "endColumn": 49
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for attr"
+            }
+           }
+          }
+         ]
+        }
+       ]
+      },
+      {
+       "threadFlows": [
+        {
+         "locations": [
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/environment.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 1
+             },
+             "region": {
+              "startLine": 471,
+              "startColumn": 24,
+              "endColumn": 32
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for argument"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/environment.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 1
+             },
+             "region": {
+              "startLine": 475,
+              "startColumn": 21,
+              "endColumn": 25
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for attr"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/environment.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 1
+             },
+             "region": {
+              "startLine": 480,
+              "startColumn": 45,
+              "endColumn": 49
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for attr"
+            }
+           }
+          }
+         ]
+        }
+       ]
+      },
+      {
+       "threadFlows": [
+        {
+         "locations": [
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/environment.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 1
+             },
+             "region": {
+              "startLine": 473,
+              "startColumn": 27,
+              "endColumn": 35
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for argument"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/environment.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 1
+             },
+             "region": {
+              "startLine": 475,
+              "startColumn": 21,
+              "endColumn": 25
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for attr"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/environment.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 1
+             },
+             "region": {
+              "startLine": 480,
+              "startColumn": 45,
+              "endColumn": 49
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for attr"
+            }
+           }
+          }
+         ]
+        }
+       ]
+      },
+      {
+       "threadFlows": [
+        {
+         "locations": [
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/environment.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 1
+             },
+             "region": {
+              "startLine": 475,
+              "startColumn": 32,
+              "endColumn": 40
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for argument"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/environment.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 1
+             },
+             "region": {
+              "startLine": 475,
+              "startColumn": 21,
+              "endColumn": 25
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for attr"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/environment.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 1
+             },
+             "region": {
+              "startLine": 480,
+              "startColumn": 45,
+              "endColumn": 49
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for attr"
+            }
+           }
+          }
+         ]
+        }
+       ]
+      }
+     ],
+     "relatedLocations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/environment.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 467,
+         "startColumn": 27,
+         "endColumn": 35
+        }
+       }
+      },
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/environment.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 471,
+         "startColumn": 24,
+         "endColumn": 32
+        }
+       }
+      },
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/environment.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 473,
+         "startColumn": 27,
+         "endColumn": 35
+        }
+       }
+      },
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/environment.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 475,
+         "startColumn": 32,
+         "endColumn": 40
+        }
+       }
+      }
+     ]
+    },
+    {
+     "ruleId": "py/jinja2-sandbox-escape",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-sandbox-escape",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential sandbox escape: data flows into getattr / __import__.\nPotential sandbox escape: data flows into getattr / __import__."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/environment.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 490,
+         "startColumn": 33,
+         "endColumn": 42
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "74ea0b7dbc476cbe:1",
+      "primaryLocationStartColumnFingerprint": "20"
+     },
+     "codeFlows": [
+      {
+       "threadFlows": [
+        {
+         "locations": [
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/environment.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 1
+             },
+             "region": {
+              "startLine": 485,
+              "startColumn": 35,
+              "endColumn": 44
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for attribute"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/environment.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 1
+             },
+             "region": {
+              "startLine": 490,
+              "startColumn": 33,
+              "endColumn": 42
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for attribute"
+            }
+           }
+          }
+         ]
+        }
+       ]
+      }
+     ],
+     "relatedLocations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/environment.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 485,
+         "startColumn": 35,
+         "endColumn": 44
+        }
+       }
+      }
+     ]
+    },
+    {
+     "ruleId": "py/jinja2-sandbox-escape",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-sandbox-escape",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential sandbox escape: data flows into getattr / __import__."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/ext.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 275,
+         "startColumn": 41,
+         "endColumn": 51
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "3640e56bce64df8c:1",
+      "primaryLocationStartColumnFingerprint": "32"
+     }
+    },
+    {
+     "ruleId": "py/jinja2-sandbox-escape",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-sandbox-escape",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential sandbox escape: data flows into getattr / __import__."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/ext.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 278,
+         "startColumn": 42,
+         "endColumn": 53
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "373862f8b9caa9c4:1",
+      "primaryLocationStartColumnFingerprint": "33"
+     }
+    },
+    {
+     "ruleId": "py/jinja2-sandbox-escape",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-sandbox-escape",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential sandbox escape: data flows into getattr / __import__."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/ext.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 282,
+         "startColumn": 42,
+         "endColumn": 52
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "ea97fb679c4919c0:1",
+      "primaryLocationStartColumnFingerprint": "33"
+     }
+    },
+    {
+     "ruleId": "py/jinja2-sandbox-escape",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-sandbox-escape",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential sandbox escape: data flows into getattr / __import__."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/ext.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 283,
+         "startColumn": 43,
+         "endColumn": 54
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "5388bde9f0e01da5:1",
+      "primaryLocationStartColumnFingerprint": "34"
+     }
+    },
+    {
+     "ruleId": "py/jinja2-sandbox-escape",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-sandbox-escape",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential sandbox escape: data flows into getattr / __import__.\nPotential sandbox escape: data flows into getattr / __import__.\nPotential sandbox escape: data flows into getattr / __import__.\nPotential sandbox escape: data flows into getattr / __import__.\nPotential sandbox escape: data flows into getattr / __import__."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/filters.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 3
+        },
+        "region": {
+         "startLine": 1184,
+         "startColumn": 26,
+         "endColumn": 32
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "7d87d0014c2ae73d:1",
+      "primaryLocationStartColumnFingerprint": "21"
+     },
+     "codeFlows": [
+      {
+       "threadFlows": [
+        {
+         "locations": [
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/filters.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 3
+             },
+             "region": {
+              "startLine": 1151,
+              "startColumn": 5,
+              "endColumn": 11
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for method"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/filters.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 3
+             },
+             "region": {
+              "startLine": 1184,
+              "startColumn": 26,
+              "endColumn": 32
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for method"
+            }
+           }
+          }
+         ]
+        }
+       ]
+      },
+      {
+       "threadFlows": [
+        {
+         "locations": [
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/filters.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 3
+             },
+             "region": {
+              "startLine": 1178,
+              "startColumn": 8,
+              "endColumn": 14
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for method"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/filters.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 3
+             },
+             "region": {
+              "startLine": 1184,
+              "startColumn": 26,
+              "endColumn": 32
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for method"
+            }
+           }
+          }
+         ]
+        }
+       ]
+      },
+      {
+       "threadFlows": [
+        {
+         "locations": [
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/filters.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 3
+             },
+             "region": {
+              "startLine": 1181,
+              "startColumn": 8,
+              "endColumn": 14
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for method"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/filters.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 3
+             },
+             "region": {
+              "startLine": 1184,
+              "startColumn": 26,
+              "endColumn": 32
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for method"
+            }
+           }
+          }
+         ]
+        }
+       ]
+      },
+      {
+       "threadFlows": [
+        {
+         "locations": [
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/filters.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 3
+             },
+             "region": {
+              "startLine": 1151,
+              "startColumn": 55,
+              "endColumn": 63
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for StringLiteral"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/filters.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 3
+             },
+             "region": {
+              "startLine": 1151,
+              "startColumn": 5,
+              "endColumn": 11
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for method"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/filters.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 3
+             },
+             "region": {
+              "startLine": 1184,
+              "startColumn": 26,
+              "endColumn": 32
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for method"
+            }
+           }
+          }
+         ]
+        }
+       ]
+      }
+     ],
+     "relatedLocations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/filters.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 3
+        },
+        "region": {
+         "startLine": 1151,
+         "startColumn": 5,
+         "endColumn": 11
+        }
+       }
+      },
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/filters.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 3
+        },
+        "region": {
+         "startLine": 1178,
+         "startColumn": 8,
+         "endColumn": 14
+        }
+       }
+      },
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/filters.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 3
+        },
+        "region": {
+         "startLine": 1181,
+         "startColumn": 8,
+         "endColumn": 14
+        }
+       }
+      },
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/filters.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 3
+        },
+        "region": {
+         "startLine": 1151,
+         "startColumn": 55,
+         "endColumn": 63
+        }
+       }
+      }
+     ]
+    },
+    {
+     "ruleId": "py/jinja2-sandbox-escape",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-sandbox-escape",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential sandbox escape: data flows into getattr / __import__.\nPotential sandbox escape: data flows into getattr / __import__.\nPotential sandbox escape: data flows into getattr / __import__.\nPotential sandbox escape: data flows into getattr / __import__.\nPotential sandbox escape: data flows into getattr / __import__."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/loaders.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 4
+        },
+        "region": {
+         "startLine": 676,
+         "startColumn": 36,
+         "endColumn": 42
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "45bc7cd44073f5fd:1",
+      "primaryLocationStartColumnFingerprint": "27"
+     },
+     "codeFlows": [
+      {
+       "threadFlows": [
+        {
+         "locations": [
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/loaders.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 4
+             },
+             "region": {
+              "startLine": 661,
+              "startColumn": 16,
+              "endColumn": 23
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for StringLiteral"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/loaders.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 4
+             },
+             "region": {
+              "startLine": 661,
+              "startColumn": 16,
+              "endColumn": 64
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for BinaryExpr"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/loaders.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 4
+             },
+             "region": {
+              "startLine": 674,
+              "startColumn": 15,
+              "endColumn": 42
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for Attribute()"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/loaders.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 4
+             },
+             "region": {
+              "startLine": 674,
+              "startColumn": 9,
+              "endColumn": 12
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for key"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/loaders.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 4
+             },
+             "region": {
+              "startLine": 675,
+              "startColumn": 9,
+              "endColumn": 15
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for module"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/loaders.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 4
+             },
+             "region": {
+              "startLine": 676,
+              "startColumn": 36,
+              "endColumn": 42
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for module"
+            }
+           }
+          }
+         ]
+        }
+       ]
+      },
+      {
+       "threadFlows": [
+        {
+         "locations": [
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/loaders.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 4
+             },
+             "region": {
+              "startLine": 661,
+              "startColumn": 26,
+              "endColumn": 64
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for Attribute()"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/loaders.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 4
+             },
+             "region": {
+              "startLine": 661,
+              "startColumn": 16,
+              "endColumn": 64
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for BinaryExpr"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/loaders.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 4
+             },
+             "region": {
+              "startLine": 674,
+              "startColumn": 15,
+              "endColumn": 42
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for Attribute()"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/loaders.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 4
+             },
+             "region": {
+              "startLine": 674,
+              "startColumn": 9,
+              "endColumn": 12
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for key"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/loaders.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 4
+             },
+             "region": {
+              "startLine": 675,
+              "startColumn": 9,
+              "endColumn": 15
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for module"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/loaders.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 4
+             },
+             "region": {
+              "startLine": 676,
+              "startColumn": 36,
+              "endColumn": 42
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for module"
+            }
+           }
+          }
+         ]
+        }
+       ]
+      },
+      {
+       "threadFlows": [
+        {
+         "locations": [
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/loaders.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 4
+             },
+             "region": {
+              "startLine": 661,
+              "startColumn": 16,
+              "endColumn": 64
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for BinaryExpr"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/loaders.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 4
+             },
+             "region": {
+              "startLine": 674,
+              "startColumn": 15,
+              "endColumn": 42
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for Attribute()"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/loaders.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 4
+             },
+             "region": {
+              "startLine": 674,
+              "startColumn": 9,
+              "endColumn": 12
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for key"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/loaders.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 4
+             },
+             "region": {
+              "startLine": 675,
+              "startColumn": 9,
+              "endColumn": 15
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for module"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/loaders.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 4
+             },
+             "region": {
+              "startLine": 676,
+              "startColumn": 36,
+              "endColumn": 42
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for module"
+            }
+           }
+          }
+         ]
+        }
+       ]
+      },
+      {
+       "threadFlows": [
+        {
+         "locations": [
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/loaders.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 4
+             },
+             "region": {
+              "startLine": 674,
+              "startColumn": 15,
+              "endColumn": 42
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for Attribute()"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/loaders.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 4
+             },
+             "region": {
+              "startLine": 674,
+              "startColumn": 9,
+              "endColumn": 12
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for key"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/loaders.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 4
+             },
+             "region": {
+              "startLine": 675,
+              "startColumn": 9,
+              "endColumn": 15
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for module"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/loaders.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 4
+             },
+             "region": {
+              "startLine": 676,
+              "startColumn": 36,
+              "endColumn": 42
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for module"
+            }
+           }
+          }
+         ]
+        }
+       ]
+      }
+     ],
+     "relatedLocations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/loaders.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 4
+        },
+        "region": {
+         "startLine": 661,
+         "startColumn": 16,
+         "endColumn": 23
+        }
+       }
+      },
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/loaders.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 4
+        },
+        "region": {
+         "startLine": 661,
+         "startColumn": 26,
+         "endColumn": 64
+        }
+       }
+      },
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/loaders.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 4
+        },
+        "region": {
+         "startLine": 661,
+         "startColumn": 16,
+         "endColumn": 64
+        }
+       }
+      },
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/loaders.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 4
+        },
+        "region": {
+         "startLine": 674,
+         "startColumn": 15,
+         "endColumn": 42
+        }
+       }
+      }
+     ]
+    },
+    {
+     "ruleId": "py/jinja2-sandbox-escape",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-sandbox-escape",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential sandbox escape: data flows into getattr / __import__.\nPotential sandbox escape: data flows into getattr / __import__.\nPotential sandbox escape: data flows into getattr / __import__.\nPotential sandbox escape: data flows into getattr / __import__.\nPotential sandbox escape: data flows into getattr / __import__."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/loaders.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 4
+        },
+        "region": {
+         "startLine": 680,
+         "startColumn": 34,
+         "endColumn": 40
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "9b816a55e1f5b355:1",
+      "primaryLocationStartColumnFingerprint": "17"
+     },
+     "codeFlows": [
+      {
+       "threadFlows": [
+        {
+         "locations": [
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/loaders.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 4
+             },
+             "region": {
+              "startLine": 661,
+              "startColumn": 16,
+              "endColumn": 23
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for StringLiteral"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/loaders.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 4
+             },
+             "region": {
+              "startLine": 661,
+              "startColumn": 16,
+              "endColumn": 64
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for BinaryExpr"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/loaders.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 4
+             },
+             "region": {
+              "startLine": 674,
+              "startColumn": 15,
+              "endColumn": 42
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for Attribute()"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/loaders.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 4
+             },
+             "region": {
+              "startLine": 674,
+              "startColumn": 9,
+              "endColumn": 12
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for key"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/loaders.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 4
+             },
+             "region": {
+              "startLine": 675,
+              "startColumn": 9,
+              "endColumn": 15
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for module"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/loaders.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 4
+             },
+             "region": {
+              "startLine": 680,
+              "startColumn": 34,
+              "endColumn": 40
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for module"
+            }
+           }
+          }
+         ]
+        }
+       ]
+      },
+      {
+       "threadFlows": [
+        {
+         "locations": [
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/loaders.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 4
+             },
+             "region": {
+              "startLine": 661,
+              "startColumn": 26,
+              "endColumn": 64
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for Attribute()"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/loaders.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 4
+             },
+             "region": {
+              "startLine": 661,
+              "startColumn": 16,
+              "endColumn": 64
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for BinaryExpr"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/loaders.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 4
+             },
+             "region": {
+              "startLine": 674,
+              "startColumn": 15,
+              "endColumn": 42
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for Attribute()"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/loaders.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 4
+             },
+             "region": {
+              "startLine": 674,
+              "startColumn": 9,
+              "endColumn": 12
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for key"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/loaders.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 4
+             },
+             "region": {
+              "startLine": 675,
+              "startColumn": 9,
+              "endColumn": 15
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for module"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/loaders.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 4
+             },
+             "region": {
+              "startLine": 680,
+              "startColumn": 34,
+              "endColumn": 40
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for module"
+            }
+           }
+          }
+         ]
+        }
+       ]
+      },
+      {
+       "threadFlows": [
+        {
+         "locations": [
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/loaders.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 4
+             },
+             "region": {
+              "startLine": 661,
+              "startColumn": 16,
+              "endColumn": 64
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for BinaryExpr"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/loaders.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 4
+             },
+             "region": {
+              "startLine": 674,
+              "startColumn": 15,
+              "endColumn": 42
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for Attribute()"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/loaders.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 4
+             },
+             "region": {
+              "startLine": 674,
+              "startColumn": 9,
+              "endColumn": 12
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for key"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/loaders.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 4
+             },
+             "region": {
+              "startLine": 675,
+              "startColumn": 9,
+              "endColumn": 15
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for module"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/loaders.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 4
+             },
+             "region": {
+              "startLine": 680,
+              "startColumn": 34,
+              "endColumn": 40
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for module"
+            }
+           }
+          }
+         ]
+        }
+       ]
+      },
+      {
+       "threadFlows": [
+        {
+         "locations": [
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/loaders.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 4
+             },
+             "region": {
+              "startLine": 674,
+              "startColumn": 15,
+              "endColumn": 42
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for Attribute()"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/loaders.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 4
+             },
+             "region": {
+              "startLine": 674,
+              "startColumn": 9,
+              "endColumn": 12
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for key"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/loaders.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 4
+             },
+             "region": {
+              "startLine": 675,
+              "startColumn": 9,
+              "endColumn": 15
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for module"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/loaders.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 4
+             },
+             "region": {
+              "startLine": 680,
+              "startColumn": 34,
+              "endColumn": 40
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for module"
+            }
+           }
+          }
+         ]
+        }
+       ]
+      }
+     ],
+     "relatedLocations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/loaders.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 4
+        },
+        "region": {
+         "startLine": 661,
+         "startColumn": 16,
+         "endColumn": 23
+        }
+       }
+      },
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/loaders.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 4
+        },
+        "region": {
+         "startLine": 661,
+         "startColumn": 26,
+         "endColumn": 64
+        }
+       }
+      },
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/loaders.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 4
+        },
+        "region": {
+         "startLine": 661,
+         "startColumn": 16,
+         "endColumn": 64
+        }
+       }
+      },
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/loaders.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 4
+        },
+        "region": {
+         "startLine": 674,
+         "startColumn": 15,
+         "endColumn": 42
+        }
+       }
+      }
+     ]
+    },
+    {
+     "ruleId": "py/jinja2-sandbox-escape",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-sandbox-escape",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential sandbox escape: data flows into getattr / __import__.\nPotential sandbox escape: data flows into getattr / __import__.\nPotential sandbox escape: data flows into getattr / __import__.\nPotential sandbox escape: data flows into getattr / __import__.\nPotential sandbox escape: data flows into getattr / __import__."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/nodes.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 5
+        },
+        "region": {
+         "startLine": 62,
+         "startColumn": 67,
+         "endColumn": 71
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "17d61a137afef46b:1",
+      "primaryLocationStartColumnFingerprint": "54"
+     },
+     "codeFlows": [
+      {
+       "threadFlows": [
+        {
+         "locations": [
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/nodes.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 5
+             },
+             "region": {
+              "startLine": 60,
+              "startColumn": 21,
+              "endColumn": 29
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for StringLiteral"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/nodes.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 5
+             },
+             "region": {
+              "startLine": 60,
+              "startColumn": 13,
+              "endColumn": 17
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for attr"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/nodes.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 5
+             },
+             "region": {
+              "startLine": 62,
+              "startColumn": 67,
+              "endColumn": 71
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for attr"
+            }
+           }
+          }
+         ]
+        }
+       ]
+      },
+      {
+       "threadFlows": [
+        {
+         "locations": [
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/nodes.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 5
+             },
+             "region": {
+              "startLine": 60,
+              "startColumn": 31,
+              "endColumn": 43
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for StringLiteral"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/nodes.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 5
+             },
+             "region": {
+              "startLine": 60,
+              "startColumn": 13,
+              "endColumn": 17
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for attr"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/nodes.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 5
+             },
+             "region": {
+              "startLine": 62,
+              "startColumn": 67,
+              "endColumn": 71
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for attr"
+            }
+           }
+          }
+         ]
+        }
+       ]
+      },
+      {
+       "threadFlows": [
+        {
+         "locations": [
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/nodes.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 5
+             },
+             "region": {
+              "startLine": 60,
+              "startColumn": 21,
+              "endColumn": 43
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for Tuple"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/nodes.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 5
+             },
+             "region": {
+              "startLine": 60,
+              "startColumn": 13,
+              "endColumn": 17
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for attr"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/nodes.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 5
+             },
+             "region": {
+              "startLine": 62,
+              "startColumn": 67,
+              "endColumn": 71
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for attr"
+            }
+           }
+          }
+         ]
+        }
+       ]
+      },
+      {
+       "threadFlows": [
+        {
+         "locations": [
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/nodes.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 5
+             },
+             "region": {
+              "startLine": 60,
+              "startColumn": 13,
+              "endColumn": 17
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for attr"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/nodes.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 5
+             },
+             "region": {
+              "startLine": 62,
+              "startColumn": 67,
+              "endColumn": 71
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for attr"
+            }
+           }
+          }
+         ]
+        }
+       ]
+      }
+     ],
+     "relatedLocations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/nodes.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 5
+        },
+        "region": {
+         "startLine": 60,
+         "startColumn": 21,
+         "endColumn": 29
+        }
+       }
+      },
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/nodes.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 5
+        },
+        "region": {
+         "startLine": 60,
+         "startColumn": 31,
+         "endColumn": 43
+        }
+       }
+      },
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/nodes.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 5
+        },
+        "region": {
+         "startLine": 60,
+         "startColumn": 21,
+         "endColumn": 43
+        }
+       }
+      },
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/nodes.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 5
+        },
+        "region": {
+         "startLine": 60,
+         "startColumn": 13,
+         "endColumn": 17
+        }
+       }
+      }
+     ]
+    },
+    {
+     "ruleId": "py/jinja2-sandbox-escape",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-sandbox-escape",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential sandbox escape: data flows into getattr / __import__.\nPotential sandbox escape: data flows into getattr / __import__.\nPotential sandbox escape: data flows into getattr / __import__.\nPotential sandbox escape: data flows into getattr / __import__.\nPotential sandbox escape: data flows into getattr / __import__."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/nodes.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 5
+        },
+        "region": {
+         "startLine": 165,
+         "startColumn": 47,
+         "endColumn": 51
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "184ae25b7f1145c6:1",
+      "primaryLocationStartColumnFingerprint": "26"
+     },
+     "codeFlows": [
+      {
+       "threadFlows": [
+        {
+         "locations": [
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/nodes.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 5
+             },
+             "region": {
+              "startLine": 158,
+              "startColumn": 21,
+              "endColumn": 32
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for Attribute"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/nodes.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 5
+             },
+             "region": {
+              "startLine": 158,
+              "startColumn": 13,
+              "endColumn": 17
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for name"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/nodes.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 5
+             },
+             "region": {
+              "startLine": 165,
+              "startColumn": 47,
+              "endColumn": 51
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for name"
+            }
+           }
+          }
+         ]
+        }
+       ]
+      },
+      {
+       "threadFlows": [
+        {
+         "locations": [
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/nodes.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 5
+             },
+             "region": {
+              "startLine": 158,
+              "startColumn": 13,
+              "endColumn": 17
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for name"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/nodes.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 5
+             },
+             "region": {
+              "startLine": 165,
+              "startColumn": 47,
+              "endColumn": 51
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for name"
+            }
+           }
+          }
+         ]
+        }
+       ]
+      },
+      {
+       "threadFlows": [
+        {
+         "locations": [
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/nodes.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 5
+             },
+             "region": {
+              "startLine": 162,
+              "startColumn": 42,
+              "endColumn": 46
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for name"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/nodes.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 5
+             },
+             "region": {
+              "startLine": 165,
+              "startColumn": 47,
+              "endColumn": 51
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for name"
+            }
+           }
+          }
+         ]
+        }
+       ]
+      },
+      {
+       "threadFlows": [
+        {
+         "locations": [
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/nodes.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 5
+             },
+             "region": {
+              "startLine": 165,
+              "startColumn": 27,
+              "endColumn": 31
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for name"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/nodes.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 5
+             },
+             "region": {
+              "startLine": 165,
+              "startColumn": 47,
+              "endColumn": 51
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for name"
+            }
+           }
+          }
+         ]
+        }
+       ]
+      }
+     ],
+     "relatedLocations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/nodes.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 5
+        },
+        "region": {
+         "startLine": 158,
+         "startColumn": 21,
+         "endColumn": 32
+        }
+       }
+      },
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/nodes.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 5
+        },
+        "region": {
+         "startLine": 158,
+         "startColumn": 13,
+         "endColumn": 17
+        }
+       }
+      },
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/nodes.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 5
+        },
+        "region": {
+         "startLine": 162,
+         "startColumn": 42,
+         "endColumn": 46
+        }
+       }
+      },
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/nodes.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 5
+        },
+        "region": {
+         "startLine": 165,
+         "startColumn": 27,
+         "endColumn": 31
+        }
+       }
+      }
+     ]
+    },
+    {
+     "ruleId": "py/jinja2-sandbox-escape",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-sandbox-escape",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential sandbox escape: data flows into getattr / __import__.\nPotential sandbox escape: data flows into getattr / __import__.\nPotential sandbox escape: data flows into getattr / __import__.\nPotential sandbox escape: data flows into getattr / __import__.\nPotential sandbox escape: data flows into getattr / __import__."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/nodes.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 5
+        },
+        "region": {
+         "startLine": 249,
+         "startColumn": 51,
+         "endColumn": 52
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "263d45df3e89b8ff:1",
+      "primaryLocationStartColumnFingerprint": "42"
+     },
+     "codeFlows": [
+      {
+       "threadFlows": [
+        {
+         "locations": [
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/nodes.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 5
+             },
+             "region": {
+              "startLine": 249,
+              "startColumn": 30,
+              "endColumn": 84
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for .0"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/nodes.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 5
+             },
+             "region": {
+              "startLine": 249,
+              "startColumn": 68,
+              "endColumn": 69
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for a"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/nodes.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 5
+             },
+             "region": {
+              "startLine": 249,
+              "startColumn": 51,
+              "endColumn": 52
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for a"
+            }
+           }
+          }
+         ]
+        }
+       ]
+      },
+      {
+       "threadFlows": [
+        {
+         "locations": [
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/nodes.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 5
+             },
+             "region": {
+              "startLine": 249,
+              "startColumn": 68,
+              "endColumn": 69
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for a"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/nodes.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 5
+             },
+             "region": {
+              "startLine": 249,
+              "startColumn": 51,
+              "endColumn": 52
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for a"
+            }
+           }
+          }
+         ]
+        }
+       ]
+      },
+      {
+       "threadFlows": [
+        {
+         "locations": [
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/nodes.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 5
+             },
+             "region": {
+              "startLine": 249,
+              "startColumn": 33,
+              "endColumn": 34
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for a"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/nodes.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 5
+             },
+             "region": {
+              "startLine": 249,
+              "startColumn": 51,
+              "endColumn": 52
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for a"
+            }
+           }
+          }
+         ]
+        }
+       ]
+      },
+      {
+       "threadFlows": [
+        {
+         "locations": [
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/nodes.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 5
+             },
+             "region": {
+              "startLine": 249,
+              "startColumn": 73,
+              "endColumn": 84
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for Attribute"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/nodes.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 5
+             },
+             "region": {
+              "startLine": 249,
+              "startColumn": 30,
+              "endColumn": 84
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for .0"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/nodes.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 5
+             },
+             "region": {
+              "startLine": 249,
+              "startColumn": 68,
+              "endColumn": 69
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for a"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/nodes.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 5
+             },
+             "region": {
+              "startLine": 249,
+              "startColumn": 51,
+              "endColumn": 52
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for a"
+            }
+           }
+          }
+         ]
+        }
+       ]
+      }
+     ],
+     "relatedLocations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/nodes.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 5
+        },
+        "region": {
+         "startLine": 249,
+         "startColumn": 30,
+         "endColumn": 84
+        }
+       }
+      },
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/nodes.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 5
+        },
+        "region": {
+         "startLine": 249,
+         "startColumn": 68,
+         "endColumn": 69
+        }
+       }
+      },
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/nodes.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 5
+        },
+        "region": {
+         "startLine": 249,
+         "startColumn": 33,
+         "endColumn": 34
+        }
+       }
+      },
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/nodes.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 5
+        },
+        "region": {
+         "startLine": 249,
+         "startColumn": 73,
+         "endColumn": 84
+        }
+       }
+      }
+     ]
+    },
+    {
+     "ruleId": "py/jinja2-sandbox-escape",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-sandbox-escape",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential sandbox escape: data flows into getattr / __import__.\nPotential sandbox escape: data flows into getattr / __import__.\nPotential sandbox escape: data flows into getattr / __import__.\nPotential sandbox escape: data flows into getattr / __import__.\nPotential sandbox escape: data flows into getattr / __import__."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/nodes.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 5
+        },
+        "region": {
+         "startLine": 265,
+         "startColumn": 39,
+         "endColumn": 44
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "9ff28ad9d9a826f8:1",
+      "primaryLocationStartColumnFingerprint": "22"
+     },
+     "codeFlows": [
+      {
+       "threadFlows": [
+        {
+         "locations": [
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/nodes.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 5
+             },
+             "region": {
+              "startLine": 262,
+              "startColumn": 31,
+              "endColumn": 53
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for enumerate()"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/nodes.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 5
+             },
+             "region": {
+              "startLine": 262,
+              "startColumn": 22,
+              "endColumn": 27
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for field"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/nodes.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 5
+             },
+             "region": {
+              "startLine": 265,
+              "startColumn": 39,
+              "endColumn": 44
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for field"
+            }
+           }
+          }
+         ]
+        }
+       ]
+      },
+      {
+       "threadFlows": [
+        {
+         "locations": [
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/nodes.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 5
+             },
+             "region": {
+              "startLine": 262,
+              "startColumn": 17,
+              "endColumn": 27
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for Tuple"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/nodes.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 5
+             },
+             "region": {
+              "startLine": 262,
+              "startColumn": 22,
+              "endColumn": 27
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for field"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/nodes.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 5
+             },
+             "region": {
+              "startLine": 265,
+              "startColumn": 39,
+              "endColumn": 44
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for field"
+            }
+           }
+          }
+         ]
+        }
+       ]
+      },
+      {
+       "threadFlows": [
+        {
+         "locations": [
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/nodes.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 5
+             },
+             "region": {
+              "startLine": 262,
+              "startColumn": 22,
+              "endColumn": 27
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for field"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/nodes.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 5
+             },
+             "region": {
+              "startLine": 265,
+              "startColumn": 39,
+              "endColumn": 44
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for field"
+            }
+           }
+          }
+         ]
+        }
+       ]
+      },
+      {
+       "threadFlows": [
+        {
+         "locations": [
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/nodes.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 5
+             },
+             "region": {
+              "startLine": 262,
+              "startColumn": 17,
+              "endColumn": 27
+             }
+            },
+            "message": {
+             "text": "IterableElement"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/nodes.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 5
+             },
+             "region": {
+              "startLine": 262,
+              "startColumn": 22,
+              "endColumn": 27
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for field"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/nodes.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 5
+             },
+             "region": {
+              "startLine": 265,
+              "startColumn": 39,
+              "endColumn": 44
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for field"
+            }
+           }
+          }
+         ]
+        }
+       ]
+      }
+     ],
+     "relatedLocations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/nodes.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 5
+        },
+        "region": {
+         "startLine": 262,
+         "startColumn": 31,
+         "endColumn": 53
+        }
+       }
+      },
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/nodes.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 5
+        },
+        "region": {
+         "startLine": 262,
+         "startColumn": 17,
+         "endColumn": 27
+        }
+       }
+      },
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/nodes.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 5
+        },
+        "region": {
+         "startLine": 262,
+         "startColumn": 22,
+         "endColumn": 27
+        }
+       }
+      }
+     ]
+    },
+    {
+     "ruleId": "py/jinja2-sandbox-escape",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-sandbox-escape",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential sandbox escape: data flows into getattr / __import__."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/nodes.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 5
+        },
+        "region": {
+         "startLine": 768,
+         "startColumn": 27,
+         "endColumn": 48
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "aabddee208e83017:1",
+      "primaryLocationStartColumnFingerprint": "14"
+     }
+    },
+    {
+     "ruleId": "py/jinja2-sandbox-escape",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-sandbox-escape",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential sandbox escape: data flows into getattr / __import__.\nPotential sandbox escape: data flows into getattr / __import__.\nPotential sandbox escape: data flows into getattr / __import__.\nPotential sandbox escape: data flows into getattr / __import__.\nPotential sandbox escape: data flows into getattr / __import__."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/parser.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 6
+        },
+        "region": {
+         "startLine": 176,
+         "startColumn": 35,
+         "endColumn": 71
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "a289cd4395c15ec3:1",
+      "primaryLocationStartColumnFingerprint": "18"
+     },
+     "codeFlows": [
+      {
+       "threadFlows": [
+        {
+         "locations": [
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/parser.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 6
+             },
+             "region": {
+              "startLine": 176,
+              "startColumn": 35,
+              "endColumn": 44
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for StringLiteral"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/parser.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 6
+             },
+             "region": {
+              "startLine": 176,
+              "startColumn": 35,
+              "endColumn": 71
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for Fstring"
+            }
+           }
+          }
+         ]
+        }
+       ]
+      },
+      {
+       "threadFlows": [
+        {
+         "locations": [
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/parser.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 6
+             },
+             "region": {
+              "startLine": 176,
+              "startColumn": 44,
+              "endColumn": 69
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for Attribute"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/parser.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 6
+             },
+             "region": {
+              "startLine": 176,
+              "startColumn": 35,
+              "endColumn": 71
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for Fstring"
+            }
+           }
+          }
+         ]
+        }
+       ]
+      },
+      {
+       "threadFlows": [
+        {
+         "locations": [
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/parser.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 6
+             },
+             "region": {
+              "startLine": 176,
+              "startColumn": 69,
+              "endColumn": 71
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for StringLiteral"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/parser.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 6
+             },
+             "region": {
+              "startLine": 176,
+              "startColumn": 35,
+              "endColumn": 71
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for Fstring"
+            }
+           }
+          }
+         ]
+        }
+       ]
+      },
+      {
+       "threadFlows": [
+        {
+         "locations": [
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/parser.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 6
+             },
+             "region": {
+              "startLine": 667,
+              "startColumn": 28,
+              "endColumn": 53
+             }
+            },
+            "message": {
+             "text": "[post] ControlFlowNode for Attribute"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/parser.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 6
+             },
+             "region": {
+              "startLine": 667,
+              "startColumn": 28,
+              "endColumn": 47
+             }
+            },
+            "message": {
+             "text": "[post] ControlFlowNode for Attribute [Attribute value]"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/parser.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 6
+             },
+             "region": {
+              "startLine": 667,
+              "startColumn": 28,
+              "endColumn": 39
+             }
+            },
+            "message": {
+             "text": "[post] ControlFlowNode for Attribute [Attribute current, Attribute value]"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/parser.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 6
+             },
+             "region": {
+              "startLine": 667,
+              "startColumn": 28,
+              "endColumn": 32
+             }
+            },
+            "message": {
+             "text": "[post] ControlFlowNode for self [Attribute stream, Attribute current, Attribute value]"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/parser.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 6
+             },
+             "region": {
+              "startLine": 643,
+              "startColumn": 23,
+              "endColumn": 27
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for self [Return] [Attribute stream, Attribute current, Attribute value]"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/parser.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 6
+             },
+             "region": {
+              "startLine": 501,
+              "startColumn": 26,
+              "endColumn": 30
+             }
+            },
+            "message": {
+             "text": "[post] ControlFlowNode for self [Attribute stream, Attribute current, Attribute value]"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/parser.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 6
+             },
+             "region": {
+              "startLine": 474,
+              "startColumn": 9,
+              "endColumn": 13
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for self [Return] [Attribute stream, Attribute current, Attribute value]"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/parser.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 6
+             },
+             "region": {
+              "startLine": 228,
+              "startColumn": 18,
+              "endColumn": 22
+             }
+            },
+            "message": {
+             "text": "[post] ControlFlowNode for self [Attribute stream, Attribute current, Attribute value]"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/parser.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 6
+             },
+             "region": {
+              "startLine": 233,
+              "startColumn": 16,
+              "endColumn": 20
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for self [Attribute stream, Attribute current, Attribute value]"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/parser.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 6
+             },
+             "region": {
+              "startLine": 197,
+              "startColumn": 9,
+              "endColumn": 13
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for self [Attribute stream, Attribute current, Attribute value]"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/parser.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 6
+             },
+             "region": {
+              "startLine": 214,
+              "startColumn": 18,
+              "endColumn": 22
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for self [Attribute stream, Attribute current, Attribute value]"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/parser.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 6
+             },
+             "region": {
+              "startLine": 997,
+              "startColumn": 9,
+              "endColumn": 13
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for self [Attribute stream, Attribute current, Attribute value]"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/parser.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 6
+             },
+             "region": {
+              "startLine": 1030,
+              "startColumn": 26,
+              "endColumn": 30
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for self [Attribute stream, Attribute current, Attribute value]"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/parser.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 6
+             },
+             "region": {
+              "startLine": 167,
+              "startColumn": 25,
+              "endColumn": 29
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for self [Attribute stream, Attribute current, Attribute value]"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/parser.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 6
+             },
+             "region": {
+              "startLine": 176,
+              "startColumn": 44,
+              "endColumn": 48
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for self [Attribute stream, Attribute current, Attribute value]"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/parser.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 6
+             },
+             "region": {
+              "startLine": 176,
+              "startColumn": 44,
+              "endColumn": 55
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for Attribute [Attribute current, Attribute value]"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/parser.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 6
+             },
+             "region": {
+              "startLine": 176,
+              "startColumn": 44,
+              "endColumn": 63
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for Attribute [Attribute value]"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/parser.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 6
+             },
+             "region": {
+              "startLine": 176,
+              "startColumn": 44,
+              "endColumn": 69
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for Attribute"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/parser.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 6
+             },
+             "region": {
+              "startLine": 176,
+              "startColumn": 35,
+              "endColumn": 71
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for Fstring"
+            }
+           }
+          }
+         ]
+        }
+       ]
+      }
+     ],
+     "relatedLocations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/parser.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 6
+        },
+        "region": {
+         "startLine": 176,
+         "startColumn": 35,
+         "endColumn": 44
+        }
+       }
+      },
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/parser.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 6
+        },
+        "region": {
+         "startLine": 176,
+         "startColumn": 44,
+         "endColumn": 69
+        }
+       }
+      },
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/parser.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 6
+        },
+        "region": {
+         "startLine": 176,
+         "startColumn": 69,
+         "endColumn": 71
+        }
+       }
+      },
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/parser.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 6
+        },
+        "region": {
+         "startLine": 667,
+         "startColumn": 28,
+         "endColumn": 53
+        }
+       }
+      }
+     ]
+    },
+    {
+     "ruleId": "py/jinja2-sandbox-escape",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-sandbox-escape",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential sandbox escape: data flows into getattr / __import__."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/sandbox.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 7
+        },
+        "region": {
+         "startLine": 265,
+         "startColumn": 26,
+         "endColumn": 43
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "2d91020f995e3f98:1",
+      "primaryLocationStartColumnFingerprint": "13"
+     }
+    },
+    {
+     "ruleId": "py/jinja2-sandbox-escape",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-sandbox-escape",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential sandbox escape: data flows into getattr / __import__."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/sandbox.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 7
+        },
+        "region": {
+         "startLine": 265,
+         "startColumn": 68,
+         "endColumn": 81
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "2d91020f995e3f98:1",
+      "primaryLocationStartColumnFingerprint": "55"
+     }
+    },
+    {
+     "ruleId": "py/jinja2-sandbox-escape",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-sandbox-escape",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential sandbox escape: data flows into getattr / __import__.\nPotential sandbox escape: data flows into getattr / __import__.\nPotential sandbox escape: data flows into getattr / __import__.\nPotential sandbox escape: data flows into getattr / __import__.\nPotential sandbox escape: data flows into getattr / __import__."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/sandbox.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 7
+        },
+        "region": {
+         "startLine": 302,
+         "startColumn": 46,
+         "endColumn": 50
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "c04468b6f31c5212:1",
+      "primaryLocationStartColumnFingerprint": "21"
+     },
+     "codeFlows": [
+      {
+       "threadFlows": [
+        {
+         "locations": [
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/sandbox.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 7
+             },
+             "region": {
+              "startLine": 289,
+              "startColumn": 27,
+              "endColumn": 35
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for argument"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/sandbox.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 7
+             },
+             "region": {
+              "startLine": 297,
+              "startColumn": 21,
+              "endColumn": 25
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for attr"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/sandbox.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 7
+             },
+             "region": {
+              "startLine": 302,
+              "startColumn": 46,
+              "endColumn": 50
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for attr"
+            }
+           }
+          }
+         ]
+        }
+       ]
+      },
+      {
+       "threadFlows": [
+        {
+         "locations": [
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/sandbox.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 7
+             },
+             "region": {
+              "startLine": 293,
+              "startColumn": 24,
+              "endColumn": 32
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for argument"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/sandbox.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 7
+             },
+             "region": {
+              "startLine": 297,
+              "startColumn": 21,
+              "endColumn": 25
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for attr"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/sandbox.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 7
+             },
+             "region": {
+              "startLine": 302,
+              "startColumn": 46,
+              "endColumn": 50
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for attr"
+            }
+           }
+          }
+         ]
+        }
+       ]
+      },
+      {
+       "threadFlows": [
+        {
+         "locations": [
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/sandbox.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 7
+             },
+             "region": {
+              "startLine": 295,
+              "startColumn": 27,
+              "endColumn": 35
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for argument"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/sandbox.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 7
+             },
+             "region": {
+              "startLine": 297,
+              "startColumn": 21,
+              "endColumn": 25
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for attr"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/sandbox.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 7
+             },
+             "region": {
+              "startLine": 302,
+              "startColumn": 46,
+              "endColumn": 50
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for attr"
+            }
+           }
+          }
+         ]
+        }
+       ]
+      },
+      {
+       "threadFlows": [
+        {
+         "locations": [
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/sandbox.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 7
+             },
+             "region": {
+              "startLine": 297,
+              "startColumn": 32,
+              "endColumn": 40
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for argument"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/sandbox.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 7
+             },
+             "region": {
+              "startLine": 297,
+              "startColumn": 21,
+              "endColumn": 25
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for attr"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/sandbox.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 7
+             },
+             "region": {
+              "startLine": 302,
+              "startColumn": 46,
+              "endColumn": 50
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for attr"
+            }
+           }
+          }
+         ]
+        }
+       ]
+      }
+     ],
+     "relatedLocations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/sandbox.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 7
+        },
+        "region": {
+         "startLine": 289,
+         "startColumn": 27,
+         "endColumn": 35
+        }
+       }
+      },
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/sandbox.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 7
+        },
+        "region": {
+         "startLine": 293,
+         "startColumn": 24,
+         "endColumn": 32
+        }
+       }
+      },
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/sandbox.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 7
+        },
+        "region": {
+         "startLine": 295,
+         "startColumn": 27,
+         "endColumn": 35
+        }
+       }
+      },
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/sandbox.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 7
+        },
+        "region": {
+         "startLine": 297,
+         "startColumn": 32,
+         "endColumn": 40
+        }
+       }
+      }
+     ]
+    },
+    {
+     "ruleId": "py/jinja2-sandbox-escape",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-sandbox-escape",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential sandbox escape: data flows into getattr / __import__.\nPotential sandbox escape: data flows into getattr / __import__."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/sandbox.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 7
+        },
+        "region": {
+         "startLine": 319,
+         "startColumn": 34,
+         "endColumn": 43
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "b275929b42e1eaf5:1",
+      "primaryLocationStartColumnFingerprint": "21"
+     },
+     "codeFlows": [
+      {
+       "threadFlows": [
+        {
+         "locations": [
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/sandbox.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 7
+             },
+             "region": {
+              "startLine": 314,
+              "startColumn": 35,
+              "endColumn": 44
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for attribute"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/sandbox.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 7
+             },
+             "region": {
+              "startLine": 319,
+              "startColumn": 34,
+              "endColumn": 43
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for attribute"
+            }
+           }
+          }
+         ]
+        }
+       ]
+      }
+     ],
+     "relatedLocations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/sandbox.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 7
+        },
+        "region": {
+         "startLine": 314,
+         "startColumn": 35,
+         "endColumn": 44
+        }
+       }
+      }
+     ]
+    },
+    {
+     "ruleId": "py/jinja2-sandbox-escape",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-sandbox-escape",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential sandbox escape: data flows into getattr / __import__.\nPotential sandbox escape: data flows into getattr / __import__.\nPotential sandbox escape: data flows into getattr / __import__.\nPotential sandbox escape: data flows into getattr / __import__.\nPotential sandbox escape: data flows into getattr / __import__."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/utils.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 8
+        },
+        "region": {
+         "startLine": 157,
+         "startColumn": 31,
+         "endColumn": 42
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "a2266ee33148e4b0:1",
+      "primaryLocationStartColumnFingerprint": "18"
+     },
+     "codeFlows": [
+      {
+       "threadFlows": [
+        {
+         "locations": [
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/environment.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 1
+             },
+             "region": {
+              "startLine": 110,
+              "startColumn": 5,
+              "endColumn": 15
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for extensions"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/environment.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 1
+             },
+             "region": {
+              "startLine": 117,
+              "startColumn": 9,
+              "endColumn": 18
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for extension"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/environment.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 1
+             },
+             "region": {
+              "startLine": 119,
+              "startColumn": 67,
+              "endColumn": 76
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for extension"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/utils.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 8
+             },
+             "region": {
+              "startLine": 140,
+              "startColumn": 19,
+              "endColumn": 30
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for import_name"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/utils.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 8
+             },
+             "region": {
+              "startLine": 157,
+              "startColumn": 31,
+              "endColumn": 42
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for import_name"
+            }
+           }
+          }
+         ]
+        }
+       ]
+      },
+      {
+       "threadFlows": [
+        {
+         "locations": [
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/environment.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 1
+             },
+             "region": {
+              "startLine": 117,
+              "startColumn": 22,
+              "endColumn": 32
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for extensions"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/environment.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 1
+             },
+             "region": {
+              "startLine": 117,
+              "startColumn": 9,
+              "endColumn": 18
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for extension"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/environment.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 1
+             },
+             "region": {
+              "startLine": 119,
+              "startColumn": 67,
+              "endColumn": 76
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for extension"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/utils.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 8
+             },
+             "region": {
+              "startLine": 140,
+              "startColumn": 19,
+              "endColumn": 30
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for import_name"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/utils.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 8
+             },
+             "region": {
+              "startLine": 157,
+              "startColumn": 31,
+              "endColumn": 42
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for import_name"
+            }
+           }
+          }
+         ]
+        }
+       ]
+      },
+      {
+       "threadFlows": [
+        {
+         "locations": [
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/environment.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 1
+             },
+             "region": {
+              "startLine": 117,
+              "startColumn": 9,
+              "endColumn": 18
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for extension"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/environment.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 1
+             },
+             "region": {
+              "startLine": 119,
+              "startColumn": 67,
+              "endColumn": 76
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for extension"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/utils.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 8
+             },
+             "region": {
+              "startLine": 140,
+              "startColumn": 19,
+              "endColumn": 30
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for import_name"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/utils.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 8
+             },
+             "region": {
+              "startLine": 157,
+              "startColumn": 31,
+              "endColumn": 42
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for import_name"
+            }
+           }
+          }
+         ]
+        }
+       ]
+      },
+      {
+       "threadFlows": [
+        {
+         "locations": [
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/environment.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 1
+             },
+             "region": {
+              "startLine": 118,
+              "startColumn": 23,
+              "endColumn": 32
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for extension"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/environment.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 1
+             },
+             "region": {
+              "startLine": 119,
+              "startColumn": 67,
+              "endColumn": 76
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for extension"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/utils.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 8
+             },
+             "region": {
+              "startLine": 140,
+              "startColumn": 19,
+              "endColumn": 30
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for import_name"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/utils.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 8
+             },
+             "region": {
+              "startLine": 157,
+              "startColumn": 31,
+              "endColumn": 42
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for import_name"
+            }
+           }
+          }
+         ]
+        }
+       ]
+      }
+     ],
+     "relatedLocations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/environment.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 110,
+         "startColumn": 5,
+         "endColumn": 15
+        }
+       }
+      },
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/environment.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 117,
+         "startColumn": 22,
+         "endColumn": 32
+        }
+       }
+      },
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/environment.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 117,
+         "startColumn": 9,
+         "endColumn": 18
+        }
+       }
+      },
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/environment.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 118,
+         "startColumn": 23,
+         "endColumn": 32
+        }
+       }
+      }
+     ]
+    },
+    {
+     "ruleId": "py/jinja2-sandbox-escape",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-sandbox-escape",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential sandbox escape: data flows into getattr / __import__.\nPotential sandbox escape: data flows into getattr / __import__.\nPotential sandbox escape: data flows into getattr / __import__.\nPotential sandbox escape: data flows into getattr / __import__.\nPotential sandbox escape: data flows into getattr / __import__."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/utils.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 8
+        },
+        "region": {
+         "startLine": 158,
+         "startColumn": 35,
+         "endColumn": 41
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "d730034a9bfd47fe:1",
+      "primaryLocationStartColumnFingerprint": "26"
+     },
+     "codeFlows": [
+      {
+       "threadFlows": [
+        {
+         "locations": [
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/environment.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 1
+             },
+             "region": {
+              "startLine": 110,
+              "startColumn": 5,
+              "endColumn": 15
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for extensions"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/environment.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 1
+             },
+             "region": {
+              "startLine": 117,
+              "startColumn": 9,
+              "endColumn": 18
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for extension"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/environment.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 1
+             },
+             "region": {
+              "startLine": 119,
+              "startColumn": 67,
+              "endColumn": 76
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for extension"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/utils.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 8
+             },
+             "region": {
+              "startLine": 140,
+              "startColumn": 19,
+              "endColumn": 30
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for import_name"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/utils.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 8
+             },
+             "region": {
+              "startLine": 153,
+              "startColumn": 13,
+              "endColumn": 19
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for module"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/utils.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 8
+             },
+             "region": {
+              "startLine": 158,
+              "startColumn": 35,
+              "endColumn": 41
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for module"
+            }
+           }
+          }
+         ]
+        }
+       ]
+      },
+      {
+       "threadFlows": [
+        {
+         "locations": [
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/environment.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 1
+             },
+             "region": {
+              "startLine": 117,
+              "startColumn": 22,
+              "endColumn": 32
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for extensions"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/environment.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 1
+             },
+             "region": {
+              "startLine": 117,
+              "startColumn": 9,
+              "endColumn": 18
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for extension"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/environment.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 1
+             },
+             "region": {
+              "startLine": 119,
+              "startColumn": 67,
+              "endColumn": 76
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for extension"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/utils.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 8
+             },
+             "region": {
+              "startLine": 140,
+              "startColumn": 19,
+              "endColumn": 30
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for import_name"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/utils.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 8
+             },
+             "region": {
+              "startLine": 153,
+              "startColumn": 13,
+              "endColumn": 19
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for module"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/utils.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 8
+             },
+             "region": {
+              "startLine": 158,
+              "startColumn": 35,
+              "endColumn": 41
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for module"
+            }
+           }
+          }
+         ]
+        }
+       ]
+      },
+      {
+       "threadFlows": [
+        {
+         "locations": [
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/environment.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 1
+             },
+             "region": {
+              "startLine": 117,
+              "startColumn": 9,
+              "endColumn": 18
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for extension"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/environment.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 1
+             },
+             "region": {
+              "startLine": 119,
+              "startColumn": 67,
+              "endColumn": 76
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for extension"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/utils.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 8
+             },
+             "region": {
+              "startLine": 140,
+              "startColumn": 19,
+              "endColumn": 30
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for import_name"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/utils.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 8
+             },
+             "region": {
+              "startLine": 153,
+              "startColumn": 13,
+              "endColumn": 19
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for module"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/utils.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 8
+             },
+             "region": {
+              "startLine": 158,
+              "startColumn": 35,
+              "endColumn": 41
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for module"
+            }
+           }
+          }
+         ]
+        }
+       ]
+      },
+      {
+       "threadFlows": [
+        {
+         "locations": [
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/environment.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 1
+             },
+             "region": {
+              "startLine": 118,
+              "startColumn": 23,
+              "endColumn": 32
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for extension"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/environment.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 1
+             },
+             "region": {
+              "startLine": 119,
+              "startColumn": 67,
+              "endColumn": 76
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for extension"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/utils.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 8
+             },
+             "region": {
+              "startLine": 140,
+              "startColumn": 19,
+              "endColumn": 30
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for import_name"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/utils.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 8
+             },
+             "region": {
+              "startLine": 153,
+              "startColumn": 13,
+              "endColumn": 19
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for module"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/utils.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 8
+             },
+             "region": {
+              "startLine": 158,
+              "startColumn": 35,
+              "endColumn": 41
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for module"
+            }
+           }
+          }
+         ]
+        }
+       ]
+      }
+     ],
+     "relatedLocations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/environment.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 110,
+         "startColumn": 5,
+         "endColumn": 15
+        }
+       }
+      },
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/environment.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 117,
+         "startColumn": 22,
+         "endColumn": 32
+        }
+       }
+      },
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/environment.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 117,
+         "startColumn": 9,
+         "endColumn": 18
+        }
+       }
+      },
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/environment.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 118,
+         "startColumn": 23,
+         "endColumn": 32
+        }
+       }
+      }
+     ]
+    },
+    {
+     "ruleId": "py/jinja2-sandbox-escape",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-sandbox-escape",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential sandbox escape: data flows into getattr / __import__.\nPotential sandbox escape: data flows into getattr / __import__.\nPotential sandbox escape: data flows into getattr / __import__.\nPotential sandbox escape: data flows into getattr / __import__.\nPotential sandbox escape: data flows into getattr / __import__."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/utils.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 8
+        },
+        "region": {
+         "startLine": 158,
+         "startColumn": 63,
+         "endColumn": 66
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "d730034a9bfd47fe:1",
+      "primaryLocationStartColumnFingerprint": "54"
+     },
+     "codeFlows": [
+      {
+       "threadFlows": [
+        {
+         "locations": [
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/environment.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 1
+             },
+             "region": {
+              "startLine": 110,
+              "startColumn": 5,
+              "endColumn": 15
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for extensions"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/environment.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 1
+             },
+             "region": {
+              "startLine": 117,
+              "startColumn": 9,
+              "endColumn": 18
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for extension"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/environment.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 1
+             },
+             "region": {
+              "startLine": 119,
+              "startColumn": 67,
+              "endColumn": 76
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for extension"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/utils.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 8
+             },
+             "region": {
+              "startLine": 140,
+              "startColumn": 19,
+              "endColumn": 30
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for import_name"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/utils.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 8
+             },
+             "region": {
+              "startLine": 153,
+              "startColumn": 21,
+              "endColumn": 24
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for obj"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/utils.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 8
+             },
+             "region": {
+              "startLine": 158,
+              "startColumn": 63,
+              "endColumn": 66
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for obj"
+            }
+           }
+          }
+         ]
+        }
+       ]
+      },
+      {
+       "threadFlows": [
+        {
+         "locations": [
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/environment.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 1
+             },
+             "region": {
+              "startLine": 117,
+              "startColumn": 22,
+              "endColumn": 32
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for extensions"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/environment.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 1
+             },
+             "region": {
+              "startLine": 117,
+              "startColumn": 9,
+              "endColumn": 18
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for extension"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/environment.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 1
+             },
+             "region": {
+              "startLine": 119,
+              "startColumn": 67,
+              "endColumn": 76
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for extension"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/utils.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 8
+             },
+             "region": {
+              "startLine": 140,
+              "startColumn": 19,
+              "endColumn": 30
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for import_name"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/utils.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 8
+             },
+             "region": {
+              "startLine": 153,
+              "startColumn": 21,
+              "endColumn": 24
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for obj"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/utils.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 8
+             },
+             "region": {
+              "startLine": 158,
+              "startColumn": 63,
+              "endColumn": 66
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for obj"
+            }
+           }
+          }
+         ]
+        }
+       ]
+      },
+      {
+       "threadFlows": [
+        {
+         "locations": [
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/environment.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 1
+             },
+             "region": {
+              "startLine": 117,
+              "startColumn": 9,
+              "endColumn": 18
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for extension"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/environment.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 1
+             },
+             "region": {
+              "startLine": 119,
+              "startColumn": 67,
+              "endColumn": 76
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for extension"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/utils.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 8
+             },
+             "region": {
+              "startLine": 140,
+              "startColumn": 19,
+              "endColumn": 30
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for import_name"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/utils.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 8
+             },
+             "region": {
+              "startLine": 153,
+              "startColumn": 21,
+              "endColumn": 24
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for obj"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/utils.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 8
+             },
+             "region": {
+              "startLine": 158,
+              "startColumn": 63,
+              "endColumn": 66
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for obj"
+            }
+           }
+          }
+         ]
+        }
+       ]
+      },
+      {
+       "threadFlows": [
+        {
+         "locations": [
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/environment.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 1
+             },
+             "region": {
+              "startLine": 118,
+              "startColumn": 23,
+              "endColumn": 32
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for extension"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/environment.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 1
+             },
+             "region": {
+              "startLine": 119,
+              "startColumn": 67,
+              "endColumn": 76
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for extension"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/utils.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 8
+             },
+             "region": {
+              "startLine": 140,
+              "startColumn": 19,
+              "endColumn": 30
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for import_name"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/utils.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 8
+             },
+             "region": {
+              "startLine": 153,
+              "startColumn": 21,
+              "endColumn": 24
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for obj"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/utils.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 8
+             },
+             "region": {
+              "startLine": 158,
+              "startColumn": 63,
+              "endColumn": 66
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for obj"
+            }
+           }
+          }
+         ]
+        }
+       ]
+      }
+     ],
+     "relatedLocations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/environment.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 110,
+         "startColumn": 5,
+         "endColumn": 15
+        }
+       }
+      },
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/environment.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 117,
+         "startColumn": 22,
+         "endColumn": 32
+        }
+       }
+      },
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/environment.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 117,
+         "startColumn": 9,
+         "endColumn": 18
+        }
+       }
+      },
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/environment.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 118,
+         "startColumn": 23,
+         "endColumn": 32
+        }
+       }
+      }
+     ]
+    },
+    {
+     "ruleId": "py/jinja2-sandbox-escape",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-sandbox-escape",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential sandbox escape: data flows into getattr / __import__.\nPotential sandbox escape: data flows into getattr / __import__.\nPotential sandbox escape: data flows into getattr / __import__.\nPotential sandbox escape: data flows into getattr / __import__."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/visitor.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 9
+        },
+        "region": {
+         "startLine": 33,
+         "startColumn": 30,
+         "endColumn": 60
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "5e70d81adf070933:1",
+      "primaryLocationStartColumnFingerprint": "21"
+     },
+     "codeFlows": [
+      {
+       "threadFlows": [
+        {
+         "locations": [
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/visitor.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 9
+             },
+             "region": {
+              "startLine": 33,
+              "startColumn": 30,
+              "endColumn": 39
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for StringLiteral"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/visitor.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 9
+             },
+             "region": {
+              "startLine": 33,
+              "startColumn": 30,
+              "endColumn": 60
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for Fstring"
+            }
+           }
+          }
+         ]
+        }
+       ]
+      },
+      {
+       "threadFlows": [
+        {
+         "locations": [
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/visitor.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 9
+             },
+             "region": {
+              "startLine": 33,
+              "startColumn": 39,
+              "endColumn": 58
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for Attribute"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/visitor.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 9
+             },
+             "region": {
+              "startLine": 33,
+              "startColumn": 30,
+              "endColumn": 60
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for Fstring"
+            }
+           }
+          }
+         ]
+        }
+       ]
+      },
+      {
+       "threadFlows": [
+        {
+         "locations": [
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/visitor.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 9
+             },
+             "region": {
+              "startLine": 33,
+              "startColumn": 58,
+              "endColumn": 60
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for StringLiteral"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "src/jinja2/visitor.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 9
+             },
+             "region": {
+              "startLine": 33,
+              "startColumn": 30,
+              "endColumn": 60
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for Fstring"
+            }
+           }
+          }
+         ]
+        }
+       ]
+      }
+     ],
+     "relatedLocations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/visitor.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 9
+        },
+        "region": {
+         "startLine": 33,
+         "startColumn": 30,
+         "endColumn": 39
+        }
+       }
+      },
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/visitor.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 9
+        },
+        "region": {
+         "startLine": 33,
+         "startColumn": 39,
+         "endColumn": 58
+        }
+       }
+      },
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/visitor.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 9
+        },
+        "region": {
+         "startLine": 33,
+         "startColumn": 58,
+         "endColumn": 60
+        }
+       }
+      }
+     ]
+    }
+   ]
+  }
+ ]
+}

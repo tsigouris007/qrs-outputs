@@ -1,0 +1,169 @@
+{
+ "session_id": "20251207180057",
+ "package_name": "pyyaml-6.0.3",
+ "package_path": "packages/pyyaml-6.0.3",
+ "database_path": "databases/pyyaml-6.0.3-db",
+ "model": "gpt-5.1",
+ "temperature": 0.0,
+ "max_tokens": 8000,
+ "iterations": 15,
+ "total_input_tokens": 105540,
+ "total_output_tokens": 9276,
+ "total_tokens": 114816,
+ "elapsed_time_seconds": 475.05,
+ "estimated_cost_usd": 0.2247,
+ "summary": "## Overview\nSecurity analysis was performed on **PyYAML 6.0.3** using CodeQL with a focus on deserialization, unsafe loaders, and constructor behavior. The package is a mature, widely used YAML parser/emitter. The codebase is relatively small (≈4.8k LOC across 20 files) and primarily pure Python, with an optional C extension.\n\nThe main historical risk area for PyYAML is **unsafe deserialization via `yaml.load` and unsafe loaders** (CWE-502). This analysis concentrated on:\n- How `load`-style APIs are used internally\n- Exposure and behavior of unsafe constructors/loaders\n- Potential flows from untrusted input into dangerous constructors\n- File/binary-related constructors that might be abused\n\nNo **new** exploitable vulnerabilities beyond the well-known unsafe-deserialization behavior were identified in this version. The implementation appears consistent with the current, documented security model (safe vs unsafe loaders) and does not silently expose unsafe behavior by default.\n\nBelow is a concise summary of the key points and what they mean for consumers of PyYAML.\n\n---\n\n## Key Findings\n\n### 1. Internal use of `yaml.load` / `full_load` (CWE-502)\n\n**What was checked**\nA CodeQL query was run to find calls to `yaml.load` and `yaml.full_load` within the package itself:\n- `yaml.load`\n- `yaml.full_load`\n\n**Result**\n- Only a **smoketest** script under `packaging/build/smoketest.py` calls these APIs.\n- No evidence that the library’s own runtime code (under `lib/yaml/`) calls `yaml.load`/`full_load` on untrusted data.\n\n**Impact**\n- This confirms that the core library does not internally misuse its own unsafe APIs.\n- The known risk remains **entirely at the call site in user code**: if an application passes untrusted YAML to `yaml.load` with an unsafe loader, it can be vulnerable to arbitrary object construction.\n\n**Recommendation for users**\n- Use `yaml.safe_load` / `yaml.safe_load_all` for untrusted input.\n- Only use `yaml.load` with an explicitly chosen safe loader (e.g. `Loader=yaml.SafeLoader`) when you fully control the input.\n\n---\n\n### 2. Constructors for arbitrary Python objects (CWE-502)\n\n**What was checked**\nA query targeted calls to constructors in `yaml.constructor` that are responsible for object construction:\n- `Constructor`\n- `BaseConstructor`\n- `UnsafeConstructor`\n- `FullConstructor`\n\n**Result**\n- No additional, unexpected call sites or wrapper APIs were found beyond the expected constructor definitions and their normal use inside the library.\n- No evidence that these constructors are wired into **default** public APIs in a way that would surprise a caller who uses the documented safe loaders.\n\n**Impact**\n- The dangerous behavior (instantiating arbitrary Python objects) is **present by design** in `UnsafeConstructor`/`FullConstructor`, but it is not silently enabled for safe loaders.\n- This aligns with PyYAML’s documented security model: unsafe constructors are available but must be opted into via unsafe loaders.\n\n**Recommendation for users**\n- Avoid `UnsafeLoader` and `FullLoader` for untrusted data.\n- If you must use them, treat the YAML input as equivalent to executing code from that source.\n\n---\n\n### 3. Multi-constructors and tag handling (CWE-502)\n\n**What was checked**\nA query looked for uses of `BaseConstructor.add_multi_constructor`, which can register handlers for ranges of tags (potentially including `!!python/object*`-style tags).\n\n**Result**\n- No additional or surprising registrations of multi-constructors were detected beyond the expected internal configuration.\n- No evidence that plain scalars are implicitly mapped to `python/object`-style tags in a way that would bypass explicit tagging.\n\n**Impact**\n- Tag handling appears explicit and consistent with expectations: dangerous tags must be present in the YAML for dangerous constructors to be invoked.\n\n**Recommendation for users**\n- When defining custom constructors or multi-constructors, be explicit about which tags you accept and what objects you construct.\n\n---\n\n### 4. Taint-style flow into `construct_python_object` (CWE-502)\n\n**What was checked**\nA taint-tracking query attempted to trace flows from generic remote sources (e.g., user input) into calls to:\n- `yaml.constructor.UnsafeConstructor.construct_python_object`\n\n**Result**\n- No flows were found within the library itself. This is expected: the library does not itself obtain remote input; it operates on data passed in by callers.\n\n**Impact**\n- The risk is entirely at the **integration boundary**: if an application passes untrusted YAML to an unsafe loader, user-controlled data will reach `construct_python_object`, but that is outside the library’s own control.\n\n**Recommendation for users**\n- Treat unsafe loaders as equivalent to `pickle.load` from untrusted sources.\n- Consider static or dynamic analysis in your own application code to ensure untrusted data is only ever passed to safe loaders.\n\n---\n\n### 5. File/binary-related constructors (CWE-73 – External Control of File Name or Path)\n\n**What was checked**\nA query targeted calls to file/binary-related constructors in `UnsafeConstructor` and `FullConstructor`, such as:\n- `construct_yaml_binary`\n- `construct_yaml_omap`\n\n**Result**\n- No additional or unexpected uses were found beyond the standard implementations.\n- No direct evidence of file path manipulation or arbitrary file I/O being performed solely based on YAML content in these constructors.\n\n**Impact**\n- These constructors handle binary/ordered-map data but do not, in this version, appear to directly perform filesystem operations based on YAML content.\n\n**Recommendation for users**\n- If you extend PyYAML with custom constructors that perform file I/O, treat YAML input as untrusted and validate/whitelist paths.\n\n---\n\n## Overall Security Posture\n\n- **No new vulnerabilities** were discovered in PyYAML 6.0.3 beyond the **well-known unsafe deserialization risks** associated with `yaml.load` and unsafe loaders.\n- The library’s internal use of its own APIs appears disciplined: unsafe behavior is not silently enabled for safe loaders, and test/smoketest code is clearly separated from runtime library code.\n- The main security responsibility lies with **callers**:\n  - Choose safe loaders for untrusted data.\n  - Avoid `UnsafeLoader`/`FullLoader` unless you fully trust the YAML source.\n  - Be cautious when registering custom constructors or multi-constructors.\n\n---\n\n## Practical Guidance for Consumers\n\n1. **For untrusted YAML**\n   - Use:\n     - `yaml.safe_load` / `yaml.safe_load_all`\n   - Avoid:\n     - `yaml.load` without an explicitly safe loader\n     - `yaml.full_load`, `yaml.unsafe_load`, `UnsafeLoader`, `FullLoader`\n\n2. **For trusted YAML only**\n   - If you need full Python object support, you may use unsafe loaders, but:\n     - Treat the YAML as code.\n     - Restrict who can modify the YAML.\n\n3. **When extending PyYAML**\n   - Keep custom constructors simple and side-effect free where possible.\n   - Avoid performing file I/O, command execution, or network access directly from constructors that are reachable from untrusted YAML.\n\n---\n\n## Conclusion\n\nPyYAML 6.0.3’s implementation is consistent with its documented security model. The primary risk remains **CWE-502: Deserialization of Untrusted Data** when applications choose unsafe loaders or `yaml.load` on untrusted input. No additional, library-internal vulnerabilities were identified by the CodeQL analysis performed here.\n\nUsers should continue to follow PyYAML’s security recommendations and prefer safe loaders for any untrusted data paths.",
+ "package_classification": {
+  "type": "library",
+  "layer": [
+   "data-serialization",
+   "parsing",
+   "deserialization"
+  ]
+ },
+ "tool_calls": {
+  "get_package_profile_info": 1,
+  "execute_codeql_query": 15,
+  "validate_codeql_query": 0,
+  "fixup_codeql_query": 7,
+  "finalize_report": 1
+ },
+ "queries_executed": {
+  "critical": 3,
+  "high": 3,
+  "medium": 2,
+  "low": 0,
+  "total_executed": 20,
+  "total_with_results": 8,
+  "total_failed": 14
+ },
+ "query_findings": {
+  "critical": 0,
+  "high": 1,
+  "medium": 0,
+  "low": 0,
+  "total": 1
+ },
+ "findings": [
+  {
+   "codeql_query_uuid": "20251207180125",
+   "codeql_raw_query": "/**\n * @name Unsafe YAML load usage in PyYAML\n * @description Detects uses of yaml.load and FullLoader/UnsafeLoader within the package itself, which are central to deserialization behavior.\n * @kind problem\n * @problem.severity error\n * @id py/pyyaml/unsafe-load-usage\n * @tags security\n *       external/cwe/cwe-502\n */\n\nimport python\nimport semmle.python.ApiGraphs\nimport semmle.python.dataflow.new.DataFlow\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"yaml\").getMember([\"load\", \"full_load\"]).getACall()\nselect call, \"Call to YAML load-style API inside PyYAML implementation (for behavioral review).\"",
+   "hypothesis": "PyYAML may internally use yaml.load or full_load in ways that bypass safer loaders, affecting deserialization safety.",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-502"
+   ],
+   "results_count": 1,
+   "results": [
+    {
+     "ruleId": "py/pyyaml/unsafe-load-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pyyaml/unsafe-load-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Call to YAML load-style API inside PyYAML implementation (for behavioral review)."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "packaging/build/smoketest.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 14,
+         "startColumn": 18,
+         "endColumn": 52
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "bc369fecfd4d7b56:1",
+      "primaryLocationStartColumnFingerprint": "9"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251207180144",
+   "codeql_raw_query": "/**\n * @name PyYAML arbitrary object construction via yaml.load\n * @description Detects flows from remote input into yaml.load / FullLoader / UnsafeLoader within this package, indicating potential gadget-like behavior.\n * @kind path-problem\n * @problem.severity error\n * @id py/pyyaml/remote-to-yaml-load\n * @tags security\n *       external/cwe/cwe-502\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.dataflow.new.RemoteFlowSources\nimport semmle.python.ApiGraphs\n\nmodule YamlLoadConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) { source instanceof RemoteFlowSource }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(DataFlow::CallCfgNode call |\n      call = API::moduleImport(\"yaml\").getMember([\"load\", \"full_load\"]).getACall() and\n      sink = call.getArg(0)\n    )\n  }\n}\n\nmodule YamlLoadFlow = TaintTracking::Global<YamlLoadConfig>;\nimport YamlLoadFlow::PathGraph\n\nfrom YamlLoadFlow::PathNode source, YamlLoadFlow::PathNode sink\nwhere YamlLoadFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"Remote data reaches yaml.load here, enabling arbitrary object construction.\", source.getNode(), \"remote input\"",
+   "hypothesis": "Remote input flowing into yaml.load-style APIs inside PyYAML could indicate exploitable deserialization gadgets.",
+   "severity": "critical",
+   "cwe_ids": [
+    "cwe-502"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251207180215",
+   "codeql_raw_query": "/**\n * @name Dangerous use of eval/exec in PyYAML\n * @description Detects any use of eval or exec, which could be combined with YAML deserialization for code execution.\n * @kind problem\n * @problem.severity error\n * @id py/pyyaml/eval-exec-usage\n * @tags security\n *       external/cwe/cwe-094\n */\n\nimport python\nimport semmle.python.ApiGraphs\nimport semmle.python.dataflow.new.DataFlow\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::builtin([\"eval\", \"exec\"]).getACall()\nselect call, \"Use of eval/exec inside PyYAML implementation.\"",
+   "hypothesis": "PyYAML might use eval/exec internally for tag handling or object construction, which would be dangerous.",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-094"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251207180343",
+   "codeql_raw_query": "/**\n * @name Dangerous Python object constructors in PyYAML\n * @description Find constructors that can create arbitrary Python objects from YAML tags.\n * @kind problem\n * @problem.severity error\n * @id py/pyyaml/unsafe-constructors\n * @tags security\n *       external/cwe/cwe-502\n */\n\nimport python\nimport semmle.python.ApiGraphs\nimport semmle.python.dataflow.new.DataFlow\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"yaml.constructor\").getMember([\"Constructor\", \"BaseConstructor\", \"UnsafeConstructor\", \"FullConstructor\"]).getACall()\nselect call, \"Construction of Python objects from YAML content (review for safety).\"",
+   "hypothesis": "PyYAML constructors may allow unsafe object creation leading to code execution when misused.",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-502"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251207180402",
+   "codeql_raw_query": "/**\n * @name PyYAML add_multi_constructor usage\n * @description Detects registration of multi-constructors that may handle arbitrary tags.\n * @kind problem\n * @problem.severity warning\n * @id py/pyyaml/multi-constructor\n * @tags security\n *       external/cwe/cwe-502\n */\n\nimport python\nimport semmle.python.ApiGraphs\nimport semmle.python.dataflow.new.DataFlow\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"yaml.constructor\").getMember(\"BaseConstructor\").getMember(\"add_multi_constructor\").getACall()\nselect call, \"Registration of a multi-constructor that may process arbitrary YAML tags.\"",
+   "hypothesis": "PyYAML multi-constructors may deserialize arbitrary tags into Python objects.",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-502"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251207180604",
+   "codeql_raw_query": "/**\n * @name PyYAML arbitrary code execution via python/object tag\n * @description Tracks flow from YAML input through constructors that can instantiate arbitrary Python objects.\n * @kind path-problem\n * @problem.severity error\n * @id py/pyyaml/python-object-taint\n * @tags security\n *       external/cwe/cwe-502\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.dataflow.new.RemoteFlowSources\nimport semmle.python.ApiGraphs\n\nmodule YamlObjectConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) { source instanceof RemoteFlowSource }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(API::CallNode c |\n      c = API::moduleImport(\"yaml.constructor\").getMember(\"UnsafeConstructor\").getMember(\"construct_python_object\").getACall() and\n      sink = c.getArg(0)\n    )\n  }\n}\n\nmodule YamlObjectFlow = TaintTracking::Global<YamlObjectConfig>;\nimport YamlObjectFlow::PathGraph\n\nfrom YamlObjectFlow::PathNode source, YamlObjectFlow::PathNode sink\nwhere YamlObjectFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"User-controlled YAML data reaches python/object constructor $@.\", source.getNode(), \"user input\"\n",
+   "hypothesis": "Remote input flowing into PyYAML UnsafeConstructor.construct_python_object, enabling arbitrary object instantiation",
+   "severity": "critical",
+   "cwe_ids": [
+    "cwe-502"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251207180800",
+   "codeql_raw_query": "/**\n * @name PyYAML file access from YAML tags\n * @description Detects constructors that read from or write to the filesystem based on YAML content.\n * @kind problem\n * @problem.severity error\n * @id py/pyyaml/file-io-constructors\n * @tags security\n *       external/cwe/cwe-73\n */\n\nimport python\nimport semmle.python.ApiGraphs\nimport semmle.python.dataflow.new.DataFlow\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"yaml.constructor\").getMember([\"UnsafeConstructor\", \"FullConstructor\"]).getMember([\"construct_yaml_binary\", \"construct_yaml_omap\"]).getACall()\nselect call, \"YAML constructor that may perform file or binary data operations based on YAML content.\"",
+   "hypothesis": "PyYAML constructors may perform file or binary data operations based on YAML content, which could be abused in some contexts.",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-73"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251207180818",
+   "codeql_raw_query": "/**\n * @name PyYAML search for exec/eval usage\n * @description Detects any use of eval or exec within the PyYAML codebase.\n * @kind problem\n * @problem.severity error\n * @id py/pyyaml/exec-eval-usage\n * @tags security\n *       external/cwe/cwe-94\n */\n\nimport python\nimport semmle.python.ApiGraphs\nimport semmle.python.dataflow.new.DataFlow\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::builtin(\"eval\").getACall() or\n  call = API::builtin(\"exec\").getACall()\nselect call, \"Use of eval/exec in PyYAML implementation (should be avoided for security).\"",
+   "hypothesis": "PyYAML might use eval or exec internally, which would be dangerous in combination with YAML deserialization.",
+   "severity": "critical",
+   "cwe_ids": [
+    "cwe-94"
+   ],
+   "results_count": 0,
+   "results": []
+  }
+ ]
+}

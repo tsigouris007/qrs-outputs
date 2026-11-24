@@ -1,0 +1,1900 @@
+{
+ "session_id": "20261119233543",
+ "package_name": "pillow-8.0.0",
+ "package_path": "packages/pillow-8.0.0",
+ "database_path": "databases/pillow-8.0.0-db",
+ "model": "gpt-5.1",
+ "temperature": 0.0,
+ "max_tokens": 8000,
+ "iterations": 12,
+ "total_input_tokens": 116027,
+ "total_output_tokens": 10247,
+ "total_tokens": 126274,
+ "elapsed_time_seconds": 534.54,
+ "estimated_cost_usd": 0.3465,
+ "summary": "## Package overview\n- **Name:** Pillow 8.0.0\n- **Type:** Python imaging library (PIL fork)\n- **Codebase:** ~21k LOC, primary package `PIL` under `src/PIL/`\n- **Role:** General-purpose image processing library used by applications, web services, and tools.\n\n## Classification\n- **Package type:** library\n- **Layer:** image processing / media codec layer within an application stack\n\n## Analysis scope and method\n- Used CodeQL (Python) with custom queries focused on:\n  - Use of subprocess and external tools (potential command injection, CWE-78)\n  - Dynamic code execution via `eval`/`exec` (CWE-94)\n  - High-level taint-style checks for untrusted data into image decoders (CWE-20)\n- Searched across all Python sources in `src/PIL`, `setup.py`, `winbuild/`, and tests.\n\n## Key findings\n\n### 1. Use of subprocess APIs (CWE-78 – OS Command Injection, **informational / requires context**)\n\n**Query:** `py/pillow-subprocess-usage` (custom CodeQL problem query)\n\n**What was found**\nMultiple call sites where Pillow invokes external commands via the `subprocess` module:\n\n1. **`src/PIL/EpsImagePlugin.py`**\n   - Lines around **56** and **143**\n   - This plugin typically shells out to Ghostscript to render EPS/PS files.\n   - Risk: If the command line is constructed using untrusted file paths or options without proper quoting/escaping, there is potential for command injection.\n\n2. **`src/PIL/GifImagePlugin.py`**\n   - Lines around **629–631**, **637–639**, **640–645**\n   - These regions are associated with GIF handling and may use external tools for optimization or conversion.\n   - Risk: Same pattern – if user-controlled paths or arguments are interpolated into shell commands, this can be dangerous.\n\n3. **`src/PIL/IcnsImagePlugin.py`**\n   - Lines around **345–347**\n   - ICNS plugin may call external utilities for icon conversion.\n\n4. **`src/PIL/ImageGrab.py`**\n   - Lines around **33** and **87**\n   - ImageGrab on some platforms uses external tools (e.g., `xwd`, `screencapture`) via subprocess.\n   - Risk: If the target display, file path, or other parameters are influenced by untrusted input, there is a command-injection surface.\n\n5. **`src/PIL/ImageShow.py`**\n   - Lines around **155–159**, **183–185**\n   - ImageShow uses external viewers (e.g., `display`, `xdg-open`) via subprocess.\n   - Typically, this is driven by local user actions, but if an application exposes this functionality to remote users, arguments must be sanitized.\n\n6. **`src/PIL/JpegImagePlugin.py`**\n   - Lines around **453** and **768**\n   - JPEG plugin may call external tools (e.g., for progressive JPEG or optimization).\n\n7. **Build and tooling code**\n   - `winbuild/build_prepare.py` around **327–341**\n   - `setup.py` around **176–178**, **243**, **249**, **449**, **481**\n   - These are build-time utilities and not normally reachable in production runtime.\n\n8. **Tests** (not part of the installed library in typical deployments)\n   - `Tests/test_file_palm.py` around **31–33**\n   - `Tests/test_image_access.py` around **413**\n   - `Tests/test_imagegrab.py` around **58**, **60**, **79**, **89**\n   - `Tests/test_main.py` around **7**\n\n**Assessment**\n- The CodeQL query intentionally flags **all** subprocess usage; it does **not** prove that untrusted input reaches these calls.\n- In Pillow’s typical usage model, filenames and options are often application-controlled, but in many real deployments, filenames and image paths are derived from user uploads or external sources.\n- Without full data-flow confirmation from remote sources to these arguments, these are best treated as **security-relevant hotspots** rather than confirmed vulnerabilities.\n\n**Risk level:**\n- **Library itself:** Medium, context-dependent.\n- **CWE:** CWE-78 (OS Command Injection)\n\n**Recommendations for consumers of Pillow:**\n- Treat any API that may indirectly trigger these subprocess calls (e.g., EPS loading, ImageGrab, ImageShow, some plugin operations) as **sensitive**.\n- Do not pass unvalidated or attacker-controlled paths or command-line-like strings into Pillow APIs that may invoke external tools.\n- Prefer absolute, validated paths and avoid embedding user-controlled fragments into environment variables or configuration that Pillow might use.\n\n**Recommendations for Pillow maintainers:**\n- Ensure all subprocess invocations:\n  - Use `subprocess.run([...], shell=False)` with argument lists, not shell strings.\n  - Avoid `shell=True` entirely where possible.\n  - Quote or validate any file paths or options that may be influenced by callers.\n- Consider documenting which operations invoke external tools so downstream users can treat them as privileged.\n\n---\n\n### 2. Dynamic code execution via eval/exec (CWE-94 – Code Injection, **informational / requires context**)\n\n**Query:** `py/pillow-eval-exec` (custom CodeQL problem query)\n\n**What was found**\n\n1. **`src/PIL/ImageMath.py`**\n   - Around **line 249**\n   - This module implements expression-based image math; historically it uses `eval` to evaluate user-supplied expressions over image bands.\n   - If an application passes attacker-controlled expressions directly into ImageMath without restriction, this can lead to arbitrary code execution.\n\n2. **`setup.py`**\n   - Around **line 25**\n   - `eval`/`exec` used in build-time logic (e.g., parsing version or metadata).\n   - This is not normally reachable at runtime in deployed applications.\n\n**Assessment**\n- The presence of `eval`/`exec` is inherently risky, but CodeQL did **not** establish a taint flow from remote sources to these calls in this run.\n- For `ImageMath.py`, the risk is that some APIs may accept expression strings that are evaluated in a Python context.\n- For `setup.py`, risk is limited to environments where untrusted parties can modify the source or environment at build time.\n\n**Risk level:**\n- **ImageMath expression evaluation:** Medium, highly dependent on how the host application exposes it.\n- **setup.py usage:** Low for typical users; build-time only.\n- **CWE:** CWE-94 (Improper Control of Generation of Code)\n\n**Recommendations for consumers of Pillow:**\n- Do **not** expose ImageMath expression strings directly to untrusted users.\n- If you must accept user-defined expressions, implement a strict allowlist of operations or a separate safe expression language and map it to ImageMath operations without passing raw user strings to `eval`.\n\n**Recommendations for Pillow maintainers:**\n- Where feasible, replace `eval`-based expression handling with a parsed, restricted expression language that does not execute arbitrary Python code.\n- At minimum, clearly document that certain APIs evaluate expressions and must not be fed untrusted input.\n\n---\n\n### 3. Untrusted data into image decoders (CWE-20 – Input Validation, **no specific flows found by query**)\n\n**Query:** `py/pillow-untrusted-image-decode` (custom path-problem taint query)\n- Sources: generic `RemoteFlowSource` (HTTP parameters, etc.)\n- Sinks: `PIL.Image.open`, `PIL.Image.frombytes`, `PIL.Image.frombuffer`, `Image.Image.load` first argument\n\n**Result:**\n- The query compiled and executed successfully but returned **no results**.\n\n**Interpretation:**\n- Within the Pillow codebase itself, there is no modeled flow from generic remote sources into these APIs; this is expected because Pillow is a **library**, and remote inputs are typically handled in the calling application.\n- This does **not** mean that using Pillow on untrusted images is safe from memory corruption or DoS; it only means the library does not itself fetch remote data.\n\n**Contextual risk (outside CodeQL’s direct findings):**\n- Pillow 8.0.0 historically has had multiple CVEs related to crafted image files causing crashes or potential memory issues in native decoders (e.g., TIFF, JPEG, FLI, etc.). Those are largely in C extensions and external libraries, which are outside the Python CodeQL analysis scope.\n\n**Recommendations for consumers of Pillow:**\n- Always treat image files from untrusted sources as potentially malicious.\n- Run Pillow under appropriate sandboxing or privilege separation if processing untrusted images at scale.\n- Keep Pillow and its native dependencies up to date; consider upgrading beyond 8.0.0 to a version with known security fixes.\n\n---\n\n## Overall security posture\n\n- The CodeQL analysis of the Python layer of Pillow 8.0.0 did **not** reveal confirmed, exploitable vulnerabilities by itself, but it did identify:\n  - Multiple **subprocess** call sites that are security-sensitive and could become command-injection vectors if misused by applications.\n  - Use of **`eval`/`exec`** in `ImageMath.py` and `setup.py`, which is inherently dangerous if ever exposed to untrusted input.\n- No direct taint flows from modeled remote sources into these sinks were found within the library code, which is consistent with Pillow’s role as a lower-level imaging library.\n\n## Practical guidance\n\nFor **application developers using Pillow 8.0.0**:\n- Avoid passing untrusted data into any Pillow APIs that:\n  - Evaluate expressions (ImageMath), or\n  - May invoke external tools (EPS, ImageGrab, ImageShow, some plugins).\n- Sanitize and validate all filenames and options before passing them to Pillow.\n- Run image processing in a constrained environment (separate process, limited privileges) when handling untrusted images.\n- Prefer upgrading to a newer Pillow release with accumulated security fixes.\n\nFor **Pillow maintainers**:\n- Review all subprocess call sites identified above and ensure they:\n  - Use `shell=False` and argument lists.\n  - Validate or sanitize any user-influenced arguments.\n- Consider refactoring or constraining `eval`/`exec` usage in `ImageMath.py`.\n- Document clearly which APIs:\n  - Invoke external commands, or\n  - Evaluate expressions, so downstream users can treat them as sensitive.\n\nWithin the limits of Python-level static analysis via CodeQL, no new, concrete exploitable vulnerability was proven, but several **security-sensitive patterns** were confirmed that warrant careful use and, where possible, hardening in future versions.",
+ "package_classification": {
+  "type": "library",
+  "layer": [
+   "image_processing",
+   "media_codec",
+   "runtime_library"
+  ]
+ },
+ "tool_calls": {
+  "get_package_profile_info": 1,
+  "execute_codeql_query": 13,
+  "validate_codeql_query": 0,
+  "fixup_codeql_query": 4,
+  "finalize_report": 1
+ },
+ "queries_executed": {
+  "critical": 2,
+  "high": 6,
+  "medium": 2,
+  "low": 0,
+  "total_executed": 16,
+  "total_with_results": 10,
+  "total_failed": 7
+ },
+ "query_findings": {
+  "critical": 0,
+  "high": 29,
+  "medium": 25,
+  "low": 0,
+  "total": 54
+ },
+ "findings": [
+  {
+   "codeql_query_uuid": "20261119233558",
+   "codeql_raw_query": "/**\n * @name Pillow: unsafe file path usage from remote sources\n * @description Detects flows from remote sources to file system access in Pillow\n * @kind path-problem\n * @problem.severity error\n * @id py/pillow/path-traversal\n * @tags security\n *       external/cwe/cwe-022\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.dataflow.new.RemoteFlowSources\nimport semmle.python.Concepts\n\nmodule FilePathConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    source instanceof RemoteFlowSource\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    sink = any(FileSystemAccess fa).getAPathArgument()\n  }\n}\n\nmodule FilePathFlow = TaintTracking::Global<FilePathConfig>;\nimport FilePathFlow::PathGraph\n\nfrom FilePathFlow::PathNode source, FilePathFlow::PathNode sink\nwhere FilePathFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"User-controlled data reaches file system access $@.\", sink.getNode(), \"file path\"",
+   "hypothesis": "User-controlled data may reach file system operations in Pillow, leading to path traversal or arbitrary file access",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-022"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20261119233801",
+   "codeql_raw_query": "/**\n * @name Untrusted image data reaching image decoders\n * @description Detect flows from remote/user-controlled sources into Pillow image loading/decoding APIs, which may expose memory corruption or DoS in native decoders.\n * @kind path-problem\n * @problem.severity error\n * @id py/pillow-untrusted-image-decode\n * @tags security\n *       external/cwe/cwe-020\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.dataflow.new.RemoteFlowSources\nimport semmle.python.ApiGraphs\nimport semmle.python.Concepts\n\nmodule PillowImageDecodeConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    source instanceof RemoteFlowSource\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(API::CallNode call, DataFlow::Node argNode |\n      // PIL.Image.open(...)\n      call = API::moduleImport(\"PIL\").getMember(\"Image\").getMember(\"open\").getACall() or\n      // PIL.Image.frombytes/frombuffer\n      call = API::moduleImport(\"PIL\").getMember(\"Image\").getMember([\"frombytes\", \"frombuffer\"]).getACall() or\n      // Image.Image.load (instance method)\n      call = API::moduleImport(\"PIL\").getMember(\"Image!\").getMember(\"load\").getACall()\n      |\n      argNode = call.getArg(0) and\n      sink = argNode\n    )\n  }\n}\n\nmodule PillowImageDecodeFlow = TaintTracking::Global<PillowImageDecodeConfig>;\nimport PillowImageDecodeFlow::PathGraph\n\nfrom PillowImageDecodeFlow::PathNode source, PillowImageDecodeFlow::PathNode sink\nwhere PillowImageDecodeFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"Untrusted data flows into Pillow image decoding API $@.\", source.getNode(), \"user-controlled data\"\n",
+   "hypothesis": "Untrusted remote input may reach Pillow image decoding APIs, potentially triggering memory corruption or DoS in native decoders.",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-020"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20261119233846",
+   "codeql_raw_query": "/**\n * @name Insecure temporary file usage in Pillow\n * @description Detect use of tempfile APIs without secure patterns (e.g., mktemp) that may lead to race conditions or file overwrite.\n * @kind problem\n * @problem.severity warning\n * @id py/pillow-insecure-tempfile-usage\n * @tags security\n *       external/cwe/cwe-377\n */\n\nimport python\nimport semmle.python.ApiGraphs\nimport semmle.python.dataflow.new.DataFlow\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"tempfile\").getMember([\"mktemp\"]).getACall()\nselect call, \"Insecure use of tempfile.mktemp(), which is vulnerable to race conditions and symlink attacks. Use NamedTemporaryFile or mkstemp instead.\"\n",
+   "hypothesis": "Pillow may use insecure temporary file creation patterns via tempfile.mktemp.",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-377"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20261119233913",
+   "codeql_raw_query": "/**\n * @name Subprocess execution in Pillow\n * @description Detect uses of subprocess or os.system that may be influenced by external input.\n * @kind path-problem\n * @problem.severity error\n * @id py/pillow-subprocess-taint\n * @tags security\n *       external/cwe/cwe-078\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.dataflow.new.RemoteFlowSources\nimport semmle.python.ApiGraphs\n\nmodule PillowSubprocessConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    source instanceof RemoteFlowSource\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(API::CallNode call, DataFlow::Node arg |\n      // subprocess.*\n      call = API::moduleImport(\"subprocess\").getMember([\"call\", \"check_call\", \"check_output\", \"run\", \"Popen\"]).getACall() or\n      // os.system, os.popen\n      call = API::moduleImport(\"os\").getMember([\"system\", \"popen\"]).getACall()\n      |\n      arg = call.getArg(0) and\n      sink = arg\n    )\n  }\n}\n\nmodule PillowSubprocessFlow = TaintTracking::Global<PillowSubprocessConfig>;\nimport PillowSubprocessFlow::PathGraph\n\nfrom PillowSubprocessFlow::PathNode source, PillowSubprocessFlow::PathNode sink\nwhere PillowSubprocessFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"User-controlled data flows into subprocess or os command execution $@.\", source.getNode(), \"user input\" \n",
+   "hypothesis": "Pillow may invoke subprocesses or shell commands with arguments derived from untrusted input.",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-078"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20261119233959",
+   "codeql_raw_query": "/**\n * @name Unsafe use of subprocess in Pillow utilities\n * @description Detect uses of subprocess module that may be influenced by external input.\n * @kind problem\n * @problem.severity warning\n * @id py/pillow-subprocess-usage\n * @tags security\n *       external/cwe/cwe-078\n */\n\nimport python\nimport semmle.python.ApiGraphs\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.dataflow.new.RemoteFlowSources\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"subprocess\").getMember([\"Popen\", \"call\", \"check_call\", \"check_output\", \"run\"]).getACall()\nselect call, \"Use of subprocess API in Pillow codebase; review for untrusted input handling.\"\n",
+   "hypothesis": "Pillow may invoke subprocesses (for external tools like ghostscript) in ways that could be influenced by untrusted data.",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-078"
+   ],
+   "results_count": 25,
+   "results": [
+    {
+     "ruleId": "py/pillow-subprocess-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pillow-subprocess-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of subprocess API in Pillow codebase; review for untrusted input handling."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/PIL/EpsImagePlugin.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 56,
+         "startColumn": 13,
+         "endColumn": 82
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "f6b27e9d304e8127:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/pillow-subprocess-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pillow-subprocess-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of subprocess API in Pillow codebase; review for untrusted input handling."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/PIL/EpsImagePlugin.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 143,
+         "startColumn": 9,
+         "endColumn": 64
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "b24a996d2a8c501:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/pillow-subprocess-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pillow-subprocess-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of subprocess API in Pillow codebase; review for untrusted input handling."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/PIL/GifImagePlugin.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 629,
+         "startColumn": 17,
+         "endLine": 631,
+         "endColumn": 18
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "2555b00147610953:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/pillow-subprocess-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pillow-subprocess-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of subprocess API in Pillow codebase; review for untrusted input handling."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/PIL/GifImagePlugin.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 637,
+         "startColumn": 30,
+         "endLine": 639,
+         "endColumn": 18
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "1779436231f2d744:1",
+      "primaryLocationStartColumnFingerprint": "13"
+     }
+    },
+    {
+     "ruleId": "py/pillow-subprocess-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pillow-subprocess-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of subprocess API in Pillow codebase; review for untrusted input handling."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/PIL/GifImagePlugin.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 640,
+         "startColumn": 30,
+         "endLine": 645,
+         "endColumn": 18
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "70efb7f34bac16ce:1",
+      "primaryLocationStartColumnFingerprint": "13"
+     }
+    },
+    {
+     "ruleId": "py/pillow-subprocess-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pillow-subprocess-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of subprocess API in Pillow codebase; review for untrusted input handling."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/PIL/IcnsImagePlugin.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 345,
+         "startColumn": 24,
+         "endLine": 347,
+         "endColumn": 10
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "803a453f742d94b1:1",
+      "primaryLocationStartColumnFingerprint": "15"
+     }
+    },
+    {
+     "ruleId": "py/pillow-subprocess-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pillow-subprocess-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of subprocess API in Pillow codebase; review for untrusted input handling."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/PIL/ImageGrab.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 3
+        },
+        "region": {
+         "startLine": 33,
+         "startColumn": 13,
+         "endColumn": 63
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "d083d30770cf47f:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/pillow-subprocess-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pillow-subprocess-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of subprocess API in Pillow codebase; review for untrusted input handling."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/PIL/ImageGrab.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 3
+        },
+        "region": {
+         "startLine": 87,
+         "startColumn": 9,
+         "endColumn": 32
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "4a202c0a7fc7a658:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/pillow-subprocess-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pillow-subprocess-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of subprocess API in Pillow codebase; review for untrusted input handling."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/PIL/ImageShow.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 4
+        },
+        "region": {
+         "startLine": 155,
+         "startColumn": 13,
+         "endLine": 159,
+         "endColumn": 14
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "a397403b0e669358:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/pillow-subprocess-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pillow-subprocess-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of subprocess API in Pillow codebase; review for untrusted input handling."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/PIL/ImageShow.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 4
+        },
+        "region": {
+         "startLine": 183,
+         "startColumn": 13,
+         "endLine": 185,
+         "endColumn": 14
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "36192bb3fb821560:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/pillow-subprocess-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pillow-subprocess-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of subprocess API in Pillow codebase; review for untrusted input handling."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/PIL/JpegImagePlugin.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 5
+        },
+        "region": {
+         "startLine": 453,
+         "startColumn": 13,
+         "endColumn": 78
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "22287c1836dcd119:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/pillow-subprocess-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pillow-subprocess-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of subprocess API in Pillow codebase; review for untrusted input handling."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/PIL/JpegImagePlugin.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 5
+        },
+        "region": {
+         "startLine": 768,
+         "startColumn": 5,
+         "endColumn": 69
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "b554d97da22c3fea:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/pillow-subprocess-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pillow-subprocess-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of subprocess API in Pillow codebase; review for untrusted input handling."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "winbuild/build_prepare.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 6
+        },
+        "region": {
+         "startLine": 327,
+         "startColumn": 13,
+         "endLine": 341,
+         "endColumn": 14
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "a9d729d1188b08a0:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/pillow-subprocess-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pillow-subprocess-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of subprocess API in Pillow codebase; review for untrusted input handling."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "setup.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 7
+        },
+        "region": {
+         "startLine": 176,
+         "startColumn": 13,
+         "endLine": 178,
+         "endColumn": 10
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "33665076010fda7b:1",
+      "primaryLocationStartColumnFingerprint": "4"
+     }
+    },
+    {
+     "ruleId": "py/pillow-subprocess-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pillow-subprocess-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of subprocess API in Pillow codebase; review for untrusted input handling."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "setup.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 7
+        },
+        "region": {
+         "startLine": 243,
+         "startColumn": 13,
+         "endColumn": 50
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "d4aab0155294c5fe:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/pillow-subprocess-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pillow-subprocess-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of subprocess API in Pillow codebase; review for untrusted input handling."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "setup.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 7
+        },
+        "region": {
+         "startLine": 249,
+         "startColumn": 13,
+         "endColumn": 52
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "6fc930b7e8358466:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/pillow-subprocess-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pillow-subprocess-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of subprocess API in Pillow codebase; review for untrusted input handling."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "setup.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 7
+        },
+        "region": {
+         "startLine": 449,
+         "startColumn": 21,
+         "endColumn": 66
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "c5b689024796d7e8:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/pillow-subprocess-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pillow-subprocess-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of subprocess API in Pillow codebase; review for untrusted input handling."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "setup.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 7
+        },
+        "region": {
+         "startLine": 481,
+         "startColumn": 21,
+         "endColumn": 74
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "93e1027da531a683:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/pillow-subprocess-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pillow-subprocess-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of subprocess API in Pillow codebase; review for untrusted input handling."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "Tests/test_file_palm.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 8
+        },
+        "region": {
+         "startLine": 31,
+         "startColumn": 10,
+         "endLine": 33,
+         "endColumn": 6
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "1dc4496644c7df33:1",
+      "primaryLocationStartColumnFingerprint": "5"
+     }
+    },
+    {
+     "ruleId": "py/pillow-subprocess-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pillow-subprocess-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of subprocess API in Pillow codebase; review for untrusted input handling."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "Tests/test_image_access.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 9
+        },
+        "region": {
+         "startLine": 413,
+         "startColumn": 19,
+         "endColumn": 63
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "6bcea8add5c0a01d:1",
+      "primaryLocationStartColumnFingerprint": "10"
+     }
+    },
+    {
+     "ruleId": "py/pillow-subprocess-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pillow-subprocess-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of subprocess API in Pillow codebase; review for untrusted input handling."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "Tests/test_imagegrab.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 10
+        },
+        "region": {
+         "startLine": 58,
+         "startColumn": 13,
+         "endColumn": 54
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "220a5e2092a9fbcf:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/pillow-subprocess-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pillow-subprocess-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of subprocess API in Pillow codebase; review for untrusted input handling."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "Tests/test_imagegrab.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 10
+        },
+        "region": {
+         "startLine": 60,
+         "startColumn": 17,
+         "endColumn": 89
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "fbb4af21c1ea467f:1",
+      "primaryLocationStartColumnFingerprint": "4"
+     }
+    },
+    {
+     "ruleId": "py/pillow-subprocess-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pillow-subprocess-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of subprocess API in Pillow codebase; review for untrusted input handling."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "Tests/test_imagegrab.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 10
+        },
+        "region": {
+         "startLine": 79,
+         "startColumn": 13,
+         "endColumn": 85
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "4073c82f6d9ba5e6:1",
+      "primaryLocationStartColumnFingerprint": "4"
+     }
+    },
+    {
+     "ruleId": "py/pillow-subprocess-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pillow-subprocess-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of subprocess API in Pillow codebase; review for untrusted input handling."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "Tests/test_imagegrab.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 10
+        },
+        "region": {
+         "startLine": 89,
+         "startColumn": 13,
+         "endColumn": 85
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "4f6f3d34292836eb:1",
+      "primaryLocationStartColumnFingerprint": "4"
+     }
+    },
+    {
+     "ruleId": "py/pillow-subprocess-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pillow-subprocess-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of subprocess API in Pillow codebase; review for untrusted input handling."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "Tests/test_main.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 11
+        },
+        "region": {
+         "startLine": 7,
+         "startColumn": 11,
+         "endColumn": 65
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "e6a97d46c31de06a:1",
+      "primaryLocationStartColumnFingerprint": "6"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20261119234026",
+   "codeql_raw_query": "/**\n * @name Use of eval/exec in Pillow\n * @description Detect dynamic code execution which can be dangerous if influenced by untrusted input.\n * @kind problem\n * @problem.severity error\n * @id py/pillow-eval-exec\n * @tags security\n *       external/cwe/cwe-094\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::builtin([\"eval\", \"exec\"]).getACall()\nselect call, \"Dynamic code execution via eval/exec in Pillow codebase.\"",
+   "hypothesis": "Pillow might use eval/exec for dynamic operations, which could be dangerous if user-controlled data reaches them.",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-094"
+   ],
+   "results_count": 2,
+   "results": [
+    {
+     "ruleId": "py/pillow-eval-exec",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pillow-eval-exec",
+      "index": 0
+     },
+     "message": {
+      "text": "Dynamic code execution via eval/exec in Pillow codebase."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/PIL/ImageMath.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 249,
+         "startColumn": 11,
+         "endColumn": 42
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "e576d7e4d890cc06:1",
+      "primaryLocationStartColumnFingerprint": "6"
+     }
+    },
+    {
+     "ruleId": "py/pillow-eval-exec",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pillow-eval-exec",
+      "index": 0
+     },
+     "message": {
+      "text": "Dynamic code execution via eval/exec in Pillow codebase."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "setup.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 25,
+         "startColumn": 9,
+         "endColumn": 54
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "c5447fdc20afe87e:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20261119234103",
+   "codeql_raw_query": "/**\n * @name Untrusted input to subprocess in Pillow\n * @description Detect flows from remote/user-controlled sources into subprocess command/argument parameters used by Pillow.\n * @kind path-problem\n * @problem.severity error\n * @id py/pillow-subprocess-taint\n * @tags security\n *       external/cwe/cwe-078\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.dataflow.new.RemoteFlowSources\nimport semmle.python.ApiGraphs\nimport semmle.python.Concepts\n\nmodule PillowSubprocessConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    source instanceof RemoteFlowSource\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(API::CallNode call, DataFlow::Node arg |\n      call = API::moduleImport(\"subprocess\").getMember([\"Popen\", \"call\", \"check_call\", \"check_output\", \"run\"]).getACall() and\n      arg = call.getArg(0) and\n      sink = arg\n    )\n  }\n}\n\nmodule PillowSubprocessFlow = TaintTracking::Global<PillowSubprocessConfig>;\nimport PillowSubprocessFlow::PathGraph\n\nfrom PillowSubprocessFlow::PathNode source, PillowSubprocessFlow::PathNode sink\nwhere PillowSubprocessFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"Untrusted data flows into subprocess command/arguments in Pillow $@.\", source.getNode(), \"user-controlled data\"",
+   "hypothesis": "Untrusted data may reach subprocess calls in Pillow, leading to command injection.",
+   "severity": "critical",
+   "cwe_ids": [
+    "cwe-078"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20261119234141",
+   "codeql_raw_query": "/**\n * @name Untrusted input to eval/exec in Pillow\n * @description Detect flows from remote/user-controlled sources into eval/exec usage in Pillow.\n * @kind path-problem\n * @problem.severity error\n * @id py/pillow-eval-exec-taint\n * @tags security\n *       external/cwe/cwe-094\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.dataflow.new.RemoteFlowSources\nimport semmle.python.ApiGraphs\nimport semmle.python.Concepts\n\nmodule PillowEvalExecConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    source instanceof RemoteFlowSource\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(API::CallNode call, DataFlow::Node arg |\n      call = API::builtin([\"eval\", \"exec\"]).getACall() and\n      arg = call.getArg(0) and\n      sink = arg\n    )\n  }\n}\n\nmodule PillowEvalExecFlow = TaintTracking::Global<PillowEvalExecConfig>;\nimport PillowEvalExecFlow::PathGraph\n\nfrom PillowEvalExecFlow::PathNode source, PillowEvalExecFlow::PathNode sink\nwhere PillowEvalExecFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"Untrusted data flows into dynamic code execution (eval/exec) in Pillow $@.\", source.getNode(), \"user-controlled data\"",
+   "hypothesis": "Untrusted data may reach eval/exec in Pillow, leading to code injection.",
+   "severity": "critical",
+   "cwe_ids": [
+    "cwe-094"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20261119234318",
+   "codeql_raw_query": "/**\n * @name Pillow subprocess usage\n * @description Find uses of subprocess module in Pillow to assess command injection risk.\n * @kind problem\n * @problem.severity warning\n * @id py/pillow-subprocess-usage\n * @tags security\n *       external/cwe/cwe-078\n */\n\nimport python\nimport semmle.python.ApiGraphs\nimport semmle.python.dataflow.new.DataFlow\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"subprocess\").getMember([\"Popen\", \"call\", \"check_call\", \"check_output\", \"run\"]).getACall()\nselect call, \"Use of subprocess API in Pillow codebase; review for untrusted input handling.\"\n",
+   "hypothesis": "Pillow uses subprocess APIs that could be influenced by untrusted data, leading to command injection.",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-078"
+   ],
+   "results_count": 25,
+   "results": [
+    {
+     "ruleId": "py/pillow-subprocess-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pillow-subprocess-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of subprocess API in Pillow codebase; review for untrusted input handling."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/PIL/EpsImagePlugin.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 56,
+         "startColumn": 13,
+         "endColumn": 82
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "f6b27e9d304e8127:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/pillow-subprocess-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pillow-subprocess-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of subprocess API in Pillow codebase; review for untrusted input handling."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/PIL/EpsImagePlugin.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 143,
+         "startColumn": 9,
+         "endColumn": 64
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "b24a996d2a8c501:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/pillow-subprocess-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pillow-subprocess-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of subprocess API in Pillow codebase; review for untrusted input handling."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/PIL/GifImagePlugin.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 629,
+         "startColumn": 17,
+         "endLine": 631,
+         "endColumn": 18
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "2555b00147610953:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/pillow-subprocess-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pillow-subprocess-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of subprocess API in Pillow codebase; review for untrusted input handling."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/PIL/GifImagePlugin.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 637,
+         "startColumn": 30,
+         "endLine": 639,
+         "endColumn": 18
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "1779436231f2d744:1",
+      "primaryLocationStartColumnFingerprint": "13"
+     }
+    },
+    {
+     "ruleId": "py/pillow-subprocess-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pillow-subprocess-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of subprocess API in Pillow codebase; review for untrusted input handling."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/PIL/GifImagePlugin.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 640,
+         "startColumn": 30,
+         "endLine": 645,
+         "endColumn": 18
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "70efb7f34bac16ce:1",
+      "primaryLocationStartColumnFingerprint": "13"
+     }
+    },
+    {
+     "ruleId": "py/pillow-subprocess-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pillow-subprocess-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of subprocess API in Pillow codebase; review for untrusted input handling."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/PIL/IcnsImagePlugin.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 345,
+         "startColumn": 24,
+         "endLine": 347,
+         "endColumn": 10
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "803a453f742d94b1:1",
+      "primaryLocationStartColumnFingerprint": "15"
+     }
+    },
+    {
+     "ruleId": "py/pillow-subprocess-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pillow-subprocess-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of subprocess API in Pillow codebase; review for untrusted input handling."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/PIL/ImageGrab.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 3
+        },
+        "region": {
+         "startLine": 33,
+         "startColumn": 13,
+         "endColumn": 63
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "d083d30770cf47f:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/pillow-subprocess-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pillow-subprocess-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of subprocess API in Pillow codebase; review for untrusted input handling."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/PIL/ImageGrab.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 3
+        },
+        "region": {
+         "startLine": 87,
+         "startColumn": 9,
+         "endColumn": 32
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "4a202c0a7fc7a658:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/pillow-subprocess-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pillow-subprocess-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of subprocess API in Pillow codebase; review for untrusted input handling."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/PIL/ImageShow.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 4
+        },
+        "region": {
+         "startLine": 155,
+         "startColumn": 13,
+         "endLine": 159,
+         "endColumn": 14
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "a397403b0e669358:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/pillow-subprocess-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pillow-subprocess-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of subprocess API in Pillow codebase; review for untrusted input handling."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/PIL/ImageShow.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 4
+        },
+        "region": {
+         "startLine": 183,
+         "startColumn": 13,
+         "endLine": 185,
+         "endColumn": 14
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "36192bb3fb821560:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/pillow-subprocess-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pillow-subprocess-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of subprocess API in Pillow codebase; review for untrusted input handling."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/PIL/JpegImagePlugin.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 5
+        },
+        "region": {
+         "startLine": 453,
+         "startColumn": 13,
+         "endColumn": 78
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "22287c1836dcd119:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/pillow-subprocess-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pillow-subprocess-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of subprocess API in Pillow codebase; review for untrusted input handling."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/PIL/JpegImagePlugin.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 5
+        },
+        "region": {
+         "startLine": 768,
+         "startColumn": 5,
+         "endColumn": 69
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "b554d97da22c3fea:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/pillow-subprocess-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pillow-subprocess-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of subprocess API in Pillow codebase; review for untrusted input handling."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "winbuild/build_prepare.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 6
+        },
+        "region": {
+         "startLine": 327,
+         "startColumn": 13,
+         "endLine": 341,
+         "endColumn": 14
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "a9d729d1188b08a0:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/pillow-subprocess-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pillow-subprocess-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of subprocess API in Pillow codebase; review for untrusted input handling."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "setup.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 7
+        },
+        "region": {
+         "startLine": 176,
+         "startColumn": 13,
+         "endLine": 178,
+         "endColumn": 10
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "33665076010fda7b:1",
+      "primaryLocationStartColumnFingerprint": "4"
+     }
+    },
+    {
+     "ruleId": "py/pillow-subprocess-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pillow-subprocess-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of subprocess API in Pillow codebase; review for untrusted input handling."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "setup.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 7
+        },
+        "region": {
+         "startLine": 243,
+         "startColumn": 13,
+         "endColumn": 50
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "d4aab0155294c5fe:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/pillow-subprocess-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pillow-subprocess-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of subprocess API in Pillow codebase; review for untrusted input handling."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "setup.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 7
+        },
+        "region": {
+         "startLine": 249,
+         "startColumn": 13,
+         "endColumn": 52
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "6fc930b7e8358466:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/pillow-subprocess-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pillow-subprocess-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of subprocess API in Pillow codebase; review for untrusted input handling."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "setup.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 7
+        },
+        "region": {
+         "startLine": 449,
+         "startColumn": 21,
+         "endColumn": 66
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "c5b689024796d7e8:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/pillow-subprocess-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pillow-subprocess-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of subprocess API in Pillow codebase; review for untrusted input handling."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "setup.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 7
+        },
+        "region": {
+         "startLine": 481,
+         "startColumn": 21,
+         "endColumn": 74
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "93e1027da531a683:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/pillow-subprocess-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pillow-subprocess-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of subprocess API in Pillow codebase; review for untrusted input handling."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "Tests/test_file_palm.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 8
+        },
+        "region": {
+         "startLine": 31,
+         "startColumn": 10,
+         "endLine": 33,
+         "endColumn": 6
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "1dc4496644c7df33:1",
+      "primaryLocationStartColumnFingerprint": "5"
+     }
+    },
+    {
+     "ruleId": "py/pillow-subprocess-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pillow-subprocess-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of subprocess API in Pillow codebase; review for untrusted input handling."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "Tests/test_image_access.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 9
+        },
+        "region": {
+         "startLine": 413,
+         "startColumn": 19,
+         "endColumn": 63
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "6bcea8add5c0a01d:1",
+      "primaryLocationStartColumnFingerprint": "10"
+     }
+    },
+    {
+     "ruleId": "py/pillow-subprocess-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pillow-subprocess-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of subprocess API in Pillow codebase; review for untrusted input handling."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "Tests/test_imagegrab.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 10
+        },
+        "region": {
+         "startLine": 58,
+         "startColumn": 13,
+         "endColumn": 54
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "220a5e2092a9fbcf:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/pillow-subprocess-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pillow-subprocess-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of subprocess API in Pillow codebase; review for untrusted input handling."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "Tests/test_imagegrab.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 10
+        },
+        "region": {
+         "startLine": 60,
+         "startColumn": 17,
+         "endColumn": 89
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "fbb4af21c1ea467f:1",
+      "primaryLocationStartColumnFingerprint": "4"
+     }
+    },
+    {
+     "ruleId": "py/pillow-subprocess-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pillow-subprocess-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of subprocess API in Pillow codebase; review for untrusted input handling."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "Tests/test_imagegrab.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 10
+        },
+        "region": {
+         "startLine": 79,
+         "startColumn": 13,
+         "endColumn": 85
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "4073c82f6d9ba5e6:1",
+      "primaryLocationStartColumnFingerprint": "4"
+     }
+    },
+    {
+     "ruleId": "py/pillow-subprocess-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pillow-subprocess-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of subprocess API in Pillow codebase; review for untrusted input handling."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "Tests/test_imagegrab.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 10
+        },
+        "region": {
+         "startLine": 89,
+         "startColumn": 13,
+         "endColumn": 85
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "4f6f3d34292836eb:1",
+      "primaryLocationStartColumnFingerprint": "4"
+     }
+    },
+    {
+     "ruleId": "py/pillow-subprocess-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pillow-subprocess-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of subprocess API in Pillow codebase; review for untrusted input handling."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "Tests/test_main.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 11
+        },
+        "region": {
+         "startLine": 7,
+         "startColumn": 11,
+         "endColumn": 65
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "e6a97d46c31de06a:1",
+      "primaryLocationStartColumnFingerprint": "6"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20261119234342",
+   "codeql_raw_query": "/**\n * @name Dynamic code execution via eval/exec in Pillow\n * @description Detect uses of eval or exec in Pillow which may lead to code injection if fed untrusted input.\n * @kind problem\n * @problem.severity warning\n * @id py/pillow-eval-exec\n * @tags security\n *       external/cwe/cwe-094\n */\n\nimport python\nimport semmle.python.ApiGraphs\nimport semmle.python.dataflow.new.DataFlow\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::builtin([\"eval\", \"exec\"]).getACall()\nselect call, \"Dynamic code execution via eval/exec in Pillow codebase.\"\n",
+   "hypothesis": "Pillow uses eval/exec which could be reachable with untrusted input, leading to code injection.",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-094"
+   ],
+   "results_count": 2,
+   "results": [
+    {
+     "ruleId": "py/pillow-eval-exec",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pillow-eval-exec",
+      "index": 0
+     },
+     "message": {
+      "text": "Dynamic code execution via eval/exec in Pillow codebase."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/PIL/ImageMath.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 249,
+         "startColumn": 11,
+         "endColumn": 42
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "e576d7e4d890cc06:1",
+      "primaryLocationStartColumnFingerprint": "6"
+     }
+    },
+    {
+     "ruleId": "py/pillow-eval-exec",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pillow-eval-exec",
+      "index": 0
+     },
+     "message": {
+      "text": "Dynamic code execution via eval/exec in Pillow codebase."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "setup.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 25,
+         "startColumn": 9,
+         "endColumn": 54
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "c5447fdc20afe87e:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    }
+   ]
+  }
+ ],
+ "cache_usage": {
+  "prompt_tokens_total": 116027,
+  "uncached_input_tokens": 29627,
+  "cache_creation_input_tokens": 0,
+  "cache_read_input_tokens": 86400,
+  "output_tokens": 10247,
+  "calls": 16,
+  "caching_enabled": false,
+  "cost_usd_with_cache": 0.150304,
+  "cost_usd_no_cache": 0.247504,
+  "cache_read_share_of_prompt": 0.7447,
+  "prices_per_mtok": {
+   "claude-sonnet-4-5-20250929": {
+    "input": 3.0,
+    "output": 15.0
+   },
+   "claude-haiku-4-5-20251001": {
+    "input": 1.0,
+    "output": 5.0
+   },
+   "deepseek/deepseek-reasoner": {
+    "input": 0.15,
+    "output": 0.6,
+    "cache_read": 0.003,
+    "cache_write_mult": 1.0,
+    "peak_mult": 2.0
+   },
+   "gpt-5.1": {
+    "input": 1.25,
+    "output": 10.0,
+    "cache_read": 0.125,
+    "cache_write_mult": 1.0
+   },
+   "gpt-4.1": {
+    "input": 2.0,
+    "output": 8.0,
+    "cache_read": 0.5,
+    "cache_write_mult": 1.0
+   }
+  },
+  "cache_multipliers": {
+   "write_5m": 1.25,
+   "read": 0.1
+  }
+ }
+}

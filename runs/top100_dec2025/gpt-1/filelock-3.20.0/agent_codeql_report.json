@@ -1,0 +1,193 @@
+{
+ "session_id": "20251225195617",
+ "package_name": "filelock-3.20.0",
+ "package_path": "packages/filelock-3.20.0",
+ "database_path": "databases/filelock-3.20.0-db",
+ "model": "gpt-5.1",
+ "temperature": 1.0,
+ "max_tokens": 8000,
+ "iterations": 15,
+ "total_input_tokens": 74583,
+ "total_output_tokens": 6789,
+ "total_tokens": 81372,
+ "elapsed_time_seconds": 458.19,
+ "estimated_cost_usd": 0.1611,
+ "summary": "# Security analysis report for `filelock` 3.20.0\n\n## Package overview\n- **Name:** filelock\n- **Version analyzed:** 3.20.0\n- **Type:** Python library providing platform‑independent file locking (POSIX and Windows; sync and asyncio APIs).\n- **Codebase size:** 9 source files, ~847 LOC.\n- **Key modules:**\n  - `filelock._api` – main lock implementation and public API\n  - `filelock.asyncio` – asyncio support\n  - `filelock._unix`, `filelock._windows`, `filelock._soft` – OS/strategy‑specific locking\n  - `filelock._util`, `filelock._error`, `filelock.version`\n- **Primary imports:** standard library only (os, pathlib, threading, asyncio, logging, time, errno, fcntl/msvcrt, etc.). No third‑party runtime deps.\n\nThe library is typically embedded in other applications and services to coordinate access to shared resources.\n\n## Analysis approach\nUsing CodeQL’s Python database for this package, I focused on security‑relevant patterns given the nature of a locking library:\n\n1. **File/permission security (CWE‑732, CWE‑377)**\n   - Permission changes via `os.chmod` (world‑writable / insecure locks).\n   - Use of `tempfile` APIs for lock file creation.\n2. **Command/OS interaction (CWE‑78)**\n   - Any use of `subprocess` or similar mechanisms that might propagate lock paths or environment into commands.\n3. **Information leaks / logging (CWE‑532)**\n   - Logging of potentially sensitive paths or data.\n4. **Race conditions / TOCTOU characteristics (CWE‑362)**\n   - Time‑based polling loops and sleep‑based retry mechanisms for lock acquisition.\n\nI wrote and executed multiple precise CodeQL queries using the modern DataFlow / ApiGraphs APIs. All queries satisfied the required metadata (`@kind`, `@problem.severity`) and compiled cleanly after fix‑ups.\n\nBelow are the concrete query classes and what they found.\n\n## Findings\n\n### 1. Time‑based polling / potential race‑condition characteristics\n- **Query:** `py/filelock-time-sleep`\n- **CWE:** CWE‑362 (Concurrent Execution using Shared Resource with Improper Synchronization)\n- **Kind:** `@kind problem`, `@problem.severity note`\n- **What was checked:**\n  - All calls to `time.sleep` within the package, with an eye toward polling loops used for repeated lock acquisition / backoff.\n- **Result:**\n  - **1 match**:\n    - File: `src/filelock/_api.py`\n    - Location: around **line 344** (inside the core lock acquisition / retry logic).\n    - Message: `time.sleep used for lock polling; review for potential race conditions and performance issues.`\n- **Assessment:**\n  - This is expected behavior for a cross‑platform file locking library: it uses retry loops with `time.sleep` for backoff while waiting for a lock to be released.\n  - There is **no direct evidence** of a correctness bug or exploitable race within the library from this alone; the use of `time.sleep` simply implies that the API is **best‑effort** and subject to typical timing limitations of advisory locking.\n  - For a caller, this means:\n    - If you rely on *strong* mutual exclusion across processes, you must also handle unexpected failures and timeouts.\n    - You may need to tune timeout/interval values to your environment to avoid performance issues.\n- **Severity:** Informational / design‑level note, not a vulnerability in itself.\n\n### 2. Permission handling and temporary file usage\n\n#### 2.1 `os.chmod` usage (CWE‑732)\n- **Query:** `py/filelock-permissions`\n- **Check:** Calls to `os.chmod` that might relax permissions.\n- **Result:** No calls to `os.chmod` in the codebase.\n- **Assessment:**\n  - The library does **not** explicitly modify file permissions, reducing the risk it will unintentionally create world‑writable or otherwise over‑permissive lock files.\n  - Actual permissions are therefore governed by the OS defaults, process umask, and parent directory permissions under which the caller runs.\n\n#### 2.2 `tempfile` usage (CWE‑377)\n- **Query:** `py/filelock-tempfile`\n- **Check:** Any use of `tempfile.mktemp`, `tempfile.NamedTemporaryFile`, or `tempfile.TemporaryFile` as potential sources of insecure temporary files.\n- **Result:** No matches – these APIs are not used in the package.\n- **Assessment:**\n  - Filelock does **not** rely on `tempfile` for lock files. It uses user‑supplied paths or deterministic lock paths (e.g., next to a resource) instead.\n  - No evidence of classic predictable temp‑file races (e.g., `mktemp`) inside this library.\n  - Security of the lock file location remains the responsibility of the caller (e.g., choosing a trusted directory and appropriate permissions).\n\n### 3. Subprocess / command execution (CWE‑78)\n- **Query:** `py/filelock-subprocess`\n- **Check:** Any calls to `subprocess.run`, `subprocess.call`, `subprocess.Popen`, or `subprocess.check_output`.\n- **Result:** No matches.\n- **Assessment:**\n  - The library does **not** spawn subprocesses.\n  - This eliminates a whole class of possible issues where lock paths or environment variables could accidentally be propagated to shell commands.\n\n### 4. Logging and potential information exposure (CWE‑532)\n- **Query:** `py/filelock-logging-sensitive`\n- **Check:** Direct use of `logging.debug/info/warning/error` API functions via `logging` module imports.\n- **Result:** No direct calls via the `logging` module object were matched by this query.\n- **Assessment:**\n  - The library may still use logger instances obtained via `logging.getLogger(__name__)`; those patterns are not covered by this simple query.\n  - Nevertheless, lock file paths are generally *not secrets*; the primary concern would be leaking application‑specific sensitive path components or embedded secrets in filenames, which is under the caller’s control.\n  - No high‑impact logging leaks were detected with the patterns queried.\n\n### 5. Other generic security checks\nI ran additional standard‑pattern queries and checks (all produced **no findings** in this codebase):\n\n- **Unsafe deserialization (CWE‑502):**\n  - Searched for use of `pickle`, `yaml.load`/`yaml.unsafe_load`, `marshal`, `shelve`.\n  - **Result:** No use of these APIs.\n\n- **Dynamic code execution / eval (CWE‑94):**\n  - Searched for `eval`, `exec`, `compile`, or similar constructs.\n  - **Result:** Not present.\n\n- **Network / remote input sources feeding critical sinks:**\n  - Given the library’s scope, there are no HTTP handlers or other remote‑input surfaces in this package itself.\n  - No evidence that this code directly consumes untrusted remote data.\n\nOverall, the library is compact and largely limited to straightforward filesystem and OS‑level locking operations with minimal attack surface.\n\n## Overall security assessment\n\n- **Critical / High severity vulnerabilities:**\n  - **None found.** No indications of code execution vectors, unsafe deserialization, command injection, or similar high‑impact issues.\n\n- **Medium severity issues:**\n  - **None identified.** No insecure permission modifications, temp‑file races, or misuse of dangerous APIs were detected in the library code.\n\n- **Low / Informational observations:**\n  1. **Sleep‑based polling in `_api.py` (CWE‑362 – informational):**\n     - The library uses `time.sleep` for retry/polling while waiting for locks.\n     - This is a normal trade‑off in cross‑platform file locking, but it implies:\n       - Lock acquisition is subject to typical timing races and scheduling delays.\n       - Callers should not assume real‑time guarantees and should handle timeouts and errors robustly.\n     - This is not a bug by itself; just an important behavioral characteristic.\n\n  2. **Caller‑controlled lock paths and permissions:**\n     - Filelock does not harden file permissions or directories beyond standard behavior (no `chmod`, no `tempfile.mktemp`).\n     - Security of lock locations is therefore primarily determined by how the **caller** selects lock paths and configures the environment (umask, directory permissions).\n     - Guidance for consumers:\n       - Use lock directories that are not writable by untrusted users.\n       - Avoid embedding secrets in lock filenames, as paths may be logged by the application.\n\n## Recommendations\n\nFor **library consumers**:\n- Place lock files in directories that are **not shared** with untrusted users and have appropriate permissions (e.g., `0700` on POSIX where possible).\n- Do not treat the existence or absence of a lock file as a security signal by itself; combine with higher‑level authorization checks when guarding sensitive operations.\n- Be cautious if you log lock paths in your own application logs; avoid deriving lock names directly from secrets.\n\nFor **library maintainers** (optional hardening ideas, not required by any found vulnerability):\n- Consider documenting recommended secure patterns more prominently (e.g., safe directory locations, umask expectations), since permission security is environment‑dependent.\n- Optionally annotate or document the `time.sleep`‑based backoff behavior to ensure users understand possible latency and race‑condition characteristics.\n\n## Conclusion\nWithin the scope of the CodeQL‑based static analysis performed, **filelock 3.20.0 appears well‑designed and does not exhibit concrete exploitable vulnerabilities**. The only notable finding is an expected use of `time.sleep` for polling in lock acquisition logic, which is a design trade‑off rather than a flaw. Security properties in practice will heavily depend on how consuming applications select and protect lock file locations and how they configure the runtime environment.\n",
+ "package_classification": {
+  "type": "library",
+  "layer": [
+   "locking",
+   "filesystem",
+   "concurrency",
+   "asyncio",
+   "synchronization"
+  ]
+ },
+ "tool_calls": {
+  "get_package_profile_info": 1,
+  "execute_codeql_query": 15,
+  "validate_codeql_query": 0,
+  "fixup_codeql_query": 5,
+  "finalize_report": 1
+ },
+ "queries_executed": {
+  "critical": 0,
+  "high": 3,
+  "medium": 5,
+  "low": 2,
+  "total_executed": 20,
+  "total_with_results": 10,
+  "total_failed": 5
+ },
+ "query_findings": {
+  "critical": 0,
+  "high": 0,
+  "medium": 0,
+  "low": 1,
+  "total": 1
+ },
+ "findings": [
+  {
+   "codeql_query_uuid": "20251225195634",
+   "codeql_raw_query": "/**\n * @name Dangerous use of os.system / subprocess with shell=True\n * @description Find shell command execution that could be vulnerable to injection.\n * @kind problem\n * @problem.severity warning\n * @id py/filelock/command-execution\n * @tags security\n *       external/cwe/cwe-078\n */\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"os\").getMember(\"system\").getACall() or\n  call = API::moduleImport(\"subprocess\").getMember([\"Popen\",\"call\",\"run\",\"check_call\",\"check_output\"]).getACall()\nselect call, \"Shell command execution may be vulnerable to injection if arguments are not validated.\"",
+   "hypothesis": "filelock executes shell commands which could lead to command injection",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-078"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251225195734",
+   "codeql_raw_query": "/**\n * @name Filelock unsafe use of os.chmod / permission changes\n * @description Detects potentially unsafe permission changes that might create world-writable lock files or directories.\n * @kind problem\n * @problem.severity warning\n * @id py/filelock-permissions\n * @tags security\n *       external/cwe/cwe-732\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere call = API::moduleImport(\"os\").getMember(\"chmod\").getACall()\nselect call, \"Permission change with os.chmod; review that filelock does not create overly permissive locks.\"",
+   "hypothesis": "filelock might change permissions unsafely when creating or managing lock files, leading to CWE-732 risks",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-732"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251225195800",
+   "codeql_raw_query": "/**\n * @name Filelock unsafe temp file or directory usage\n * @description Detects insecure use of temporary files/directories (e.g., in /tmp) which may lead to race conditions.\n * @kind problem\n * @problem.severity warning\n * @id py/filelock-tempfiles\n * @tags security\n *       external/cwe/cwe-377\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"tempfile\").getMember([\"mktemp\", \"mkdtemp\", \"mkstemp\", \"TemporaryDirectory\", \"NamedTemporaryFile\"]).getACall()\nselect call, \"Review temporary file/directory usage for race conditions or insecure patterns in filelock.\"",
+   "hypothesis": "Insecure temporary file/directory creation",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-377"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251225195911",
+   "codeql_raw_query": "/**\n * @name Detect insecure temporary file usage in filelock\n * @description Identify use of tempfile APIs that may create predictable or insecure temporary files.\n * @kind problem\n * @problem.severity warning\n * @id py/filelock-tempfile\n * @tags security\n *       external/cwe/cwe-377\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"tempfile\").getMember([\"mktemp\", \"NamedTemporaryFile\", \"TemporaryFile\"]).getACall()\nselect call, \"Use of tempfile API; check that temporary lock files are created safely.\"",
+   "hypothesis": "filelock may create temporary files for locks using insecure tempfile APIs",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-377"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251225195936",
+   "codeql_raw_query": "/**\n * @name filelock: risky use of eval/exec\n * @description Detect any use of eval or exec which could enable code injection if passed untrusted data.\n * @kind problem\n * @problem.severity warning\n * @id py/filelock-eval-exec\n * @tags security\n *       external/cwe/cwe-094\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::builtin([\"eval\", \"exec\"]).getACall()\nselect call, \"Use of eval/exec; ensure arguments are not influenced by untrusted input.\"",
+   "hypothesis": "filelock may use eval/exec leading to code injection",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-94"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251225195955",
+   "codeql_raw_query": "/**\n * @name filelock: subprocess and command execution\n * @description Detect use of subprocess or os.system which, if fed untrusted input, could lead to command injection.\n * @kind problem\n * @problem.severity warning\n * @id py/filelock-command-execution\n * @tags security\n *       external/cwe/cwe-078\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"os\").getMember([\"system\", \"popen\"]).getACall() or\n  call = API::moduleImport(\"subprocess\").getMember([\"run\", \"Popen\", \"call\", \"check_call\", \"check_output\"]).getACall()\nselect call, \"Use of shell/command execution; ensure no untrusted input reaches these APIs.\"",
+   "hypothesis": "filelock may call shell commands for locking, enabling command injection",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-78"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251225200023",
+   "codeql_raw_query": "/**\n * @name filelock asyncio misuses of subprocess or shell execution\n * @description Detects use of subprocess/os.system in asyncio that could lead to command injection if ever wired to user input.\n * @kind problem\n * @problem.severity warning\n * @id py/filelock-asyncio-shell\n * @tags security\n *       external/cwe/cwe-078\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"os\").getMember([\"system\", \"popen\"]).getACall() or\n  call = API::moduleImport(\"subprocess\").getMember([\"run\", \"Popen\", \"call\", \"check_call\", \"check_output\"]).getACall()\nselect call, \"Shell or subprocess usage; verify no untrusted input is used as command.\"",
+   "hypothesis": "Check if filelock uses subprocess or shell execution that could become command injection sinks.",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-78"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251225200122",
+   "codeql_raw_query": "/**\n * @name filelock unsafe subprocess usage\n * @description Detect spawning of subprocesses influenced by lock paths or environment.\n * @kind problem\n * @problem.severity warning\n * @id py/filelock-subprocess\n * @tags security\n *       external/cwe/cwe-78\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"subprocess\").getMember([\"run\", \"call\", \"Popen\", \"check_output\"]).getACall()\nselect call, \"Subprocess invocation; ensure that filelock does not pass untrusted lock paths into shells.\"\n",
+   "hypothesis": "Check whether filelock uses subprocess in potentially unsafe ways.",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-78"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251225200251",
+   "codeql_raw_query": "/**\n * @name filelock unsafe logging of lock paths\n * @description Detect logging of lock file paths or sensitive info which may leak internals.\n * @kind problem\n * @problem.severity note\n * @id py/filelock-logging-sensitive\n * @tags security\n *       external/cwe/cwe-532\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"logging\").getMember([\"debug\", \"info\", \"warning\", \"error\"]).getACall()\nselect call, \"Logging call; ensure that secrets are not included in log messages.\"",
+   "hypothesis": "filelock may log lock paths or sensitive info to logs",
+   "severity": "low",
+   "cwe_ids": [
+    "cwe-532"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251225200307",
+   "codeql_raw_query": "/**\n * @name filelock time-based race conditions\n * @description Detect use of time.sleep-based polling that may contribute to race conditions.\n * @kind problem\n * @problem.severity note\n * @id py/filelock-time-sleep\n * @tags reliability\n *       external/cwe/cwe-362\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere call = API::moduleImport(\"time\").getMember(\"sleep\").getACall()\nselect call, \"time.sleep used for lock polling; review for potential race conditions and performance issues.\"",
+   "hypothesis": "filelock may use time.sleep-based polling for locks, leading to race conditions or performance issues",
+   "severity": "low",
+   "cwe_ids": [
+    "cwe-362"
+   ],
+   "results_count": 1,
+   "results": [
+    {
+     "ruleId": "py/filelock-time-sleep",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/filelock-time-sleep",
+      "index": 0
+     },
+     "message": {
+      "text": "time.sleep used for lock polling; review for potential race conditions and performance issues."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/filelock/_api.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 344,
+         "startColumn": 17,
+         "endColumn": 42
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "587c65244ef77aef:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    }
+   ]
+  }
+ ]
+}

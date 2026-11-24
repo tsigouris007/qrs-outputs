@@ -1,0 +1,2408 @@
+{
+ "session_id": "20251208105439",
+ "package_name": "botocore-1.40.64",
+ "package_path": "packages/botocore-1.40.64",
+ "database_path": "databases/botocore-1.40.64-db",
+ "model": "gemini/gemini-3-pro-preview",
+ "temperature": 0.0,
+ "max_tokens": 8000,
+ "iterations": 20,
+ "total_input_tokens": 367604,
+ "total_output_tokens": 44192,
+ "total_tokens": 411796,
+ "elapsed_time_seconds": 2171.99,
+ "estimated_cost_usd": 1.2655,
+ "summary": "Security analysis of `botocore` (v1.40.64) revealed several potential security findings, ranging from code injection risks in vendored dependencies to potential path traversal and sensitive data exposure.\n\n**Key Findings:**\n\n1.  **Potential Code Injection (CWE-94):**\n    *   A potential code injection vulnerability was flagged in `botocore/vendored/six.py` using `exec` or `eval`.\n    *   **Context:** This is likely part of the `six` library's compatibility mechanisms (metaprogramming) for Python 2/3 support. While technically dangerous, it is a standard pattern in this library and typically not exploitable unless the library itself is misused.\n\n2.  **Path Traversal (CWE-22):**\n    *   Two instances of potential path traversal were identified in `botocore/utils.py`.\n    *   **Details:** The analysis flagged flows from parameters `filename` and `cache_key` to file system operations. This suggests that if an attacker can influence these keys (e.g., via manipulated endpoint data or configuration), they might be able to write or access files outside the intended directory. This is particularly relevant for credential caching mechanisms.\n\n3.  **Sensitive Information in Logs (CWE-532):**\n    *   The analysis detected potential logging of sensitive variables in `botocore/session.py` (`ignored_credentials`) and `botocore/utils.py` (`credentials`, `cache_key`).\n    *   **Risk:** If logging levels are set to DEBUG or similar in production, this could leak valid AWS credentials to log files, leading to account compromise.\n\n4.  **Weak Cryptography & PRNG (CWE-327, CWE-338):**\n    *   **Weak Hashing:** Usage of MD5 and SHA1 was found in `compat.py`, `credentials.py`, `httpchecksum.py`, and `utils.py`.\n        *   **Context:** AWS APIs (specifically S3) historically use MD5 for ETags and content integrity checks. This is likely required for protocol compliance rather than used for password storage.\n    *   **Weak PRNG:** The `random` module is used in `retryhandler.py` and `utils.py`.\n        *   **Context:** This is likely used for calculating jitter in exponential backoff retry strategies, where cryptographic randomness is not strictly required.\n\n5.  **Hardcoded Credential Markers (CWE-798):**\n    *   Multiple alerts for \"hardcoded credentials\" in `botocore/credentials.py`.\n    *   **Context:** These appear to be variable names (e.g., `ACCESS_KEY`, `SECRET_KEY`) used within the logic for processing credentials, rather than actual hardcoded secrets.\n\n6.  **Regular Expression Complexity (CWE-1333):**\n    *   Numerous complex regular expressions were identified across the codebase. While no specific ReDoS vulnerability was confirmed, the complexity suggests a need for review to ensure they cannot be exploited with crafted inputs.\n\n**Conclusion:**\nThe most significant findings are the potential **Path Traversal** in utility functions and **Sensitive Data Logging**. The code injection in `six.py` is likely a false positive due to the nature of the vendored library. The cryptographic findings are likely intentional for AWS protocol compatibility. Users should ensure logging is configured securely to prevent credential leakage.",
+ "package_classification": {
+  "type": [
+   "SDK",
+   "Middleware"
+  ],
+  "layer": [
+   "Library",
+   "Core"
+  ]
+ },
+ "tool_calls": {
+  "get_package_profile_info": 1,
+  "execute_codeql_query": 46,
+  "validate_codeql_query": 0,
+  "fixup_codeql_query": 2,
+  "finalize_report": 1
+ },
+ "queries_executed": {
+  "critical": 6,
+  "high": 15,
+  "medium": 11,
+  "low": 2,
+  "total_executed": 48,
+  "total_with_results": 34,
+  "total_failed": 12
+ },
+ "query_findings": {
+  "critical": 1,
+  "high": 2,
+  "medium": 22,
+  "low": 24,
+  "total": 49
+ },
+ "findings": [
+  {
+   "codeql_query_uuid": "20251208105459",
+   "codeql_raw_query": "/**\n * @name XML External Entity (XXE) injection\n * @description Parsing untrusted XML data with a vulnerable parser can lead to XXE.\n * @kind problem\n * @problem.severity error\n * @id py/xxe-injection\n * @tags security\n *       external/cwe/cwe-611\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  (\n    call = API::moduleImport(\"xml\").getMember(\"etree\").getMember(\"ElementTree\").getMember([\"parse\", \"fromstring\", \"XML\"]).getACall() or\n    call = API::moduleImport(\"xml\").getMember(\"dom\").getMember(\"minidom\").getMember(\"parseString\").getACall() or\n    call = API::moduleImport(\"xml\").getMember(\"sax\").getMember(\"parseString\").getACall() or\n    call = API::moduleImport(\"lxml\").getMember(\"etree\").getMember([\"parse\", \"fromstring\", \"XML\"]).getACall()\n  )\nselect call, \"Potential XXE vulnerability: XML parsing without defusedxml.\"",
+   "hypothesis": "XML parsing without defusedxml might be vulnerable to XXE.",
+   "severity": "high",
+   "cwe_ids": [
+    "CWE-611"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251208105523",
+   "codeql_raw_query": "/**\n * @name Code Injection\n * @description Using eval or exec with untrusted input.\n * @kind path-problem\n * @problem.severity error\n * @id py/code-injection\n * @tags security\n *       external/cwe/cwe-094\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.dataflow.new.RemoteFlowSources\nimport semmle.python.Concepts\n\nmodule CodeInjectionConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    source instanceof RemoteFlowSource\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    sink = any(CodeExecution ce).getCode()\n  }\n}\n\nmodule CodeInjectionFlow = TaintTracking::Global<CodeInjectionConfig>;\nimport CodeInjectionFlow::PathGraph\n\nfrom CodeInjectionFlow::PathNode source, CodeInjectionFlow::PathNode sink\nwhere CodeInjectionFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"Code injection from $@.\", source.getNode(), \"user input\"",
+   "hypothesis": "Code injection via eval or exec.",
+   "severity": "critical",
+   "cwe_ids": [
+    "CWE-94"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251208105650",
+   "codeql_raw_query": "/**\n * @name Hardcoded Credentials\n * @description Hardcoded AWS credentials.\n * @kind problem\n * @problem.severity error\n * @id py/hardcoded-credentials\n * @tags security\n *       external/cwe/cwe-798\n */\nimport python\nimport semmle.python.ApiGraphs\n\nfrom AssignStmt assign, StrConst str\nwhere\n  assign.getATarget().(Name).getId() in [\"AWS_ACCESS_KEY_ID\", \"AWS_SECRET_ACCESS_KEY\", \"aws_access_key_id\", \"aws_secret_access_key\"] and\n  assign.getValue() = str and\n  str.getText().length() > 10\nselect assign, \"Possible hardcoded credential.\"",
+   "hypothesis": "Hardcoded AWS credentials in source code",
+   "severity": "high",
+   "cwe_ids": [
+    "CWE-798"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251208105742",
+   "codeql_raw_query": "/**\n * @name XML External Entity (XXE)\n * @description Parsing untrusted XML data can lead to XXE.\n * @kind problem\n * @problem.severity error\n * @id py/xml-external-entity\n * @tags security\n *       external/cwe/cwe-611\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"xml\").getMember(\"etree\").getMember(\"ElementTree\").getMember([\"parse\", \"fromstring\", \"XML\"]).getACall() or\n  call = API::moduleImport(\"xml\").getMember(\"dom\").getMember(\"minidom\").getMember([\"parse\", \"parseString\"]).getACall() or\n  call = API::moduleImport(\"xml\").getMember(\"sax\").getMember([\"parse\", \"parseString\"]).getACall() or\n  call = API::moduleImport(\"lxml\").getMember(\"etree\").getMember([\"parse\", \"fromstring\"]).getACall()\nselect call, \"Potential XML External Entity (XXE) vulnerability.\"\n",
+   "hypothesis": "XML parsing with standard libraries or lxml might be vulnerable to XXE if not configured correctly.",
+   "severity": "medium",
+   "cwe_ids": [
+    "CWE-611"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251208105801",
+   "codeql_raw_query": "/**\n * @name Unsafe Deserialization\n * @description Deserializing untrusted data can lead to arbitrary code execution.\n * @kind problem\n * @problem.severity error\n * @id py/unsafe-deserialization\n * @tags security\n *       external/cwe/cwe-502\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"pickle\").getMember([\"load\", \"loads\"]).getACall() or\n  call = API::moduleImport(\"yaml\").getMember([\"load\", \"unsafe_load\", \"load_all\"]).getACall() or\n  call = API::moduleImport(\"marshal\").getMember([\"load\", \"loads\"]).getACall() or\n  call = API::moduleImport(\"shelve\").getMember(\"open\").getACall() or\n  call = API::moduleImport(\"jsonpickle\").getMember([\"decode\", \"unpickler\"]).getACall()\nselect call, \"Potential unsafe deserialization.\"\n",
+   "hypothesis": "Unsafe deserialization using pickle, yaml, or marshal.",
+   "severity": "high",
+   "cwe_ids": [
+    "CWE-502"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251208105825",
+   "codeql_raw_query": "/**\n * @name Code Injection\n * @description Executing arbitrary code via eval or exec.\n * @kind problem\n * @problem.severity error\n * @id py/code-injection\n * @tags security\n *       external/cwe/cwe-094\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::builtin([\"eval\", \"exec\"]).getACall()\nselect call, \"Potential code injection via eval or exec.\"\n",
+   "hypothesis": "Code injection via eval or exec.",
+   "severity": "critical",
+   "cwe_ids": [
+    "CWE-094"
+   ],
+   "results_count": 1,
+   "results": [
+    {
+     "ruleId": "py/code-injection",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/code-injection",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential code injection via eval or exec."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "botocore/vendored/six.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 735,
+         "startColumn": 9,
+         "endColumn": 51
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "7c9d7425c352adba:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251208105919",
+   "codeql_raw_query": "/**\n * @name XML External Entity (XXE) injection\n * @description Parsing untrusted XML data with a vulnerable parser can lead to XXE.\n * @kind problem\n * @problem.severity error\n * @id py/xxe-injection\n * @tags security\n *       external/cwe/cwe-611\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"xml\").getMember(\"etree\").getMember(\"ElementTree\").getMember(\"parse\").getACall() or\n  call = API::moduleImport(\"xml\").getMember(\"etree\").getMember(\"ElementTree\").getMember(\"fromstring\").getACall() or\n  call = API::moduleImport(\"lxml\").getMember(\"etree\").getMember(\"parse\").getACall() or\n  call = API::moduleImport(\"lxml\").getMember(\"etree\").getMember(\"fromstring\").getACall() or\n  call = API::moduleImport(\"xml\").getMember(\"dom\").getMember(\"minidom\").getMember(\"parse\").getACall() or\n  call = API::moduleImport(\"xml\").getMember(\"dom\").getMember(\"minidom\").getMember(\"parseString\").getACall() or\n  call = API::moduleImport(\"xml\").getMember(\"sax\").getMember(\"parse\").getACall() or\n  call = API::moduleImport(\"xml\").getMember(\"sax\").getMember(\"parseString\").getACall()\nselect call, \"Potential XML parsing vulnerability (XXE).\"",
+   "hypothesis": "XML parsing with standard libraries might be vulnerable to XXE if not configured correctly.",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-611"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251208105937",
+   "codeql_raw_query": "/**\n * @name Unsafe deserialization\n * @description Deserializing untrusted data using pickle or other unsafe methods.\n * @kind problem\n * @problem.severity error\n * @id py/unsafe-deserialization\n * @tags security\n *       external/cwe/cwe-502\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"pickle\").getMember([\"load\", \"loads\"]).getACall() or\n  call = API::moduleImport(\"cPickle\").getMember([\"load\", \"loads\"]).getACall() or\n  call = API::moduleImport(\"_pickle\").getMember([\"load\", \"loads\"]).getACall() or\n  call = API::moduleImport(\"marshal\").getMember([\"load\", \"loads\"]).getACall() or\n  call = API::moduleImport(\"yaml\").getMember([\"load\", \"unsafe_load\"]).getACall() or\n  call = API::moduleImport(\"shelve\").getMember(\"open\").getACall()\nselect call, \"Potential unsafe deserialization.\"",
+   "hypothesis": "Deserialization of untrusted data can lead to arbitrary code execution.",
+   "severity": "critical",
+   "cwe_ids": [
+    "cwe-502"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251208110001",
+   "codeql_raw_query": "/**\n * @name Command Injection\n * @description Execution of OS commands with untrusted input.\n * @kind problem\n * @problem.severity error\n * @id py/command-injection\n * @tags security\n *       external/cwe/cwe-078\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"subprocess\").getMember([\"call\", \"check_call\", \"check_output\", \"run\", \"Popen\"]).getACall() or\n  call = API::moduleImport(\"os\").getMember([\"system\", \"popen\", \"spawnl\", \"spawnle\", \"spawnlp\", \"spawnlpe\", \"spawnv\", \"spawnve\", \"spawnvp\", \"spawnvpe\"]).getACall()\nselect call, \"Potential command execution.\"",
+   "hypothesis": "Using subprocess or os.system with untrusted input can lead to command injection.",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-078"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251208110119",
+   "codeql_raw_query": "/**\n * @name Insertion of Sensitive Information into Log File\n * @description Logging sensitive information such as passwords or keys can lead to information disclosure.\n * @kind problem\n * @problem.severity warning\n * @id py/sensitive-logging\n * @tags security\n *       external/cwe/cwe-532\n */\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call, DataFlow::Node arg, Name n\nwhere\n  (\n    call = API::moduleImport(\"logging\").getMember([\"debug\", \"info\", \"warning\", \"error\", \"critical\", \"log\"]).getACall() or\n    call = API::moduleImport(\"logging\").getMember(\"getLogger\").getACall().getReturn().getMember([\"debug\", \"info\", \"warning\", \"error\", \"critical\", \"log\"]).getACall()\n  ) and\n  arg = call.getArg(_) and\n  n = arg.asExpr() and\n  n.getId().regexpMatch(\"(?i).*(password|secret|token|key|auth|credential).*\") and\n  not n.getId().regexpMatch(\"(?i).*(public|id|name|file|path|msg|message|format).*\")\nselect call, \"Potential logging of sensitive variable: \" + n.getId()",
+   "hypothesis": "Logging of sensitive information (passwords, keys, tokens)",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-532"
+   ],
+   "results_count": 3,
+   "results": [
+    {
+     "ruleId": "py/sensitive-logging",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/sensitive-logging",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential logging of sensitive variable: ignored_credentials"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "botocore/session.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 981,
+         "startColumn": 17,
+         "endLine": 985,
+         "endColumn": 18
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "7147c0e949727156:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/sensitive-logging",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/sensitive-logging",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential logging of sensitive variable: credentials"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "botocore/utils.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 624,
+         "startColumn": 21,
+         "endLine": 628,
+         "endColumn": 22
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "1432bd1d55c3baa8:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/sensitive-logging",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/sensitive-logging",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential logging of sensitive variable: cache_key"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "botocore/utils.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 3397,
+         "startColumn": 9,
+         "endColumn": 68
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "dfcb7042971935d2:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251208110152",
+   "codeql_raw_query": "/**\n * @name Regex usage\n * @description List regular expressions used in the code to check for ReDoS\n * @kind problem\n * @problem.severity recommendation\n * @id py/regex-usage\n * @tags security\n *       external/cwe/cwe-1333\n */\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call, DataFlow::Node arg\nwhere\n  call = API::moduleImport(\"re\").getMember([\"compile\", \"match\", \"search\", \"findall\", \"finditer\", \"split\", \"sub\"]).getACall() and\n  arg = call.getArg(0) and\n  exists(arg.asExpr().(StrConst).getText())\nselect call, \"Regex used: \" + arg.asExpr().(StrConst).getText()",
+   "hypothesis": "Inefficient Regular Expression Complexity (ReDoS)",
+   "severity": "low",
+   "cwe_ids": [
+    "cwe-1333"
+   ],
+   "results_count": 24,
+   "results": [
+    {
+     "ruleId": "py/regex-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/regex-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Regex used: (.)(\\[A-Z\\]\\[a-z\\]+)"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "botocore/__init__.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 29,
+         "startColumn": 20,
+         "endColumn": 50
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "fa1e3800b3902334:1",
+      "primaryLocationStartColumnFingerprint": "19"
+     }
+    },
+    {
+     "ruleId": "py/regex-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/regex-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Regex used: (\\[a-z0-9\\])(\\[A-Z\\])"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "botocore/__init__.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 30,
+         "startColumn": 18,
+         "endColumn": 49
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "3aba8c502e57a659:1",
+      "primaryLocationStartColumnFingerprint": "17"
+     }
+    },
+    {
+     "ruleId": "py/regex-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/regex-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Regex used: \\[A-Z\\]{{2,}}s$"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "botocore/__init__.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 33,
+         "startColumn": 27,
+         "endColumn": 52
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "884e36121399a64e:1",
+      "primaryLocationStartColumnFingerprint": "26"
+     }
+    },
+    {
+     "ruleId": "py/regex-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/regex-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Regex used: \\{{\\[a-zA-Z#\\]+\\}}"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "botocore/endpoint_provider.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 44,
+         "startColumn": 22,
+         "endColumn": 51
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "95eb0b3589b93079:1",
+      "primaryLocationStartColumnFingerprint": "21"
+     }
+    },
+    {
+     "ruleId": "py/regex-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/regex-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Regex used: (\\w*)\\\\[(\\d+)\\\\]"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "botocore/endpoint_provider.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 45,
+         "startColumn": 15,
+         "endColumn": 44
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "b94c1a5eafd7b784:1",
+      "primaryLocationStartColumnFingerprint": "14"
+     }
+    },
+    {
+     "ruleId": "py/regex-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/regex-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Regex used: ^(?!-)\\[a-zA-Z\\d-\\]{{1,63}}(?<!-)$"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "botocore/endpoint_provider.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 46,
+         "startColumn": 23,
+         "endLine": 48,
+         "endColumn": 2
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "b26a04e71fd60ab5:1",
+      "primaryLocationStartColumnFingerprint": "22"
+     }
+    },
+    {
+     "ruleId": "py/regex-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/regex-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Regex used: (?!-)\\[a-z\\d-\\]{{1,63}}(?<!-)$"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "botocore/handlers.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 1001,
+         "startColumn": 23,
+         "endColumn": 79
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "ade1b777775984e6:1",
+      "primaryLocationStartColumnFingerprint": "18"
+     }
+    },
+    {
+     "ruleId": "py/regex-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/regex-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Regex used: ^\\[a-zA-Z0-9.\\-_\\]{{1,255}}$"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "botocore/handlers.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 91,
+         "startColumn": 16,
+         "endColumn": 55
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "16ce9c871ab0bec4:1",
+      "primaryLocationStartColumnFingerprint": "15"
+     }
+    },
+    {
+     "ruleId": "py/regex-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/regex-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Regex used: \\?versionId=\\[^\\s\\]+$"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "botocore/handlers.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 104,
+         "startColumn": 21,
+         "endColumn": 55
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "fe4932c3a33d64b3:1",
+      "primaryLocationStartColumnFingerprint": "20"
+     }
+    },
+    {
+     "ruleId": "py/regex-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/regex-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Regex used: AWS4-HMAC-SHA256 Credential=(?P<access_key>\\w+)/\\d+/(?P<signing_region>\\[a-z0-9-\\]+)/"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "botocore/monitoring.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 3
+        },
+        "region": {
+         "startLine": 334,
+         "startColumn": 15,
+         "endLine": 338,
+         "endColumn": 10
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "9d8c159c20127369:1",
+      "primaryLocationStartColumnFingerprint": "6"
+     }
+    },
+    {
+     "ruleId": "py/regex-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/regex-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Regex used: AWS (?P<access_key>\\w+):"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "botocore/monitoring.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 3
+        },
+        "region": {
+         "startLine": 339,
+         "startColumn": 15,
+         "endColumn": 54
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "cbab9a03d5795513:1",
+      "primaryLocationStartColumnFingerprint": "6"
+     }
+    },
+    {
+     "ruleId": "py/regex-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/regex-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Regex used: {{.*}}"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "botocore/parsers.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 4
+        },
+        "region": {
+         "startLine": 418,
+         "startColumn": 30,
+         "endColumn": 48
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "ce44b9c4b9ebfca0:1",
+      "primaryLocationStartColumnFingerprint": "21"
+     }
+    },
+    {
+     "ruleId": "py/regex-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/regex-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Regex used: {{(.*?)}}"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "botocore/serialize.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 5
+        },
+        "region": {
+         "startLine": 846,
+         "startColumn": 31,
+         "endColumn": 67
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "95cf15d4168a263f:1",
+      "primaryLocationStartColumnFingerprint": "22"
+     }
+    },
+    {
+     "ruleId": "py/regex-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/regex-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Regex used: ^\\[A-Za-z0-9\\.\\-\\]+$"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "botocore/serialize.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 5
+        },
+        "region": {
+         "startLine": 67,
+         "startColumn": 18,
+         "endColumn": 51
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "cd0d3a021f1ae6db:1",
+      "primaryLocationStartColumnFingerprint": "17"
+     }
+    },
+    {
+     "ruleId": "py/regex-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/regex-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Regex used: ^__version__ = \\['\\\"\\](\\[^'\\\"\\]*)\\['\\\"\\]"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "setup.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 6
+        },
+        "region": {
+         "startLine": 17,
+         "startColumn": 21,
+         "endLine": 19,
+         "endColumn": 6
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "5fc17d1916bc633f:1",
+      "primaryLocationStartColumnFingerprint": "16"
+     }
+    },
+    {
+     "ruleId": "py/regex-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/regex-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Regex used: \\W+"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "botocore/utils.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 7
+        },
+        "region": {
+         "startLine": 278,
+         "startColumn": 12,
+         "endColumn": 36
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "182a3b871f07f64:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/regex-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/regex-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Regex used: ^((?!-)\\[A-Z\\d-\\]{{1,63}}(?<!-)\\.)*((?!-)\\[A-Z\\d-\\]{{1,63}}(?<!-))$"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "botocore/utils.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 7
+        },
+        "region": {
+         "startLine": 1321,
+         "startColumn": 15,
+         "endLine": 1324,
+         "endColumn": 6
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "fcd917f30430f72b:1",
+      "primaryLocationStartColumnFingerprint": "10"
+     }
+    },
+    {
+     "ruleId": "py/regex-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/regex-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Regex used: ^(?!\\[0-9\\]+$)(?!-)\\[a-zA-Z0-9-\\]{{,63}}(?<!-)$"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "botocore/utils.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 7
+        },
+        "region": {
+         "startLine": 1338,
+         "startColumn": 24,
+         "endColumn": 80
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "5e6633af4db7307b:1",
+      "primaryLocationStartColumnFingerprint": "19"
+     }
+    },
+    {
+     "ruleId": "py/regex-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/regex-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Regex used: ^(?P<resource_type>accesspoint|outpost)\\[/:\\](?P<resource_name>.+)$"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "botocore/utils.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 7
+        },
+        "region": {
+         "startLine": 2155,
+         "startColumn": 23,
+         "endLine": 2157,
+         "endColumn": 6
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "62824b41b10672f5:1",
+      "primaryLocationStartColumnFingerprint": "18"
+     }
+    },
+    {
+     "ruleId": "py/regex-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/regex-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Regex used: ^(?P<outpost_name>\\[a-zA-Z0-9\\-\\]{{1,63}})\\[/:\\]accesspoint\\[/:\\](?P<accesspoint_name>\\[a-zA-Z0-9\\-\\]{{1,63}}$)"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "botocore/utils.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 7
+        },
+        "region": {
+         "startLine": 2158,
+         "startColumn": 31,
+         "endLine": 2161,
+         "endColumn": 6
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "e9e878a1a4836f47:1",
+      "primaryLocationStartColumnFingerprint": "26"
+     }
+    },
+    {
+     "ruleId": "py/regex-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/regex-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Regex used: ^\\[a-zA-Z0-9\\-\\]{{1,63}}$"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "botocore/utils.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 7
+        },
+        "region": {
+         "startLine": 2649,
+         "startColumn": 25,
+         "endColumn": 61
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "3b9d20498b1ab2ae:1",
+      "primaryLocationStartColumnFingerprint": "20"
+     }
+    },
+    {
+     "ruleId": "py/regex-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/regex-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Regex used: \\[/:\\]"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "botocore/utils.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 7
+        },
+        "region": {
+         "startLine": 2865,
+         "startColumn": 29,
+         "endColumn": 48
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "3981e7ed177356e6:1",
+      "primaryLocationStartColumnFingerprint": "24"
+     }
+    },
+    {
+     "ruleId": "py/regex-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/regex-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Regex used: \\[a-z0-9\\]\\[a-z0-9\\-\\]*\\[a-z0-9\\]"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "botocore/utils.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 7
+        },
+        "region": {
+         "startLine": 106,
+         "startColumn": 12,
+         "endColumn": 54
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "aa3353706044277f:1",
+      "primaryLocationStartColumnFingerprint": "11"
+     }
+    },
+    {
+     "ruleId": "py/regex-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/regex-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Regex used: ^X-Amz-Checksum-(\\[a-z0-9\\]*)$"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "botocore/utils.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 7
+        },
+        "region": {
+         "startLine": 188,
+         "startColumn": 27,
+         "endLine": 191,
+         "endColumn": 2
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "f883ddbad68bd4b:1",
+      "primaryLocationStartColumnFingerprint": "26"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251208110230",
+   "codeql_raw_query": "/**\n * @name Weak Hashing\n * @description Use of weak hashing algorithms\n * @kind problem\n * @problem.severity warning\n * @id py/weak-hashing\n * @tags security\n *       external/cwe/cwe-327\n */\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"hashlib\").getMember([\"md5\", \"sha1\"]).getACall()\nselect call, \"Weak hashing algorithm used.\"",
+   "hypothesis": "Use of Broken or Risky Cryptographic Algorithm",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-327"
+   ],
+   "results_count": 6,
+   "results": [
+    {
+     "ruleId": "py/weak-hashing",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/weak-hashing",
+      "index": 0
+     },
+     "message": {
+      "text": "Weak hashing algorithm used."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "botocore/compat.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 162,
+         "startColumn": 16,
+         "endColumn": 44
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "d33b7d794f490fec:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/weak-hashing",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/weak-hashing",
+      "index": 0
+     },
+     "message": {
+      "text": "Weak hashing algorithm used."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "botocore/compat.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 146,
+         "startColumn": 5,
+         "endColumn": 39
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "a8cd5e4a0c00586b:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/weak-hashing",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/weak-hashing",
+      "index": 0
+     },
+     "message": {
+      "text": "Weak hashing algorithm used."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "botocore/credentials.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 819,
+         "startColumn": 25,
+         "endColumn": 51
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "5f2328375a38400a:1",
+      "primaryLocationStartColumnFingerprint": "16"
+     }
+    },
+    {
+     "ruleId": "py/weak-hashing",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/weak-hashing",
+      "index": 0
+     },
+     "message": {
+      "text": "Weak hashing algorithm used."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "botocore/credentials.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 2271,
+         "startColumn": 25,
+         "endColumn": 51
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "5f2328375a38400a:2",
+      "primaryLocationStartColumnFingerprint": "16"
+     }
+    },
+    {
+     "ruleId": "py/weak-hashing",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/weak-hashing",
+      "index": 0
+     },
+     "message": {
+      "text": "Weak hashing algorithm used."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "botocore/httpchecksum.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 132,
+         "startColumn": 26,
+         "endColumn": 32
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "120eb6ae9248ea61:1",
+      "primaryLocationStartColumnFingerprint": "17"
+     }
+    },
+    {
+     "ruleId": "py/weak-hashing",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/weak-hashing",
+      "index": 0
+     },
+     "message": {
+      "text": "Weak hashing algorithm used."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "botocore/utils.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 3
+        },
+        "region": {
+         "startLine": 3389,
+         "startColumn": 16,
+         "endColumn": 55
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "5876958d75f6fdd:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251208110349",
+   "codeql_raw_query": "/**\n * @name XML External Entity (XXE)\n * @description Checks for XML parsing that might be vulnerable to XXE.\n * @kind problem\n * @problem.severity error\n * @id py/xxe\n * @tags security\n *       external/cwe/cwe-611\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  (\n    call = API::moduleImport(\"xml.etree.ElementTree\").getMember([\"parse\", \"fromstring\", \"XML\"]).getACall() or\n    call = API::moduleImport(\"xml.dom.minidom\").getMember(\"parseString\").getACall() or\n    call = API::moduleImport(\"xml.sax\").getMember(\"parse\").getACall() or\n    call = API::moduleImport(\"lxml.etree\").getMember([\"parse\", \"fromstring\", \"XML\"]).getACall()\n  )\nselect call, \"Potential XXE vulnerability in XML parsing.\"",
+   "hypothesis": "XML parsing without defusedxml might be vulnerable to XXE.",
+   "severity": "high",
+   "cwe_ids": [
+    "CWE-611"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251208110426",
+   "codeql_raw_query": "/**\n * @name Unsafe Deserialization\n * @description Checks for usage of unsafe deserialization libraries.\n * @kind problem\n * @problem.severity error\n * @id py/unsafe-deserialization\n * @tags security\n *       external/cwe/cwe-502\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  (\n    call = API::moduleImport(\"pickle\").getMember([\"load\", \"loads\"]).getACall() or\n    call = API::moduleImport(\"cPickle\").getMember([\"load\", \"loads\"]).getACall() or\n    call = API::moduleImport(\"yaml\").getMember([\"load\", \"unsafe_load\"]).getACall() or\n    call = API::moduleImport(\"marshal\").getMember([\"load\", \"loads\"]).getACall() or\n    call = API::moduleImport(\"shelve\").getMember(\"open\").getACall()\n  )\nselect call, \"Potential unsafe deserialization.\"",
+   "hypothesis": "Unsafe deserialization can lead to RCE.",
+   "severity": "critical",
+   "cwe_ids": [
+    "CWE-502"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251208110509",
+   "codeql_raw_query": "/**\n * @name Command Injection\n * @description Checks for usage of subprocess and os.system.\n * @kind problem\n * @problem.severity error\n * @id py/command-injection\n * @tags security\n *       external/cwe/cwe-078\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  (\n    call = API::moduleImport(\"subprocess\").getMember([\"call\", \"check_call\", \"check_output\", \"run\", \"Popen\"]).getACall() or\n    call = API::moduleImport(\"os\").getMember([\"system\", \"popen\", \"spawnl\", \"spawnle\", \"spawnlp\", \"spawnlpe\", \"spawnv\", \"spawnve\", \"spawnvp\", \"spawnvpe\"]).getACall()\n  )\nselect call, \"Potential command injection.\"",
+   "hypothesis": "Command injection via subprocess or os.system.",
+   "severity": "high",
+   "cwe_ids": [
+    "CWE-78"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251208110649",
+   "codeql_raw_query": "/**\n * @name Insecure Temporary File Creation\n * @description Using tempfile.mktemp is insecure as it allows race conditions.\n * @kind problem\n * @problem.severity error\n * @id py/insecure-temp-file\n * @tags security\n *       external/cwe/cwe-377\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"tempfile\").getMember(\"mktemp\").getACall()\nselect call, \"Use of insecure temporary file creation function 'mktemp'.\"",
+   "hypothesis": "Usage of tempfile.mktemp leads to race conditions and potential file hijacking.",
+   "severity": "medium",
+   "cwe_ids": [
+    "CWE-377"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251208110832",
+   "codeql_raw_query": "/**\n * @name XML External Entity (XXE)\n * @description Parsing untrusted XML data with a vulnerable parser can lead to XXE.\n * @kind problem\n * @problem.severity error\n * @id py/xml-external-entity\n * @tags security\n *       external/cwe/cwe-611\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"xml\").getMember(\"etree\").getMember(\"ElementTree\").getMember(\"parse\").getACall() or\n  call = API::moduleImport(\"xml\").getMember(\"etree\").getMember(\"ElementTree\").getMember(\"fromstring\").getACall() or\n  call = API::moduleImport(\"xml\").getMember(\"dom\").getMember(\"minidom\").getMember(\"parse\").getACall() or\n  call = API::moduleImport(\"xml\").getMember(\"dom\").getMember(\"minidom\").getMember(\"parseString\").getACall() or\n  call = API::moduleImport(\"xml\").getMember(\"sax\").getMember(\"parse\").getACall() or\n  call = API::moduleImport(\"xml\").getMember(\"sax\").getMember(\"parseString\").getACall() or\n  call = API::moduleImport(\"lxml\").getMember(\"etree\").getMember(\"parse\").getACall() or\n  call = API::moduleImport(\"lxml\").getMember(\"etree\").getMember(\"fromstring\").getACall()\nselect call, \"Potential XML External Entity (XXE) vulnerability.\"",
+   "hypothesis": "XML parsing without disabling external entities can lead to XXE.",
+   "severity": "high",
+   "cwe_ids": [
+    "CWE-611"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251208110908",
+   "codeql_raw_query": "/**\n * @name Unsafe Deserialization (Pickle)\n * @description Deserializing untrusted data using pickle can lead to arbitrary code execution.\n * @kind problem\n * @problem.severity error\n * @id py/unsafe-deserialization-pickle\n * @tags security\n *       external/cwe/cwe-502\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"pickle\").getMember([\"load\", \"loads\"]).getACall() or\n  call = API::moduleImport(\"_pickle\").getMember([\"load\", \"loads\"]).getACall() or\n  call = API::moduleImport(\"cPickle\").getMember([\"load\", \"loads\"]).getACall() or\n  call = API::moduleImport(\"dill\").getMember([\"load\", \"loads\"]).getACall() or\n  call = API::moduleImport(\"shelve\").getMember(\"open\").getACall()\nselect call, \"Potential unsafe deserialization using pickle or similar library.\"",
+   "hypothesis": "Deserialization of untrusted data using pickle allows arbitrary code execution.",
+   "severity": "critical",
+   "cwe_ids": [
+    "CWE-502"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251208110952",
+   "codeql_raw_query": "/**\n * @name Weak PRNG\n * @description Using random module for security-sensitive operations is insecure.\n * @kind problem\n * @problem.severity warning\n * @id py/weak-prng\n * @tags security\n *       external/cwe/cwe-338\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"random\").getMember([\"random\", \"randint\", \"randrange\", \"choice\", \"choices\", \"uniform\", \"triangular\"]).getACall()\nselect call, \"Usage of weak PRNG from random module.\"",
+   "hypothesis": "Using the random module for cryptographic or security purposes is insecure.",
+   "severity": "medium",
+   "cwe_ids": [
+    "CWE-338"
+   ],
+   "results_count": 3,
+   "results": [
+    {
+     "ruleId": "py/weak-prng",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/weak-prng",
+      "index": 0
+     },
+     "message": {
+      "text": "Usage of weak PRNG from random module."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "botocore/retryhandler.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 57,
+         "startColumn": 16,
+         "endColumn": 31
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "67cde3fec895172e:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/weak-prng",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/weak-prng",
+      "index": 0
+     },
+     "message": {
+      "text": "Usage of weak PRNG from random module."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "botocore/utils.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 694,
+         "startColumn": 22,
+         "endColumn": 46
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "7e4f8a928d81c8c7:1",
+      "primaryLocationStartColumnFingerprint": "9"
+     }
+    },
+    {
+     "ruleId": "py/weak-prng",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/weak-prng",
+      "index": 0
+     },
+     "message": {
+      "text": "Usage of weak PRNG from random module."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "botocore/utils.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 1243,
+         "startColumn": 28,
+         "endColumn": 53
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "8a7595370e89e510:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251208111041",
+   "codeql_raw_query": "/**\n * @name XML External Entity (XXE)\n * @description Parsing untrusted XML data with a vulnerable parser can lead to XXE.\n * @kind problem\n * @problem.severity error\n * @id py/xxe\n * @tags security\n *       external/cwe/cwe-611\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  (\n    call = API::moduleImport(\"xml\").getMember(\"etree\").getMember(\"ElementTree\").getMember(\"parse\").getACall() or\n    call = API::moduleImport(\"xml\").getMember(\"etree\").getMember(\"ElementTree\").getMember(\"fromstring\").getACall() or\n    call = API::moduleImport(\"xml\").getMember(\"sax\").getMember(\"parse\").getACall() or\n    call = API::moduleImport(\"xml\").getMember(\"dom\").getMember(\"minidom\").getMember(\"parse\").getACall() or\n    call = API::moduleImport(\"xml\").getMember(\"dom\").getMember(\"pulldom\").getMember(\"parse\").getACall() or\n    call = API::moduleImport(\"lxml\").getMember(\"etree\").getMember(\"parse\").getACall() or\n    call = API::moduleImport(\"lxml\").getMember(\"etree\").getMember(\"fromstring\").getACall()\n  )\nselect call, \"Potential XXE vulnerability in XML parsing.\"\n",
+   "hypothesis": "XML parsing without disabling external entities can lead to XXE.",
+   "severity": "high",
+   "cwe_ids": [
+    "CWE-611"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251208111116",
+   "codeql_raw_query": "/**\n * @name Unsafe YAML deserialization\n * @description Deserializing untrusted YAML data can lead to arbitrary code execution.\n * @kind problem\n * @problem.severity error\n * @id py/unsafe-yaml\n * @tags security\n *       external/cwe/cwe-502\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"yaml\").getMember(\"load\").getACall()\nselect call, \"Unsafe YAML deserialization.\"\n",
+   "hypothesis": "Unsafe YAML loading can lead to RCE.",
+   "severity": "critical",
+   "cwe_ids": [
+    "CWE-502"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251208111153",
+   "codeql_raw_query": "/**\n * @name Subprocess with shell=True\n * @description Executing commands with shell=True can lead to command injection.\n * @kind problem\n * @problem.severity error\n * @id py/subprocess-shell-true\n * @tags security\n *       external/cwe/cwe-078\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"subprocess\").getMember([\"call\", \"check_call\", \"check_output\", \"Popen\", \"run\"]).getACall() and\n  call.getArgByName(\"shell\").asExpr().(BooleanLiteral).booleanValue() = true\nselect call, \"subprocess call with shell=True.\"\n",
+   "hypothesis": "Using shell=True in subprocess calls is dangerous.",
+   "severity": "high",
+   "cwe_ids": [
+    "CWE-78"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251208111450",
+   "codeql_raw_query": "/**\n * @name XML External Entity (XXE)\n * @description Parsing XML with external entities enabled can lead to information disclosure or denial of service.\n * @kind problem\n * @problem.severity error\n * @id py/xxe\n * @tags security\n *       external/cwe/cwe-611\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  (\n    call = API::moduleImport(\"xml.etree.ElementTree\").getMember([\"parse\", \"fromstring\", \"XML\"]).getACall() or\n    call = API::moduleImport(\"xml.dom.minidom\").getMember(\"parseString\").getACall() or\n    call = API::moduleImport(\"lxml.etree\").getMember([\"parse\", \"fromstring\", \"XML\"]).getACall()\n  )\nselect call, \"Potential XML External Entity (XXE) vulnerability if external entities are not disabled.\"\n",
+   "hypothesis": "Parsing XML with external entities enabled can lead to information disclosure or denial of service.",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-611"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251208111646",
+   "codeql_raw_query": "/**\n * @name Command Injection in subprocess\n * @description Using subprocess with shell=True or untrusted input can lead to command injection.\n * @kind problem\n * @problem.severity error\n * @id py/command-injection-subprocess\n * @tags security\n *       external/cwe/cwe-078\n */\n\nimport python\nimport semmle.python.ApiGraphs\nimport semmle.python.dataflow.new.DataFlow\n\nfrom DataFlow::CallCfgNode call\nwhere\n  (\n    call = API::moduleImport(\"subprocess\").getMember([\"Popen\", \"call\", \"check_call\", \"check_output\", \"run\"]).getACall() and\n    exists(DataFlow::Node shellArg |\n        shellArg = call.getArgByName(\"shell\") and\n        shellArg.asExpr().(BooleanLiteral).booleanValue() = true\n    )\n  )\n  or\n  call = API::moduleImport(\"os\").getMember([\"system\", \"popen\"]).getACall()\nselect call, \"Potential command injection via subprocess with shell=True or os.system.\"",
+   "hypothesis": "Command injection via subprocess with shell=True or os.system.",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-078"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251208111823",
+   "codeql_raw_query": "/**\n * @name XML External Entity (XXE) injection\n * @description Parsing untrusted XML data with a vulnerable parser can lead to XXE.\n * @kind problem\n * @problem.severity error\n * @id py/xxe-injection\n * @tags security\n *       external/cwe/cwe-611\n */\n\nimport python\nimport semmle.python.ApiGraphs\nimport semmle.python.dataflow.new.DataFlow\n\nfrom DataFlow::CallCfgNode call\nwhere\n  (\n    call = API::moduleImport(\"xml\").getMember(\"etree\").getMember(\"ElementTree\").getMember([\"parse\", \"iterparse\", \"fromstring\", \"XML\"]).getACall() or\n    call = API::moduleImport(\"lxml\").getMember(\"etree\").getMember([\"parse\", \"iterparse\", \"fromstring\", \"XML\"]).getACall() or\n    call = API::moduleImport(\"xml\").getMember(\"dom\").getMember(\"minidom\").getMember(\"parse\").getACall() or\n    call = API::moduleImport(\"xml\").getMember(\"sax\").getMember(\"parse\").getACall()\n  )\nselect call, \"Potential XML parsing vulnerability (XXE).\"",
+   "hypothesis": "XML parsing without defusedxml might be vulnerable to XXE.",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-611"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251208111849",
+   "codeql_raw_query": "/**\n * @name Insecure temporary file creation\n * @description Using tempfile.mktemp is insecure as it can lead to race conditions.\n * @kind problem\n * @problem.severity error\n * @id py/insecure-temp-file\n * @tags security\n *       external/cwe/cwe-377\n */\n\nimport python\nimport semmle.python.ApiGraphs\nimport semmle.python.dataflow.new.DataFlow\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"tempfile\").getMember(\"mktemp\").getACall()\nselect call, \"Use of insecure temporary file function 'mktemp'.\"",
+   "hypothesis": "Usage of tempfile.mktemp is insecure.",
+   "severity": "low",
+   "cwe_ids": [
+    "cwe-377"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251208111921",
+   "codeql_raw_query": "/**\n * @name Cleartext transmission of sensitive information\n * @description Using HTTP instead of HTTPS can expose sensitive information.\n * @kind problem\n * @problem.severity warning\n * @id py/cleartext-transmission\n * @tags security\n *       external/cwe/cwe-319\n */\n\nimport python\nimport semmle.python.ApiGraphs\nimport semmle.python.dataflow.new.DataFlow\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"http\").getMember(\"client\").getMember(\"HTTPConnection\").getACall() or\n  call = API::moduleImport(\"httplib\").getMember(\"HTTPConnection\").getACall() or\n  call = API::moduleImport(\"urllib3\").getMember(\"connection\").getMember(\"HTTPConnection\").getACall() or\n  call = API::moduleImport(\"botocore\").getMember(\"vendored\").getMember(\"requests\").getMember(\"packages\").getMember(\"urllib3\").getMember(\"connection\").getMember(\"HTTPConnection\").getACall()\nselect call, \"Instantiation of HTTPConnection (unencrypted).\"",
+   "hypothesis": "Usage of unencrypted HTTP connections.",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-319"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251208112054",
+   "codeql_raw_query": "/**\n * @name Path Traversal\n * @description Path traversal in file access\n * @kind path-problem\n * @problem.severity error\n * @id py/path-traversal\n * @tags security\n *       external/cwe/cwe-022\n */\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.ApiGraphs\n\nmodule PathTraversalConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    // For a library, parameters are potential sources\n    source instanceof DataFlow::ParameterNode\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(DataFlow::CallCfgNode call |\n      call = API::builtin(\"open\").getACall() and\n      sink = call.getArg(0)\n    )\n  }\n}\n\nmodule PathTraversalFlow = TaintTracking::Global<PathTraversalConfig>;\nimport PathTraversalFlow::PathGraph\n\nfrom PathTraversalFlow::PathNode source, PathTraversalFlow::PathNode sink\nwhere PathTraversalFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"Path traversal from $@.\", source.getNode(), \"parameter\"",
+   "hypothesis": "Path traversal via file open with user-controlled path",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-022"
+   ],
+   "results_count": 2,
+   "results": [
+    {
+     "ruleId": "py/path-traversal",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/path-traversal",
+      "index": 0
+     },
+     "message": {
+      "text": "Path traversal from [parameter](1)."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "botocore/utils.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 862,
+         "startColumn": 20,
+         "endColumn": 28
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "d2b658c49cb33ad0:1",
+      "primaryLocationStartColumnFingerprint": "11"
+     },
+     "codeFlows": [
+      {
+       "threadFlows": [
+        {
+         "locations": [
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "botocore/utils.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 860,
+              "startColumn": 24,
+              "endColumn": 32
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for filename"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "botocore/utils.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 862,
+              "startColumn": 20,
+              "endColumn": 28
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for filename"
+            }
+           }
+          }
+         ]
+        }
+       ]
+      }
+     ],
+     "relatedLocations": [
+      {
+       "id": 1,
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "botocore/utils.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 860,
+         "startColumn": 24,
+         "endColumn": 32
+        }
+       },
+       "message": {
+        "text": "parameter"
+       }
+      },
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "botocore/utils.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 860,
+         "startColumn": 24,
+         "endColumn": 32
+        }
+       }
+      }
+     ]
+    },
+    {
+     "ruleId": "py/path-traversal",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/path-traversal",
+      "index": 0
+     },
+     "message": {
+      "text": "Path traversal from [parameter](1).\nPath traversal from [parameter](2)."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "botocore/utils.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 3557,
+         "startColumn": 23,
+         "endColumn": 33
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "5744579ebd420cd2:1",
+      "primaryLocationStartColumnFingerprint": "10"
+     },
+     "codeFlows": [
+      {
+       "threadFlows": [
+        {
+         "locations": [
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "botocore/utils.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 3553,
+              "startColumn": 27,
+              "endColumn": 36
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for cache_key"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "botocore/utils.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 3555,
+              "startColumn": 46,
+              "endColumn": 55
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for cache_key"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "botocore/utils.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 3586,
+              "startColumn": 34,
+              "endColumn": 43
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for cache_key"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "botocore/utils.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 3587,
+              "startColumn": 9,
+              "endColumn": 18
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for full_path"
+            }
+           },
+           "taxa": [
+            {
+             "id": "AdditionalTaintStep",
+             "properties": {
+              "CodeQL/DataflowRole": "step"
+             }
+            }
+           ]
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "botocore/utils.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 3588,
+              "startColumn": 16,
+              "endColumn": 25
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for full_path"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "botocore/utils.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 3555,
+              "startColumn": 22,
+              "endColumn": 56
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for Attribute()"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "botocore/utils.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 3555,
+              "startColumn": 9,
+              "endColumn": 19
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for actual_key"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "botocore/utils.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 3557,
+              "startColumn": 23,
+              "endColumn": 33
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for actual_key"
+            }
+           }
+          }
+         ]
+        }
+       ]
+      },
+      {
+       "threadFlows": [
+        {
+         "locations": [
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "botocore/utils.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 3586,
+              "startColumn": 34,
+              "endColumn": 43
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for cache_key"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "botocore/utils.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 3587,
+              "startColumn": 9,
+              "endColumn": 18
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for full_path"
+            }
+           },
+           "taxa": [
+            {
+             "id": "AdditionalTaintStep",
+             "properties": {
+              "CodeQL/DataflowRole": "step"
+             }
+            }
+           ]
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "botocore/utils.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 3588,
+              "startColumn": 16,
+              "endColumn": 25
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for full_path"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "botocore/utils.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 3555,
+              "startColumn": 22,
+              "endColumn": 56
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for Attribute()"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "botocore/utils.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 3555,
+              "startColumn": 9,
+              "endColumn": 19
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for actual_key"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "botocore/utils.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 3557,
+              "startColumn": 23,
+              "endColumn": 33
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for actual_key"
+            }
+           }
+          }
+         ]
+        }
+       ]
+      }
+     ],
+     "relatedLocations": [
+      {
+       "id": 1,
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "botocore/utils.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 3553,
+         "startColumn": 27,
+         "endColumn": 36
+        }
+       },
+       "message": {
+        "text": "parameter"
+       }
+      },
+      {
+       "id": 2,
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "botocore/utils.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 3586,
+         "startColumn": 34,
+         "endColumn": 43
+        }
+       },
+       "message": {
+        "text": "parameter"
+       }
+      },
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "botocore/utils.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 3553,
+         "startColumn": 27,
+         "endColumn": 36
+        }
+       }
+      },
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "botocore/utils.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 3586,
+         "startColumn": 34,
+         "endColumn": 43
+        }
+       }
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251208112205",
+   "codeql_raw_query": "/**\n * @name Potential SSRF\n * @description User controlled URL in HTTP request\n * @kind path-problem\n * @problem.severity error\n * @id py/ssrf\n * @tags security\n *       external/cwe/cwe-918\n */\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.ApiGraphs\n\nmodule SSRFConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    source instanceof DataFlow::ParameterNode\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(DataFlow::CallCfgNode call |\n      (\n        call = API::moduleImport(\"urllib\").getMember(\"request\").getMember(\"urlopen\").getACall() or\n        call = API::moduleImport(\"urllib3\").getMember(\"PoolManager\").getMember(\"request\").getACall() or\n        call = API::moduleImport(\"requests\").getMember([\"get\", \"post\", \"put\", \"delete\", \"head\", \"patch\", \"request\"]).getACall()\n      ) and\n      sink = call.getArg(0)\n    )\n  }\n}\n\nmodule SSRFFlow = TaintTracking::Global<SSRFConfig>;\nimport SSRFFlow::PathGraph\n\nfrom SSRFFlow::PathNode source, SSRFFlow::PathNode sink\nwhere SSRFFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"Potential SSRF from $@.\", source.getNode(), \"parameter\"",
+   "hypothesis": "SSRF via user-controlled URL in HTTP request",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-918"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251208112323",
+   "codeql_raw_query": "/**\n * @name Improper Certificate Validation\n * @description Disabling SSL certificate validation (verify=False) is insecure.\n * @kind problem\n * @problem.severity error\n * @id py/improper-cert-validation\n * @tags security\n *       external/cwe/cwe-295\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call, DataFlow::Node arg\nwhere\n  (\n    call = API::moduleImport(\"requests\").getMember([\"request\", \"get\", \"post\", \"put\", \"delete\", \"head\", \"patch\", \"options\"]).getACall() or\n    call = API::moduleImport(\"botocore\").getMember(\"vendored\").getMember(\"requests\").getMember([\"request\", \"get\", \"post\", \"put\", \"delete\", \"head\", \"patch\", \"options\"]).getACall() or\n    call = API::moduleImport(\"urllib3\").getMember(\"PoolManager\").getACall() or\n    call = API::moduleImport(\"urllib3\").getMember(\"ProxyManager\").getACall()\n  )\n  and\n  (\n    (\n      arg = call.getArgByName(\"verify\") and\n      arg.asExpr().(BooleanLiteral).booleanValue() = false\n    )\n    or\n    (\n      arg = call.getArgByName(\"cert_reqs\") and\n      arg.asExpr().(StringLiteral).getText() = \"CERT_NONE\"\n    )\n  )\nselect call, \"SSL certificate validation is disabled.\"",
+   "hypothesis": "Disabling SSL certificate validation allows man-in-the-middle attacks.",
+   "severity": "high",
+   "cwe_ids": [
+    "CWE-295"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251208112545",
+   "codeql_raw_query": "/**\n * @name Unsafe deserialization\n * @description Deserializing untrusted data using pickle, yaml, or marshal can lead to code execution.\n * @kind problem\n * @problem.severity error\n * @id py/unsafe-deserialization\n * @tags security\n *       external/cwe/cwe-502\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  (\n    call = API::moduleImport(\"pickle\").getMember([\"load\", \"loads\", \"Unpickler\"]).getACall() or\n    call = API::moduleImport(\"_pickle\").getMember([\"load\", \"loads\", \"Unpickler\"]).getACall() or\n    call = API::moduleImport(\"cPickle\").getMember([\"load\", \"loads\", \"Unpickler\"]).getACall() or\n    call = API::moduleImport(\"yaml\").getMember([\"load\", \"unsafe_load\"]).getACall() or\n    call = API::moduleImport(\"marshal\").getMember([\"load\", \"loads\"]).getACall() or\n    call = API::moduleImport(\"shelve\").getMember(\"open\").getACall() or\n    call = API::moduleImport(\"jsonpickle\").getMember([\"decode\", \"unpickler\"]).getACall()\n  )\nselect call, \"Potentially unsafe deserialization.\"",
+   "hypothesis": "Unsafe deserialization using pickle, yaml, or marshal.",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-502"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251208112646",
+   "codeql_raw_query": "/**\n * @name Hardcoded Credentials\n * @description Hardcoding credentials in source code is a security risk.\n * @kind problem\n * @problem.severity error\n * @id py/hardcoded-credentials\n * @tags security\n *       external/cwe/cwe-798\n */\n\nimport python\n\nfrom AssignStmt assign, Name target, Str value\nwhere\n    assign.getTargets().getAnItem() = target and\n    assign.getValue() = value and\n    (\n        target.getId().regexpMatch(\"(?i).*(secret|password|token|api_key|access_key).*\")\n    ) and\n    // Filter out likely non-credentials\n    not target.getId().regexpMatch(\"(?i).*(file|path|name|url|uri|format|type|config|env|example|test).*\") and\n    value.getS().length() > 8 and\n    // Filter out template strings or placeholders\n    not value.getS().regexpMatch(\".*(%s|\\\\{|\\\\}).*\")\nselect assign, \"Possible hardcoded credential assigned to '\" + target.getId() + \"'.\"",
+   "hypothesis": "Hardcoded credentials in source code.",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-798"
+   ],
+   "results_count": 10,
+   "results": [
+    {
+     "ruleId": "py/hardcoded-credentials",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/hardcoded-credentials",
+      "index": 0
+     },
+     "message": {
+      "text": "Possible hardcoded credential assigned to 'ACCESS_KEY'."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "botocore/credentials.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 1160,
+         "startColumn": 5,
+         "endColumn": 37
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "913d8ac323c8b18e:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/hardcoded-credentials",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/hardcoded-credentials",
+      "index": 0
+     },
+     "message": {
+      "text": "Possible hardcoded credential assigned to 'SECRET_KEY'."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "botocore/credentials.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 1161,
+         "startColumn": 5,
+         "endColumn": 41
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "13636bdc6930d7e5:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/hardcoded-credentials",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/hardcoded-credentials",
+      "index": 0
+     },
+     "message": {
+      "text": "Possible hardcoded credential assigned to 'ACCESS_KEY'."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "botocore/credentials.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 1305,
+         "startColumn": 5,
+         "endColumn": 34
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "4bd56e0028222ea4:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/hardcoded-credentials",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/hardcoded-credentials",
+      "index": 0
+     },
+     "message": {
+      "text": "Possible hardcoded credential assigned to 'SECRET_KEY'."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "botocore/credentials.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 1306,
+         "startColumn": 5,
+         "endColumn": 32
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "b704dd883a14e948:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/hardcoded-credentials",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/hardcoded-credentials",
+      "index": 0
+     },
+     "message": {
+      "text": "Possible hardcoded credential assigned to 'ACCESS_KEY'."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "botocore/credentials.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 1339,
+         "startColumn": 5,
+         "endColumn": 37
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "6c1410f9c50b2cbb:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/hardcoded-credentials",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/hardcoded-credentials",
+      "index": 0
+     },
+     "message": {
+      "text": "Possible hardcoded credential assigned to 'SECRET_KEY'."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "botocore/credentials.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 1340,
+         "startColumn": 5,
+         "endColumn": 41
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "f0150fd877eee0fe:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/hardcoded-credentials",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/hardcoded-credentials",
+      "index": 0
+     },
+     "message": {
+      "text": "Possible hardcoded credential assigned to 'ACCESS_KEY'."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "botocore/credentials.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 1397,
+         "startColumn": 5,
+         "endColumn": 37
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "6c1410f9c50b2cbb:2",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/hardcoded-credentials",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/hardcoded-credentials",
+      "index": 0
+     },
+     "message": {
+      "text": "Possible hardcoded credential assigned to 'SECRET_KEY'."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "botocore/credentials.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 1398,
+         "startColumn": 5,
+         "endColumn": 41
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "f0150fd877eee0fe:2",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/hardcoded-credentials",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/hardcoded-credentials",
+      "index": 0
+     },
+     "message": {
+      "text": "Possible hardcoded credential assigned to 'ACCESS_KEY'."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "botocore/credentials.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 1467,
+         "startColumn": 5,
+         "endColumn": 37
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "a9373918c9e353f4:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/hardcoded-credentials",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/hardcoded-credentials",
+      "index": 0
+     },
+     "message": {
+      "text": "Possible hardcoded credential assigned to 'SECRET_KEY'."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "botocore/credentials.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 1468,
+         "startColumn": 5,
+         "endColumn": 41
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "9da55d20508b461:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251208112806",
+   "codeql_raw_query": "/**\n * @name Unsafe Deserialization (Pickle)\n * @description Usage of pickle module which is unsafe for untrusted data.\n * @kind problem\n * @problem.severity error\n * @id py/unsafe-pickle\n * @tags security\n *       external/cwe/cwe-502\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"pickle\").getMember([\"load\", \"loads\", \"Unpickler\"]).getACall() or\n  call = API::moduleImport(\"_pickle\").getMember([\"load\", \"loads\", \"Unpickler\"]).getACall() or\n  call = API::moduleImport(\"cPickle\").getMember([\"load\", \"loads\", \"Unpickler\"]).getACall()\nselect call, \"Potential unsafe deserialization using pickle.\"\n",
+   "hypothesis": "Check for unsafe pickle deserialization.",
+   "severity": "high",
+   "cwe_ids": [
+    "CWE-502"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251208112842",
+   "codeql_raw_query": "/**\n * @name Unsafe YAML Deserialization\n * @description Usage of yaml.load without SafeLoader.\n * @kind problem\n * @problem.severity error\n * @id py/unsafe-yaml\n * @tags security\n *       external/cwe/cwe-502\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"yaml\").getMember(\"load\").getACall()\nselect call, \"Potential unsafe YAML deserialization. Use safe_load instead.\"\n",
+   "hypothesis": "Check for unsafe YAML deserialization.",
+   "severity": "high",
+   "cwe_ids": [
+    "CWE-502"
+   ],
+   "results_count": 0,
+   "results": []
+  }
+ ]
+}

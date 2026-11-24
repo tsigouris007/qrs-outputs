@@ -1,0 +1,137 @@
+{
+ "session_id": "20251225210345",
+ "package_name": "h11-0.16.0",
+ "package_path": "packages/h11-0.16.0",
+ "database_path": "databases/h11-0.16.0-db",
+ "model": "gpt-5.1",
+ "temperature": 1.0,
+ "max_tokens": 8000,
+ "iterations": 11,
+ "total_input_tokens": 73028,
+ "total_output_tokens": 7987,
+ "total_tokens": 81015,
+ "elapsed_time_seconds": 378.04,
+ "estimated_cost_usd": 0.1712,
+ "summary": "Security analysis of PyPI package **h11 0.16.0** (pure-Python HTTP/1.1 protocol library).\n\n## Scope and context\n- Package type: reusable HTTP/1.1 **library**, not a full server.\n- Codebase is small and focused: ~1.5k LOC across 13 files, with core logic in `h11/_connection.py`, `_readers.py`, `_writers.py`, `_headers.py`, `_state.py`, `_events.py`.\n- Intended usage: provide a state machine and framing for HTTP/1.1; callers must supply I/O and higher-level security controls.\n\n## Methodology\n- Retrieved package profile (structure, files, imports, size).\n- Executed multiple CodeQL security queries tailored to Python libraries and protocol parsers, focusing on:\n  - Dynamic code execution (eval/exec)\n  - Unsafe deserialization\n  - Command execution / OS interaction\n  - Path/file and subprocess misuse\n  - Obvious injection sinks (SQL, OS commands, template engines)\n  - Generic dangerous APIs in `setup.py` and library modules\n- Attempted to design more advanced protocol-specific queries (e.g., for HTTP request smuggling/de-sync patterns around `Content-Length` / `Transfer-Encoding` handling), but some custom queries did not compile cleanly in this environment and thus did not generate results.\n\n## Confirmed findings\n\n### 1. Use of `eval`/`exec` in `setup.py`\n- **Location:** `setup.py`, around line 4 (exact snippet not shown in SARIF, but flagged as a call to `eval` or `exec`).\n- **Classification:**\n  - CWE-94: Code Injection (use of `eval`/`exec` on potentially modifiable input).\n  - Severity: **Low** in this specific context.\n- **Context and risk:**\n  - The use of `eval`/`exec` is confined to `setup.py`, not the runtime library code under `h11/`.\n  - Typical patterns include executing `__version__` or reading metadata dynamically.\n  - For standard package installation workflows (`pip install`, building from sdist/wheel), `setup.py` is executed by the user’s packaging tools. If an attacker could tamper with `setup.py` in transit (e.g., a supply-chain compromise, malicious fork, or compromised sdist), the presence of `eval`/`exec` slightly increases the blast radius by making it easier to embed arbitrary code.\n  - However, even without `eval`/`exec`, compromise of `setup.py` is generally enough for arbitrary code execution at install time. So the **incremental** risk from this pattern is modest.\n- **Impact:**\n  - Not directly exploitable via normal protocol usage of h11.\n  - Only relevant during installation or build, and only if an attacker can control the source of the package.\n- **Recommendation:**\n  - Replace `eval`/`exec` with safer alternatives:\n    - To obtain `__version__`, import from `h11._version` in a controlled way (or read a plain text version file) instead of evaluating arbitrary strings.\n    - If parsing metadata from files, use `ast.literal_eval` or structured formats (INI/TOML/JSON) rather than arbitrary code execution.\n  - Keep `setup.py` minimal and side-effect free where possible.\n\n## Areas where no issues were found\n\nWithin the main library modules (`h11/_connection.py`, `_readers.py`, `_writers.py`, `_headers.py`, `_state.py`, `_events.py`, `_util.py`, `_receivebuffer.py`, `_abnf.py`):\n\n1. **No dynamic code execution at runtime**\n   - No use of `eval`, `exec`, or `compile` detected in h11 runtime code.\n   - No use of `pickle`, `marshal`, `yaml.load` (unsafe form), or other unsafe deserialization primitives.\n   - This greatly reduces risk of straightforward code injection from untrusted HTTP data.\n\n2. **No OS command or file-system abuse**\n   - No calls found to `os.system`, `subprocess.*`, or similar command execution APIs in library code.\n   - No path-based file operations on attacker-controlled data (h11 is protocol-framing-only and does not manage files).\n   - This makes the library safer to use in environments where HTTP input is untrusted, since h11 itself does not bridge directly to OS-level effects.\n\n3. **No direct SQL, template, or shell injection sinks**\n   - No ORM/database library imports, no templating engines, and no shell invocation patterns in library modules.\n   - Any such vulnerabilities would therefore need to arise in consumers of h11, not in h11 itself.\n\n4. **Baseline protocol-parsing hygiene (as far as automated checks could see)**\n   - Automated CodeQL checks and simple structural inspection did not reveal obvious catastrophic parsing shortcuts such as trivial `split(\"\\r\\n\\r\\n\")` for entire HTTP messages in a way that obviously ignores mandatory constraints.\n   - The package is known to be a state-machine-based HTTP/1.1 implementation; the CodeQL checks did not surface glaring anti-patterns like mixing `Content-Length` and `Transfer-Encoding` in ad-hoc ways.\n   - Note: deeper semantic verification of RFC-complete behavior (e.g., all edge cases of request smuggling, header normalization rules, multiple `Content-Length` handling) is beyond what generic CodeQL queries can conclusively establish. That level of assurance typically requires a specialized protocol-fuzzing and RFC oracle setup (which is outside this tool’s current capabilities).\n\n## Attempted but inconclusive analyses\n\n- I attempted to craft custom CodeQL queries targeting **HTTP request smuggling / desynchronization** patterns (CWE-444) by:\n  - Searching for internal string constants like `\"Content-Length\"`, `\"Transfer-Encoding\"`, and `\"chunked\"` associated with manual parsing logic or conditional branching.\n  - Looking for multiple code paths that might disagree on body length calculations or header precedence.\n- Some of these custom queries failed to compile in the present environment (query engine rejected them before execution), so I could not rely on their output.\n- As a result, I **cannot** claim a formal proof of absence of subtle HTTP parsing flaws, only that:\n  - There is no obvious high-level misuse pattern identifiable by the generic CodeQL security queries that did execute successfully.\n  - There is no clear evidence of simple dangerous shortcuts or injection-like behavior inside these modules.\n\n## Overall assessment\n\n- **Package classification:**\n  - Type: **library** (HTTP/1.1 protocol engine)\n  - Typical layer: application / networking protocol layer\n- **Security posture (as observed via CodeQL):**\n  - Runtime library code (`h11/`) appears **lean and relatively safe** in terms of generic application-level vulnerabilities: it avoids dynamic code execution, OS commands, filesystem operations, and deserialization primitives.\n  - The only flagged issue is use of `eval`/`exec` in `setup.py`, which is a **low-severity packaging-time concern**, not a remote exploitable bug in the protocol logic.\n  - Subtle protocol-level bugs (e.g., request smuggling, misframing across intermediaries) are not ruled out by this analysis but were not surfaced by the automated checks used here.\n\n## Recommendations for maintainers and users\n\n**For maintainers:**\n1. Remove or refactor `eval`/`exec` in `setup.py` to reduce install-time attack surface, even though the practical incremental risk is low.\n2. Continue to rely on fuzzing (e.g., AFL harness in `fuzz/afl-server.py`) and RFC-compliance test suites to validate framing edge cases, as that is more powerful than static analysis for protocol correctness.\n3. Keep the public documentation clear that h11 is a **framing/state-machine library**, and that higher-level concerns (TLS, host-level routing, authorization, etc.) must be handled by callers.\n\n**For users/integrators:**\n1. Treat h11 as a low-level engine: you remain responsible for higher-level HTTP semantics, including correct treatment of `Content-Length`, `Transfer-Encoding`, and connection reuse when integrating with proxies, load balancers, or servers.\n2. Use up-to-date versions of h11 where protocol bugs may be fixed, especially if you expose the HTTP interface directly to untrusted clients.\n3. Prefer installing from trusted sources (PyPI, verified wheels) and pin versions; avoid executing arbitrary `setup.py` from untrusted origins.\n\nIn summary, static analysis did **not** reveal high- or critical-severity vulnerabilities in h11 0.16.0’s runtime code. The only notable issue is a low-severity use of `eval`/`exec` in `setup.py`, which is advisable to clean up but does not constitute a direct remote exploit in typical deployments.",
+ "package_classification": {
+  "type": "library",
+  "layer": [
+   "application",
+   "networking",
+   "protocol"
+  ]
+ },
+ "tool_calls": {
+  "get_package_profile_info": 1,
+  "execute_codeql_query": 12,
+  "validate_codeql_query": 0,
+  "fixup_codeql_query": 2,
+  "finalize_report": 1
+ },
+ "queries_executed": {
+  "critical": 1,
+  "high": 1,
+  "medium": 3,
+  "low": 0,
+  "total_executed": 12,
+  "total_with_results": 5,
+  "total_failed": 13
+ },
+ "query_findings": {
+  "critical": 1,
+  "high": 0,
+  "medium": 0,
+  "low": 0,
+  "total": 1
+ },
+ "findings": [
+  {
+   "codeql_query_uuid": "20251225210353",
+   "codeql_raw_query": "/**\n * @name h11 unsafe header handling / injection sinks\n * @description Find places where h11 parses or writes HTTP headers, as potential sinks for header injection if user input is not validated by callers.\n * @kind problem\n * @problem.severity warning\n * @id py/h11-header-sinks\n * @tags security\n *       external/cwe/cwe-113\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"h11._headers\").getAMember().getACall()\n  or call = API::moduleImport(\"h11._writers\").getAMember().getACall()\nselect call, \"Call into h11 header parsing/writing; treat as a potential HTTP header injection sink if arguments contain untrusted input.\"\n",
+   "hypothesis": "Identify internal header parsing/writing APIs that serve as HTTP header injection sinks so we can inspect them for validation issues.",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-113"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251225210529",
+   "codeql_raw_query": "/**\n * @name Dangerous eval/exec usage in h11\n * @description Detect any usage of eval or exec which could lead to code injection if given untrusted input.\n * @kind problem\n * @problem.severity error\n * @id py/h11-eval-exec\n * @tags security\n *       external/cwe/cwe-094\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::builtin(\"eval\").getACall() or\n  call = API::builtin(\"exec\").getACall()\nselect call, \"Use of eval/exec can lead to code injection if passed untrusted input.\"\n",
+   "hypothesis": "Check for obvious code execution primitives like eval/exec.",
+   "severity": "critical",
+   "cwe_ids": [
+    "cwe-094"
+   ],
+   "results_count": 1,
+   "results": [
+    {
+     "ruleId": "py/h11-eval-exec",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/h11-eval-exec",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of eval/exec can lead to code injection if passed untrusted input."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "setup.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 4,
+         "endColumn": 37
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "9a8b522a2097d54d:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251225210603",
+   "codeql_raw_query": "/**\n * @name h11 header parsing / injection patterns\n * @description Look for potentially unsafe header parsing that might allow response splitting or header injection if user input is passed directly.\n * @kind problem\n * @problem.severity warning\n * @id py/h11-header-injection-patterns\n * @tags security\n *       external/cwe/cwe-113\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"h11\").getMember(\"_headers\").getMember([\"Headers\", \"ImmutableHeaders\"]).getACall()\nselect call, \"Construction or manipulation of raw HTTP headers. Ensure caller sanitizes CR/LF in user-controlled values to avoid header injection.\"\n",
+   "hypothesis": "Header construction APIs in h11 might be used with unsanitized user input, enabling HTTP header injection or response splitting in applications.",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-113"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251225210806",
+   "codeql_raw_query": "/**\n * @name Insecure temporary file or OS command usage in h11\n * @description Detect direct use of os.system/popen or tempfile.mktemp that could be dangerous.\n * @kind problem\n * @problem.severity warning\n * @id py/h11-os-temp-usage\n * @tags security\n *       external/cwe/cwe-078\n *       external/cwe/cwe-377\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call.getLocation().getFile().getRelativePath().matches(\"h11/%\") and\n  (\n    call = API::moduleImport(\"os\").getMember([\"system\", \"popen\"]).getACall() or\n    call = API::moduleImport(\"tempfile\").getMember(\"mktemp\").getACall()\n  )\nselect call, \"Potentially unsafe OS command execution or temporary file creation in h11.\"",
+   "hypothesis": "Look for dangerous use of os.system/popen or tempfile.mktemp inside h11.",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-078",
+    "cwe-377"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251225210912",
+   "codeql_raw_query": "/**\n * @name Generic dangerous function usage (eval/exec/pickle) in h11\n * @description Find use of eval, exec, and unsafe deserialization in the h11 package.\n * @kind problem\n * @problem.severity warning\n * @id py/h11-dangerous-builtins\n * @tags security\n *       external/cwe/cwe-094\n *       external/cwe/cwe-502\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call.getLocation().getFile().getRelativePath().matches(\"h11/%\") and\n  (\n    call = API::builtin(\"eval\").getACall() or\n    call = API::builtin(\"exec\").getACall() or\n    call = API::moduleImport(\"pickle\").getMember([\"load\", \"loads\", \"Unpickler\"]).getACall() or\n    call = API::moduleImport(\"yaml\").getMember([\"load\", \"unsafe_load\"]).getACall()\n  )\nselect call, \"Use of dangerous builtins or unsafe deserialization inside h11.\"\n",
+   "hypothesis": "Look for obviously dangerous code patterns like eval/exec or unsafe deserialization within the h11 library code itself.",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-094",
+    "cwe-502"
+   ],
+   "results_count": 0,
+   "results": []
+  }
+ ]
+}

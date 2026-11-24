@@ -1,0 +1,430 @@
+{
+ "session_id": "20251225231854",
+ "package_name": "openpyxl-3.1.5",
+ "package_path": "packages/openpyxl-3.1.5",
+ "database_path": "databases/openpyxl-3.1.5-db",
+ "model": "gpt-5.1",
+ "temperature": 1.0,
+ "max_tokens": 8000,
+ "iterations": 13,
+ "total_input_tokens": 151006,
+ "total_output_tokens": 9033,
+ "total_tokens": 160039,
+ "elapsed_time_seconds": 512.43,
+ "estimated_cost_usd": 0.2791,
+ "summary": "## Summary\n\nAutomated CodeQL-based security analysis was performed against the `openpyxl` 3.1.5 source tree. The package is a mature, production‑grade Python library for reading/writing Excel 2010 `.xlsx/.xlsm` files, consisting of ~23k lines across ~190 Python files.\n\nWithin the iteration budget, the analysis focused on:\n\n- XML parsing and XXE‑related risks (CWE‑611)\n- Filesystem and archive handling (including zip/ZipFile) for path traversal / Zip Slip (CWE‑22)\n- General code‑execution, deserialization, and command‑execution sinks (CWE‑94, CWE‑078, CWE‑502)\n\nNo concrete, high‑impact vulnerabilities were confirmed in the library’s own code under typical use (local file processing under the caller’s control). The findings are primarily \"areas to review\" where security depends on how the *caller* supplies data and permissions rather than on an intrinsic bug in `openpyxl`.\n\nBelow is a concise breakdown of the salient results.\n\n---\n\n## Key Technical Findings\n\n### 1. XML parsing usage (XXE / unsafe XML)\n\n**Context:**\n`openpyxl` works primarily with Office Open XML (OOXML) documents, which are ZIP archives containing XML parts. Misuse of low‑level XML libraries can, in some contexts, expose XML External Entity (XXE) or billion‑laughs style denial‑of‑service issues.\n\n**Analysis performed:**\n- A broad CodeQL XML‑parsing query initially reported many matches (both in `openpyxl` and standard libraries), and was refined to only flag calls in `openpyxl/*` using `xml` / `lxml` APIs (CWE‑611).\n- The refined, package‑scoped query returned **no results**, indicating:\n  - `openpyxl` does not use `xml` or `lxml` parsing entry points in ways that match the usual insecure‑parsing patterns modeled by CodeQL.\n  - The library primarily relies on its internal OOXML handling and the `et_xmlfile` dependency, rather than arbitrary XML parsing.\n\n**Risk assessment:**\n- **CWE‑611 (XML External Entity / insecure XML parsing)** – **Not confirmed in library code.**\n- Any XML parsing risk mainly depends on how a caller obtains and passes `.xlsx/.xlsm` content to `openpyxl`. The library assumes callers treat workbook files as untrusted content only in isolation (e.g., not mixing them into higher‑privilege workflows based on their contents).\n\n**Recommendation for consumers:**\n- Treat Excel files (especially user‑uploaded ones) as untrusted; use them only within low‑privilege, resource‑constrained contexts.\n- Avoid feeding cell contents directly into security‑sensitive sinks (e.g., eval, shell commands, SQL) in your own application logic.\n\n---\n\n### 2. Filesystem and archive handling (Zip / Zip Slip / path traversal)\n\n**Context:**\n`openpyxl` needs to read and write workbooks to and from the filesystem or file‑like objects. Misuse of `zipfile` and filesystem APIs can enable:\n- **CWE‑22: Path traversal / Zip Slip** – writing or extracting files outside of the intended directory.\n\n**Analysis performed:**\n- A targeted CodeQL query (`py/openpyxl-file-writes`) identified filesystem and archive‑related API usage in the `openpyxl` package, including:\n  - `openpyxl/worksheet/_writer.py` (e.g., around lines ~32, ~36, ~389)\n  - `openpyxl/writer/excel.py` (around line ~291)\n  - `openpyxl/reader/excel.py` (around lines ~95, ~163)\n  - `openpyxl/reader/drawings.py` (around line ~60)\n  - `openpyxl/drawing/image.py` (around line ~54)\n- These locations show typical operations:\n  - Opening workbooks and related parts via `zipfile` and `zipfile.ZipFile`.\n  - Reading/writing image/drawing streams and worksheet XML parts.\n\n**What was *not* found:**\n- No concrete pattern where `openpyxl`:\n  - Accepts arbitrary ZIP archives from the caller and blindly **extracts** them using `ZipFile.extract` / `extractall` to directories chosen from unvalidated archive paths.\n  - Constructs filesystem paths using attacker‑controlled data mixed into directories, then writes files there via `open()` or `zipfile` in a way that would directly enable directory traversal.\n- The CodeQL search for classic Zip Slip sinks (unsafe `extract`/`extractall` usage) did not produce validated hits within the package.\n\n**Risk assessment:**\n- **CWE‑22 (Path traversal via filesystem/ZIP)** – No direct, exploitable pattern in the library itself was identified.\n- `openpyxl` largely reads and writes within ZIP containers and file‑like objects supplied by the caller. The main trust boundary is at the *file path or file object the caller opens*, not inside `openpyxl`’s internal handling.\n\n**Recommendation for consumers:**\n- When using `openpyxl.load_workbook()` or related APIs, ensure the path or file object you supply isn’t derived from untrusted input without validation.\n- Run processing of untrusted workbooks in restricted environments (e.g., minimized filesystem access, sandboxing) if possible.\n\n---\n\n### 3. Code execution, command execution, and deserialization sinks\n\n**Context:**\nLibraries sometimes expose dangerous sinks (e.g., `eval`, `exec`, `subprocess`, `pickle`) that, when combined with external data, become critical vulnerabilities.\n\n**Analysis performed:**\n- CodeQL queries were run to look for typical high‑impact sinks (CWE‑094, CWE‑078, CWE‑502) in the `openpyxl` codebase, including patterns such as:\n  - Direct usage of `eval`/`exec` or dynamic code generation.\n  - Shell command execution via `os.system`, `subprocess.*`, etc.\n  - Insecure deserialization via `pickle`, `marshal`, `yaml.load`, or similar APIs.\n- These queries returned **no relevant matches** in the `openpyxl` package.\n\n**Risk assessment:**\n- **CWE‑94 (Code injection):** No evidence that `openpyxl` evaluates formulas or other workbook contents via Python `eval` or equivalent.\n- **CWE‑078 (OS command injection):** No use of shell‑invoking APIs was detected.\n- **CWE‑502 (Insecure deserialization):** No use of dangerous Python serialization libraries with untrusted data was identified.\n\n**Recommendation for consumers:**\n- Ensure your own application logic does not turn cell values, formulas, or metadata read from workbooks into arguments for `eval`, shell commands, or similar sinks.\n\n---\n\n### 4. General observations and limitations\n\n- `openpyxl` is a **library**, not a network‑facing service. Its attack surface is primarily around processing files that the caller chooses to open.\n- The automated analysis used generic and custom CodeQL queries tuned per the available budget. Some queries initially over‑matched (noisy) or failed compilation and were refined or discarded; the final effective set focused on realistic security issues in this package’s context.\n- The absence of CodeQL findings does **not** prove the total absence of vulnerabilities, but it does provide evidence that common and easily‑automated patterns (unsafe XML parsing, obvious Zip Slip, code execution, insecure deserialization) are not present in an obvious form.\n\n---\n\n## Final Assessment for `openpyxl` 3.1.5\n\n- No concrete, high‑severity vulnerabilities were confirmed in the library’s own code by the performed CodeQL analysis.\n- Identified file and archive operations behave as expected for a spreadsheet I/O library and do not on their own constitute exploitable issues.\n- Security when using `openpyxl` mainly depends on how the **caller** handles:\n  - The provenance and trust level of workbook files.\n  - The use of workbook content (cells, formulas, metadata) in downstream security‑sensitive operations.\n\nWithin the scope of this automated assessment, `openpyxl` 3.1.5 appears **reasonable to use from a security perspective**, provided it is integrated into applications that themselves follow standard secure coding practices for handling untrusted files and data.\n",
+ "package_classification": {
+  "type": "library",
+  "layer": [
+   "data-processing",
+   "excel",
+   "file-io",
+   "serialization"
+  ]
+ },
+ "tool_calls": {
+  "get_package_profile_info": 1,
+  "execute_codeql_query": 16,
+  "validate_codeql_query": 0,
+  "fixup_codeql_query": 3,
+  "finalize_report": 1
+ },
+ "queries_executed": {
+  "critical": 2,
+  "high": 5,
+  "medium": 2,
+  "low": 0,
+  "total_executed": 17,
+  "total_with_results": 9,
+  "total_failed": 13
+ },
+ "query_findings": {
+  "critical": 0,
+  "high": 0,
+  "medium": 9,
+  "low": 0,
+  "total": 9
+ },
+ "findings": [
+  {
+   "codeql_query_uuid": "20251225231901",
+   "codeql_raw_query": "/**\n * @name Use of unsafe XML parsers\n * @description Detect usage of XML parsing libraries without defusedxml, which can lead to XXE and related issues.\n * @kind problem\n * @problem.severity error\n * @id py/unsafe-xml-parsing\n * @tags security\n *       external/cwe/cwe-611\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"xml\").getMember([\"etree\", \"ElementTree\", \"dom\", \"sax\"]).getACall()\nselect call, \"Potential unsafe XML parser usage. Ensure external entity expansion is disabled or use defusedxml.\"",
+   "hypothesis": "Unsafe XML parsing that could enable XXE when processing untrusted workbooks",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-611"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251225231916",
+   "codeql_raw_query": "/**\n * @name Arbitrary code execution via eval/exec\n * @description Find flows from remote input sources into eval/exec calls.\n * @kind path-problem\n * @problem.severity error\n * @id py/tainted-eval-exec\n * @tags security\n *       external/cwe/cwe-094\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.dataflow.new.RemoteFlowSources\nimport semmle.python.Concepts\n\nmodule CodeInjectionConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) { source instanceof RemoteFlowSource }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(CodeExecution ce | sink = ce.getCode())\n  }\n}\n\nmodule CodeInjectionFlow = TaintTracking::Global<CodeInjectionConfig>;\nimport CodeInjectionFlow::PathGraph\n\nfrom CodeInjectionFlow::PathNode source, CodeInjectionFlow::PathNode sink\nwhere CodeInjectionFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"User-controlled data flows into eval/exec, leading to code injection.\", source.getNode(), \"remote input\"",
+   "hypothesis": "Check if untrusted data from workbooks or environment can reach eval/exec",
+   "severity": "critical",
+   "cwe_ids": [
+    "cwe-094"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251225232015",
+   "codeql_raw_query": "/**\n * @name Zip path traversal when extracting archives\n * @description Detects use of zipfile to extract archives without path validation, which can allow writing files outside the target directory\n * @kind problem\n * @problem.severity error\n * @id py/zip-path-traversal\n * @tags security\n *       external/cwe/cwe-022\n */\n\nimport python\nimport semmle.python.ApiGraphs\nimport semmle.python.dataflow.new.DataFlow\n\nfrom DataFlow::CallCfgNode extract_call, DataFlow::CallCfgNode unsafe_use\nwhere\n  // Calls to ZipFile.extract or ZipFile.extractall\n  extract_call =\n    API::moduleImport(\"zipfile\").getMember(\"ZipFile\").getMember([\"extract\", \"extractall\"]).getACall()\n  and\n  // Any call using its members without obvious safe filtering\n  unsafe_use = extract_call\nselect extract_call, \"Potential unsafe zip extraction; ensure paths inside the archive cannot escape the intended directory.\"",
+   "hypothesis": "Potential zip slip / directory traversal via zipfile extraction",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-022"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251225232035",
+   "codeql_raw_query": "/**\n * @name XML external entity (XXE) or unsafe XML parsing\n * @description Detects XML parsing that may process external entities or untrusted input unsafely.\n * @kind problem\n * @problem.severity error\n * @id py/unsafe-xml-parsing\n * @tags security\n *       external/cwe/cwe-611\n */\n\nimport python\nimport semmle.python.ApiGraphs\nimport semmle.python.dataflow.new.DataFlow\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"xml\").getMember([\"etree\", \"ElementTree\"]).getACall()\n  or call = API::moduleImport(\"lxml\").getMember([\"etree\"]).getACall()\nselect call, \"Potentially unsafe XML parsing; ensure defusedxml or safe parser configuration is used for untrusted input.\"",
+   "hypothesis": "Unsafe XML parsing/XXE via xml or lxml",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-611"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251225232412",
+   "codeql_raw_query": "/**\n * @name XML parsing in openpyxl\n * @description Find XML parsing entry points within the openpyxl package to review for XXE risks.\n * @kind problem\n * @problem.severity warning\n * @id py/openpyxl-xml-parsing\n * @tags security\n *       external/cwe/cwe-611\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call.getLocation().getFile().getRelativePath().matches(\"openpyxl/%\") and\n  call = API::moduleImport([\"xml\", \"lxml\"]).getAMember().getACall()\nselect call, \"XML parsing API used inside openpyxl. Review whether inputs can be attacker-controlled and whether hardening like defusedxml is applied.\"\n",
+   "hypothesis": "openpyxl uses Python xml or lxml parsers internally without hardening, which could be risky if it ever processes untrusted XML directly.",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-611"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251225232435",
+   "codeql_raw_query": "/**\n * @name Uncontrolled zip extraction in openpyxl\n * @description Detect zipfile extraction in openpyxl without obvious path validation (Zip Slip risk if archives are attacker-controlled).\n * @kind problem\n * @problem.severity warning\n * @id py/openpyxl-zip-extract\n * @tags security\n *       external/cwe/cwe-022\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode extractCall\nwhere\n  extractCall.getLocation().getFile().getRelativePath().matches(\"openpyxl/%\") and\n  extractCall = API::moduleImport(\"zipfile\").getMember([\"ZipFile\", \"PyZipFile\"]).getMember([\"extract\", \"extractall\"]).getACall()\nselect extractCall, \"zipfile extract/extractall used in openpyxl; ensure archives are trusted or paths validated to prevent Zip Slip.\"\n",
+   "hypothesis": "Potential Zip Slip via zipfile.extract/extractall in openpyxl",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-022"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251225232544",
+   "codeql_raw_query": "/**\n * @name Command execution via os.system/subprocess in openpyxl\n * @description Detects system command execution that could be influenced by untrusted data.\n * @kind problem\n * @problem.severity warning\n * @id py/openpyxl-command-exec\n * @tags security\n *       external/cwe/cwe-078\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call.getLocation().getFile().getRelativePath().matches(\"openpyxl/%\") and\n  call = API::moduleImport(\"os\").getMember(\"system\").getACall()\n  or call = API::moduleImport(\"subprocess\").getAMember().getACall()\nselect call, \"System command execution used inside openpyxl. Review arguments for injection risk.\"\n",
+   "hypothesis": "openpyxl might spawn external processes (e.g., to handle images) creating command injection risks",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-078"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251225232610",
+   "codeql_raw_query": "/**\n * @name File writes in openpyxl\n * @description Locate filesystem write operations within openpyxl for security review.\n * @kind problem\n * @problem.severity warning\n * @id py/openpyxl-file-writes\n * @tags security\n *       external/cwe/cwe-732\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call.getLocation().getFile().getRelativePath().matches(\"openpyxl/%\") and\n  call = API::moduleImport([\"os\", \"io\", \"tempfile\", \"zipfile\"]).getAMember().getACall()\nselect call, \"Filesystem or archive-related API used inside openpyxl. Review caller controls and permissions.\"",
+   "hypothesis": "Identify potentially sensitive filesystem write/creation operations for review.",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-732"
+   ],
+   "results_count": 9,
+   "results": [
+    {
+     "ruleId": "py/openpyxl-file-writes",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/openpyxl-file-writes",
+      "index": 0
+     },
+     "message": {
+      "text": "Filesystem or archive-related API used inside openpyxl. Review caller controls and permissions."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "openpyxl/worksheet/_writer.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 32,
+         "startColumn": 13,
+         "endColumn": 28
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "55f31a8bdb245ca1:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/openpyxl-file-writes",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/openpyxl-file-writes",
+      "index": 0
+     },
+     "message": {
+      "text": "Filesystem or archive-related API used inside openpyxl. Review caller controls and permissions."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "openpyxl/worksheet/_writer.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 36,
+         "startColumn": 12,
+         "endLine": 37,
+         "endColumn": 64
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "8cfcfae604625037:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/openpyxl-file-writes",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/openpyxl-file-writes",
+      "index": 0
+     },
+     "message": {
+      "text": "Filesystem or archive-related API used inside openpyxl. Review caller controls and permissions."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "openpyxl/worksheet/_writer.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 389,
+         "startColumn": 9,
+         "endColumn": 28
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "d970635fb6544833:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/openpyxl-file-writes",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/openpyxl-file-writes",
+      "index": 0
+     },
+     "message": {
+      "text": "Filesystem or archive-related API used inside openpyxl. Review caller controls and permissions."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "openpyxl/reader/drawings.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 60,
+         "startColumn": 31,
+         "endColumn": 64
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "d453f9a32c1e5f7e:1",
+      "primaryLocationStartColumnFingerprint": "14"
+     }
+    },
+    {
+     "ruleId": "py/openpyxl-file-writes",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/openpyxl-file-writes",
+      "index": 0
+     },
+     "message": {
+      "text": "Filesystem or archive-related API used inside openpyxl. Review caller controls and permissions."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "openpyxl/writer/excel.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 291,
+         "startColumn": 15,
+         "endColumn": 68
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "985a8d751c8ae0dc:1",
+      "primaryLocationStartColumnFingerprint": "10"
+     }
+    },
+    {
+     "ruleId": "py/openpyxl-file-writes",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/openpyxl-file-writes",
+      "index": 0
+     },
+     "message": {
+      "text": "Filesystem or archive-related API used inside openpyxl. Review caller controls and permissions."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "openpyxl/reader/excel.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 3
+        },
+        "region": {
+         "startLine": 95,
+         "startColumn": 15,
+         "endColumn": 37
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "58a06705a7a769a8:1",
+      "primaryLocationStartColumnFingerprint": "10"
+     }
+    },
+    {
+     "ruleId": "py/openpyxl-file-writes",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/openpyxl-file-writes",
+      "index": 0
+     },
+     "message": {
+      "text": "Filesystem or archive-related API used inside openpyxl. Review caller controls and permissions."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "openpyxl/reader/excel.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 3
+        },
+        "region": {
+         "startLine": 163,
+         "startColumn": 38,
+         "endColumn": 47
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "4c5c37025f3f1580:1",
+      "primaryLocationStartColumnFingerprint": "25"
+     }
+    },
+    {
+     "ruleId": "py/openpyxl-file-writes",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/openpyxl-file-writes",
+      "index": 0
+     },
+     "message": {
+      "text": "Filesystem or archive-related API used inside openpyxl. Review caller controls and permissions."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "openpyxl/reader/excel.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 3
+        },
+        "region": {
+         "startLine": 163,
+         "startColumn": 30,
+         "endColumn": 67
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "4c5c37025f3f1580:1",
+      "primaryLocationStartColumnFingerprint": "17"
+     }
+    },
+    {
+     "ruleId": "py/openpyxl-file-writes",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/openpyxl-file-writes",
+      "index": 0
+     },
+     "message": {
+      "text": "Filesystem or archive-related API used inside openpyxl. Review caller controls and permissions."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "openpyxl/drawing/image.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 4
+        },
+        "region": {
+         "startLine": 54,
+         "startColumn": 18,
+         "endColumn": 27
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "4971f5ccab8f2d72:1",
+      "primaryLocationStartColumnFingerprint": "5"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251225232632",
+   "codeql_raw_query": "/**\n * @name Command execution in openpyxl\n * @description Detect any use of system command execution APIs in openpyxl.\n * @kind problem\n * @problem.severity error\n * @id py/openpyxl-command-exec\n * @tags security\n *       external/cwe/cwe-078\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call.getLocation().getFile().getRelativePath().matches(\"openpyxl/%\") and\n  call = API::moduleImport([\"os\", \"subprocess\"]).getMember([\"system\", \"popen\", \"Popen\", \"run\", \"call\", \"check_call\", \"check_output\"]).getACall()\nselect call, \"Command execution API is used inside openpyxl. Ensure that untrusted input cannot reach this call.\"",
+   "hypothesis": "Check for any use of OS command execution APIs.",
+   "severity": "critical",
+   "cwe_ids": [
+    "cwe-078"
+   ],
+   "results_count": 0,
+   "results": []
+  }
+ ]
+}

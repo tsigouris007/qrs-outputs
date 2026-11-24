@@ -1,0 +1,399 @@
+{
+ "session_id": "20251213183750",
+ "package_name": "jinja2-3.1.6",
+ "package_path": "packages/jinja2-3.1.6",
+ "database_path": "databases/jinja2-3.1.6-db",
+ "model": "gpt-5.1",
+ "temperature": 0.0,
+ "max_tokens": 8000,
+ "iterations": 15,
+ "total_input_tokens": 106647,
+ "total_output_tokens": 10167,
+ "total_tokens": 116814,
+ "elapsed_time_seconds": 548.05,
+ "estimated_cost_usd": 0.235,
+ "summary": "## Security analysis summary for `jinja2` 3.1.6\n\nScope: Source under `src/jinja2/` (≈10.9k LOC). Focus was on code-execution, deserialization, filesystem, and command-execution risks using CodeQL’s modern dataflow and API graph libraries.\n\n### Package classification\n- **Type:** library\n- **Layer:** application, templating / view layer\n\n---\n\n## Key findings\n\n### 1. Use of unsafe deserialization APIs (pickle / marshal)\n- **Files / locations**\n  - `src/jinja2/bccache.py:73`\n  - `src/jinja2/bccache.py:79`\n- **CodeQL rule:** `py/jinja2/insecure-deserialization`\n- **CWE:** CWE-502 (Deserialization of Untrusted Data)\n- **What was detected**\n  - Calls to Python’s unsafe deserialization primitives (`pickle` / `marshal`) were found in the bytecode cache implementation.\n  - These APIs can execute arbitrary code if they deserialize attacker-controlled data.\n- **Risk interpretation for Jinja2**\n  - Jinja2’s bytecode cache is intended to read and write cache files that are **local to the application** and not directly influenced by remote users.\n  - Under normal, recommended usage, the cache directory and files are controlled by the application owner, so the immediate risk is limited.\n  - However, if an attacker can write to or replace the cache files (e.g., via a separate vulnerability, misconfigured shared filesystem, or untrusted plugin), these deserialization points could be used to achieve code execution.\n- **Severity:**\n  - In isolation: **medium** (dangerous primitive, but not directly exposed to remote input by design).\n  - In a compromised or multi-tenant environment where cache files are attacker-controlled: **high**.\n- **Recommendations for consumers**\n  - Treat the bytecode cache directory as **trusted-only**; do not share it between tenants or across trust boundaries.\n  - Ensure file permissions prevent untrusted users from writing to Jinja2’s cache files.\n  - If you operate in a highly locked-down environment, consider disabling bytecode caching or placing it on a secure, non-shared filesystem.\n\n---\n\n### 2. Use of dynamic code execution (eval/exec/compile)\n- **Files / locations**\n  - `src/jinja2/debug.py:105–107`\n  - `src/jinja2/debug.py:145`\n  - `src/jinja2/environment.py:709`\n  - `src/jinja2/environment.py:1228`\n- **CodeQL rule:** `py/jinja2/dangerous-eval-usage`\n- **CWE:** CWE-94 (Code Injection)\n- **What was detected**\n  - Multiple uses of Python’s dynamic code execution mechanisms (`eval`, `exec`, `compile`) in the core engine and debugging helpers.\n  - These are expected in a template engine that compiles templates to Python code.\n- **Risk interpretation for Jinja2**\n  - Jinja2 compiles templates to Python code and executes them; this is fundamental to its design.\n  - The dangerous aspect is **not** the presence of `eval/exec/compile` itself, but whether **untrusted template sources** are allowed and whether sandboxing is used.\n  - The CodeQL taint-tracking query for “remote data to eval/exec” did **not** find a direct flow from generic remote sources into these calls within the library code itself. That is, the library does not obviously take raw remote data and pass it straight into `eval/exec` without going through the template compilation pipeline.\n- **Severity:**\n  - As a primitive: **high** if misused.\n  - In Jinja2’s own implementation: **medium** – expected for a template engine, but it means that **any untrusted template content is effectively code**.\n- **Recommendations for consumers**\n  - **Never render untrusted templates without sandboxing.** If templates come from users or other untrusted parties, use `jinja2.sandbox.SandboxedEnvironment` or an equivalent hardened environment.\n  - Treat template authors as code authors: only allow trusted parties to define templates in non-sandboxed environments.\n  - Keep Jinja2 up to date; past vulnerabilities in template engines often involve subtle bypasses of sandboxing or escaping.\n\n---\n\n### 3. No direct remote-to-eval, remote-to-filesystem, or remote-to-command-execution flows found\n- **Queries run**\n  - Remote data → dynamic code execution (`eval/exec` / `CodeExecution` sinks)\n  - Remote data → filesystem path arguments (`FileSystemAccess` sinks)\n  - Remote data → OS / subprocess command execution (os.system, subprocess.*)\n- **CodeQL results**\n  - All of these taint-tracking queries returned **no flows** within the Jinja2 library code.\n- **Interpretation**\n  - Within the boundaries of the library itself, CodeQL did not detect straightforward flows where generic remote input is passed directly into:\n    - `eval` / `exec` / `compile` or other `CodeExecution` sinks,\n    - file path arguments for filesystem operations, or\n    - OS / subprocess command execution APIs.\n  - This does **not** mean applications using Jinja2 are safe by default; it only indicates that the library’s own code does not obviously wire generic remote input directly into these sinks without going through its templating abstractions.\n\n---\n\n## Overall risk assessment\n\n- Jinja2 3.1.6 behaves as expected for a mature template engine:\n  - It uses dynamic code execution and unsafe deserialization primitives internally to implement performance features (bytecode caching) and template compilation.\n  - These primitives are **inherently dangerous** if they are ever exposed to attacker-controlled data.\n- CodeQL analysis did **not** reveal new or unexpected direct dataflow vulnerabilities (e.g., raw remote input directly into `eval` or OS commands) in the library code.\n- The main security posture remains:\n  - **Templates are code.** Treat untrusted templates as untrusted code.\n  - **Cache files must be trusted.** If an attacker can write to Jinja2’s cache, they can likely escalate to code execution via the unsafe deserialization points.\n\n---\n\n## Recommendations\n\n### For library users (application developers)\n1. **Control template sources**\n   - Only load templates from trusted locations by default.\n   - If you must accept user-supplied templates, use `SandboxedEnvironment` and carefully review which filters, tests, and globals are exposed.\n\n2. **Secure bytecode cache storage**\n   - Place the bytecode cache directory on a filesystem where only the application (or trusted administrators) can write.\n   - Avoid sharing the cache directory between tenants or across different trust domains.\n\n3. **Harden the runtime environment**\n   - Run applications using Jinja2 with least privilege (e.g., non-root user, restricted filesystem access).\n   - Consider additional sandboxing (containers, seccomp, etc.) for high-risk multi-tenant scenarios.\n\n### For Jinja2 maintainers\n1. **Document trust assumptions around caches**\n   - Explicitly document that bytecode cache files must be trusted and that tampering with them can lead to code execution.\n\n2. **Optional hardening for deserialization**\n   - Consider offering a configuration option to disable or restrict the use of `pickle` / `marshal` for environments that prefer safety over performance.\n\n3. **Continuous security testing**\n   - Keep running static analysis (like CodeQL) and dynamic tests against new features, especially around sandboxing, filters, and loaders.\n\n---\n\n## Conclusion\n\nWithin the analyzed version (3.1.6), Jinja2’s core security-relevant behavior aligns with expectations for a powerful template engine: it uses dynamic code execution and unsafe deserialization internally, but CodeQL did not reveal new, direct remote-input-to-sink vulnerabilities in the library code itself. The primary risks arise from how applications configure and expose Jinja2 (template trust, sandboxing, and cache file integrity), rather than from an obvious intrinsic flaw in this version of the library.",
+ "package_classification": {
+  "type": "library",
+  "layer": [
+   "application",
+   "templating"
+  ]
+ },
+ "tool_calls": {
+  "get_package_profile_info": 1,
+  "execute_codeql_query": 14,
+  "validate_codeql_query": 0,
+  "fixup_codeql_query": 5,
+  "finalize_report": 1
+ },
+ "queries_executed": {
+  "critical": 1,
+  "high": 6,
+  "medium": 2,
+  "low": 0,
+  "total_executed": 18,
+  "total_with_results": 9,
+  "total_failed": 8
+ },
+ "query_findings": {
+  "critical": 0,
+  "high": 2,
+  "medium": 6,
+  "low": 0,
+  "total": 8
+ },
+ "findings": [
+  {
+   "codeql_query_uuid": "20251213183841",
+   "codeql_raw_query": "/**\n * @name Tainted data flowing into Python eval/exec in Jinja2\n * @description Detects whether untrusted (remote) data can reach eval/exec or similar dynamic code execution in the Jinja2 package.\n * @kind path-problem\n * @problem.severity error\n * @id py/jinja2/remote-to-eval\n * @tags security\n *       external/cwe/cwe-094\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.dataflow.new.RemoteFlowSources\nimport semmle.python.Concepts\n\nmodule Jinja2EvalConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    source instanceof RemoteFlowSource\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(CodeExecution ce |\n      sink = ce.getCode()\n    )\n  }\n}\n\nmodule Jinja2EvalFlow = TaintTracking::Global<Jinja2EvalConfig>;\nimport Jinja2EvalFlow::PathGraph\n\nfrom Jinja2EvalFlow::PathNode source, Jinja2EvalFlow::PathNode sink\nwhere Jinja2EvalFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"User-controlled data reaches dynamic code execution $@.\", source.getNode(), \"user input\"",
+   "hypothesis": "Untrusted data may reach eval/exec or similar dynamic code execution in Jinja2, leading to code injection.",
+   "severity": "critical",
+   "cwe_ids": [
+    "cwe-094"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251213183930",
+   "codeql_raw_query": "/**\n * @name Insecure use of pickle / marshal in Jinja2\n * @description Detects uses of pickle or marshal which may deserialize untrusted data.\n * @kind problem\n * @problem.severity warning\n * @id py/jinja2/insecure-deserialization\n * @tags security\n *       external/cwe/cwe-502\n */\n\nimport python\nimport semmle.python.ApiGraphs\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.RemoteFlowSources\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"pickle\").getMember([\"load\", \"loads\", \"Unpickler\"]).getACall() or\n  call = API::moduleImport(\"marshal\").getMember([\"load\", \"loads\"]).getACall()\nselect call, \"Potentially unsafe deserialization operation that could execute arbitrary code if given untrusted data.\"",
+   "hypothesis": "Jinja2 may use pickle or marshal in a way that could deserialize untrusted data.",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-502"
+   ],
+   "results_count": 2,
+   "results": [
+    {
+     "ruleId": "py/jinja2/insecure-deserialization",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2/insecure-deserialization",
+      "index": 0
+     },
+     "message": {
+      "text": "Potentially unsafe deserialization operation that could execute arbitrary code if given untrusted data."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/bccache.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 73,
+         "startColumn": 20,
+         "endColumn": 34
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "ebf3dcd53e82ba7d:1",
+      "primaryLocationStartColumnFingerprint": "11"
+     }
+    },
+    {
+     "ruleId": "py/jinja2/insecure-deserialization",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2/insecure-deserialization",
+      "index": 0
+     },
+     "message": {
+      "text": "Potentially unsafe deserialization operation that could execute arbitrary code if given untrusted data."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/bccache.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 79,
+         "startColumn": 25,
+         "endColumn": 40
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "4a6ea71f28fee9ee:1",
+      "primaryLocationStartColumnFingerprint": "12"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251213184018",
+   "codeql_raw_query": "/**\n * @name Insecure use of pickle, marshal, or shelve in Jinja2\n * @description Detects uses of unsafe deserialization APIs (pickle, marshal, shelve) inside the Jinja2 package.\n * @kind problem\n * @problem.severity warning\n * @id py/jinja2/insecure-deserialization\n * @tags security\n *       external/cwe/cwe-502\n */\n\nimport python\nimport semmle.python.ApiGraphs\nimport semmle.python.dataflow.new.DataFlow\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"pickle\").getMember([\"load\", \"loads\", \"Unpickler\"]).getACall() or\n  call = API::moduleImport(\"marshal\").getMember([\"load\", \"loads\"]).getACall() or\n  call = API::moduleImport(\"shelve\").getMember(\"open\").getACall()\nselect call, \"Potentially unsafe deserialization operation that could execute arbitrary code if given untrusted data.\"",
+   "hypothesis": "Jinja2 may use pickle/marshal/shelve for bytecode caching or other features, which is unsafe on untrusted data.",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-502"
+   ],
+   "results_count": 2,
+   "results": [
+    {
+     "ruleId": "py/jinja2/insecure-deserialization",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2/insecure-deserialization",
+      "index": 0
+     },
+     "message": {
+      "text": "Potentially unsafe deserialization operation that could execute arbitrary code if given untrusted data."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/bccache.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 73,
+         "startColumn": 20,
+         "endColumn": 34
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "ebf3dcd53e82ba7d:1",
+      "primaryLocationStartColumnFingerprint": "11"
+     }
+    },
+    {
+     "ruleId": "py/jinja2/insecure-deserialization",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2/insecure-deserialization",
+      "index": 0
+     },
+     "message": {
+      "text": "Potentially unsafe deserialization operation that could execute arbitrary code if given untrusted data."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/bccache.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 79,
+         "startColumn": 25,
+         "endColumn": 40
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "4a6ea71f28fee9ee:1",
+      "primaryLocationStartColumnFingerprint": "12"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251213184034",
+   "codeql_raw_query": "/**\n * @name Tainted data flowing into file system access in Jinja2\n * @description Detects whether untrusted (remote) data can reach file system path operations in the Jinja2 package.\n * @kind path-problem\n * @problem.severity error\n * @id py/jinja2/remote-to-filesystem\n * @tags security\n *       external/cwe/cwe-022\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.dataflow.new.RemoteFlowSources\nimport semmle.python.Concepts\n\nmodule Jinja2FsConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    source instanceof RemoteFlowSource\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(FileSystemAccess fa |\n      sink = fa.getAPathArgument()\n    )\n  }\n}\n\nmodule Jinja2FsFlow = TaintTracking::Global<Jinja2FsConfig>;\nimport Jinja2FsFlow::PathGraph\n\nfrom Jinja2FsFlow::PathNode source, Jinja2FsFlow::PathNode sink\nwhere Jinja2FsFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"User-controlled data reaches file system access $@.\", source.getNode(), \"user input\"",
+   "hypothesis": "Untrusted template names or paths may reach file system operations in Jinja2 loaders, leading to path traversal if not properly constrained.",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-022"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251213184119",
+   "codeql_raw_query": "/**\n * @name Insecure file system access in Jinja2 loaders\n * @description Detects use of untrusted template names flowing into file system path operations in Jinja2 loaders.\n * @kind path-problem\n * @problem.severity error\n * @id py/jinja2/untrusted-template-path\n * @tags security\n *       external/cwe/cwe-022\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.dataflow.new.RemoteFlowSources\nimport semmle.python.Concepts\n\nclass FileSystemAccess extends DataFlow::Node {\n  FileSystemAccess() { this instanceof DataFlow::Node }\n}\n\nmodule TemplatePathConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    source instanceof RemoteFlowSource\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(FileSystemAccess fa |\n      sink = fa\n    )\n  }\n}\n\nmodule TemplatePathFlow = TaintTracking::Global<TemplatePathConfig>;\nimport TemplatePathFlow::PathGraph\n\nfrom TemplatePathFlow::PathNode source, TemplatePathFlow::PathNode sink\nwhere TemplatePathFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"User-controlled data reaches file system path operations $@.\", source.getNode(), \"user input\"",
+   "hypothesis": "Untrusted template names may reach file system path operations in loaders, leading to path traversal (CWE-22).",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-022"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251213184149",
+   "codeql_raw_query": "/**\n * @name Dangerous use of eval/exec-like APIs in Jinja2\n * @description Flags direct uses of eval, exec, compile, or execfile in the Jinja2 codebase.\n * @kind problem\n * @problem.severity warning\n * @id py/jinja2/dangerous-eval-usage\n * @tags security\n *       external/cwe/cwe-094\n */\n\nimport python\nimport semmle.python.ApiGraphs\nimport semmle.python.dataflow.new.DataFlow\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::builtin(\"eval\").getACall() or\n  call = API::builtin(\"exec\").getACall() or\n  call = API::builtin(\"compile\").getACall()\nselect call, \"Use of dynamic code execution (eval/exec/compile) which can be dangerous if given untrusted input.\"",
+   "hypothesis": "Jinja2 may use Python eval/exec/compile directly, which is risky if ever exposed to untrusted data.",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-094"
+   ],
+   "results_count": 4,
+   "results": [
+    {
+     "ruleId": "py/jinja2/dangerous-eval-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2/dangerous-eval-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of dynamic code execution (eval/exec/compile) which can be dangerous if given untrusted input."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/debug.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 145,
+         "startColumn": 9,
+         "endColumn": 36
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "799c068da957600:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/jinja2/dangerous-eval-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2/dangerous-eval-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of dynamic code execution (eval/exec/compile) which can be dangerous if given untrusted input."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/debug.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 105,
+         "startColumn": 22,
+         "endLine": 107,
+         "endColumn": 6
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "16573e133a7c4168:1",
+      "primaryLocationStartColumnFingerprint": "17"
+     }
+    },
+    {
+     "ruleId": "py/jinja2/dangerous-eval-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2/dangerous-eval-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of dynamic code execution (eval/exec/compile) which can be dangerous if given untrusted input."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/environment.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 709,
+         "startColumn": 16,
+         "endColumn": 49
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "b67c41110e7ef1d7:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/jinja2/dangerous-eval-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2/dangerous-eval-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of dynamic code execution (eval/exec/compile) which can be dangerous if given untrusted input."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/environment.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 1228,
+         "startColumn": 9,
+         "endColumn": 30
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "f77517f1e751fe3c:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251213184219",
+   "codeql_raw_query": "/**\n * @name Tainted data flowing into file system access in Jinja2\n * @description Detects whether untrusted (remote) data can reach file path arguments in Jinja2, which could indicate directory traversal or arbitrary file access.\n * @kind path-problem\n * @problem.severity error\n * @id py/jinja2/remote-to-filesystem\n * @tags security\n *       external/cwe/cwe-022\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.dataflow.new.RemoteFlowSources\nimport semmle.python.Concepts\n\nmodule Jinja2FsConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    source instanceof RemoteFlowSource\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(FileSystemAccess fa |\n      sink = fa.getAPathArgument()\n    )\n  }\n}\n\nmodule Jinja2FsFlow = TaintTracking::Global<Jinja2FsConfig>;\nimport Jinja2FsFlow::PathGraph\n\nfrom Jinja2FsFlow::PathNode source, Jinja2FsFlow::PathNode sink\nwhere Jinja2FsFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"User-controlled data reaches a file system path $@.\", source.getNode(), \"user input\"",
+   "hypothesis": "Remote user input may reach file system APIs in Jinja2 (e.g., template loaders), enabling path traversal or arbitrary file read/write.",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-022"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251213184341",
+   "codeql_raw_query": "/**\n * @name Insecure file loading in Jinja2 loaders\n * @description Detects use of unvalidated file paths in Jinja2 loader implementations that may lead to directory traversal.\n * @kind path-problem\n * @problem.severity error\n * @id py/jinja2/loader-path-traversal\n * @tags security\n *       external/cwe/cwe-022\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.dataflow.new.RemoteFlowSources\nimport semmle.python.Concepts\n\nclass FileSystemAccess extends DataFlow::Node {\n  FileSystemAccess() { this.asExpr() instanceof Expr }\n}\n\nmodule LoaderPathConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    source instanceof RemoteFlowSource\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(FileSystemAccess fa |\n      sink = fa\n    )\n  }\n}\n\nmodule LoaderPathFlow = TaintTracking::Global<LoaderPathConfig>;\nimport LoaderPathFlow::PathGraph\n\nfrom LoaderPathFlow::PathNode source, LoaderPathFlow::PathNode sink\nwhere LoaderPathFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"User-controlled data reaches file system access in loaders $@.\", source.getNode(), \"user input\"",
+   "hypothesis": "Remote input reaching filesystem paths in loaders",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-22"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251213184500",
+   "codeql_raw_query": "/**\n * @name Tainted data flowing into file system operations in Jinja2\n * @description Detects whether untrusted (remote) data can reach file system path arguments in the Jinja2 package.\n * @kind path-problem\n * @problem.severity error\n * @id py/jinja2/remote-to-filesystem\n * @tags security\n *       external/cwe/cwe-022\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.dataflow.new.RemoteFlowSources\nimport semmle.python.Concepts\n\nmodule Jinja2FsConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    source instanceof RemoteFlowSource\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(FileSystemAccess fa |\n      sink = fa.getAPathArgument()\n    )\n  }\n}\n\nmodule Jinja2FsFlow = TaintTracking::Global<Jinja2FsConfig>;\nimport Jinja2FsFlow::PathGraph\n\nfrom Jinja2FsFlow::PathNode source, Jinja2FsFlow::PathNode sink\nwhere Jinja2FsFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"User-controlled data reaches a file system path argument $@.\", source.getNode(), \"user input\"",
+   "hypothesis": "Remote user input can reach filesystem path operations in Jinja2, leading to path traversal or arbitrary file access.",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-022"
+   ],
+   "results_count": 0,
+   "results": []
+  }
+ ]
+}

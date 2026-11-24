@@ -1,0 +1,4530 @@
+{
+ "session_id": "20261119012040",
+ "package_name": "aiohttp-3.9.1",
+ "package_path": "packages/aiohttp-3.9.1",
+ "database_path": "databases/aiohttp-3.9.1-db",
+ "model": "deepseek/deepseek-reasoner",
+ "temperature": 0.0,
+ "max_tokens": 8000,
+ "iterations": 19,
+ "total_input_tokens": 226785,
+ "total_output_tokens": 52630,
+ "total_tokens": 279415,
+ "elapsed_time_seconds": 795.24,
+ "estimated_cost_usd": 0.0856,
+ "summary": "## Security Analysis — aiohttp 3.9.1\n\n**Package:** `aiohttp` 3.9.1 — async HTTP client/server framework (45 files, ~15.7k LOC). CodeQL analysis focused on the server-side request handling paths, static file serving, cookie persistence, header handling and HTML generation.\n\n### Finding 1 — Directory traversal in `StaticResource._handle` (HIGH, CWE-22)\n`aiohttp/web_urldispatcher.py`, `StaticResource._handle` (lines ~656–690).\n\nConfirmed request-controlled data flow:\n- L657 `filename = request.match_info[\"filename\"]` (attacker-controlled URL path segment, captured by the `{filename:.*}` route regex)\n- L659 `filepath = <directory> / filename` — a `Path` object is constructed directly from the request value **without normalization** (`Path()` sink reported at L659 with flow from the `match_info` read at L657)\n- L665 `resolve()` is only reached on the `follow_symlinks=True` branch; L666–667 `relative_to(...)` is the containment check.\n\nBecause the containment test is performed lexically (`Path.relative_to`) on a non-normalized path, `..` sequences survive and a value such as `../../etc/passwd` still satisfies the prefix relationship against the root directory, letting the resolved file escape `self._directory` when `follow_symlinks=False` (the default for `app.router.add_static(...)`). This is the well-known defect fixed in aiohttp 3.9.2 (GHSA-5h86-8mv2-jq9f / CVE-2024-23334); the patch resolves/normalizes the path before the containment check. Impact: unauthenticated arbitrary file read of files readable by the server process. Mitigation: upgrade to ≥ 3.9.2 (ideally ≥ 3.10.x), or keep static roots free of symlinks/`..`-reachable parents.\n\n### Finding 2 — Unsafe deserialization in `CookieJar.load` (MEDIUM, CWE-502)\n`aiohttp/cookiejar.py` L114 — `pickle.load(...)` is used to restore a persisted cookie jar from a caller-supplied path. Pickle deserialization of attacker-influenceable file content leads to arbitrary code execution. Threat model requires an attacker to control the cookie file (local file write, shared/upload directory, or a config-controllable path), so severity is bounded but the primitive is arbitrary code execution. Recommendations: use a non-executable serialization format (e.g. the `c_1` JSON/delimited format already implemented for new jars, or `json`) and reject pickle-based payloads.\n\n### Finding 3 — HTML generation in `DirectoryResource` index page (MEDIUM, CWE-79)\n`aiohttp/web_urldispatcher.py` directory-index construction (L~451–516) interleaves `format()` calls with `html.escape()` at L466 and L485. Multiple concatenated `format()`/`write()` sinks assemble the listing HTML; entry names derived from the filesystem/URL are only escaped in some of the template slots. This matches the known reflected-XSS class in the static directory listing (CVE-2024-27306, fixed in 3.9.4): with `add_static(..., show_index=True)`, a crafted URL/filename can be reflected into the listing page unescaped. Recommendation: upgrade to ≥ 3.9.4 and/or escape every interpolated value via `html.escape()`.\n\n### Areas reviewed without confirmed exploitable flow\n- `web_response.py` L259–266 and L442: response header write paths (`CIMultiDict` mutation / `ifilename` handling) — no verified attacker-controlled header-injection chain (CVE-2024-23829-length header leniency in `http_parser.py` was not provably reachable through data flow within budget).\n- `web_fileresponse.py` L132/139/276 (`name`, `stat`, `open`) — file selection is driven by server-side arguments, not request data.\n- Multipart/form-data parsing (`multipart.py`) DoS surface (CVE-2024-30251) noted but not queried.\n\n### Bottom line\naiohttp 3.9.1 carries at least one high-impact, remotely reachable vulnerability (unauthenticated directory traversal / arbitrary file read in the default static-file handler) plus a code-execution-capable pickle load and an unescaped directory-listing XSS. Upgrade to the latest 3.10/3.11 line (≥ 3.9.4 minimum, ≥ 3.9.2 for the traversal, and prefer a release also covering CVE-2024-30251).",
+ "package_classification": {
+  "type": [
+   "library",
+   "framework"
+  ],
+  "layer": [
+   "network",
+   "application",
+   "http_server",
+   "http_client"
+  ]
+ },
+ "tool_calls": {
+  "get_package_profile_info": 1,
+  "execute_codeql_query": 27,
+  "validate_codeql_query": 0,
+  "fixup_codeql_query": 1,
+  "finalize_report": 1
+ },
+ "queries_executed": {
+  "critical": 0,
+  "high": 11,
+  "medium": 4,
+  "low": 0,
+  "total_executed": 27,
+  "total_with_results": 15,
+  "total_failed": 14
+ },
+ "query_findings": {
+  "critical": 0,
+  "high": 120,
+  "medium": 12,
+  "low": 0,
+  "total": 132
+ },
+ "findings": [
+  {
+   "codeql_query_uuid": "20261119012128",
+   "codeql_raw_query": "/**\n * @name Unsafe deserialization\n * @description Deserializing untrusted data can lead to arbitrary code execution\n * @kind problem\n * @problem.severity error\n * @id py/aiohttp-unsafe-deser\n * @tags security\n *        external/cwe/cwe-502\n */\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode c\nwhere\n  c = API::moduleImport(\"pickle\").getMember([\"load\", \"loads\", \"Unpickler\"]).getACall() or\n  c = API::moduleImport(\"yaml\").getMember([\"load\", \"unsafe_load\", \"full_load\"]).getACall() or\n  c = API::moduleImport(\"marshal\").getMember([\"load\", \"loads\"]).getACall()\nselect c, \"Unsafe deserialization call\"",
+   "hypothesis": "Package may deserialize untrusted input with pickle/yaml/marshal",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-502"
+   ],
+   "results_count": 1,
+   "results": [
+    {
+     "ruleId": "py/aiohttp-unsafe-deser",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-unsafe-deser",
+      "index": 0
+     },
+     "message": {
+      "text": "Unsafe deserialization call"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/cookiejar.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 114,
+         "startColumn": 29,
+         "endColumn": 43
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "6963aaae75a5c2c5:1",
+      "primaryLocationStartColumnFingerprint": "16"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20261119012503",
+   "codeql_raw_query": "/**\n * @name Map static file handler attribute usages\n * @description Lists attribute usages in the static file response handler\n * @kind problem\n * @problem.severity note\n * @id py/aiohttp-fileresponse-map\n * @tags security\n */\n\nimport python\n\nfrom Attribute attr\nwhere\n  attr.getLocation().getFile().getBaseName() = \"web_fileresponse.py\" and\n  attr.getAttr() in [\"resolve\", \"relative_to\", \"is_relative_to\", \"joinpath\", \"open\",\n                     \"iterdir\", \"escape\", \"format\", \"name\", \"is_symlink\", \"stat\", \"encode\"]\nselect attr, \"attr: \" + attr.getAttr() + \" (line \" + attr.getLocation().getStartLine().toString() + \")\"",
+   "hypothesis": "Map the directory-containment / path resolution logic in the static file handler (CVE-2024-23334 path traversal)",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-022"
+   ],
+   "results_count": 4,
+   "results": [
+    {
+     "ruleId": "py/aiohttp-fileresponse-map",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-fileresponse-map",
+      "index": 0
+     },
+     "message": {
+      "text": "attr: name (line 132)"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_fileresponse.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 132,
+         "startColumn": 44,
+         "endColumn": 57
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "67c165bd3aa33453:1",
+      "primaryLocationStartColumnFingerprint": "31"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-fileresponse-map",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-fileresponse-map",
+      "index": 0
+     },
+     "message": {
+      "text": "attr: stat (line 139)"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_fileresponse.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 139,
+         "startColumn": 63,
+         "endColumn": 76
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "419b83b0e19cad5d:1",
+      "primaryLocationStartColumnFingerprint": "54"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-fileresponse-map",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-fileresponse-map",
+      "index": 0
+     },
+     "message": {
+      "text": "attr: format (line 268)"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_fileresponse.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 268,
+         "startColumn": 48,
+         "endColumn": 71
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "42f7d121f6a1fbb4:1",
+      "primaryLocationStartColumnFingerprint": "35"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-fileresponse-map",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-fileresponse-map",
+      "index": 0
+     },
+     "message": {
+      "text": "attr: open (line 276)"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_fileresponse.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 276,
+         "startColumn": 49,
+         "endColumn": 62
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "206df4315c0682b0:1",
+      "primaryLocationStartColumnFingerprint": "40"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20261119012520",
+   "codeql_raw_query": "/**\n * @name HTML escaping usage in file response handler\n * @description Checks whether file names are HTML-escaped when building directory listings\n * @kind problem\n * @problem.severity warning\n * @id py/aiohttp-fileresponse-escape\n * @tags security\n *        external/cwe/cwe-079\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call.getLocation().getFile().getBaseName() = \"web_fileresponse.py\" and\n  (\n    call = API::moduleImport(\"html\").getMember(\"escape\").getACall() or\n    call = API::moduleImport(\"html\").getMember(\"quote\").getACall()\n  )\nselect call, \"HTML escaping applied to directory listing entries\"",
+   "hypothesis": "Directory listing in static file handler fails to HTML-escape file names, leading to XSS (CVE-2024-27306)",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-079"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20261119012605",
+   "codeql_raw_query": "/**\n * @name Unsafe path sink calls\n * @description Finds calls to os-level file helpers reached in the static handler\n * @kind problem\n * @problem.severity note\n * @id py/aiohttp-pathlib-sinks\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"pathlib\").getMember(\"Path\").getACall() and\n  call.getLocation().getFile().getRelativePath().matches(\"%web_urldispatcher.py\")\nselect call, \"Path() constructed from \" + call.getArg(0).toString()",
+   "hypothesis": "Path() constructed from request data in static handler",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-022"
+   ],
+   "results_count": 3,
+   "results": [
+    {
+     "ruleId": "py/aiohttp-pathlib-sinks",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-pathlib-sinks",
+      "index": 0
+     },
+     "message": {
+      "text": "Path() constructed from ControlFlowNode for directory"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 556,
+         "startColumn": 25,
+         "endColumn": 40
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "6f57616d62952e76:1",
+      "primaryLocationStartColumnFingerprint": "12"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-pathlib-sinks",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-pathlib-sinks",
+      "index": 0
+     },
+     "message": {
+      "text": "Path() constructed from ControlFlowNode for Attribute()"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 558,
+         "startColumn": 29,
+         "endColumn": 69
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "4725783fc191fb56:1",
+      "primaryLocationStartColumnFingerprint": "12"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-pathlib-sinks",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-pathlib-sinks",
+      "index": 0
+     },
+     "message": {
+      "text": "Path() constructed from ControlFlowNode for rel_url"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 659,
+         "startColumn": 24,
+         "endColumn": 37
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "908de6efc96a44cf:1",
+      "primaryLocationStartColumnFingerprint": "11"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20261119012642",
+   "codeql_raw_query": "/**\n * @name Directory index HTML generation in web_urldispatcher\n * @description Lists calls and string constructions used while building the directory index page\n * @kind problem\n * @problem.severity warning\n * @id py/aiohttp-dirindex\n * @tags security\n *        external/cwe/cwe-079\n */\n\nimport python\n\nfrom Call call, Attribute f\nwhere\n  call.getLocation().getFile().getBaseName() = \"web_urldispatcher.py\" and\n  call.getFunc() = f and\n  f.getAttr() in [\"write\", \"escape\", \"format\", \"join\", \"decode\", \"encode\", \"quote\"]\nselect call, \"call to \" + f.getAttr() + \"() while building index response\"\n",
+   "hypothesis": "XSS in static directory index page (CVE-2024-27306) - filenames inserted into HTML without escaping",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-079"
+   ],
+   "results_count": 21,
+   "results": [
+    {
+     "ruleId": "py/aiohttp-dirindex",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-dirindex",
+      "index": 0
+     },
+     "message": {
+      "text": "call to escape() while building index response"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 87,
+         "startColumn": 24,
+         "endColumn": 38
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "5b3ed06c92170045:1",
+      "primaryLocationStartColumnFingerprint": "23"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-dirindex",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-dirindex",
+      "index": 0
+     },
+     "message": {
+      "text": "call to format() while building index response"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 290,
+         "startColumn": 21,
+         "endLine": 292,
+         "endColumn": 22
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "a79dd37a00b55201:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-dirindex",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-dirindex",
+      "index": 0
+     },
+     "message": {
+      "text": "call to format() while building index response"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 318,
+         "startColumn": 16,
+         "endLine": 320,
+         "endColumn": 10
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "441a390ee70eb9e0:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-dirindex",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-dirindex",
+      "index": 0
+     },
+     "message": {
+      "text": "call to write() while building index response"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 332,
+         "startColumn": 19,
+         "endColumn": 73
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "5d437bd51bc0fd7d:1",
+      "primaryLocationStartColumnFingerprint": "6"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-dirindex",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-dirindex",
+      "index": 0
+     },
+     "message": {
+      "text": "call to format() while building index response"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 353,
+         "startColumn": 21,
+         "endLine": 355,
+         "endColumn": 57
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "b59c68db22efcdea:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-dirindex",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-dirindex",
+      "index": 0
+     },
+     "message": {
+      "text": "call to format() while building index response"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 451,
+         "startColumn": 28,
+         "endColumn": 78
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "1023fa494a98aa6b:1",
+      "primaryLocationStartColumnFingerprint": "11"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-dirindex",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-dirindex",
+      "index": 0
+     },
+     "message": {
+      "text": "call to format() while building index response"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 457,
+         "startColumn": 28,
+         "endColumn": 73
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "584eb732b68aec01:1",
+      "primaryLocationStartColumnFingerprint": "11"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-dirindex",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-dirindex",
+      "index": 0
+     },
+     "message": {
+      "text": "call to escape() while building index response"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 466,
+         "startColumn": 24,
+         "endColumn": 39
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "9c572c52605f29dd:1",
+      "primaryLocationStartColumnFingerprint": "11"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-dirindex",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-dirindex",
+      "index": 0
+     },
+     "message": {
+      "text": "call to escape() while building index response"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 485,
+         "startColumn": 36,
+         "endColumn": 53
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "876a6db07d7cdb75:1",
+      "primaryLocationStartColumnFingerprint": "27"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-dirindex",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-dirindex",
+      "index": 0
+     },
+     "message": {
+      "text": "call to format() while building index response"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 509,
+         "startColumn": 16,
+         "endLine": 511,
+         "endColumn": 10
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "90cef2d42d19e6c:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-dirindex",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-dirindex",
+      "index": 0
+     },
+     "message": {
+      "text": "call to decode() while building index response"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 621,
+         "startColumn": 16,
+         "endColumn": 35
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "bc73f9cd265a20e5:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-dirindex",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-dirindex",
+      "index": 0
+     },
+     "message": {
+      "text": "call to format() while building index response"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 718,
+         "startColumn": 17,
+         "endLine": 720,
+         "endColumn": 18
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "c43a32e042eed749:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-dirindex",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-dirindex",
+      "index": 0
+     },
+     "message": {
+      "text": "call to format() while building index response"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 722,
+         "startColumn": 14,
+         "endColumn": 61
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "a30760013403a918:1",
+      "primaryLocationStartColumnFingerprint": "5"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-dirindex",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-dirindex",
+      "index": 0
+     },
+     "message": {
+      "text": "call to join() while building index response"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 722,
+         "startColumn": 39,
+         "endColumn": 60
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "a30760013403a918:1",
+      "primaryLocationStartColumnFingerprint": "30"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-dirindex",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-dirindex",
+      "index": 0
+     },
+     "message": {
+      "text": "call to format() while building index response"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 732,
+         "startColumn": 16,
+         "endLine": 734,
+         "endColumn": 10
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "74d55cbcf58ed8a4:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-dirindex",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-dirindex",
+      "index": 0
+     },
+     "message": {
+      "text": "call to format() while building index response"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 776,
+         "startColumn": 16,
+         "endLine": 778,
+         "endColumn": 10
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "8395a705c593c14c:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-dirindex",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-dirindex",
+      "index": 0
+     },
+     "message": {
+      "text": "call to format() while building index response"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 878,
+         "startColumn": 16,
+         "endColumn": 77
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "4171997214e9d5cb:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-dirindex",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-dirindex",
+      "index": 0
+     },
+     "message": {
+      "text": "call to format() while building index response"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 897,
+         "startColumn": 16,
+         "endLine": 899,
+         "endColumn": 10
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "2530aa6d67088db7:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-dirindex",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-dirindex",
+      "index": 0
+     },
+     "message": {
+      "text": "call to format() while building index response"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 944,
+         "startColumn": 16,
+         "endColumn": 78
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "22a7cc59bb83feea:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-dirindex",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-dirindex",
+      "index": 0
+     },
+     "message": {
+      "text": "call to format() while building index response"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 1064,
+         "startColumn": 25,
+         "endLine": 1067,
+         "endColumn": 62
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "80909213591908ad:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-dirindex",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-dirindex",
+      "index": 0
+     },
+     "message": {
+      "text": "call to format() while building index response"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 1071,
+         "startColumn": 21,
+         "endLine": 1072,
+         "endColumn": 88
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "f155765d05eee0a2:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20261119012733",
+   "codeql_raw_query": "/**\n * @name Path traversal from aiohttp request match_info to file operations\n * @description Request-controlled URL path segments flowing into Path construction / file open\n *              in the static resource handler may allow escape from the served directory.\n * @kind path-problem\n * @problem.severity error\n * @id py/aiohttp-static-path-traversal\n * @tags security\n *        external/cwe/cwe-022\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\n\nmodule Cfg implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node s) {\n    exists(Subscript sub, Attribute a |\n      a.getAttr() = \"match_info\" and\n      sub.getObject() = a and\n      s.asExpr() = sub\n    )\n    or\n    exists(Attribute a |\n      a.getAttr() = \"match_info\" and\n      s.asExpr() = a\n    )\n  }\n\n  predicate isSink(DataFlow::Node s) {\n    exists(Call c | s.asExpr() = c.getAnArg() |\n      c.getFunc().(Attribute).getAttr() in [\"open\", \"sendfile\", \"stat\", \"read_bytes\", \"read_text\", \"exists\", \"is_file\"]\n      or c.getFunc().(Name).getId() = \"open\"\n    )\n    or\n    exists(Call c |\n      c.getFunc().(Name).getId() = \"Path\" and\n      s.asExpr() = c.getAnArg()\n    )\n  }\n}\n\nmodule Flow = TaintTracking::Global<Cfg>;\nimport Flow::PathGraph\n\nfrom Flow::PathNode src, Flow::PathNode snk\nwhere Flow::flowPath(src, snk)\nselect snk.getNode(), src, snk, \"Request-controlled path data reaches a filesystem operation.\"",
+   "hypothesis": "CVE-2024-23334: path traversal in aiohttp StaticResource — request match_info filename flows into filesystem path resolution/opening without directory containment validation.",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-022"
+   ],
+   "results_count": 1,
+   "results": [
+    {
+     "ruleId": "py/aiohttp-static-path-traversal",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-static-path-traversal",
+      "index": 0
+     },
+     "message": {
+      "text": "Request-controlled path data reaches a filesystem operation.\nRequest-controlled path data reaches a filesystem operation."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 659,
+         "startColumn": 29,
+         "endColumn": 36
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "908de6efc96a44cf:1",
+      "primaryLocationStartColumnFingerprint": "16"
+     },
+     "codeFlows": [
+      {
+       "threadFlows": [
+        {
+         "locations": [
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "aiohttp/web_urldispatcher.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 657,
+              "startColumn": 19,
+              "endColumn": 37
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for Attribute"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "aiohttp/web_urldispatcher.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 657,
+              "startColumn": 9,
+              "endColumn": 16
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for rel_url"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "aiohttp/web_urldispatcher.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 659,
+              "startColumn": 29,
+              "endColumn": 36
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for rel_url"
+            }
+           }
+          }
+         ]
+        }
+       ]
+      },
+      {
+       "threadFlows": [
+        {
+         "locations": [
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "aiohttp/web_urldispatcher.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 657,
+              "startColumn": 19,
+              "endColumn": 49
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for Subscript"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "aiohttp/web_urldispatcher.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 657,
+              "startColumn": 9,
+              "endColumn": 16
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for rel_url"
+            }
+           }
+          },
+          {
+           "location": {
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "aiohttp/web_urldispatcher.py",
+              "uriBaseId": "%SRCROOT%",
+              "index": 0
+             },
+             "region": {
+              "startLine": 659,
+              "startColumn": 29,
+              "endColumn": 36
+             }
+            },
+            "message": {
+             "text": "ControlFlowNode for rel_url"
+            }
+           }
+          }
+         ]
+        }
+       ]
+      }
+     ],
+     "relatedLocations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 657,
+         "startColumn": 19,
+         "endColumn": 37
+        }
+       }
+      },
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 657,
+         "startColumn": 19,
+         "endColumn": 49
+        }
+       }
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20261119012804",
+   "codeql_raw_query": "/**\n * @name Directory containment checks present in package\n * @description Looks for is_relative_to / relative_to / commonpath / startswith containment\n *              checks which would mitigate path traversal, plus Path.resolve calls\n * @kind problem\n * @problem.severity note\n * @id py/aiohttp-containment-checks\n * @tags security\n *        external/cwe/cwe-022\n */\n\nimport python\n\nfrom Call c\nwhere\n  c.getLocation().getFile().getBaseName() in [\"web_urldispatcher.py\", \"web_fileresponse.py\"]\n  and\n  (\n    c.getFunc().(Attribute).getAttr() in [\"is_relative_to\", \"relative_to\", \"commonpath\", \"resolve\", \"normpath\", \"absolute\"]\n    or c.getFunc().(Name).getId() in [\"commonpath\", \"normpath\", \"abspath\", \"realpath\"]\n  )\nselect c, \"containment/resolution op: \" + c.getFunc().toString() + \" (line \" + c.getLocation().getStartLine().toString() + \")\"",
+   "hypothesis": "Determine whether aiohttp 3.9.1 performs directory containment validation (is_relative_to/commonpath) before serving files, i.e. whether CVE-2024-23334 is present.",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-022"
+   ],
+   "results_count": 10,
+   "results": [
+    {
+     "ruleId": "py/aiohttp-containment-checks",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-containment-checks",
+      "index": 0
+     },
+     "message": {
+      "text": "containment/resolution op: Attribute (line 559)"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 559,
+         "startColumn": 25,
+         "endColumn": 44
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "41a5c07e1495aac2:1",
+      "primaryLocationStartColumnFingerprint": "12"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-containment-checks",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-containment-checks",
+      "index": 0
+     },
+     "message": {
+      "text": "containment/resolution op: Attribute (line 599)"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 599,
+         "startColumn": 28,
+         "endColumn": 72
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "a215b9a529b8a27d:1",
+      "primaryLocationStartColumnFingerprint": "11"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-containment-checks",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-containment-checks",
+      "index": 0
+     },
+     "message": {
+      "text": "containment/resolution op: Attribute (line 601)"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 601,
+         "startColumn": 21,
+         "endColumn": 58
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "eaef88bd13ab956c:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-containment-checks",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-containment-checks",
+      "index": 0
+     },
+     "message": {
+      "text": "containment/resolution op: Attribute (line 665)"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 665,
+         "startColumn": 24,
+         "endColumn": 68
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "a215b9a529b8a27d:2",
+      "primaryLocationStartColumnFingerprint": "11"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-containment-checks",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-containment-checks",
+      "index": 0
+     },
+     "message": {
+      "text": "containment/resolution op: Attribute (line 667)"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 667,
+         "startColumn": 17,
+         "endColumn": 54
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "2e4bba3362ac6a89:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-containment-checks",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-containment-checks",
+      "index": 0
+     },
+     "message": {
+      "text": "containment/resolution op: Attribute (line 700)"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 700,
+         "startColumn": 32,
+         "endColumn": 69
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "14e9398eb634b085:1",
+      "primaryLocationStartColumnFingerprint": "23"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-containment-checks",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-containment-checks",
+      "index": 0
+     },
+     "message": {
+      "text": "containment/resolution op: Attribute (line 708)"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 708,
+         "startColumn": 24,
+         "endColumn": 58
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "587d05d69d7287b1:1",
+      "primaryLocationStartColumnFingerprint": "11"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-containment-checks",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-containment-checks",
+      "index": 0
+     },
+     "message": {
+      "text": "containment/resolution op: Attribute (line 761)"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 761,
+         "startColumn": 28,
+         "endColumn": 61
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "8a4c5de5f34213d3:1",
+      "primaryLocationStartColumnFingerprint": "19"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-containment-checks",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-containment-checks",
+      "index": 0
+     },
+     "message": {
+      "text": "containment/resolution op: Attribute (line 869)"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 869,
+         "startColumn": 28,
+         "endColumn": 61
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "8a4c5de5f34213d3:2",
+      "primaryLocationStartColumnFingerprint": "19"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-containment-checks",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-containment-checks",
+      "index": 0
+     },
+     "message": {
+      "text": "containment/resolution op: Attribute (line 1012)"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 1012,
+         "startColumn": 41,
+         "endColumn": 66
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "1863f8e96af96b0c:1",
+      "primaryLocationStartColumnFingerprint": "28"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20261119012903",
+   "codeql_raw_query": "/**\n * @name startswith containment checks in aiohttp\n * @description Finds startswith-based path containment checks which are vulnerable to prefix confusion\n * @kind problem\n * @problem.severity error\n * @id py/aiohttp-startswith-contain\n * @tags security\n *        external/cwe/cwe-022\n */\n\nimport python\n\nfrom Call call, Attribute attr\nwhere\n  call.getFunc() = attr and\n  attr.getAttr() = \"startswith\" and\n  call.getLocation().getFile().getBaseName() = [\"web_urldispatcher.py\", \"web_fileresponse.py\", \"helpers.py\", \"web_request.py\", \"web.py\", \"web_urldispatcher.py\"]\nselect call, \"startswith() used as containment check at \" + call.getLocation().getFile().getBaseName() + \":\" + call.getLocation().getStartLine().toString()",
+   "hypothesis": "Prefix-based containment validation of filesystem paths in static file serving code",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-022"
+   ],
+   "results_count": 14,
+   "results": [
+    {
+     "ruleId": "py/aiohttp-startswith-contain",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-startswith-contain",
+      "index": 0
+     },
+     "message": {
+      "text": "startswith() used as containment check at web.py:591"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 591,
+         "startColumn": 8,
+         "endColumn": 31
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "9fea19d0fd955763:1",
+      "primaryLocationStartColumnFingerprint": "3"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-startswith-contain",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-startswith-contain",
+      "index": 0
+     },
+     "message": {
+      "text": "startswith() used as containment check at web_request.py:756"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_request.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 756,
+         "startColumn": 48,
+         "endColumn": 76
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "bd02f73e3078b0b0:1",
+      "primaryLocationStartColumnFingerprint": "23"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-startswith-contain",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-startswith-contain",
+      "index": 0
+     },
+     "message": {
+      "text": "startswith() used as containment check at web_urldispatcher.py:400"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 400,
+         "startColumn": 28,
+         "endColumn": 48
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "f1e773ab57d7a521:1",
+      "primaryLocationStartColumnFingerprint": "19"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-startswith-contain",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-startswith-contain",
+      "index": 0
+     },
+     "message": {
+      "text": "startswith() used as containment check at web_urldispatcher.py:412"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 412,
+         "startColumn": 16,
+         "endColumn": 38
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "f61ee82d7a8f55cf:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-startswith-contain",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-startswith-contain",
+      "index": 0
+     },
+     "message": {
+      "text": "startswith() used as containment check at web_urldispatcher.py:472"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 472,
+         "startColumn": 16,
+         "endColumn": 53
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "8bdbd73672644f58:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-startswith-contain",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-startswith-contain",
+      "index": 0
+     },
+     "message": {
+      "text": "startswith() used as containment check at web_urldispatcher.py:473"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 473,
+         "startColumn": 16,
+         "endColumn": 41
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "6fee7131bea457dd:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-startswith-contain",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-startswith-contain",
+      "index": 0
+     },
+     "message": {
+      "text": "startswith() used as containment check at web_urldispatcher.py:482"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 482,
+         "startColumn": 16,
+         "endColumn": 38
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "166c3143dd23b19f:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-startswith-contain",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-startswith-contain",
+      "index": 0
+     },
+     "message": {
+      "text": "startswith() used as containment check at web_urldispatcher.py:516"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 516,
+         "startColumn": 30,
+         "endColumn": 52
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "d3df4ae4a3b89e78:1",
+      "primaryLocationStartColumnFingerprint": "21"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-startswith-contain",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-startswith-contain",
+      "index": 0
+     },
+     "message": {
+      "text": "startswith() used as containment check at web_urldispatcher.py:527"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 527,
+         "startColumn": 16,
+         "endColumn": 38
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "11366e6107984297:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-startswith-contain",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-startswith-contain",
+      "index": 0
+     },
+     "message": {
+      "text": "startswith() used as containment check at web_urldispatcher.py:557"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 557,
+         "startColumn": 16,
+         "endColumn": 46
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "7656f6fbd4daa109:1",
+      "primaryLocationStartColumnFingerprint": "3"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-startswith-contain",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-startswith-contain",
+      "index": 0
+     },
+     "message": {
+      "text": "startswith() used as containment check at web_urldispatcher.py:641"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 641,
+         "startColumn": 16,
+         "endColumn": 46
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "816bbbc405ed35f9:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-startswith-contain",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-startswith-contain",
+      "index": 0
+     },
+     "message": {
+      "text": "startswith() used as containment check at web_urldispatcher.py:757"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 757,
+         "startColumn": 17,
+         "endColumn": 63
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "71f450ccf32b5852:1",
+      "primaryLocationStartColumnFingerprint": "4"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-startswith-contain",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-startswith-contain",
+      "index": 0
+     },
+     "message": {
+      "text": "startswith() used as containment check at web_urldispatcher.py:1078"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 1078,
+         "startColumn": 25,
+         "endColumn": 45
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "b8983942e4e0663e:1",
+      "primaryLocationStartColumnFingerprint": "16"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-startswith-contain",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-startswith-contain",
+      "index": 0
+     },
+     "message": {
+      "text": "startswith() used as containment check at web_urldispatcher.py:1123"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 1123,
+         "startColumn": 16,
+         "endColumn": 38
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "b50edaa3e2b8a1c7:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20261119012956",
+   "codeql_raw_query": "/**\n * @name Static handler containment logic\n * @description Dump the resolve/containment related calls in StaticResource._handle\n * @kind problem\n * @problem.severity warning\n * @id py/aiohttp-static-handler-dump\n * @tags security\n *        external/cwe/cwe-022\n */\n\nimport python\n\nfrom Call c\nwhere\n  c.getLocation().getFile().getBaseName() = \"web_urldispatcher.py\" and\n  c.getLocation().getStartLine() >= 630 and\n  c.getLocation().getStartLine() <= 700 and\n  (\n    c.getFunc().(Attribute).getAttr() = [\"resolve\", \"is_relative_to\", \"relative_to\", \"joinpath\", \"startswith\", \"exists\", \"is_file\", \"lstat\", \"stat\"] or\n    c.getFunc().(Name).getId() = [\"Path\", \"commonprefix\", \"commonpath\", \"join\", \"normpath\"]\n  )\nselect c, c.getLocation().getStartLine().toString() + \": \" + c.toString()",
+   "hypothesis": "CVE-2024-23334: StaticResource path traversal — verify whether request-derived filename is resolved and checked for containment before being served",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-022"
+   ],
+   "results_count": 7,
+   "results": [
+    {
+     "ruleId": "py/aiohttp-static-handler-dump",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-static-handler-dump",
+      "index": 0
+     },
+     "message": {
+      "text": "641: Attribute()"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 641,
+         "startColumn": 16,
+         "endColumn": 46
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "816bbbc405ed35f9:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-static-handler-dump",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-static-handler-dump",
+      "index": 0
+     },
+     "message": {
+      "text": "659: Path()"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 659,
+         "startColumn": 24,
+         "endColumn": 37
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "908de6efc96a44cf:1",
+      "primaryLocationStartColumnFingerprint": "11"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-static-handler-dump",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-static-handler-dump",
+      "index": 0
+     },
+     "message": {
+      "text": "665: Attribute()"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 665,
+         "startColumn": 24,
+         "endColumn": 68
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "a215b9a529b8a27d:2",
+      "primaryLocationStartColumnFingerprint": "11"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-static-handler-dump",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-static-handler-dump",
+      "index": 0
+     },
+     "message": {
+      "text": "665: Attribute()"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 665,
+         "startColumn": 24,
+         "endColumn": 58
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "a215b9a529b8a27d:2",
+      "primaryLocationStartColumnFingerprint": "11"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-static-handler-dump",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-static-handler-dump",
+      "index": 0
+     },
+     "message": {
+      "text": "667: Attribute()"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 667,
+         "startColumn": 17,
+         "endColumn": 54
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "2e4bba3362ac6a89:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-static-handler-dump",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-static-handler-dump",
+      "index": 0
+     },
+     "message": {
+      "text": "689: Attribute()"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 689,
+         "startColumn": 14,
+         "endColumn": 32
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "5da781e311721e50:1",
+      "primaryLocationStartColumnFingerprint": "5"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-static-handler-dump",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-static-handler-dump",
+      "index": 0
+     },
+     "message": {
+      "text": "700: Attribute()"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 700,
+         "startColumn": 32,
+         "endColumn": 69
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "14e9398eb634b085:1",
+      "primaryLocationStartColumnFingerprint": "23"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20261119013013",
+   "codeql_raw_query": "/**\n * @name Directory index HTML construction\n * @description Find HTML template strings used to build directory index pages\n * @kind problem\n * @problem.severity warning\n * @id py/aiohttp-index-html-strings\n * @tags security\n *        external/cwe/cwe-079\n */\n\nimport python\n\nfrom StrConst s\nwhere\n  s.getLocation().getFile().getBaseName() = \"web_urldispatcher.py\" and\n  (\n    s.getText().matches(\"%Index of%\") or\n    s.getText().matches(\"%<a href%\") or\n    s.getText().matches(\"%<html%\") or\n    s.getText().matches(\"%<li>%\")\n  )\nselect s, s.getLocation().getStartLine().toString() + \": \" + s.getText().prefix(200)",
+   "hypothesis": "CVE-2024-27306: Directory index HTML reflects request path / file names without escaping (XSS)",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-079"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20261119013122",
+   "codeql_raw_query": "/**\n * @name Dump static resource handler statements\n * @description Prints statements of StaticResource._handle to inspect containment logic\n * @kind problem\n * @problem.severity note\n * @id py/aiohttp-static-stmt-dump\n */\n\nimport python\n\nfrom Stmt s\nwhere\n  s.getLocation().getFile().getRelativePath() = \"aiohttp/web_urldispatcher.py\" and\n  s.getLocation().getStartLine() >= 645 and\n  s.getLocation().getStartLine() <= 680\nselect s, s.getLocation().getStartLine().toString() + \" :: \" + s.toString()",
+   "hypothesis": "StaticResource._handle resolves request-controlled path against root and only checks startswith/follow_symlinks, enabling path traversal (CVE-2024-23334)",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-022",
+    "cwe-023"
+   ],
+   "results_count": 25,
+   "results": [
+    {
+     "ruleId": "py/aiohttp-static-stmt-dump",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-static-stmt-dump",
+      "index": 0
+     },
+     "message": {
+      "text": "645 :: Return"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 645,
+         "startColumn": 13,
+         "endColumn": 41
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "78a2ebbc3a5c8c6a:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-static-stmt-dump",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-static-stmt-dump",
+      "index": 0
+     },
+     "message": {
+      "text": "647 :: AssignStmt"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 647,
+         "startColumn": 9,
+         "endColumn": 80
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "f2b62cad3ec5cbcb:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-static-stmt-dump",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-static-stmt-dump",
+      "index": 0
+     },
+     "message": {
+      "text": "648 :: Return"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 648,
+         "startColumn": 9,
+         "endColumn": 88
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "1a5d8d478e59604c:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-static-stmt-dump",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-static-stmt-dump",
+      "index": 0
+     },
+     "message": {
+      "text": "650 :: FunctionDef"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 650,
+         "startColumn": 5,
+         "endColumn": 30
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "172c0ef5e5c4a713:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-static-stmt-dump",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-static-stmt-dump",
+      "index": 0
+     },
+     "message": {
+      "text": "651 :: Return"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 651,
+         "startColumn": 9,
+         "endColumn": 33
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "4e52e96c278915b2:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-static-stmt-dump",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-static-stmt-dump",
+      "index": 0
+     },
+     "message": {
+      "text": "653 :: FunctionDef"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 653,
+         "startColumn": 5,
+         "endColumn": 51
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "cb2514ba5fa6a181:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-static-stmt-dump",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-static-stmt-dump",
+      "index": 0
+     },
+     "message": {
+      "text": "654 :: Return"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 654,
+         "startColumn": 9,
+         "endColumn": 43
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "e128bfabd99f6d8b:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-static-stmt-dump",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-static-stmt-dump",
+      "index": 0
+     },
+     "message": {
+      "text": "656 :: FunctionDef"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 656,
+         "startColumn": 11,
+         "endColumn": 65
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "1660788b65c1b302:1",
+      "primaryLocationStartColumnFingerprint": "6"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-static-stmt-dump",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-static-stmt-dump",
+      "index": 0
+     },
+     "message": {
+      "text": "657 :: AssignStmt"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 657,
+         "startColumn": 9,
+         "endColumn": 49
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "43faef7d0c7b7ff9:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-static-stmt-dump",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-static-stmt-dump",
+      "index": 0
+     },
+     "message": {
+      "text": "658 :: Try"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 658,
+         "startColumn": 9,
+         "endColumn": 13
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "6170a21e0087bae7:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-static-stmt-dump",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-static-stmt-dump",
+      "index": 0
+     },
+     "message": {
+      "text": "659 :: AssignStmt"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 659,
+         "startColumn": 13,
+         "endColumn": 37
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "908de6efc96a44cf:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-static-stmt-dump",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-static-stmt-dump",
+      "index": 0
+     },
+     "message": {
+      "text": "660 :: If"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 660,
+         "startColumn": 13,
+         "endColumn": 32
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "4336635974603b62:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-static-stmt-dump",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-static-stmt-dump",
+      "index": 0
+     },
+     "message": {
+      "text": "664 :: Raise"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 664,
+         "startColumn": 17,
+         "endColumn": 38
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "49427d7553130d0c:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-static-stmt-dump",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-static-stmt-dump",
+      "index": 0
+     },
+     "message": {
+      "text": "665 :: AssignStmt"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 665,
+         "startColumn": 13,
+         "endColumn": 68
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "a215b9a529b8a27d:2",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-static-stmt-dump",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-static-stmt-dump",
+      "index": 0
+     },
+     "message": {
+      "text": "666 :: If"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 666,
+         "startColumn": 13,
+         "endColumn": 42
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "faeb429b2cf12034:2",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-static-stmt-dump",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-static-stmt-dump",
+      "index": 0
+     },
+     "message": {
+      "text": "667 :: ExprStmt"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 667,
+         "startColumn": 17,
+         "endColumn": 54
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "2e4bba3362ac6a89:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-static-stmt-dump",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-static-stmt-dump",
+      "index": 0
+     },
+     "message": {
+      "text": "668 :: ExceptStmt"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 668,
+         "startColumn": 9,
+         "endColumn": 57
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "cd2983d092467e3a:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-static-stmt-dump",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-static-stmt-dump",
+      "index": 0
+     },
+     "message": {
+      "text": "670 :: Raise"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 670,
+         "startColumn": 13,
+         "endColumn": 44
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "fbbfcdd9728f8ae2:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-static-stmt-dump",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-static-stmt-dump",
+      "index": 0
+     },
+     "message": {
+      "text": "671 :: ExceptStmt"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 671,
+         "startColumn": 9,
+         "endColumn": 30
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "7937e8c5520bfc55:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-static-stmt-dump",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-static-stmt-dump",
+      "index": 0
+     },
+     "message": {
+      "text": "672 :: Raise"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 672,
+         "startColumn": 13,
+         "endColumn": 18
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "7f339184949157da:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-static-stmt-dump",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-static-stmt-dump",
+      "index": 0
+     },
+     "message": {
+      "text": "673 :: ExceptStmt"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 673,
+         "startColumn": 9,
+         "endColumn": 35
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "accc7534b872e3d0:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-static-stmt-dump",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-static-stmt-dump",
+      "index": 0
+     },
+     "message": {
+      "text": "675 :: ExprStmt"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 675,
+         "startColumn": 13,
+         "endColumn": 48
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "f0fa99057f3c1c32:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-static-stmt-dump",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-static-stmt-dump",
+      "index": 0
+     },
+     "message": {
+      "text": "676 :: Raise"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 676,
+         "startColumn": 13,
+         "endColumn": 44
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "f2439d9513aecbb5:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-static-stmt-dump",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-static-stmt-dump",
+      "index": 0
+     },
+     "message": {
+      "text": "679 :: If"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 679,
+         "startColumn": 9,
+         "endColumn": 30
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "4b6e64779e1f164e:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-static-stmt-dump",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-static-stmt-dump",
+      "index": 0
+     },
+     "message": {
+      "text": "680 :: If"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 680,
+         "startColumn": 13,
+         "endColumn": 33
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "d804e51badc6f6f8:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20261119013143",
+   "codeql_raw_query": "/**\n * @name Server-side response header/multi-dict writes from request data\n * @description Finds response header construction where values may include unvalidated request-derived strings\n * @kind problem\n * @problem.severity warning\n * @id py/aiohttp-header-injection\n * @tags security\n *        external/cwe/cwe-113\n */\n\nimport python\n\nfrom Call call, Attribute a\nwhere\n  call.getFunc() = a and\n  a.getAttr() = [\"set_cookie\", \"add\", \"update\"] and\n  call.getLocation().getFile().getRelativePath() = \"aiohttp/web_response.py\"\nselect call, \"Response header manipulation at line \" + call.getLocation().getStartLine().toString()",
+   "hypothesis": "Server response headers set from unvalidated user data leading to HTTP response splitting / header injection",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-113"
+   ],
+   "results_count": 2,
+   "results": [
+    {
+     "ruleId": "py/aiohttp-header-injection",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-header-injection",
+      "index": 0
+     },
+     "message": {
+      "text": "Response header manipulation at line 259"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_response.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 259,
+         "startColumn": 9,
+         "endLine": 266,
+         "endColumn": 10
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "1aa521e0ecafddd4:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-header-injection",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-header-injection",
+      "index": 0
+     },
+     "message": {
+      "text": "Response header manipulation at line 442"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_response.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 442,
+         "startColumn": 13,
+         "endColumn": 48
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "85ff65c485f114d6:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20261119013224",
+   "codeql_raw_query": "/**\n * @name Containment comparisons in static resource handler\n * @description Dumps comparison expressions inside the StaticResource handler region\n * @kind problem\n * @problem.severity recommendation\n * @id py/aiohttp-cmp-dump\n */\n\nimport python\n\nfrom Compare c\nwhere\n  c.getLocation().getFile().getBaseName() = \"web_urldispatcher.py\" and\n  c.getLocation().getStartLine() >= 540 and\n  c.getLocation().getEndLine() <= 720\nselect c, \"line \" + c.getLocation().getStartLine().toString() + \": \" + c.toString()",
+   "hypothesis": "The StaticResource handler performs a directory-containment check (startswith / relative_to); inspecting the comparison shows whether containment is enforced on the resolved path",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-022"
+   ],
+   "results_count": 5,
+   "results": [
+    {
+     "ruleId": "py/aiohttp-cmp-dump",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-cmp-dump",
+      "index": 0
+     },
+     "message": {
+      "text": "line 586: Compare"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 586,
+         "startColumn": 12,
+         "endColumn": 34
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "664b1e64b55f3ed5:1",
+      "primaryLocationStartColumnFingerprint": "3"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-cmp-dump",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-cmp-dump",
+      "index": 0
+     },
+     "message": {
+      "text": "line 592: Compare"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 592,
+         "startColumn": 12,
+         "endColumn": 33
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "c540b61904b638ed:1",
+      "primaryLocationStartColumnFingerprint": "3"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-cmp-dump",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-cmp-dump",
+      "index": 0
+     },
+     "message": {
+      "text": "line 631: Compare"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 631,
+         "startColumn": 12,
+         "endColumn": 37
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "ddbb88b680e1cf7d:1",
+      "primaryLocationStartColumnFingerprint": "3"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-cmp-dump",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-cmp-dump",
+      "index": 0
+     },
+     "message": {
+      "text": "line 641: Compare"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 641,
+         "startColumn": 51,
+         "endColumn": 71
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "816bbbc405ed35f9:1",
+      "primaryLocationStartColumnFingerprint": "42"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-cmp-dump",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-cmp-dump",
+      "index": 0
+     },
+     "message": {
+      "text": "line 644: Compare"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 644,
+         "startColumn": 12,
+         "endColumn": 41
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "13a8c6606ee22f91:1",
+      "primaryLocationStartColumnFingerprint": "3"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20261119013242",
+   "codeql_raw_query": "/**\n * @name Path containment helper calls\n * @description Finds resolve/relative_to/joinpath/startswith calls in web_urldispatcher.py\n * @kind problem\n * @problem.severity recommendation\n * @id py/aiohttp-pathops\n */\n\nimport python\n\nfrom Call c, Attribute a\nwhere\n  c.getFunc() = a and\n  a.getAttr() = [\"resolve\", \"relative_to\", \"joinpath\", \"startswith\", \"is_relative_to\", \"commonpath\"] and\n  c.getLocation().getFile().getBaseName() = \"web_urldispatcher.py\"\nselect c, \"line \" + c.getLocation().getStartLine().toString() + \": \" + a.getAttr() + \"(...)\"",
+   "hypothesis": "Static file handler builds the on-disk path and validates containment; enumerating path ops shows whether validation happens before/after resolve()",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-022"
+   ],
+   "results_count": 24,
+   "results": [
+    {
+     "ruleId": "py/aiohttp-pathops",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-pathops",
+      "index": 0
+     },
+     "message": {
+      "text": "line 400: startswith(...)"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 400,
+         "startColumn": 28,
+         "endColumn": 48
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "f1e773ab57d7a521:1",
+      "primaryLocationStartColumnFingerprint": "19"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-pathops",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-pathops",
+      "index": 0
+     },
+     "message": {
+      "text": "line 412: startswith(...)"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 412,
+         "startColumn": 16,
+         "endColumn": 38
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "f61ee82d7a8f55cf:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-pathops",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-pathops",
+      "index": 0
+     },
+     "message": {
+      "text": "line 472: startswith(...)"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 472,
+         "startColumn": 16,
+         "endColumn": 53
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "8bdbd73672644f58:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-pathops",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-pathops",
+      "index": 0
+     },
+     "message": {
+      "text": "line 473: startswith(...)"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 473,
+         "startColumn": 16,
+         "endColumn": 41
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "6fee7131bea457dd:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-pathops",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-pathops",
+      "index": 0
+     },
+     "message": {
+      "text": "line 482: startswith(...)"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 482,
+         "startColumn": 16,
+         "endColumn": 38
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "166c3143dd23b19f:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-pathops",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-pathops",
+      "index": 0
+     },
+     "message": {
+      "text": "line 516: startswith(...)"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 516,
+         "startColumn": 30,
+         "endColumn": 52
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "d3df4ae4a3b89e78:1",
+      "primaryLocationStartColumnFingerprint": "21"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-pathops",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-pathops",
+      "index": 0
+     },
+     "message": {
+      "text": "line 527: startswith(...)"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 527,
+         "startColumn": 16,
+         "endColumn": 38
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "11366e6107984297:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-pathops",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-pathops",
+      "index": 0
+     },
+     "message": {
+      "text": "line 557: startswith(...)"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 557,
+         "startColumn": 16,
+         "endColumn": 46
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "7656f6fbd4daa109:1",
+      "primaryLocationStartColumnFingerprint": "3"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-pathops",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-pathops",
+      "index": 0
+     },
+     "message": {
+      "text": "line 559: resolve(...)"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 559,
+         "startColumn": 25,
+         "endColumn": 44
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "41a5c07e1495aac2:1",
+      "primaryLocationStartColumnFingerprint": "12"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-pathops",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-pathops",
+      "index": 0
+     },
+     "message": {
+      "text": "line 599: resolve(...)"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 599,
+         "startColumn": 28,
+         "endColumn": 72
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "a215b9a529b8a27d:1",
+      "primaryLocationStartColumnFingerprint": "11"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-pathops",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-pathops",
+      "index": 0
+     },
+     "message": {
+      "text": "line 599: joinpath(...)"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 599,
+         "startColumn": 28,
+         "endColumn": 62
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "a215b9a529b8a27d:1",
+      "primaryLocationStartColumnFingerprint": "11"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-pathops",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-pathops",
+      "index": 0
+     },
+     "message": {
+      "text": "line 601: relative_to(...)"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 601,
+         "startColumn": 21,
+         "endColumn": 58
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "eaef88bd13ab956c:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-pathops",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-pathops",
+      "index": 0
+     },
+     "message": {
+      "text": "line 641: startswith(...)"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 641,
+         "startColumn": 16,
+         "endColumn": 46
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "816bbbc405ed35f9:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-pathops",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-pathops",
+      "index": 0
+     },
+     "message": {
+      "text": "line 665: resolve(...)"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 665,
+         "startColumn": 24,
+         "endColumn": 68
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "a215b9a529b8a27d:2",
+      "primaryLocationStartColumnFingerprint": "11"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-pathops",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-pathops",
+      "index": 0
+     },
+     "message": {
+      "text": "line 665: joinpath(...)"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 665,
+         "startColumn": 24,
+         "endColumn": 58
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "a215b9a529b8a27d:2",
+      "primaryLocationStartColumnFingerprint": "11"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-pathops",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-pathops",
+      "index": 0
+     },
+     "message": {
+      "text": "line 667: relative_to(...)"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 667,
+         "startColumn": 17,
+         "endColumn": 54
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "2e4bba3362ac6a89:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-pathops",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-pathops",
+      "index": 0
+     },
+     "message": {
+      "text": "line 700: relative_to(...)"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 700,
+         "startColumn": 32,
+         "endColumn": 69
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "14e9398eb634b085:1",
+      "primaryLocationStartColumnFingerprint": "23"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-pathops",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-pathops",
+      "index": 0
+     },
+     "message": {
+      "text": "line 708: relative_to(...)"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 708,
+         "startColumn": 24,
+         "endColumn": 58
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "587d05d69d7287b1:1",
+      "primaryLocationStartColumnFingerprint": "11"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-pathops",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-pathops",
+      "index": 0
+     },
+     "message": {
+      "text": "line 757: startswith(...)"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 757,
+         "startColumn": 17,
+         "endColumn": 63
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "71f450ccf32b5852:1",
+      "primaryLocationStartColumnFingerprint": "4"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-pathops",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-pathops",
+      "index": 0
+     },
+     "message": {
+      "text": "line 761: resolve(...)"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 761,
+         "startColumn": 28,
+         "endColumn": 61
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "8a4c5de5f34213d3:1",
+      "primaryLocationStartColumnFingerprint": "19"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-pathops",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-pathops",
+      "index": 0
+     },
+     "message": {
+      "text": "line 869: resolve(...)"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 869,
+         "startColumn": 28,
+         "endColumn": 61
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "8a4c5de5f34213d3:2",
+      "primaryLocationStartColumnFingerprint": "19"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-pathops",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-pathops",
+      "index": 0
+     },
+     "message": {
+      "text": "line 1012: resolve(...)"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 1012,
+         "startColumn": 41,
+         "endColumn": 66
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "1863f8e96af96b0c:1",
+      "primaryLocationStartColumnFingerprint": "28"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-pathops",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-pathops",
+      "index": 0
+     },
+     "message": {
+      "text": "line 1078: startswith(...)"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 1078,
+         "startColumn": 25,
+         "endColumn": 45
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "b8983942e4e0663e:1",
+      "primaryLocationStartColumnFingerprint": "16"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-pathops",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-pathops",
+      "index": 0
+     },
+     "message": {
+      "text": "line 1123: startswith(...)"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 1123,
+         "startColumn": 16,
+         "endColumn": 38
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "b50edaa3e2b8a1c7:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20261119013319",
+   "codeql_raw_query": "/**\n * @name Static handler guard dump\n * @description Dumps guards and assignments inside StaticResource._handle\n * @kind problem\n * @problem.severity note\n * @id py/aiohttp-static-guards\n */\n\nimport python\n\nfrom Stmt s\nwhere\n  s.getLocation().getFile().getBaseName() = \"web_urldispatcher.py\" and\n  s.getLocation().getStartLine() >= 655 and\n  s.getLocation().getStartLine() <= 705 and\n  (s instanceof If or s instanceof Assign)\nselect s, s.getLocation().getStartLine().toString() + \" :: \" + s.toString()",
+   "hypothesis": "StaticResource._handle in aiohttp 3.9.1 builds a filesystem path from request.match_info[\"filename\"] and only performs a string/relative_to containment check, allowing ../ traversal (CVE-2024-23334)",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-022"
+   ],
+   "results_count": 15,
+   "results": [
+    {
+     "ruleId": "py/aiohttp-static-guards",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-static-guards",
+      "index": 0
+     },
+     "message": {
+      "text": "656 :: FunctionDef"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 656,
+         "startColumn": 11,
+         "endColumn": 65
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "1660788b65c1b302:1",
+      "primaryLocationStartColumnFingerprint": "6"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-static-guards",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-static-guards",
+      "index": 0
+     },
+     "message": {
+      "text": "657 :: AssignStmt"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 657,
+         "startColumn": 9,
+         "endColumn": 49
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "43faef7d0c7b7ff9:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-static-guards",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-static-guards",
+      "index": 0
+     },
+     "message": {
+      "text": "659 :: AssignStmt"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 659,
+         "startColumn": 13,
+         "endColumn": 37
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "908de6efc96a44cf:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-static-guards",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-static-guards",
+      "index": 0
+     },
+     "message": {
+      "text": "660 :: If"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 660,
+         "startColumn": 13,
+         "endColumn": 32
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "4336635974603b62:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-static-guards",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-static-guards",
+      "index": 0
+     },
+     "message": {
+      "text": "665 :: AssignStmt"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 665,
+         "startColumn": 13,
+         "endColumn": 68
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "a215b9a529b8a27d:2",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-static-guards",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-static-guards",
+      "index": 0
+     },
+     "message": {
+      "text": "666 :: If"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 666,
+         "startColumn": 13,
+         "endColumn": 42
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "faeb429b2cf12034:2",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-static-guards",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-static-guards",
+      "index": 0
+     },
+     "message": {
+      "text": "679 :: If"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 679,
+         "startColumn": 9,
+         "endColumn": 30
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "4b6e64779e1f164e:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-static-guards",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-static-guards",
+      "index": 0
+     },
+     "message": {
+      "text": "680 :: If"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 680,
+         "startColumn": 13,
+         "endColumn": 33
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "d804e51badc6f6f8:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-static-guards",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-static-guards",
+      "index": 0
+     },
+     "message": {
+      "text": "689 :: If"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 689,
+         "startColumn": 9,
+         "endColumn": 33
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "5da781e311721e50:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-static-guards",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-static-guards",
+      "index": 0
+     },
+     "message": {
+      "text": "694 :: FunctionDef"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 694,
+         "startColumn": 5,
+         "endColumn": 57
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "fc0233bf2947fb9e:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-static-guards",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-static-guards",
+      "index": 0
+     },
+     "message": {
+      "text": "700 :: AssignStmt"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 700,
+         "startColumn": 9,
+         "endColumn": 80
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "14e9398eb634b085:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-static-guards",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-static-guards",
+      "index": 0
+     },
+     "message": {
+      "text": "701 :: AssignStmt"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 701,
+         "startColumn": 9,
+         "endColumn": 55
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "831d3bb5ac284f98:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-static-guards",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-static-guards",
+      "index": 0
+     },
+     "message": {
+      "text": "702 :: AssignStmt"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 702,
+         "startColumn": 9,
+         "endColumn": 36
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "47ed4fe9f8b0998b:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-static-guards",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-static-guards",
+      "index": 0
+     },
+     "message": {
+      "text": "704 :: AssignStmt"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 704,
+         "startColumn": 9,
+         "endColumn": 24
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "3fdaff37fda3ec01:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/aiohttp-static-guards",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/aiohttp-static-guards",
+      "index": 0
+     },
+     "message": {
+      "text": "705 :: AssignStmt"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "aiohttp/web_urldispatcher.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 705,
+         "startColumn": 9,
+         "endColumn": 39
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "c0648ff5e34cc3a9:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    }
+   ]
+  }
+ ],
+ "cache_usage": {
+  "prompt_tokens_total": 226785,
+  "uncached_input_tokens": 24161,
+  "cache_creation_input_tokens": 0,
+  "cache_read_input_tokens": 202624,
+  "output_tokens": 52630,
+  "calls": 21,
+  "caching_enabled": false,
+  "cost_usd_with_cache": 0.03581,
+  "cost_usd_no_cache": 0.065596,
+  "cache_read_share_of_prompt": 0.8935,
+  "prices_per_mtok": {
+   "claude-sonnet-4-5-20250929": {
+    "input": 3.0,
+    "output": 15.0
+   },
+   "claude-haiku-4-5-20251001": {
+    "input": 1.0,
+    "output": 5.0
+   },
+   "deepseek/deepseek-reasoner": {
+    "input": 0.15,
+    "output": 0.6,
+    "cache_read": 0.003,
+    "cache_write_mult": 1.0,
+    "peak_mult": 2.0
+   }
+  },
+  "cache_multipliers": {
+   "write_5m": 1.25,
+   "read": 0.1
+  }
+ }
+}

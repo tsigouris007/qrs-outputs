@@ -1,0 +1,1739 @@
+{
+ "session_id": "20261118203502",
+ "package_name": "jinja2-3.1.5",
+ "package_path": "packages/jinja2-3.1.5",
+ "database_path": "databases/jinja2-3.1.5-db",
+ "model": "claude-sonnet-4-5-20250929",
+ "temperature": 0.0,
+ "max_tokens": 4000,
+ "iterations": 20,
+ "total_input_tokens": 193701,
+ "total_output_tokens": 7679,
+ "total_tokens": 201380,
+ "elapsed_time_seconds": 541.84,
+ "estimated_cost_usd": 0.6963,
+ "summary": "## Security Analysis Summary: Jinja2 v3.1.5\n\n### Package Overview\nJinja2 is a widely-used Python template engine with ~11k lines of code across 24 files. As a template engine, it handles user input and code generation, making security critical.\n\n### Key Findings\n\n#### Critical Severity Issues\n\n1. **Unsafe Deserialization (CWE-502)** - 2 instances in `bccache.py`\n   - Lines 73 and 79 use `pickle.load()` and `marshal.load()` for bytecode cache deserialization\n   - If an attacker can control cached bytecode files, arbitrary code execution is possible\n   - Impact: Remote Code Execution if cache files are attacker-controlled\n\n2. **Code Execution via compile()/exec()** - 4 instances\n   - `debug.py` (lines 105, 145), `environment.py` (lines 709, 1228)\n   - Core template compilation uses `compile()` and `exec()` to generate Python code\n   - While necessary for Jinja2's functionality, improper template input validation could lead to code injection\n   - Impact: Server-Side Template Injection (SSTI) if templates from untrusted sources aren't properly sandboxed\n\n#### High Severity Issues\n\n3. **Dangerous Attribute Access** - 8 instances\n   - Access to `__class__`, `__self__`, `__code__` attributes across multiple files\n   - Found in: `compiler.py`, `environment.py`, `exceptions.py`, `ext.py`, `idtracking.py`, `sandbox.py`, `utils.py`\n   - These are internal uses but represent potential sandbox escape vectors\n   - Impact: Sandbox bypass if exploited in template context\n\n4. **Insecure File Operations** - 6 instances\n   - File operations in `bccache.py`, `environment.py`, `loaders.py`, `utils.py`\n   - May allow path traversal if template names aren't properly validated\n   - Impact: Unauthorized file access\n\n5. **TOCTOU Race Conditions (CWE-367)** - 6 instances\n   - File existence checks followed by operations in `environment.py`, `loaders.py`, `utils.py`\n   - Classic time-of-check-time-of-use vulnerabilities\n   - Impact: Race condition exploitation in multi-threaded environments\n\n#### Medium Severity Issues\n\n6. **Weak Cryptography (CWE-327/CWE-330)** - 5 instances\n   - Use of MD5 hashing and `random` module in `bccache.py`, `filters.py`, `loaders.py`, `utils.py`\n   - MD5 used for cache keys (non-cryptographic purpose, but still weak)\n   - `random` module used instead of `secrets` for security-sensitive operations\n   - Impact: Predictable values, cache collision attacks\n\n7. **Regular Expression Operations (CWE-1333)** - 17 instances\n   - Multiple regex operations in `lexer.py`, `filters.py`, `utils.py`, `ext.py`, `_identifier.py`\n   - Potential ReDoS (Regular Expression Denial of Service) if complex patterns are used\n   - Impact: Denial of Service through crafted input\n\n### Recommendations\n\n1. **Bytecode Cache Security**: Document that bytecode cache directories must be protected from untrusted write access\n2. **Template Source Validation**: Ensure templates from untrusted sources always use SandboxedEnvironment\n3. **File Operation Hardening**: Implement atomic file operations to prevent TOCTOU races\n4. **Cryptographic Updates**: Replace MD5 with SHA-256 for cache keys; use `secrets` module for random values\n5. **Regex Review**: Audit regex patterns for ReDoS vulnerabilities, especially in user-facing filters\n\n### Conclusion\n\nJinja2 has several security-sensitive areas inherent to its design as a template engine. The most critical concerns are:\n- Unsafe deserialization in bytecode cache (exploitable if cache is compromised)\n- Code execution primitives (necessary but require proper sandboxing)\n- Multiple file operation vulnerabilities\n\nMost findings are architectural necessities for a template engine, but proper deployment and configuration are essential for security.",
+ "package_classification": {
+  "type": [
+   "library",
+   "framework"
+  ],
+  "layer": [
+   "application",
+   "presentation"
+  ]
+ },
+ "tool_calls": {
+  "get_package_profile_info": 1,
+  "execute_codeql_query": 14,
+  "validate_codeql_query": 0,
+  "fixup_codeql_query": 0,
+  "finalize_report": 1
+ },
+ "queries_executed": {
+  "critical": 4,
+  "high": 5,
+  "medium": 5,
+  "low": 0,
+  "total_executed": 14,
+  "total_with_results": 14,
+  "total_failed": 0
+ },
+ "query_findings": {
+  "critical": 12,
+  "high": 8,
+  "medium": 28,
+  "low": 0,
+  "total": 48
+ },
+ "findings": [
+  {
+   "codeql_query_uuid": "20261118203520",
+   "codeql_raw_query": "/**\n * @name Server-Side Template Injection via unsafe template rendering\n * @description User-controlled input flowing into Jinja2 template compilation or rendering can lead to arbitrary code execution\n * @kind path-problem\n * @problem.severity error\n * @id py/jinja2-ssti\n * @tags security\n *        external/cwe/cwe-094\n *        external/cwe/cwe-1336\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.dataflow.new.RemoteFlowSources\nimport semmle.python.ApiGraphs\n\nmodule SSTIConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    source instanceof RemoteFlowSource\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(DataFlow::CallCfgNode call |\n      (\n        // Template.render() or Template.generate()\n        call = API::moduleImport(\"jinja2\").getMember(\"Template\").getReturn().getMember([\"render\", \"generate\", \"render_async\", \"generate_async\"]).getACall() and\n        sink = call.getArg(0)\n        or\n        // Environment.from_string() - compiles template from string\n        call = API::moduleImport(\"jinja2\").getMember(\"Environment\").getReturn().getMember(\"from_string\").getACall() and\n        sink = call.getArg(0)\n        or\n        // Template() constructor - direct template compilation\n        call = API::moduleImport(\"jinja2\").getMember(\"Template\").getACall() and\n        sink = call.getArg(0)\n      )\n    )\n  }\n}\n\nmodule SSTIFlow = TaintTracking::Global<SSTIConfig>;\nimport SSTIFlow::PathGraph\n\nfrom SSTIFlow::PathNode source, SSTIFlow::PathNode sink\nwhere SSTIFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"Server-Side Template Injection: user input flows into template $@.\", source.getNode(), \"from user input\"\n",
+   "hypothesis": "Server-Side Template Injection (SSTI) - Detect unsafe template rendering where user input flows directly into template compilation or rendering without proper sandboxing",
+   "severity": "critical",
+   "cwe_ids": [
+    "cwe-94",
+    "cwe-1336"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20261118203607",
+   "codeql_raw_query": "/**\n * @name Path traversal in template loading\n * @description User-controlled template names may allow access to files outside intended directories\n * @kind path-problem\n * @problem.severity error\n * @id py/jinja2-path-traversal\n * @tags security\n *        external/cwe/cwe-022\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.dataflow.new.RemoteFlowSources\nimport semmle.python.Concepts\n\nmodule PathTraversalConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    source instanceof RemoteFlowSource\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(DataFlow::CallCfgNode call |\n      // Template loading methods\n      call.getFunction().(DataFlow::AttrRead).getAttributeName() in [\"get_template\", \"select_template\", \"get_or_select_template\", \"load\"] and\n      sink = call.getArg(0)\n    )\n  }\n}\n\nmodule PathTraversalFlow = TaintTracking::Global<PathTraversalConfig>;\nimport PathTraversalFlow::PathGraph\n\nfrom PathTraversalFlow::PathNode source, PathTraversalFlow::PathNode sink\nwhere PathTraversalFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"Template name from $@ may allow path traversal.\", source.getNode(), \"user input\"",
+   "hypothesis": "Path traversal in template loaders - checking if user-controlled input can be used to access files outside intended directories",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-22"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20261118203649",
+   "codeql_raw_query": "/**\n * @name Potential sandbox escape via dangerous attribute access\n * @description Accessing dangerous attributes like __class__, __subclasses__, __globals__ could allow sandbox escape\n * @kind problem\n * @problem.severity error\n * @id py/jinja2-sandbox-escape\n * @tags security\n *        external/cwe/cwe-094\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::AttrRead attr, string attrName\nwhere\n  attrName in [\"__class__\", \"__subclasses__\", \"__globals__\", \"__builtins__\", \"__import__\", \n               \"__code__\", \"__func__\", \"__self__\", \"func_globals\", \"func_code\"] and\n  attr.getAttributeName() = attrName and\n  attr.getObject().getScope().getEnclosingModule().getName().matches(\"jinja2%\")\nselect attr, \"Access to dangerous attribute '\" + attrName + \"' that could be used for sandbox escape.\"\n",
+   "hypothesis": "Sandbox escape through accessing dangerous attributes like __class__, __subclasses__, __globals__, etc. that could bypass Jinja2 sandbox restrictions",
+   "severity": "critical",
+   "cwe_ids": [
+    "cwe-94"
+   ],
+   "results_count": 8,
+   "results": [
+    {
+     "ruleId": "py/jinja2-sandbox-escape",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-sandbox-escape",
+      "index": 0
+     },
+     "message": {
+      "text": "Access to dangerous attribute '__class__' that could be used for sandbox escape."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/compiler.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 221,
+         "startColumn": 29,
+         "endColumn": 43
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "f7d22aabe78be10e:1",
+      "primaryLocationStartColumnFingerprint": "20"
+     }
+    },
+    {
+     "ruleId": "py/jinja2-sandbox-escape",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-sandbox-escape",
+      "index": 0
+     },
+     "message": {
+      "text": "Access to dangerous attribute '__class__' that could be used for sandbox escape."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/environment.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 432,
+         "startColumn": 29,
+         "endColumn": 43
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "12106148cf98e546:1",
+      "primaryLocationStartColumnFingerprint": "20"
+     }
+    },
+    {
+     "ruleId": "py/jinja2-sandbox-escape",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-sandbox-escape",
+      "index": 0
+     },
+     "message": {
+      "text": "Access to dangerous attribute '__class__' that could be used for sandbox escape."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/exceptions.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 136,
+         "startColumn": 16,
+         "endColumn": 30
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "4177e3f53d8bc737:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/jinja2-sandbox-escape",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-sandbox-escape",
+      "index": 0
+     },
+     "message": {
+      "text": "Access to dangerous attribute '__class__' that could be used for sandbox escape."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/ext.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 3
+        },
+        "region": {
+         "startLine": 94,
+         "startColumn": 29,
+         "endColumn": 43
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "b5d851129ef39e0:1",
+      "primaryLocationStartColumnFingerprint": "20"
+     }
+    },
+    {
+     "ruleId": "py/jinja2-sandbox-escape",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-sandbox-escape",
+      "index": 0
+     },
+     "message": {
+      "text": "Access to dangerous attribute '__class__' that could be used for sandbox escape."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/idtracking.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 4
+        },
+        "region": {
+         "startLine": 90,
+         "startColumn": 29,
+         "endColumn": 43
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "e154497246d5384c:1",
+      "primaryLocationStartColumnFingerprint": "20"
+     }
+    },
+    {
+     "ruleId": "py/jinja2-sandbox-escape",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-sandbox-escape",
+      "index": 0
+     },
+     "message": {
+      "text": "Access to dangerous attribute '__self__' that could be used for sandbox escape."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/sandbox.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 5
+        },
+        "region": {
+         "startLine": 355,
+         "startColumn": 25,
+         "endColumn": 39
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "f301e1e13e6dc558:1",
+      "primaryLocationStartColumnFingerprint": "16"
+     }
+    },
+    {
+     "ruleId": "py/jinja2-sandbox-escape",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-sandbox-escape",
+      "index": 0
+     },
+     "message": {
+      "text": "Access to dangerous attribute '__code__' that could be used for sandbox escape."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/utils.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 6
+        },
+        "region": {
+         "startLine": 100,
+         "startColumn": 23,
+         "endColumn": 33
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "19df3484603aa40f:1",
+      "primaryLocationStartColumnFingerprint": "18"
+     }
+    },
+    {
+     "ruleId": "py/jinja2-sandbox-escape",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-sandbox-escape",
+      "index": 0
+     },
+     "message": {
+      "text": "Access to dangerous attribute '__class__' that could be used for sandbox escape."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/utils.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 6
+        },
+        "region": {
+         "startLine": 469,
+         "startColumn": 14,
+         "endColumn": 28
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "5adcb1d110dcc416:1",
+      "primaryLocationStartColumnFingerprint": "5"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20261118203722",
+   "codeql_raw_query": "/**\n * @name Unsafe code execution in Jinja2\n * @description Using compile, eval, or exec with potentially untrusted input can lead to arbitrary code execution\n * @kind problem\n * @problem.severity error\n * @id py/jinja2-unsafe-code-execution\n * @tags security\n *        external/cwe/cwe-094\n *        external/cwe/cwe-095\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  (\n    call = API::builtin(\"compile\").getACall() or\n    call = API::builtin(\"eval\").getACall() or\n    call = API::builtin(\"exec\").getACall()\n  )\nselect call, \"Use of \" + call.getFunction().asExpr().(Name).getId() + \"() which could execute arbitrary code if input is not properly sanitized.\"",
+   "hypothesis": "Check for unsafe use of compile(), eval(), or exec() functions that could lead to code injection vulnerabilities",
+   "severity": "critical",
+   "cwe_ids": [
+    "cwe-94",
+    "cwe-95"
+   ],
+   "results_count": 4,
+   "results": [
+    {
+     "ruleId": "py/jinja2-unsafe-code-execution",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-unsafe-code-execution",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of exec() which could execute arbitrary code if input is not properly sanitized."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/debug.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 145,
+         "startColumn": 9,
+         "endColumn": 36
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "799c068da957600:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/jinja2-unsafe-code-execution",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-unsafe-code-execution",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of compile() which could execute arbitrary code if input is not properly sanitized."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/debug.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 105,
+         "startColumn": 22,
+         "endLine": 107,
+         "endColumn": 6
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "16573e133a7c4168:1",
+      "primaryLocationStartColumnFingerprint": "17"
+     }
+    },
+    {
+     "ruleId": "py/jinja2-unsafe-code-execution",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-unsafe-code-execution",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of compile() which could execute arbitrary code if input is not properly sanitized."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/environment.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 709,
+         "startColumn": 16,
+         "endColumn": 49
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "b67c41110e7ef1d7:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/jinja2-unsafe-code-execution",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-unsafe-code-execution",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of exec() which could execute arbitrary code if input is not properly sanitized."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/environment.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 1228,
+         "startColumn": 9,
+         "endColumn": 30
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "f77517f1e751fe3c:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20261118203754",
+   "codeql_raw_query": "/**\n * @name Unsafe deserialization with pickle or marshal\n * @description Using pickle or marshal to deserialize data can lead to arbitrary code execution\n * @kind problem\n * @problem.severity warning\n * @id py/jinja2-unsafe-deserialization\n * @tags security\n *        external/cwe/cwe-502\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  (\n    call = API::moduleImport(\"pickle\").getMember([\"load\", \"loads\", \"Unpickler\"]).getACall() or\n    call = API::moduleImport(\"marshal\").getMember([\"load\", \"loads\"]).getACall()\n  )\nselect call, \"Use of unsafe deserialization function that could execute arbitrary code if data is attacker-controlled.\"\n",
+   "hypothesis": "Check for any use of pickle or marshal deserialization which could be exploited if an attacker can control the serialized data",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-502"
+   ],
+   "results_count": 2,
+   "results": [
+    {
+     "ruleId": "py/jinja2-unsafe-deserialization",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-unsafe-deserialization",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of unsafe deserialization function that could execute arbitrary code if data is attacker-controlled."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/bccache.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 73,
+         "startColumn": 20,
+         "endColumn": 34
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "ebf3dcd53e82ba7d:1",
+      "primaryLocationStartColumnFingerprint": "11"
+     }
+    },
+    {
+     "ruleId": "py/jinja2-unsafe-deserialization",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-unsafe-deserialization",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of unsafe deserialization function that could execute arbitrary code if data is attacker-controlled."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/bccache.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 79,
+         "startColumn": 25,
+         "endColumn": 40
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "4a6ea71f28fee9ee:1",
+      "primaryLocationStartColumnFingerprint": "12"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20261118203831",
+   "codeql_raw_query": "/**\n * @name Potential SSRF through URL operations\n * @description URL operations with user-controlled input could lead to SSRF\n * @kind problem\n * @problem.severity warning\n * @id py/jinja2-ssrf\n * @tags security\n *        external/cwe/cwe-918\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  (\n    call = API::moduleImport(\"urllib\").getMember(\"request\").getMember([\"urlopen\", \"urlretrieve\", \"Request\"]).getACall() or\n    call = API::moduleImport(\"urllib\").getMember(\"parse\").getMember([\"urlparse\", \"urljoin\"]).getACall()\n  )\nselect call, \"URL operation that could be vulnerable to SSRF if input is user-controlled.\"\n",
+   "hypothesis": "Check for Server-Side Request Forgery (SSRF) vulnerabilities through URL operations with user-controlled input",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-918"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20261118203903",
+   "codeql_raw_query": "/**\n * @name Command injection\n * @description Executing system commands with user-controlled input can lead to command injection\n * @kind problem\n * @problem.severity error\n * @id py/jinja2-command-injection\n * @tags security\n *        external/cwe/cwe-078\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  (\n    call = API::moduleImport(\"os\").getMember(\"system\").getACall() or\n    call = API::moduleImport(\"os\").getMember(\"popen\").getACall() or\n    call = API::moduleImport(\"subprocess\").getMember([\"call\", \"run\", \"Popen\", \"check_call\", \"check_output\"]).getACall()\n  )\nselect call, \"Potential command execution that could be vulnerable to injection if input is not sanitized.\"",
+   "hypothesis": "Command injection through subprocess or os.system calls with user-controlled input",
+   "severity": "critical",
+   "cwe_ids": [
+    "cwe-78"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20261118203940",
+   "codeql_raw_query": "/**\n * @name XML External Entity (XXE) vulnerability\n * @description XML parsing without proper configuration can lead to XXE attacks\n * @kind problem\n * @problem.severity error\n * @id py/jinja2-xxe\n * @tags security\n *        external/cwe/cwe-611\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  (\n    call = API::moduleImport(\"xml\").getMember(\"etree\").getMember([\"parse\", \"fromstring\", \"XMLParser\"]).getACall() or\n    call = API::moduleImport(\"xml\").getMember(\"dom\").getMember(\"minidom\").getMember(\"parse\").getACall() or\n    call = API::moduleImport(\"xml\").getMember(\"sax\").getMember(\"parse\").getACall() or\n    call = API::moduleImport(\"lxml\").getMember(\"etree\").getMember([\"parse\", \"fromstring\", \"XMLParser\"]).getACall()\n  )\nselect call, \"XML parsing operation that may be vulnerable to XXE attacks if not properly configured.\"",
+   "hypothesis": "Check for XML parsing that could be vulnerable to XXE attacks",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-611"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20261118204018",
+   "codeql_raw_query": "/**\n * @name Insecure file operations\n * @description File operations without proper path validation could lead to arbitrary file access\n * @kind problem\n * @problem.severity warning\n * @id py/jinja2-insecure-file-ops\n * @tags security\n *        external/cwe/cwe-022\n *        external/cwe/cwe-073\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  (\n    call = API::builtin(\"open\").getACall() or\n    call = API::moduleImport(\"os\").getMember([\"open\", \"read\", \"write\"]).getACall() or\n    call = API::moduleImport(\"io\").getMember([\"open\", \"FileIO\"]).getACall()\n  )\nselect call, \"File operation that may need path validation to prevent unauthorized access.\"\n",
+   "hypothesis": "Check for insecure file operations (open, read, write) that could lead to arbitrary file access if paths are not properly validated",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-22",
+    "cwe-73"
+   ],
+   "results_count": 6,
+   "results": [
+    {
+     "ruleId": "py/jinja2-insecure-file-ops",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-insecure-file-ops",
+      "index": 0
+     },
+     "message": {
+      "text": "File operation that may need path validation to prevent unauthorized access."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/bccache.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 270,
+         "startColumn": 17,
+         "endColumn": 37
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "77523f9d2dd60066:1",
+      "primaryLocationStartColumnFingerprint": "4"
+     }
+    },
+    {
+     "ruleId": "py/jinja2-insecure-file-ops",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-insecure-file-ops",
+      "index": 0
+     },
+     "message": {
+      "text": "File operation that may need path validation to prevent unauthorized access."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/environment.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 860,
+         "startColumn": 22,
+         "endColumn": 64
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "cd9593d0fe66fc61:1",
+      "primaryLocationStartColumnFingerprint": "5"
+     }
+    },
+    {
+     "ruleId": "py/jinja2-insecure-file-ops",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-insecure-file-ops",
+      "index": 0
+     },
+     "message": {
+      "text": "File operation that may need path validation to prevent unauthorized access."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/environment.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 1611,
+         "startColumn": 36,
+         "endColumn": 50
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "4b719e23629112ae:1",
+      "primaryLocationStartColumnFingerprint": "23"
+     }
+    },
+    {
+     "ruleId": "py/jinja2-insecure-file-ops",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-insecure-file-ops",
+      "index": 0
+     },
+     "message": {
+      "text": "File operation that may need path validation to prevent unauthorized access."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/loaders.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 214,
+         "startColumn": 14,
+         "endColumn": 52
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "a2941abc069d7a1b:1",
+      "primaryLocationStartColumnFingerprint": "5"
+     }
+    },
+    {
+     "ruleId": "py/jinja2-insecure-file-ops",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-insecure-file-ops",
+      "index": 0
+     },
+     "message": {
+      "text": "File operation that may need path validation to prevent unauthorized access."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/loaders.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 382,
+         "startColumn": 18,
+         "endColumn": 31
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "1b1781034d372221:1",
+      "primaryLocationStartColumnFingerprint": "5"
+     }
+    },
+    {
+     "ruleId": "py/jinja2-insecure-file-ops",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-insecure-file-ops",
+      "index": 0
+     },
+     "message": {
+      "text": "File operation that may need path validation to prevent unauthorized access."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/utils.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 3
+        },
+        "region": {
+         "startLine": 171,
+         "startColumn": 12,
+         "endColumn": 32
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "41ec2bfda989e5b4:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20261118204055",
+   "codeql_raw_query": "/**\n * @name Weak cryptographic operations\n * @description Use of weak hashing algorithms or insecure random number generation\n * @kind problem\n * @problem.severity warning\n * @id py/jinja2-weak-crypto\n * @tags security\n *        external/cwe/cwe-327\n *        external/cwe/cwe-338\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  (\n    // Weak hash algorithms\n    call = API::moduleImport(\"hashlib\").getMember([\"md5\", \"sha1\"]).getACall() or\n    call = API::moduleImport(\"md5\").getMember(\"new\").getACall() or\n    call = API::moduleImport(\"sha\").getMember(\"new\").getACall() or\n    // Insecure random\n    call = API::moduleImport(\"random\").getMember([\"random\", \"randint\", \"choice\", \"shuffle\"]).getACall()\n  )\nselect call, \"Use of weak cryptographic operation or insecure random number generation.\"",
+   "hypothesis": "Checking for weak cryptographic operations like MD5/SHA1 hashing or insecure random number generation",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-327",
+    "cwe-338"
+   ],
+   "results_count": 5,
+   "results": [
+    {
+     "ruleId": "py/jinja2-weak-crypto",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-weak-crypto",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of weak cryptographic operation or insecure random number generation."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/bccache.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 156,
+         "startColumn": 16,
+         "endColumn": 42
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "1d1a5dadede33439:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/jinja2-weak-crypto",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-weak-crypto",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of weak cryptographic operation or insecure random number generation."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/bccache.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 165,
+         "startColumn": 16,
+         "endColumn": 44
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "cad47572bc7acac1:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/jinja2-weak-crypto",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-weak-crypto",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of weak cryptographic operation or insecure random number generation."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/filters.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 698,
+         "startColumn": 16,
+         "endColumn": 34
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "180f31521b0c356c:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/jinja2-weak-crypto",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-weak-crypto",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of weak cryptographic operation or insecure random number generation."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/loaders.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 661,
+         "startColumn": 26,
+         "endColumn": 52
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "cb69ea7884c4638f:1",
+      "primaryLocationStartColumnFingerprint": "17"
+     }
+    },
+    {
+     "ruleId": "py/jinja2-weak-crypto",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-weak-crypto",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of weak cryptographic operation or insecure random number generation."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/utils.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 3
+        },
+        "region": {
+         "startLine": 372,
+         "startColumn": 24,
+         "endColumn": 37
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "ab2577d9f1d7d4a6:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20261118204131",
+   "codeql_raw_query": "/**\n * @name Potential ReDoS vulnerability\n * @description Regular expressions with complex patterns could lead to denial of service\n * @kind problem\n * @problem.severity warning\n * @id py/jinja2-redos\n * @tags security\n *        external/cwe/cwe-1333\n *        external/cwe/cwe-400\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  (\n    call = API::moduleImport(\"re\").getMember([\"compile\", \"match\", \"search\", \"findall\", \"finditer\", \"sub\", \"subn\"]).getACall()\n  ) and\n  exists(call.getArg(0))\nselect call, \"Regular expression operation that may be vulnerable to ReDoS if pattern is complex.\"",
+   "hypothesis": "Detect potentially vulnerable regular expressions that could lead to ReDoS (Regular Expression Denial of Service) attacks",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-1333",
+    "cwe-400"
+   ],
+   "results_count": 17,
+   "results": [
+    {
+     "ruleId": "py/jinja2-redos",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-redos",
+      "index": 0
+     },
+     "message": {
+      "text": "Regular expression operation that may be vulnerable to ReDoS if pattern is complex."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/_identifier.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 4,
+         "startColumn": 11,
+         "endLine": 6,
+         "endColumn": 2
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "1478656eb2ead81:1",
+      "primaryLocationStartColumnFingerprint": "10"
+     }
+    },
+    {
+     "ruleId": "py/jinja2-redos",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-redos",
+      "index": 0
+     },
+     "message": {
+      "text": "Regular expression operation that may be vulnerable to ReDoS if pattern is complex."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/ext.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 52,
+         "startColumn": 10,
+         "endColumn": 33
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "3da1aa790e46e789:1",
+      "primaryLocationStartColumnFingerprint": "9"
+     }
+    },
+    {
+     "ruleId": "py/jinja2-redos",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-redos",
+      "index": 0
+     },
+     "message": {
+      "text": "Regular expression operation that may be vulnerable to ReDoS if pattern is complex."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/filters.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 255,
+         "startColumn": 16,
+         "endColumn": 54
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "4e46ccb5a25531be:1",
+      "primaryLocationStartColumnFingerprint": "15"
+     }
+    },
+    {
+     "ruleId": "py/jinja2-redos",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-redos",
+      "index": 0
+     },
+     "message": {
+      "text": "Regular expression operation that may be vulnerable to ReDoS if pattern is complex."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/filters.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 327,
+         "startColumn": 28,
+         "endColumn": 56
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "333781d66659f91d:1",
+      "primaryLocationStartColumnFingerprint": "27"
+     }
+    },
+    {
+     "ruleId": "py/jinja2-redos",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-redos",
+      "index": 0
+     },
+     "message": {
+      "text": "Regular expression operation that may be vulnerable to ReDoS if pattern is complex."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/filters.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 741,
+         "startColumn": 18,
+         "endColumn": 57
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "6cd7f931dc95a4d3:1",
+      "primaryLocationStartColumnFingerprint": "17"
+     }
+    },
+    {
+     "ruleId": "py/jinja2-redos",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-redos",
+      "index": 0
+     },
+     "message": {
+      "text": "Regular expression operation that may be vulnerable to ReDoS if pattern is complex."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/filters.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 976,
+         "startColumn": 12,
+         "endColumn": 30
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "593d57f758a9cc33:1",
+      "primaryLocationStartColumnFingerprint": "11"
+     }
+    },
+    {
+     "ruleId": "py/jinja2-redos",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-redos",
+      "index": 0
+     },
+     "message": {
+      "text": "Regular expression operation that may be vulnerable to ReDoS if pattern is complex."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/lexer.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 3
+        },
+        "region": {
+         "startLine": 484,
+         "startColumn": 20,
+         "endColumn": 46
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "89279451a584d8b5:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/jinja2-redos",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-redos",
+      "index": 0
+     },
+     "message": {
+      "text": "Regular expression operation that may be vulnerable to ReDoS if pattern is complex."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/lexer.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 3
+        },
+        "region": {
+         "startLine": 27,
+         "startColumn": 17,
+         "endColumn": 35
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "9cf2f6c9d6ef4b3e:1",
+      "primaryLocationStartColumnFingerprint": "16"
+     }
+    },
+    {
+     "ruleId": "py/jinja2-redos",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-redos",
+      "index": 0
+     },
+     "message": {
+      "text": "Regular expression operation that may be vulnerable to ReDoS if pattern is complex."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/lexer.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 3
+        },
+        "region": {
+         "startLine": 28,
+         "startColumn": 14,
+         "endColumn": 41
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "12625a3d8d09c3ea:1",
+      "primaryLocationStartColumnFingerprint": "13"
+     }
+    },
+    {
+     "ruleId": "py/jinja2-redos",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-redos",
+      "index": 0
+     },
+     "message": {
+      "text": "Regular expression operation that may be vulnerable to ReDoS if pattern is complex."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/lexer.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 3
+        },
+        "region": {
+         "startLine": 29,
+         "startColumn": 13,
+         "endLine": 31,
+         "endColumn": 2
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "c4cbe019aaf1f78f:1",
+      "primaryLocationStartColumnFingerprint": "12"
+     }
+    },
+    {
+     "ruleId": "py/jinja2-redos",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-redos",
+      "index": 0
+     },
+     "message": {
+      "text": "Regular expression operation that may be vulnerable to ReDoS if pattern is complex."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/lexer.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 3
+        },
+        "region": {
+         "startLine": 32,
+         "startColumn": 14,
+         "endLine": 47,
+         "endColumn": 2
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "7f5b9424f2047d2b:1",
+      "primaryLocationStartColumnFingerprint": "13"
+     }
+    },
+    {
+     "ruleId": "py/jinja2-redos",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-redos",
+      "index": 0
+     },
+     "message": {
+      "text": "Regular expression operation that may be vulnerable to ReDoS if pattern is complex."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/lexer.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 3
+        },
+        "region": {
+         "startLine": 48,
+         "startColumn": 12,
+         "endLine": 60,
+         "endColumn": 2
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "5db46db55e621184:1",
+      "primaryLocationStartColumnFingerprint": "11"
+     }
+    },
+    {
+     "ruleId": "py/jinja2-redos",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-redos",
+      "index": 0
+     },
+     "message": {
+      "text": "Regular expression operation that may be vulnerable to ReDoS if pattern is complex."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/lexer.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 3
+        },
+        "region": {
+         "startLine": 145,
+         "startColumn": 15,
+         "endLine": 147,
+         "endColumn": 2
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "640b73a02f94683e:1",
+      "primaryLocationStartColumnFingerprint": "14"
+     }
+    },
+    {
+     "ruleId": "py/jinja2-redos",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-redos",
+      "index": 0
+     },
+     "message": {
+      "text": "Regular expression operation that may be vulnerable to ReDoS if pattern is complex."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/utils.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 4
+        },
+        "region": {
+         "startLine": 287,
+         "startColumn": 17,
+         "endColumn": 51
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "2493cb1adc361ed7:1",
+      "primaryLocationStartColumnFingerprint": "8"
+     }
+    },
+    {
+     "ruleId": "py/jinja2-redos",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-redos",
+      "index": 0
+     },
+     "message": {
+      "text": "Regular expression operation that may be vulnerable to ReDoS if pattern is complex."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/utils.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 4
+        },
+        "region": {
+         "startLine": 297,
+         "startColumn": 21,
+         "endColumn": 60
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "7b46a03902482cb9:1",
+      "primaryLocationStartColumnFingerprint": "8"
+     }
+    },
+    {
+     "ruleId": "py/jinja2-redos",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-redos",
+      "index": 0
+     },
+     "message": {
+      "text": "Regular expression operation that may be vulnerable to ReDoS if pattern is complex."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/utils.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 4
+        },
+        "region": {
+         "startLine": 199,
+         "startColumn": 12,
+         "endLine": 226,
+         "endColumn": 2
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "adb345c278ac3e9:1",
+      "primaryLocationStartColumnFingerprint": "11"
+     }
+    },
+    {
+     "ruleId": "py/jinja2-redos",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-redos",
+      "index": 0
+     },
+     "message": {
+      "text": "Regular expression operation that may be vulnerable to ReDoS if pattern is complex."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/utils.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 4
+        },
+        "region": {
+         "startLine": 227,
+         "startColumn": 13,
+         "endColumn": 48
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "8cfda9969f7c751c:1",
+      "primaryLocationStartColumnFingerprint": "12"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20261118204206",
+   "codeql_raw_query": "/**\n * @name Information disclosure through logging or error messages\n * @description Logging or exposing sensitive information could lead to information disclosure\n * @kind problem\n * @problem.severity warning\n * @id py/jinja2-info-disclosure\n * @tags security\n *        external/cwe/cwe-209\n *        external/cwe/cwe-532\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  (\n    // Logging calls that might expose sensitive data\n    call = API::moduleImport(\"logging\").getMember([\"debug\", \"info\", \"warning\", \"error\", \"exception\", \"critical\"]).getACall() or\n    call = API::moduleImport(\"sys\").getMember(\"stderr\").getMember(\"write\").getACall() or\n    call = API::moduleImport(\"sys\").getMember(\"stdout\").getMember(\"write\").getACall() or\n    // Print statements\n    call = API::builtin(\"print\").getACall()\n  )\nselect call, \"Logging or output operation that may expose sensitive information.\"",
+   "hypothesis": "Check for potential information disclosure through logging, error messages, or debug output that could expose sensitive data",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-209",
+    "cwe-532"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20261118204239",
+   "codeql_raw_query": "/**\n * @name Time-of-check time-of-use (TOCTOU) race condition\n * @description File existence checks followed by file operations may be vulnerable to race conditions\n * @kind problem\n * @problem.severity medium\n * @id py/jinja2-toctou\n * @tags security\n *        external/cwe/cwe-367\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode check, DataFlow::CallCfgNode fileOp\nwhere\n  (\n    check = API::moduleImport(\"os\").getMember(\"path\").getMember([\"exists\", \"isfile\", \"isdir\"]).getACall() or\n    check = API::moduleImport(\"pathlib\").getMember(\"Path\").getReturn().getMember([\"exists\", \"is_file\", \"is_dir\"]).getACall()\n  ) and\n  (\n    fileOp = API::builtin([\"open\", \"read\", \"write\"]).getACall() or\n    fileOp = API::moduleImport(\"os\").getMember([\"remove\", \"unlink\", \"rmdir\", \"mkdir\"]).getACall()\n  )\nselect check, \"File existence check that may lead to TOCTOU race condition if followed by file operation.\"",
+   "hypothesis": "Check for time-of-check time-of-use race conditions in file operations",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-367"
+   ],
+   "results_count": 6,
+   "results": [
+    {
+     "ruleId": "py/jinja2-toctou",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-toctou",
+      "index": 0
+     },
+     "message": {
+      "text": "File existence check that may lead to TOCTOU race condition if followed by file operation."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/environment.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 874,
+         "startColumn": 20,
+         "endColumn": 41
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "60d51f9aaff6d86d:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/jinja2-toctou",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-toctou",
+      "index": 0
+     },
+     "message": {
+      "text": "File existence check that may lead to TOCTOU race condition if followed by file operation."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/loaders.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 204,
+         "startColumn": 16,
+         "endColumn": 40
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "485c6ad21ccac87b:1",
+      "primaryLocationStartColumnFingerprint": "3"
+     }
+    },
+    {
+     "ruleId": "py/jinja2-toctou",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-toctou",
+      "index": 0
+     },
+     "message": {
+      "text": "File existence check that may lead to TOCTOU race condition if followed by file operation."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/loaders.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 355,
+         "startColumn": 20,
+         "endColumn": 39
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "6306c4b21279ae49:1",
+      "primaryLocationStartColumnFingerprint": "3"
+     }
+    },
+    {
+     "ruleId": "py/jinja2-toctou",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-toctou",
+      "index": 0
+     },
+     "message": {
+      "text": "File existence check that may lead to TOCTOU race condition if followed by file operation."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/loaders.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 388,
+         "startColumn": 24,
+         "endColumn": 41
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "f966cc8a25ecec44:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/jinja2-toctou",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-toctou",
+      "index": 0
+     },
+     "message": {
+      "text": "File existence check that may lead to TOCTOU race condition if followed by file operation."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/loaders.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 379,
+         "startColumn": 20,
+         "endColumn": 37
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "f717822b969087a:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/jinja2-toctou",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/jinja2-toctou",
+      "index": 0
+     },
+     "message": {
+      "text": "File existence check that may lead to TOCTOU race condition if followed by file operation."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/jinja2/utils.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 168,
+         "startColumn": 12,
+         "endColumn": 36
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "464b73790bbc3f22:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20261118204316",
+   "codeql_raw_query": "/**\n * @name Hardcoded secrets or credentials\n * @description Hardcoded secrets, passwords, or API keys in source code\n * @kind problem\n * @problem.severity warning\n * @id py/jinja2-hardcoded-secrets\n * @tags security\n *        external/cwe/cwe-798\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\n\nfrom DataFlow::Node node, string varName\nwhere\n  exists(Assign assign, Name target |\n    assign.getATarget() = target and\n    target.getId() = varName and\n    (\n      varName.toLowerCase().matches(\"%password%\") or\n      varName.toLowerCase().matches(\"%secret%\") or\n      varName.toLowerCase().matches(\"%api_key%\") or\n      varName.toLowerCase().matches(\"%token%\") or\n      varName.toLowerCase().matches(\"%credential%\")\n    ) and\n    node.asExpr() = assign.getValue() and\n    node.asExpr() instanceof StrConst\n  )\nselect node, \"Potential hardcoded secret in variable '\" + varName + \"'.\"",
+   "hypothesis": "Check for hardcoded secrets, passwords, or API keys in the source code",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-798"
+   ],
+   "results_count": 0,
+   "results": []
+  }
+ ],
+ "cache_usage": {
+  "prompt_tokens_total": 193701,
+  "uncached_input_tokens": 60,
+  "cache_creation_input_tokens": 14670,
+  "cache_read_input_tokens": 178971,
+  "output_tokens": 7679,
+  "calls": 20,
+  "caching_enabled": true,
+  "cost_usd_with_cache": 0.224069,
+  "cost_usd_no_cache": 0.696288,
+  "cache_read_share_of_prompt": 0.924,
+  "prices_per_mtok": {
+   "claude-sonnet-4-5-20250929": {
+    "input": 3.0,
+    "output": 15.0
+   },
+   "claude-haiku-4-5-20251001": {
+    "input": 1.0,
+    "output": 5.0
+   }
+  },
+  "cache_multipliers": {
+   "write_5m": 1.25,
+   "read": 0.1
+  }
+ }
+}

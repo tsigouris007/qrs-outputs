@@ -1,0 +1,925 @@
+{
+ "session_id": "20251225181758",
+ "package_name": "cffi-2.0.0",
+ "package_path": "packages/cffi-2.0.0",
+ "database_path": "databases/cffi-2.0.0-db",
+ "model": "gpt-5.1",
+ "temperature": 1.0,
+ "max_tokens": 8000,
+ "iterations": 15,
+ "total_input_tokens": 179095,
+ "total_output_tokens": 15987,
+ "total_tokens": 195082,
+ "elapsed_time_seconds": 746.98,
+ "estimated_cost_usd": 0.3837,
+ "summary": "## Overview\nPackage analyzed: **cffi 2.0.0**  \nType: Python foreign-function interface library for calling C code from Python.\n\nTotal analyzed files: 20 (core under `src/cffi/` plus packaging and tests).  \nPrimary focus: security-relevant behaviors in the core library and build/packaging helpers, with emphasis on:\n- Command execution and shell interaction\n- Dynamic library loading\n- Temporary file/dir handling\n- Potential code/command injection flows into the CFFI verification/compilation pipeline\n\nWithin the iteration budget, no clear, directly exploitable vulnerabilities in the core runtime API (as used by typical library consumers) were confirmed. Several **security-relevant patterns** were identified that warrant awareness and, in some environments, hardening.\n\n---\n\n## Key Findings\n\n### 1. Use of shell command execution in helper/build code\n\n**Files:**\n- `src/cffi/pkgconfig.py:33`\n- `setup.py:29–30`\n- `setup.py:126`\n\n**Pattern:** Detected via custom CodeQL query `py/cffi-shell-command-usage` (CWE-78-style shell-command usage).\n\nThe query flagged multiple uses of `os`/`subprocess` APIs in non-test code:\n\n1. **`src/cffi/pkgconfig.py:33`**\n   - A helper that queries `pkg-config` or similar tooling by invoking a shell command (likely via `subprocess` or `os.popen/system`).\n   - Intended purpose: discover compile/link flags for C libraries.\n   - **Security impact:**\n     - This helper is generally used at *build or verification time*, not at runtime on a server handling untrusted inputs.\n     - Risk materializes only if **arguments to the command are derived from untrusted data** (e.g., environment variables, web input, or other attacker-controlled configuration) without proper validation.\n   - **Assessment:**\n     - For typical usage (developer-controlled build configuration), impact is low.\n     - In highly locked-down or multi-tenant build environments, you should\n       - Treat any parameters passed into these helpers as potentially sensitive, and\n       - Avoid forwarding unvalidated user input into these routines.\n\n2. **`setup.py:29–30`, `setup.py:126`**\n   - Shell commands are invoked as part of the package’s setup/installation or test/build helpers.\n   - **Security impact:**\n     - Running arbitrary third-party `setup.py` is **inherently unsafe** in hostile environments; this is not unique to `cffi`.\n     - These calls can be abused if a hostile actor controls the environment or arguments to `setup.py`.\n   - **Assessment:**\n     - Standard supply-chain guidance applies: only install from trusted sources, avoid running `setup.py` directly in untrusted contexts, and prefer isolated build environments.\n\n**Severity:** *Medium in hostile build environments; Low in standard development/CI usage.*  \n**Relevant CWE:** CWE-78 (OS Command Injection) potential, though not directly demonstrated from untrusted input in this codebase.\n\n**Recommendations for consumers:**\n- Do not treat `cffi` build helpers as safe endpoints for untrusted data.\n- In multi-tenant build systems, sandbox builds and treat all `setup.py` executions as untrusted.\n\n**Recommendations for maintainers (hardening):**\n- Keep shell command use localized and well-documented as *build-only* behavior.\n- Prefer `subprocess` with list-style arguments and `shell=False` where feasible.\n- Ensure that any arguments interpolated into shell commands are restricted to safe, validated values (e.g., library names from a fixed allowlist where practicable).\n\n---\n\n### 2. Dynamic library loading in `backend_ctypes`\n\n**File:**\n- `src/cffi/backend_ctypes.py:324`\n\n**Pattern:** Detected via `py/cffi-dynamic-library-loading` query.  \nThe backend implementation leverages `ctypes` to perform dynamic library loading. The flagged location around line 324 is part of code that:\n- Constructs a library handle via `ctypes` (e.g., `ctypes.CDLL`, `ctypes.PyDLL`, or similar),\n- Uses a path or library name resolved at runtime.\n\n**Security considerations:**\n- This behavior is conceptually expected for a FFI library: loading arbitrary native libraries is its core purpose.\n- The **security boundary is the caller**: if library names/paths originate from untrusted input, you can end up loading an attacker-controlled shared object, which is equivalent to arbitrary native code execution.\n\n**Assessment:**\n- **Not inherently a vulnerability in cffi**: the library is doing what it advertises.\n- **Risk to applications** arises if:\n  - You derive library paths or names from user-controlled data (e.g., HTTP parameters, configuration values supplied by an attacker), or\n  - You load libraries from directories where an attacker can drop their own `.so`/`.dll` files without appropriate path hardening.\n\n**Severity (library itself):** Informational/Low.  \n**Severity (misuse by consumers):** Potentially Critical (arbitrary native code execution).  \n**Relevant CWE:** CWE-829 (Inclusion of Functionality from Untrusted Control Sphere).\n\n**Recommendations for consumers:**\n- **Never** pass unvalidated user input as a library path/name into CFFI.\n- Prefer fixed, absolute paths or names pointing into trusted, system-managed library directories.\n- In plugin-like systems where paths are dynamic, maintain an explicit allowlist or signed artifacts.\n\n**Recommendations for maintainers:**\n- Consider strengthening documentation warnings around using user-controlled paths/names for dynamic libraries.\n- Where feasible, encourage callers to specify absolute paths or controlled search paths.\n\n---\n\n### 3. Temporary directory and file usage (mostly tests)\n\n**Files (all under `testing/`):**\n- `testing/cffi0/backend_tests.py:1244`\n- `testing/cffi1/test_new_ffi_1.py:1213`\n- `testing/cffi0/test_verify.py:1430, 1440`\n- `testing/cffi1/test_verify1.py:1399, 1410`\n- `testing/cffi1/test_zdist.py:45`\n\n**Pattern:** Detected via `py/cffi-tempdir-usage` query.\n\nThese locations use temporary files/directories (likely via `tempfile.mkdtemp`, `NamedTemporaryFile`, or similar) in **test-only code**.\n\n**Security impact:**\n- The flagged code is *not* part of the installed library API but test harnesses.\n- In normal usage, these tests are run by developers or CI with full trust in the environment.\n- Any classic temp-file issues (e.g., predictable filenames, insecure permissions) therefore have limited security impact for library consumers.\n\n**Assessment:**\n- No direct vulnerability for typical users.\n- Could be mildly relevant for hardening CI or shared test runners; still low priority.\n\n**Severity:** Low / Informational.  \n**Relevant CWE:** CWE-377 (Insecure Temporary File) potential pattern, but not demonstrated as exploitable.\n\n**Recommendations:**\n- Continue to rely on `tempfile` APIs (secure by default on modern Python).\n- Avoid manual construction of temp paths in shared world-writable directories without `tempfile`.\n\n---\n\n### 4. No evidence of remote-to-code execution via eval/exec in this revision\n\nA taint-style CodeQL query (`py/cffi-code-execution`, CWE-94) was run to detect flows from generic remote sources (`RemoteFlowSource`) into `eval`, `exec`, or `compile`.\n\n**Result:**\n- **No findings** in the `cffi` 2.0.0 codebase; the query ran successfully and returned zero results.\n\n**Interpretation:**\n- Within the scope of CodeQL’s `RemoteFlowSource` model and the inspected files, `cffi` core and helper modules do not take remote input and pass it directly into Python’s dynamic code-evaluation primitives.\n- This does *not* mean applications using `cffi` cannot be vulnerable if they themselves call `eval`/`exec`, but it indicates `cffi` itself does not appear to add such a sink.\n\n**Severity:** Not applicable (no hit).\n\n---\n\n### 5. No confirmed tainted flows into subprocess env/command in this revision\n\nAn additional (more complex) taint-tracking query was drafted to track remote data into `subprocess` calls (commands and `env` parameter). That query failed validation repeatedly under the current CodeQL environment and could not be executed successfully within the iteration budget.\n\nHowever, the earlier shell-usage query (`py/cffi-shell-command-usage`) enumerated all direct uses of `os`/`subprocess` in non-test code and showed only a **small, localized set** of locations (primarily build/config helpers as described in Finding 1). Manual reasoning about these specific call sites suggests:\n- They are invoked in tightly scoped build/verification contexts.\n- There is no obvious direct consumption of remote input from untrusted sources **within this library**.\n\n**Assessment:**\n- No evidence that `cffi` itself introduces a remote-command-injection vector via `subprocess` or `os.system`, **given typical library usage**.\n- Security posture still depends heavily on how an application passes parameters into these build helpers.\n\n---\n\n## Overall Risk Assessment\n\n- **Library behavior:**\n  - `cffi` is inherently security-sensitive because it enables calling arbitrary C code and loading arbitrary dynamic libraries.\n  - The observed implementation patterns (dynamic library loading, compiler invocations, etc.) are consistent with that mission.\n- **Direct vulnerabilities in `cffi` 2.0.0:**\n  - No clear, standalone, remotely exploitable vulnerability was identified within the core runtime API during this analysis.\n  - Shell command usage and dynamic loading can be dangerous **if** application code passes in untrusted input; this is more an *API misuse* risk than an intrinsic bug.\n- **Attack surface:**\n  - Build-time command invocations (`pkgconfig.py`, `setup.py`) — risk bounded to build environments.\n  - Runtime dynamic library loading — critical if misused with untrusted paths/names, but that choice is owned by the application developer.\n\n**High-level severity judgment for this package version:**\n- **Baseline security posture:** Reasonable for a low-level FFI library, with expected high inherent risk when misused.\n- **Confirmed issues:**\n  - Shell command use and dynamic loading locations that warrant **secure usage** but do not, by themselves, constitute confirmed vulnerabilities.\n\n---\n\n## Hardening & Usage Guidance\n\n### For Application Developers Using `cffi`\n\n1. **Treat CFFI as a powerful, dangerous primitive**\n   - Any ability to choose which C library to load or which C code to compile is effectively the ability to execute native code.\n   - Never let attackers control:\n     - Library file paths or names passed to CFFI/`ctypes` backends.\n     - C source strings given to `FFI.verify`/`set_source` that then get compiled.\n\n2. **Control your build environment**\n   - Do not run `setup.py` (including that of `cffi`) in an environment where potential attackers can control command-line arguments, environment variables, or the working directory in a way that changes the meaning of invoked shell commands.\n   - Use isolated build containers, locked-down PATH and library search paths, and minimal privileges.\n\n3. **Audit configuration-driven behavior**\n   - If you expose configuration options that ultimately influence compiler flags or library paths for CFFI, validate them rigorously:\n     - Enforce strict patterns (e.g., absolute paths under a controlled root directory).\n     - Use allowlists or signature-based verification for plugins/libraries.\n\n### For `cffi` Maintainers\n\n1. **Documentation hardening**\n   - Explicitly call out in documentation that:\n     - Passing user-controlled paths/names into CFFI’s dynamic loaders is equivalent to executing attacker-chosen native code.\n     - Build-time helpers invoking shell commands assume a **trusted** environment.\n\n2. **Command execution best practices**\n   - Where feasible, avoid `shell=True` patterns and prefer `subprocess` with argument lists.\n   - Normalize and validate any inputs that can reach shell commands (even if currently only configuration-driven).\n\n3. **Testing and CI**\n   - Continue to keep security-relevant behavior (tempfiles, shell use) primarily in tests, not in the core runtime API.\n   - Consider adding static- or dynamic-analysis checks in CI to prevent introduction of new unsafe patterns (e.g., new `eval`/`exec` uses, or new shell commands in runtime modules).\n\n---\n\n## Conclusion\n\nWithin the limits of the analysis and the CodeQL environment provided, `cffi` 2.0.0 appears to have **no confirmed, direct, remotely exploitable vulnerabilities** in its core runtime logic. The package does contain security-relevant behaviors — dynamic library loading and shell command execution in helper/build code — that require **careful usage** by applications and **secure configuration** of build environments.\n\nThe highest risks arise from **misuse**: giving attackers control over library names, file paths, or C source compiled via CFFI. Consumers should treat these surfaces as equivalent to arbitrary native code execution and defend them accordingly.",
+ "package_classification": {
+  "type": "library",
+  "layer": [
+   "language_binding",
+   "ffi",
+   "runtime",
+   "build-helper"
+  ]
+ },
+ "tool_calls": {
+  "get_package_profile_info": 1,
+  "execute_codeql_query": 13,
+  "validate_codeql_query": 0,
+  "fixup_codeql_query": 6,
+  "finalize_report": 1
+ },
+ "queries_executed": {
+  "critical": 1,
+  "high": 2,
+  "medium": 5,
+  "low": 0,
+  "total_executed": 15,
+  "total_with_results": 8,
+  "total_failed": 21
+ },
+ "query_findings": {
+  "critical": 0,
+  "high": 13,
+  "medium": 12,
+  "low": 0,
+  "total": 25
+ },
+ "findings": [
+  {
+   "codeql_query_uuid": "20251225181825",
+   "codeql_raw_query": "/**\n * @name cffi: unsafe use of shell command execution\n * @description Finds uses of os.system, subprocess with shell=True in cffi build/verification helpers.\n * @kind problem\n * @problem.severity warning\n * @id py/cffi-shell-command-usage\n * @tags security\n *       external/cwe/cwe-078\n */\n\nimport python\nimport semmle.python.ApiGraphs\nimport semmle.python.dataflow.new.DataFlow\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"os\").getMember(\"system\").getACall() or\n  call = API::moduleImport(\"subprocess\").getMember([\"call\", \"run\", \"Popen\", \"check_call\", \"check_output\"]).getACall()\nselect call, \"Use of shell command execution in cffi helper code.\"",
+   "hypothesis": "Use of shell command execution APIs in cffi which might be influenced by untrusted input (command injection risk).",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-078"
+   ],
+   "results_count": 13,
+   "results": [
+    {
+     "ruleId": "py/cffi-shell-command-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/cffi-shell-command-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of shell command execution in cffi helper code."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/cffi/pkgconfig.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 33,
+         "startColumn": 14,
+         "endColumn": 81
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "48d477f6f13a0004:1",
+      "primaryLocationStartColumnFingerprint": "5"
+     }
+    },
+    {
+     "ruleId": "py/cffi-shell-command-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/cffi-shell-command-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of shell command execution in cffi helper code."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "setup.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 29,
+         "startColumn": 13,
+         "endLine": 30,
+         "endColumn": 53
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "c4bb49112d1a1eb0:1",
+      "primaryLocationStartColumnFingerprint": "4"
+     }
+    },
+    {
+     "ruleId": "py/cffi-shell-command-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/cffi-shell-command-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of shell command execution in cffi helper code."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "testing/embedding/test_basic.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 57,
+         "startColumn": 16,
+         "endColumn": 46
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "baaf3564183e10cc:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/cffi-shell-command-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/cffi-shell-command-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of shell command execution in cffi helper code."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "testing/cffi0/test_ownlib.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 3
+        },
+        "region": {
+         "startLine": 161,
+         "startColumn": 17,
+         "endColumn": 72
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "acc9577da5cae1ca:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/cffi-shell-command-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/cffi-shell-command-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of shell command execution in cffi helper code."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "testing/cffi0/test_ownlib.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 3
+        },
+        "region": {
+         "startLine": 177,
+         "startColumn": 13,
+         "endLine": 179,
+         "endColumn": 43
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "51e549a40a42574b:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/cffi-shell-command-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/cffi-shell-command-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of shell command execution in cffi helper code."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "testing/cffi0/test_verify.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 4
+        },
+        "region": {
+         "startLine": 1606,
+         "startColumn": 9,
+         "endLine": 1607,
+         "endColumn": 72
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "c7abae0a70493dcf:1",
+      "primaryLocationStartColumnFingerprint": "4"
+     }
+    },
+    {
+     "ruleId": "py/cffi-shell-command-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/cffi-shell-command-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of shell command execution in cffi helper code."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "testing/cffi1/test_verify1.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 5
+        },
+        "region": {
+         "startLine": 1568,
+         "startColumn": 9,
+         "endLine": 1569,
+         "endColumn": 72
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "c7abae0a70493dcf:1",
+      "primaryLocationStartColumnFingerprint": "4"
+     }
+    },
+    {
+     "ruleId": "py/cffi-shell-command-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/cffi-shell-command-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of shell command execution in cffi helper code."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "testing/cffi1/test_zdist.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 6
+        },
+        "region": {
+         "startLine": 53,
+         "startColumn": 13,
+         "endColumn": 78
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "17e58648ef5908fe:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/cffi-shell-command-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/cffi-shell-command-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of shell command execution in cffi helper code."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "testing/cffi0/test_zintegration.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 7
+        },
+        "region": {
+         "startLine": 21,
+         "startColumn": 9,
+         "endLine": 25,
+         "endColumn": 45
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "e1fdf0a71870df86:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/cffi-shell-command-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/cffi-shell-command-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of shell command execution in cffi helper code."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "testing/cffi0/test_zintegration.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 7
+        },
+        "region": {
+         "startLine": 29,
+         "startColumn": 9,
+         "endLine": 37,
+         "endColumn": 11
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "5a29e0649807c13d:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/cffi-shell-command-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/cffi-shell-command-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of shell command execution in cffi helper code."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "testing/cffi0/test_zintegration.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 7
+        },
+        "region": {
+         "startLine": 97,
+         "startColumn": 9,
+         "endColumn": 66
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "2d5dbf9fbe9fd59a:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/cffi-shell-command-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/cffi-shell-command-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of shell command execution in cffi helper code."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "testing/cffi0/test_zintegration.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 7
+        },
+        "region": {
+         "startLine": 101,
+         "startColumn": 9,
+         "endColumn": 98
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "328e5c85c9c2ebb7:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/cffi-shell-command-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/cffi-shell-command-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of shell command execution in cffi helper code."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "testing/cffi0/test_zintegration.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 7
+        },
+        "region": {
+         "startLine": 102,
+         "startColumn": 9,
+         "endColumn": 60
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "fb7e1a637c967fda:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251225181943",
+   "codeql_raw_query": "/**\n * @name Shell command execution in cffi helper code\n * @description Detects use of subprocess/os.system in core cffi library (excluding tests) as it may run shell commands during verification/build.\n * @kind problem\n * @problem.severity warning\n * @id py/cffi-shell-command-usage\n * @tags security\n *       external/cwe/cwe-078\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom API::CallNode call, File f\nwhere\n  call = API::moduleImport([\"os\", \"subprocess\"]).getMember([\"system\", \"popen\", \"Popen\", \"run\", \"check_call\", \"check_output\"]).getACall() and\n  f = call.getLocation().getFile() and\n  not f.getRelativePath().matches(\"testing/%\")\nselect call, \"Use of shell command execution in cffi helper code.\"\n",
+   "hypothesis": "Core cffi library may execute shell commands via os.system/subprocess.* during verification or build, leading to command injection if arguments are influenced by untrusted input.",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-078"
+   ],
+   "results_count": 3,
+   "results": [
+    {
+     "ruleId": "py/cffi-shell-command-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/cffi-shell-command-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of shell command execution in cffi helper code."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/cffi/pkgconfig.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 33,
+         "startColumn": 14,
+         "endColumn": 81
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "48d477f6f13a0004:1",
+      "primaryLocationStartColumnFingerprint": "5"
+     }
+    },
+    {
+     "ruleId": "py/cffi-shell-command-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/cffi-shell-command-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of shell command execution in cffi helper code."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "setup.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 29,
+         "startColumn": 13,
+         "endLine": 30,
+         "endColumn": 53
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "c4bb49112d1a1eb0:1",
+      "primaryLocationStartColumnFingerprint": "4"
+     }
+    },
+    {
+     "ruleId": "py/cffi-shell-command-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/cffi-shell-command-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of shell command execution in cffi helper code."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "setup.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 126,
+         "startColumn": 10,
+         "endColumn": 42
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "27f415e6226d9c56:1",
+      "primaryLocationStartColumnFingerprint": "5"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251225182032",
+   "codeql_raw_query": "/**\n * @name cffi arbitrary file write via verifier\n * @description Detects flows from untrusted input into file paths used by cffi verifier / build helpers for writing C files or libraries.\n * @kind path-problem\n * @problem.severity error\n * @id py/cffi-verifier-arbitrary-file-write\n * @tags security\n *       external/cwe/cwe-073\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.dataflow.new.RemoteFlowSources\nimport semmle.python.Concepts\n\nmodule VerifierFileWriteConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) { source instanceof RemoteFlowSource }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(FileSystemAccess fa |\n      sink = fa.getAPathArgument()\n    )\n  }\n}\n\nmodule VerifierFileWriteFlow = TaintTracking::Global<VerifierFileWriteConfig>;\nimport VerifierFileWriteFlow::PathGraph\n\nfrom VerifierFileWriteFlow::PathNode source, VerifierFileWriteFlow::PathNode sink\nwhere VerifierFileWriteFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"User-controlled data reaches a file path used for file writing in cffi verifier/build helpers $@.\", source.getNode(), \"user input\"",
+   "hypothesis": "User-controlled data may reach file-write paths used by cffi verifier/build helpers, enabling arbitrary file write.",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-073"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251225182414",
+   "codeql_raw_query": "/**\n * @name CFFI use of temporary build directories\n * @description Detects where cffi verifier/build code creates or writes to temporary directories, which may be security-relevant when used in privileged contexts.\n * @kind problem\n * @problem.severity warning\n * @id py/cffi-tempdir-usage\n * @tags security\n *       external/cwe/cwe-377\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom API::CallNode call\nwhere\n  call = API::moduleImport(\"tempfile\").getMember([\"mkdtemp\", \"mkstemp\", \"TemporaryDirectory\"]).getACall()\nselect call, \"Use of temporary directory/file in cffi core code (review for secure usage).\"",
+   "hypothesis": "Identify use of insecure temporary directory or file creation that might be attacker-controllable when cffi is used in privileged build contexts.",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-377"
+   ],
+   "results_count": 7,
+   "results": [
+    {
+     "ruleId": "py/cffi-tempdir-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/cffi-tempdir-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of temporary directory/file in cffi core code (review for secure usage)."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "testing/cffi0/backend_tests.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 1244,
+         "startColumn": 24,
+         "endColumn": 42
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "ac100f1f7ac371fb:1",
+      "primaryLocationStartColumnFingerprint": "15"
+     }
+    },
+    {
+     "ruleId": "py/cffi-tempdir-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/cffi-tempdir-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of temporary directory/file in cffi core code (review for secure usage)."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "testing/cffi1/test_new_ffi_1.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 1213,
+         "startColumn": 24,
+         "endColumn": 42
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "ac100f1f7ac371fb:1",
+      "primaryLocationStartColumnFingerprint": "15"
+     }
+    },
+    {
+     "ruleId": "py/cffi-tempdir-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/cffi-tempdir-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of temporary directory/file in cffi core code (review for secure usage)."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "testing/cffi0/test_verify.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 1430,
+         "startColumn": 14,
+         "endColumn": 45
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "fdb40bffb9c1d148:1",
+      "primaryLocationStartColumnFingerprint": "9"
+     }
+    },
+    {
+     "ruleId": "py/cffi-tempdir-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/cffi-tempdir-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of temporary directory/file in cffi core code (review for secure usage)."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "testing/cffi0/test_verify.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 1440,
+         "startColumn": 14,
+         "endColumn": 45
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "f68f68da9ccfa108:1",
+      "primaryLocationStartColumnFingerprint": "9"
+     }
+    },
+    {
+     "ruleId": "py/cffi-tempdir-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/cffi-tempdir-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of temporary directory/file in cffi core code (review for secure usage)."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "testing/cffi1/test_verify1.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 3
+        },
+        "region": {
+         "startLine": 1399,
+         "startColumn": 14,
+         "endColumn": 45
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "fdb40bffb9c1d148:1",
+      "primaryLocationStartColumnFingerprint": "9"
+     }
+    },
+    {
+     "ruleId": "py/cffi-tempdir-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/cffi-tempdir-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of temporary directory/file in cffi core code (review for secure usage)."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "testing/cffi1/test_verify1.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 3
+        },
+        "region": {
+         "startLine": 1410,
+         "startColumn": 14,
+         "endColumn": 45
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "f68f68da9ccfa108:1",
+      "primaryLocationStartColumnFingerprint": "9"
+     }
+    },
+    {
+     "ruleId": "py/cffi-tempdir-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/cffi-tempdir-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of temporary directory/file in cffi core code (review for secure usage)."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "testing/cffi1/test_zdist.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 4
+        },
+        "region": {
+         "startLine": 45,
+         "startColumn": 20,
+         "endColumn": 29
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "fdbd072d377090ed:1",
+      "primaryLocationStartColumnFingerprint": "11"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251225182439",
+   "codeql_raw_query": "/**\n * @name CFFI dynamic library loading from potentially unsafe paths\n * @description Flags uses of ctypes.CDLL / dlopen-like APIs in cffi that may depend on environment-controlled search paths.\n * @kind problem\n * @problem.severity warning\n * @id py/cffi-dynamic-library-loading\n * @tags security\n *       external/cwe/cwe-114\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom API::CallNode call\nwhere\n  call = API::moduleImport(\"ctypes\").getMember([\"CDLL\", \"PyDLL\", \"WinDLL\", \"OleDLL\", \"LibraryLoader\"]).getACall()\nselect call, \"Dynamic library loading used within cffi; ensure search paths are not attacker-controlled.\"",
+   "hypothesis": "Locate dynamic library loading patterns used by cffi that may be impacted by untrusted search paths or environment manipulation.",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-114"
+   ],
+   "results_count": 1,
+   "results": [
+    {
+     "ruleId": "py/cffi-dynamic-library-loading",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/cffi-dynamic-library-loading",
+      "index": 0
+     },
+     "message": {
+      "text": "Dynamic library loading used within cffi; ensure search paths are not attacker-controlled."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/cffi/backend_ctypes.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 324,
+         "startColumn": 16,
+         "endColumn": 40
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "be68f4a5aa51c727:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251225182801",
+   "codeql_raw_query": "/**\n * @name Potential code execution via eval/exec in cffi\n * @description Detects flows of remote input into eval/exec or compile used by cffi helper modules.\n * @kind path-problem\n * @problem.severity error\n * @id py/cffi-code-execution\n * @tags security\n *       external/cwe/cwe-094\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.dataflow.new.RemoteFlowSources\nimport semmle.python.ApiGraphs\n\nmodule ExecConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) { source instanceof RemoteFlowSource }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(API::CallNode call, DataFlow::Node arg0 |\n      // Calls to the built-in eval/exec/compile\n      call = API::builtin([\"eval\", \"exec\", \"compile\"]).getACall() and\n      arg0 = call.getArg(0) and\n      sink = arg0\n    )\n  }\n}\n\nmodule ExecFlow = TaintTracking::Global<ExecConfig>;\nimport ExecFlow::PathGraph\n\nfrom ExecFlow::PathNode source, ExecFlow::PathNode sink\nwhere ExecFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"User-controlled data reaches $@.\", sink, \"eval/exec/compile\"",
+   "hypothesis": "Remote input reaching eval/exec/compile in cffi code",
+   "severity": "critical",
+   "cwe_ids": [
+    "cwe-094"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251225182851",
+   "codeql_raw_query": "/**\n * @name CFFI use of system temporary directories\n * @description Finds uses of tempfile or manual temp dirs/files in non-test cffi modules for review.\n * @kind problem\n * @problem.severity warning\n * @id py/cffi-tempdir-usage\n * @tags security\n *       external/cwe/cwe-377\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom API::CallNode call, File f\nwhere\n  call = API::moduleImport(\"tempfile\").getMember([\"mkstemp\", \"mkdtemp\", \"NamedTemporaryFile\", \"TemporaryDirectory\", \"gettempdir\"]).getACall() and\n  f = call.getLocation().getFile() and\n  f.getRelativePath().matches(\"src/cffi/%\")\nselect call, \"Use of temporary directory/file in cffi core code (review for secure usage).\"",
+   "hypothesis": "Insecure tempfile usage in core cffi modules",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-377"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251225182926",
+   "codeql_raw_query": "/**\n * @name CFFI dynamic library loading\n * @description Identifies dynamic loading of shared libraries in core cffi modules.\n * @kind problem\n * @problem.severity warning\n * @id py/cffi-dynamic-library-loading\n * @tags security\n *       external/cwe/cwe-114\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom API::CallNode call, File f\nwhere\n  (\n    call = API::moduleImport(\"ctypes\").getMember([\"CDLL\", \"PyDLL\", \"WinDLL\", \"OleDLL\"]).getACall() or\n    call = API::moduleImport(\"importlib\").getMember(\"import_module\").getACall()\n  ) and\n  f = call.getLocation().getFile() and\n  f.getRelativePath().matches(\"src/cffi/%\")\nselect call, \"Dynamic library loading used within cffi; ensure search paths are not attacker-controlled.\"",
+   "hypothesis": "Dynamic library loading in cffi core that might rely on unsafe search paths",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-114"
+   ],
+   "results_count": 1,
+   "results": [
+    {
+     "ruleId": "py/cffi-dynamic-library-loading",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/cffi-dynamic-library-loading",
+      "index": 0
+     },
+     "message": {
+      "text": "Dynamic library loading used within cffi; ensure search paths are not attacker-controlled."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/cffi/backend_ctypes.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 324,
+         "startColumn": 16,
+         "endColumn": 40
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "be68f4a5aa51c727:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    }
+   ]
+  }
+ ]
+}

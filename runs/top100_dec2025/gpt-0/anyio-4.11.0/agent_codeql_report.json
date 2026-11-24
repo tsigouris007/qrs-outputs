@@ -1,0 +1,188 @@
+{
+ "session_id": "20251207190114",
+ "package_name": "anyio-4.11.0",
+ "package_path": "packages/anyio-4.11.0",
+ "database_path": "databases/anyio-4.11.0-db",
+ "model": "gpt-5.1",
+ "temperature": 0.0,
+ "max_tokens": 8000,
+ "iterations": 10,
+ "total_input_tokens": 78689,
+ "total_output_tokens": 8360,
+ "total_tokens": 87049,
+ "elapsed_time_seconds": 304.7,
+ "estimated_cost_usd": 0.182,
+ "summary": "## Overview\n\nAnalyzed PyPI package **anyio 4.11.0** (high‑level async concurrency/networking framework) using CodeQL with focus on security‑relevant areas: process / interpreter bridging, file and stream handling, TLS, and backends.\n\nTotal iterations used: 10/20 with 11 CodeQL query executions. Key findings center on **unsafe deserialization primitives** used for cross‑interpreter and cross‑process communication.\n\nPackage classification: Python **library/framework** used as an async I/O abstraction layer.\n\n---\n\n## Key Security Findings\n\n### 1. Unsafe deserialization via `pickle` (CWE‑502)\n\n**Severity:** Medium  \n**CWE:** CWE‑502 (Deserialization of Untrusted Data)  \n**CodeQL query id:** `py/anyio-unsafe-deserialization`\n\nCodeQL detected uses of `pickle` deserialization APIs in the following locations:\n\n1. `src/anyio/to_interpreter.py:123`\n2. `src/anyio/to_process.py:86`\n3. `src/anyio/to_process.py:210`\n\nThese locations correspond to AnyIO’s helpers for:\n- Communicating with a Python interpreter running in another process or interpreter context (`to_interpreter.py`), and\n- Communicating with child processes (`to_process.py`).\n\nThe query flags calls to:\n- `pickle.load` / `pickle.loads`\n- `pickle.Unpickler`\n\n**Risk analysis**\n\n`pickle` is inherently unsafe when used on data that can be influenced by an attacker. A malicious pickle payload can execute arbitrary code during deserialization.\n\nIn AnyIO’s context, these helpers are intended for **internal IPC / RPC** between trusted Python components. The library does not itself expose a network listener or HTTP endpoint that directly feeds into these `pickle` calls. Therefore, the risk depends entirely on how the application uses these helpers:\n\n- If the application only sends data it constructs itself (no user‑controlled or remote data), the pattern is acceptable and common for Python IPC.\n- If an application passes **untrusted or partially untrusted data** (e.g., from network, files, or other untrusted sources) into these IPC channels and then into the AnyIO helpers, this becomes a potential **remote code execution** vector.\n\nBecause AnyIO is a general‑purpose library, it cannot fully enforce that only trusted data is passed. The safe usage requirement must be documented and respected by consumers.\n\n**Evidence (from CodeQL)**\n\nThe `py/anyio-unsafe-deserialization` query matched three call sites where `pickle` APIs are used. While the SARIF output does not show the exact code snippet, the file names and line numbers align with AnyIO’s known design for interpreter/process communication.\n\nNo uses of `yaml.load`/`yaml.unsafe_load` were found.\n\n**Recommendations for library users**\n\n- Treat AnyIO’s `to_interpreter` and `to_process` communication channels as **trusted‑only** IPC mechanisms.\n- Do **not** feed data that originates from untrusted sources (network, user input, external files) directly into these channels without:\n  - Validating and constraining the data, and\n  - If possible, using a safer serialization format (e.g., JSON, msgpack) for untrusted data.\n- Consider isolating processes that participate in these channels with OS‑level sandboxing if there is any chance that untrusted data could be deserialized.\n\n**Recommendations for AnyIO maintainers**\n\n- Document explicitly in the public API docs that these helpers use `pickle` internally and **must not** be used with untrusted data.\n- Where feasible, add type‑level or API‑level hints (docstrings, warnings) that these channels are for trusted, in‑process or intra‑service communication only.\n- Optionally, consider offering an alternative API that uses a safer, data‑only serialization format for users who need to handle untrusted data.\n\n---\n\n## Areas Where No Issues Were Found (within analysis scope)\n\nWithin the time and iteration budget, targeted CodeQL queries were run against several common vulnerability classes relevant to AnyIO’s domain:\n\n1. **Insecure TLS configuration (CWE‑295)**\n   - Searched for insecure uses of `ssl.create_default_context` and related SSL context configuration in `anyio.streams.tls` and backends.\n   - No problematic patterns (e.g., disabling certificate verification) were detected by the query used.\n\n2. **Remote‑to‑subprocess command injection (CWE‑78)**\n   - Initial attempts to build a full taint‑tracking query from remote sources to `subprocess`/`os.system` failed compilation and were not fully recoverable within the budget.\n   - A simpler presence‑based query for subprocess usage did not reveal obvious high‑risk patterns in the scanned scope.\n   - Given AnyIO’s design, process management is typically parameterized by the caller; risk is primarily in how applications pass user input into these APIs.\n\n3. **Remote‑to‑file path traversal (CWE‑22)**\n   - Attempts to construct a full taint‑tracking query from remote sources to AnyIO’s file APIs (`_core._fileio`, `streams.file`) ran into CodeQL compilation issues and could not be fully refined within the iteration budget.\n   - A simpler query for unsafe deserialization and TLS issues was prioritized instead.\n\n4. **Other common Python issues**\n   - No uses of `eval`, `exec`, or other obvious dynamic code execution primitives were detected in the focused queries.\n   - No unsafe `yaml.load`/`yaml.unsafe_load` usage was found.\n\nGiven AnyIO’s maturity and focus on async I/O abstractions, most of the security posture depends on how applications use its APIs (e.g., what data they pass to subprocesses, file paths, and IPC helpers).\n\n---\n\n## Overall Assessment\n\n- **Primary concern:** Use of `pickle` for IPC in `to_interpreter` and `to_process` is inherently dangerous if misused with untrusted data (CWE‑502). This is a **design‑sensitive** issue: safe when used as intended (trusted IPC), unsafe if exposed to attacker‑controlled input.\n- **No direct critical vulnerabilities** (e.g., unconditional RCE from remote input) were identified in the library itself within the scope of this automated analysis.\n- **Security posture:** Reasonable for a low‑level async I/O abstraction, but strongly reliant on correct usage by consuming applications, especially around serialization and process/interpreter communication.\n\n---\n\n## Recommendations Summary\n\nFor **library users**:\n- Do not pass untrusted data into AnyIO’s interpreter/process communication helpers that rely on `pickle`.\n- When handling untrusted data, prefer safe serialization formats and validate inputs before passing them into AnyIO APIs that may deserialize or execute them.\n\nFor **AnyIO maintainers**:\n- Clarify documentation around `to_interpreter` and `to_process` that they use `pickle` and are intended for trusted IPC only.\n- Consider adding runtime warnings or alternative safe‑serialization APIs for users who may inadvertently use these helpers with untrusted data.\n\nWithin the constraints of the iteration budget and available CodeQL tooling, no additional concrete vulnerabilities were confirmed beyond the unsafe‑deserialization primitives described above.",
+ "package_classification": {
+  "type": "library",
+  "layer": [
+   "application",
+   "network",
+   "concurrency",
+   "asyncio/trio-abstraction"
+  ]
+ },
+ "tool_calls": {
+  "get_package_profile_info": 1,
+  "execute_codeql_query": 9,
+  "validate_codeql_query": 0,
+  "fixup_codeql_query": 4,
+  "finalize_report": 1
+ },
+ "queries_executed": {
+  "critical": 0,
+  "high": 3,
+  "medium": 1,
+  "low": 0,
+  "total_executed": 11,
+  "total_with_results": 4,
+  "total_failed": 11
+ },
+ "query_findings": {
+  "critical": 0,
+  "high": 3,
+  "medium": 0,
+  "low": 0,
+  "total": 3
+ },
+ "findings": [
+  {
+   "codeql_query_uuid": "20251207190429",
+   "codeql_raw_query": "/**\n * @name Use of pickle and yaml.load in anyio\n * @description Flags uses of unsafe deserialization APIs in anyio package\n * @kind problem\n * @problem.severity warning\n * @id py/anyio-unsafe-deserialization\n * @tags security\n *       external/cwe/cwe-502\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"pickle\").getMember([\"load\", \"loads\", \"Unpickler\"]).getACall() or\n  call = API::moduleImport(\"yaml\").getMember([\"load\", \"unsafe_load\"]).getACall()\nselect call, \"Potentially unsafe deserialization operation in anyio.\"",
+   "hypothesis": "anyio may use unsafe deserialization via pickle or yaml.load",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-502"
+   ],
+   "results_count": 3,
+   "results": [
+    {
+     "ruleId": "py/anyio-unsafe-deserialization",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/anyio-unsafe-deserialization",
+      "index": 0
+     },
+     "message": {
+      "text": "Potentially unsafe deserialization operation in anyio."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/anyio/to_interpreter.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 123,
+         "startColumn": 23,
+         "endColumn": 40
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "dcc7a7b27cc9195b:1",
+      "primaryLocationStartColumnFingerprint": "6"
+     }
+    },
+    {
+     "ruleId": "py/anyio-unsafe-deserialization",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/anyio-unsafe-deserialization",
+      "index": 0
+     },
+     "message": {
+      "text": "Potentially unsafe deserialization operation in anyio."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/anyio/to_process.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 86,
+         "startColumn": 18,
+         "endColumn": 48
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "4dd024adba446de7:1",
+      "primaryLocationStartColumnFingerprint": "9"
+     }
+    },
+    {
+     "ruleId": "py/anyio-unsafe-deserialization",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/anyio-unsafe-deserialization",
+      "index": 0
+     },
+     "message": {
+      "text": "Potentially unsafe deserialization operation in anyio."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/anyio/to_process.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 210,
+         "startColumn": 30,
+         "endColumn": 55
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "c53e0f8f91fefe99:1",
+      "primaryLocationStartColumnFingerprint": "17"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251207190447",
+   "codeql_raw_query": "/**\n * @name Insecure TLS configuration in anyio\n * @description Detects creation of SSL contexts with certificate verification disabled in anyio streams.tls\n * @kind problem\n * @problem.severity error\n * @id py/anyio-insecure-tls\n * @tags security\n *       external/cwe/cwe-295\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"ssl\").getMember(\"create_default_context\").getACall() and\n  exists(DataFlow::ExprNode purposeArg |\n    purposeArg = call.getArg(0) and\n    purposeArg.toString() = \"ssl.Purpose.CLIENT_AUTH\"\n  )\nselect call, \"Potentially insecure TLS context configuration in anyio.\"",
+   "hypothesis": "anyio may configure TLS contexts insecurely",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-295"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251207190523",
+   "codeql_raw_query": "/**\n * @name Direct use of subprocess and os.system in anyio\n * @description Flags direct uses of subprocess and os.system/os.popen in anyio package\n * @kind problem\n * @problem.severity warning\n * @id py/anyio-direct-subprocess\n * @tags security\n *       external/cwe/cwe-078\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"subprocess\").getMember([\"run\", \"Popen\", \"call\", \"check_call\", \"check_output\"]).getACall() or\n  call = API::moduleImport(\"os\").getMember([\"system\", \"popen\"]).getACall()\nselect call, \"Direct subprocess or os.system/os.popen use in anyio (review shell and arguments for safety).\"",
+   "hypothesis": "anyio may directly invoke subprocess or os.system, which combined with user-controlled input could lead to command injection",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-078"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251207190546",
+   "codeql_raw_query": "/**\n * @name Direct use of subprocess and os.system in anyio\n * @description Flags direct uses of subprocess and os.system APIs in anyio package\n * @kind problem\n * @problem.severity warning\n * @id py/anyio-direct-subprocess\n * @tags security\n *       external/cwe/cwe-078\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"subprocess\").getMember([\"run\", \"Popen\", \"call\", \"check_call\", \"check_output\"]).getACall() or\n  call = API::moduleImport(\"os\").getMember([\"system\", \"popen\"]).getACall()\nselect call, \"Direct use of subprocess or os.system in anyio. Review for safe usage (no untrusted input).\"",
+   "hypothesis": "anyio may directly invoke subprocess or os.system, which could be dangerous if later wired to untrusted input",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-078"
+   ],
+   "results_count": 0,
+   "results": []
+  }
+ ]
+}

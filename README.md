@@ -1,249 +1,89 @@
-# About
+# QRS: artifact for auditing the paper's numbers
 
-This repository contains artifacts produced by QRS.
+This repository holds the raw outputs of every scan reported in the paper *QRS: Agentic CodeQL Synthesis for
+Vulnerability Discovery in Open-Source Packages*, the expert labels, the inputs the agents received, and one script that
+recomputes every number of the paper from the raw outputs and compares it with the paper.
 
-```
-qrs-outputs/
-├── ablation/
-│   ├── ablation_findings_aggregate.md
-│   ├── ablation_load_aggregate.md
-│   ├── ablation_tool_aggregate.md
-│   └── code_reduction_aggregate.md
-├── configs/
-│   ├── agent-config-claude-4.5-0.yml
-│   ├── agent-config-claude-4.5-1.yml
-│   ├── agent-config-claude-4.6-1.yml
-│   ├── agent-config-deepseek-chat-0.yml
-│   ├── agent-config-deepseek-chat-1.yml
-│   ├── agent-config-deepseek-reasoner-0.yml
-│   ├── agent-config-deepseek-reasoner-1.yml
-│   ├── agent-config-gemini-3-pro-0.yml
-│   ├── agent-config-gemini-3-pro-1.yml
-│   ├── agent-config-gpt-5.1-0.yml
-│   └── agent-config-gpt-5.1-1.yml
-├── datasets/
-│   ├── cwe_bench_java_dataset.json
-│   ├── cwe_bench_java_dataset.md
-│   ├── hist20_dataset.json
-│   ├── hist20_dataset.md
-│   ├── top100_dataset.json
-│   └── top100_dataset.md
-├── instructions/
-│   ├── agents/
-│   │   ├── q_agent.md
-│   │   ├── r_agent.md
-│   │   └── s_agent.md
-│   ├── cwe_templates/
-│   │   ├── q_agent/
-│   │   │   ├── cwe-022.md
-│   │   │   ├── cwe-078.md
-│   │   │   ├── cwe-079.md
-│   │   │   └── cwe-094.md
-│   │   └── r_agent/
-│   │       ├── cwe-022.md
-│   │       ├── cwe-078.md
-│   │       ├── cwe-079.md
-│   │       └── cwe-094.md
-│   └── hist20_extra_strategy_preprompts/
-│       ├── <package>_codeql_prompt.md    (20 packages)
-│       └── <package>_reviewer_prompt.md  (20 packages)
-├── knowledge/
-│   ├── java/
-│   │   └── knowledge.md
-│   └── python/
-│       └── knowledge.md
-├── metrics/
-│   ├── cwe_bench_java.txt
-│   ├── cwe_bench_java.md
-│   ├── hist20.txt
-│   ├── hist20.md
-│   ├── top100.txt
-│   └── top100.md
-├── reports/
-│   ├── cwe_java_workbench/
-│   │   └── <vendor>__<package>_<version>/
-│   │       ├── <timestamp>_results.sarif  (per-CWE SARIF outputs)
-│   │       ├── agent_codeql_report.json
-│   │       ├── agent_codeql_run.log
-│   │       ├── agent_reviewer_groups.json
-│   │       ├── agent_reviewer_report.json
-│   │       ├── agent_sanity_report.json
-│   │       └── package_profile.json
-│   ├── hist20/
-│   │   └── <config>/                     (claude-0, deepseek-reasoner-0, gemini-0, gpt-0)
-│   │       └── <package>-<version>/
-│   │           ├── <timestamp>_results.sarif
-│   │           ├── agent_codeql_report.json
-│   │           ├── agent_codeql_run.log
-│   │           ├── agent_reviewer_groups.json
-│   │           ├── agent_reviewer_report.json
-│   │           ├── agent_sanity_report.json
-│   │           └── package_profile.json
-│   └── top100_samples/
-│       └── <config>/                     (claude-0, claude-1, deepseek-reasoner-1, gemini-0, gemini-1, gpt-0)
-│           └── <package>-<version>/
-│               ├── <timestamp>_results.sarif
-│               ├── agent_codeql_report.json
-│               ├── agent_codeql_run.log
-│               ├── agent_reviewer_groups.json
-│               ├── agent_reviewer_report.json
-│               ├── agent_sanity_report.json
-│               └── package_profile.json
-├── tools/
-│   ├── java/
-│   │   └── profiler_minimal.py
-│   ├── python/
-│   │   └── profiler_minimal.py
-│   ├── mitre_helper.py
-│   ├── q_agent_query_tools.py
-│   ├── r_agent_review_tools.py
-│   └── search_cve.py
-├── sast_reports/
-│   ├── bandit_scan.json
-│   ├── codeql_scan.json
-│   └── opengrep_scan.json
-└── visualizations/
-    ├── cwe_java_bench/    (8 PDF charts)
-    ├── hist20/            (8 PDF charts)
-    └── top100/            (8 PDF charts)
+## Quick start
+
+Requirements: Python 3.9 or newer, standard library only.
+
+```bash
+python3 verify.py
 ```
 
-## Ablation
+`verify.py` rebuilds the result databases in memory from `runs/` (no database is shipped), computes every table, figure
+and in-text number, writes them to `results.json` and compares each one with `paper_numbers.json` (the values as printed
+in the paper). It prints one line per paper element and every value that differs; it takes about 10 seconds.
 
-Ablation studies mined from the existing 1000-scan production logs (no new LLM calls), evaluating the QRS pipeline design choices across all 10 model/run configurations:
+## Layout
 
-- `ablation_findings_aggregate.md` — Per-configuration and aggregate findings comparison across pipeline stages (Q / Q+R / Q+R+S), reporting TP/FP/TN/FN and accuracy/precision/recall/F1 against the human-reviewed ground truth.
-- `ablation_load_aggregate.md` — Single-agent load and tool-preference ablation: evidence that a single agent cannot absorb the combined Q+R+S workload, and that models default to raw code reading over structured/symbolic tools when given the choice.
-- `ablation_tool_aggregate.md` — Per-configuration, per-tool average usage (calls, tokens, cost, execution time) broken down by agent (Query / Review / Sanity) and tool.
-- `code_reduction_aggregate.md` — Code reduction ablation quantifying how much of a package's source the Reviewer agent actually reads (via `extract_code_snippet`) versus total package size, demonstrating the benefit of CodeQL-first triage.
+| Path | Content |
+|---|---|
+| `verify.py` | The verification engine: one function per paper element (`table2`, ..., `table15`, `figure4`, ...) |
+| `paper_numbers.json` | Every number of the paper as printed, keyed by paper element; `results.json` has the same keys |
+| `runs/` | Raw scan outputs, one folder per scan (see [runs/README.md](runs/README.md)) |
+| `data/labels/` | Expert label per finding (`finding_id, label, severity, flags`), one file per experiment |
+| `data/label_audit.csv` | The 1,000-finding label audit: the expert's label, both blind judges' labels and the final label |
+| `data/label_audit_instructions.md` | The instructions the two judges received |
+| `data/ground_truth/` | The 12 confirmed Top100 issues (locations, close candidates), the Hist20 targets and hand decisions, the SAST decisions |
+| `data/manifests/` | Scan order and row ids of the original result databases, one file per experiment |
+| `data/exclusions/` | Scans excluded from the reruns (toolchain or network failures, superseded runs), with the reason |
+| `data/datasets/` | The three datasets (package lists, versions, CVEs) |
+| `data/cwe_bench_java/` | CWE-Bench-Java scope and QRS results per CVE; IRIS v1 and QLCoder published results |
+| `data/reference_outputs/` | Output of the recall probe, which cannot run offline |
+| `pipeline/` | What the agents received: system prompts, the CodeQL knowledge schemas, strategy directives, tool code |
+| `sources/` | 31 unmodified source files from the public PyPI packages (function spans for the SAST comparison) |
+| `reference/` | The two scripts that cannot run offline (see below) |
 
-## Datasets
+## Labels
 
-Includes the 3 datasets: Hist20, Top100, and CWE Bench Java.
+One expert labelled every finding R submitted (`tp`, `fp`, or `dup` for a repeat). Two LLM judges from different vendors
+labelled a stratified sample of 1,000 findings, blind to every verdict and to each other; `data/label_audit.csv` lists, per
+sampled finding, the expert's label, both judges' labels and the final label. The expert re-examined the 124 findings that
+both judges contested and changed 93; that re-examination is the final label, and it is the label in `data/labels/top100.csv`.
+A duplicate counts once (`final_labels()` in `verify.py`).
 
-| Dataset | JSON | Markdown |
-|---------|------|----------|
-| Hist20 | [datasets/hist20_dataset.json](datasets/hist20_dataset.json) | [datasets/hist20_dataset.md](datasets/hist20_dataset.md) |
-| Top100 | [datasets/top100_dataset.json](datasets/top100_dataset.json) | [datasets/top100_dataset.md](datasets/top100_dataset.md) |
-| CWE Bench Java | [datasets/cwe_bench_java_dataset.json](datasets/cwe_bench_java_dataset.json) | [datasets/cwe_bench_java_dataset.md](datasets/cwe_bench_java_dataset.md) |
+An issue is delivered by a scan when R and S keep a finding at the issue's location (`data/ground_truth/top100_issues.json`);
+a delivered finding that states another or a similar weakness is a close candidate (†), decided by hand and recorded there.
 
-- `hist20_dataset.json` — 20 historical Python packages with known CVEs.
-- `top100_dataset.json` — Top 100 PyPI packages.
-- `cwe_bench_java_dataset.json` — Java packages from the CWE Bench.
+## What was removed or changed for the release
 
-## Knowledge
+- **Proof-of-concept exploits.** The `exploit_payload` field is removed from every finding (17,640 occurrences).
+- **Agent free text in the logs.** The models' own messages in the run logs are replaced by
+  `<agent text removed for release>`. Only the tokens that the parsers count (tool-call markers and finding ids) are
+  kept. All structured log lines (iterations, tool calls, queries, errors, token usage) are unchanged.
+- **Free-text label notes and judge rationales.** Verdicts, severities and flags are released.
+- **SARIF files.** Their results are already inside each `agent_codeql_report.json`.
+- **Host names and absolute paths** are replaced by relative paths.
+- **Identifiers of the 8 Top100 CVEs** are replaced by `CVE-ID-1` to `CVE-ID-8`, as in the paper, everywhere
+  (raw outputs, labels, ground truth), together with the one advisory ID that refers to them.
+  Hist20 and CWE-Bench-Java CVEs are public and kept.
 
-Language-specific CodeQL knowledge files used to guide the Q agent.
+## What cannot be recomputed offline
 
-- `knowledge/python/knowledge.md` — Python CodeQL instructions.
-- `knowledge/java/knowledge.md` — Java CodeQL instructions.
+- **Recall probe (current models):** one paid API call per model and CVE; `reference/e5_recall_probe.py`, output in
+  `data/reference_outputs/e5_recall_probe.json`.
+- **IRIS re-evaluation with the reply-parsing bug fixed (40/90):** replays IRIS's own filter in its container against the
+  CodeQL databases; `reference/e4_posthoc_reeval.py`, output in `runs/iris_e4_nov2026/logs/posthoc_reeval.json`.
+- **Scanning itself:** the scans call commercial model APIs. The prompts, schemas, directives and tool code in
+  `pipeline/` and the configurations in Table 15 (checked by `verify.py`) document what each scan received.
 
-## Configs
+## Experiments
 
-Minimal YAML configurations for all scanned model/strategy combinations (11 configs total), covering: Claude 4.5, Claude 4.6, DeepSeek Chat, DeepSeek Reasoner, Gemini 2.5 Pro, and GPT-5.1 — each with strategy variants 0 and/or 1.
+| Folder | Experiment | Scans |
+|---|---|---|
+| `runs/top100_dec2025/<config>/<package>` | Top100: 10 configurations × 100 packages, no directives (Dec 2025) | 1,000 |
+| `runs/hist20_jan2026/<config>/<package>` | Hist20 with directives, D arm (Jan 2026) | 80 |
+| `runs/nov2026/hist20/<config>N-r1/<package>` | Hist20 without directives, N arm (Nov 2026); G0N: refused | 61 |
+| `runs/cwe_bench_java_apr2026/<project>` | CWE-Bench-Java, C3 (Mar–Apr 2026) | 85 |
+| `runs/nov2026/claude-{0,1}-r{1..4}/<package>` | Reruns of C0 and C1 on the 10 packages with confirmed issues | 80 (+5 excluded) |
+| `runs/single_agent_nov2026/<arm>/<package>` | One agent with every tool, text and native history | 20 |
+| `runs/iris_e4_nov2026/` | IRIS v1 with Sonnet 4.6 on the 90 CVEs (summaries per project) | 90 |
+| `runs/nov2026/e5/<config>-r1/<package>` | The setting with November 2026 models | 40 (+14 excluded) |
+| `runs/sast_jan2026/` | Bandit, Opengrep and CodeQL default-suite outputs on Top100, with the scanner scripts | 3 tools |
 
-## Instructions
+## AI Usage
 
-- `agents/` — Base system instructions for the Q, R, and S agents.
-- `cwe_templates/` — Per-CWE template prompts for Q and R agents (CWE-022, 078, 079, 094).
-- `hist20_extra_strategy_preprompts/` — Package-specific CodeQL and reviewer preprompts used in the extra strategy (strategy 1) on the Hist20 dataset (20 packages × 2 prompt types).
-
-## Reports
-
-Per-package scan artifacts organized by dataset and model configuration. Each package directory contains:
-
-- `<timestamp>_results.sarif` — Raw CodeQL SARIF result files (one per query run).
-- `agent_codeql_report.json` — Q agent findings report.
-- `agent_codeql_run.log` — Execution log of the Q agent CodeQL run.
-- `agent_reviewer_groups.json` — Grouped findings for review.
-- `agent_reviewer_report.json` — R agent reviewer report.
-- `agent_sanity_report.json` — S agent sanity/validation report.
-- `package_profile.json` — Package metadata and profile.
-
-### cwe_java_workbench
-
-Reports for 80+ Java packages from the CWE Bench workbench, covering vendors such as Apache, Alibaba, Jenkins, Keycloak, Spring, XWiki, and others.
-
-### hist20
-
-Reports for 4 model configurations (claude-0, deepseek-reasoner-0, gemini-0, gpt-0), each covering 20 Python packages.
-
-Note: Includes anonymized artifacts for 4 configurations on the Hist20 dataset.
-
-### top100_samples
-
-Sample reports for 6 model configurations (claude-0, claude-1, deepseek-reasoner-1, gemini-0, gemini-1, gpt-0) across select Top100 packages.
-
-Note: Regarding Top100 we include public knowledge that has already been addressed or patched. We cannot publicly disclose all of the scans, as they contain package internals and exploitation snippets. Contact in private if more artifacts are needed for this purpose.
-
-## SAST Reports
-
-Consolidated SAST scan result files used as baselines or comparisons in QRS:
-
-- `bandit_scan.json` — Bandit static analysis scan results.
-- `codeql_scan.json` — CodeQL scan results.
-- `opengrep_scan.json` — Opengrep scan results.
-
-## Metrics
-
-Aggregated evaluation metrics for each dataset, available as both plain-text and GitHub-compatible Markdown:
-
-| Dataset | Plain Text | Markdown |
-|---------|-----------|----------|
-| CWE Bench Java | [metrics/cwe_bench_java.txt](metrics/cwe_bench_java.txt) | [metrics/cwe_bench_java.md](metrics/cwe_bench_java.md) |
-| Hist20 | [metrics/hist20.txt](metrics/hist20.txt) | [metrics/hist20.md](metrics/hist20.md) |
-| Top100 | [metrics/top100.txt](metrics/top100.txt) | [metrics/top100.md](metrics/top100.md) |
-
-Each metrics file contains six sections:
-
-1. **Overall Summary** — total runtime, cost, tokens, and iterations across all configurations.
-2. **Average Metrics by Model Family and Temperature** — per-model averages for runtime, cost, tokens, and agent iteration counts.
-3. **Q Agent Query Efficiency** — query totals broken down by results, no-results, and failures.
-4. **Average Tool Call Counts** — mean invocation counts for every Q, R, and S agent tool.
-5. **Performance Metrics** — prediction counts with accuracy, precision, recall, and F1 score.
-6. **TP/MR Finding Reduction** — finding count delta between the Reviewer (R) and Sanity (S) agents.
-
-## Visualizations
-
-PDF chart artifacts for each dataset, including 8 plots per dataset:
-
-- CWE heatmap by template
-- Package findings (overall and by template)
-- Package flags breakdown
-- Resource metrics boxplots
-- Sanity/S flag distribution (TP/MR)
-- Severity distribution
-- Verdict transitions
-
-## Tools
-
-A subset of core utility scripts used in QRS:
-
-- `mitre_helper.py` — MITRE CVE/CWE lookup helper.
-- `q_agent_query_tools.py` — Tools used by the Q agent for querying.
-- `r_agent_review_tools.py` — Tools used by the R agent for reviewing.
-- `search_cve.py` — CVE search utility.
-- `java/profiler_minimal.py` — Minimal Java package profiler.
-- `python/profiler_minimal.py` — Minimal Python package profiler.
-
----
-
-QRS used:
-- `configs`
-- `datasets`
-- `instructions`
-- `knowledge`
-- `tools`
-
-QRS produced:
-- `reports`
-
-SAST scans produced:
-- `sast_reports`
-
-QRS evaluations:
-- `metrics`
-- `visualizations`
-- `ablation`
-
-_This README file has been generated via Claude Sonnet 4.6_
+This repository was created via Claude Opus 5.5 to help reviewers quickly verify all metrics mentioned in the paper
+via single verification script.

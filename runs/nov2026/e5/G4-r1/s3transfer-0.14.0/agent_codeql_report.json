@@ -1,0 +1,1161 @@
+{
+ "session_id": "20261122232359",
+ "package_name": "s3transfer-0.14.0",
+ "package_path": "packages/s3transfer-0.14.0",
+ "database_path": "databases/s3transfer-0.14.0-db",
+ "model": "gemini/gemini-4-carbon",
+ "temperature": null,
+ "max_tokens": 16000,
+ "iterations": 19,
+ "total_input_tokens": 205348,
+ "total_output_tokens": 9287,
+ "total_tokens": 214635,
+ "elapsed_time_seconds": 419.02,
+ "estimated_cost_usd": 0.0,
+ "summary": "# Security Analysis Report: `s3transfer-0.14.0`\n\n## Package Overview\n`s3transfer` is Amazon's official Python library for managing high-level Amazon S3 file transfers (multipart uploads, parallel downloads, copies, and deletions), serving as the underlying transfer engine for `boto3` and the AWS CLI. It depends solely on `botocore` (and optionally `awscrt`).\n\n## Key Findings\n\n### 1. Predictable Temporary File Naming and Non-Exclusive Temporary File Creation (Low Severity)\n- **CWEs**: CWE-377 (Insecure Temporary File), CWE-330 (Use of Insufficiently Random Values), CWE-59 (Improper Link Resolution Before File Access)\n- **Locations**:\n  - `s3transfer/utils.py:54` and `s3transfer/__init__.py:160` (`random_file_extension`)\n  - `s3transfer/utils.py:287`, `s3transfer/__init__.py:355` (`OSUtils.open`), and `s3transfer/processpool.py:991` (`GetObjectWorker._write_to_file`)\n- **Description**: When downloading S3 objects to a local file path, `s3transfer` writes data to a temporary file named `<destination>.<random_suffix>` before renaming it (`OSUtils.rename_file`) to the final target path. The suffix is generated via Python's non-cryptographic `random` module (`random.choice(string.hexdigits)` with 8 characters by default), and the temporary file is opened using standard `open(filename, 'wb')` without `O_CREAT | O_EXCL` or `O_NOFOLLOW` flags.\n- **Impact**: If an application invokes `s3transfer` to download files directly into a world-writable shared directory (such as `/tmp`) on a multi-user system, a local attacker could predict PRNG output or pre-create symlinks matching the temporary filename pattern, leading to local symlink/file-overwrite or unauthorized read access prior to rename.\n- **Remediation**: Create temporary download files atomically and securely using `tempfile.NamedTemporaryFile(dir=os.path.dirname(filename), delete=False)` or `os.open()` with `os.O_WRONLY | os.O_CREAT | os.O_EXCL`, and replace `random` with `secrets`.\n\n### 2. Unanchored S3 Object Lambda ARN Validation Regex & Caller Path Responsibility (Informational / Defense-in-Depth)\n- **CWEs**: CWE-20 (Improper Input Validation), CWE-22 (Path Traversal)\n- **Locations**:\n  - `s3transfer/manager.py:226` (`_validate_all_known_args` / ARN regex check)\n  - `s3transfer/utils.py:287-315` (`OSUtils.open`, `OSUtils.rename_file`, `OSUtils.remove_file`)\n- **Description**:\n  1. In `s3transfer/manager.py:226`, the regular expression `^arn:(aws).*:s3-object-lambda:[a-z\\-0-9]+:[0-9]{12}:accesspoint[/:][a-zA-Z0-9\\-]{1,63}` lacks a trailing `$` anchor, allowing strings with arbitrary suffixes after a valid S3 Object Lambda ARN prefix to match the check (though downstream `botocore` client serialization further validates bucket/ARN parameters).\n  2. By design as a local storage SDK, `OSUtils` file operations accept caller-supplied destination paths directly without path canonicalization. Applications mapping untrusted S3 object keys directly to local download filenames must sanitize `../` sequences to prevent path traversal.\n\n## Verified Clean Areas\n- **Code & Command Injection (CWE-78, CWE-94)**: Confirmed zero usage of `eval`, `exec`, `compile`, `os.system`, `os.popen`, or `subprocess`.\n- **Unsafe Deserialization & IPC Exposure (CWE-502)**: Confirmed zero usage of `pickle`, `yaml`, `marshal`, or `shelve`, and verified `s3transfer/processpool.py` uses local `multiprocessing` queues/managers without exposing network IPC listeners.\n- **Cryptography & Transport Security (CWE-295, CWE-798)**: Confirmed no hardcoded credentials or SSL/TLS verification bypasses; all network transport and request signing are delegated to `botocore`/`awscrt`.\n- **Regular Expression Complexity (CWE-1333)**: Audited all compiled regular expressions (`s3transfer/crt.py:965`, `s3transfer/manager.py:226`, `setup.py:8`) and confirmed no catastrophic backtracking vectors.",
+ "package_classification": {
+  "layer": [
+   "data-access",
+   "network",
+   "infrastructure"
+  ],
+  "type": [
+   "library",
+   "sdk",
+   "cloud-storage-client"
+  ]
+ },
+ "tool_calls": {
+  "get_package_profile_info": 1,
+  "execute_codeql_query": 8,
+  "validate_codeql_query": 0,
+  "fixup_codeql_query": 0,
+  "finalize_report": 1
+ },
+ "queries_executed": {
+  "critical": 1,
+  "high": 1,
+  "medium": 5,
+  "low": 0,
+  "total_executed": 8,
+  "total_with_results": 7,
+  "total_failed": 1
+ },
+ "query_findings": {
+  "critical": 0,
+  "high": 16,
+  "medium": 13,
+  "low": 0,
+  "total": 29
+ },
+ "findings": [
+  {
+   "codeql_query_uuid": "20261122232423",
+   "codeql_raw_query": "/**\n * @name Code execution, command execution, or unsafe deserialization\n * @description Detects dynamic code execution, OS command execution, or unsafe deserialization sinks\n * @kind problem\n * @problem.severity error\n * @id py/code-cmd-deser-sinks\n * @tags security\n *       external/cwe/cwe-094\n *       external/cwe/cwe-078\n *       external/cwe/cwe-502\n */\n\nimport python\nimport semmle.python.Concepts\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::Node sink, string kind\nwhere\n  (\n    sink = any(CodeExecution ce).getCode() and kind = \"CodeExecution\"\n  )\n  or\n  (\n    sink = any(SystemCommandExecution sce).getCommand() and kind = \"SystemCommandExecution\"\n  )\n  or\n  (\n    sink = any(Decoding d | d.mayExecuteInput()).getAnInput() and kind = \"UnsafeDeserialization\"\n  )\n  or\n  (\n    sink = API::builtin([\"eval\", \"exec\", \"compile\", \"__import__\"]).getACall() and kind = \"BuiltinExec\"\n  )\nselect sink, \"Potential dangerous sink of type \" + kind + \".\"\n",
+   "hypothesis": "Check for any dynamic code execution, OS command execution, or unsafe deserialization across the package",
+   "severity": "critical",
+   "cwe_ids": [
+    "cwe-94",
+    "cwe-78",
+    "cwe-502"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20261122232542",
+   "codeql_raw_query": "/**\n * @name Weak random usage and file creation operations\n * @description Check usage of random module and file creation/rename operations for insecure temp files or symlink vulnerabilities\n * @kind problem\n * @problem.severity warning\n * @id py/weak-random-and-file-ops\n * @tags security\n *       external/cwe/cwe-330\n *       external/cwe/cwe-377\n *       external/cwe/cwe-059\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call, string kind\nwhere\n  (\n    call = API::moduleImport(\"random\").getAMember().getACall() and kind = \"random call\"\n    or\n    call = API::builtin(\"open\").getACall() and kind = \"builtin open\"\n    or\n    call = API::moduleImport(\"io\").getMember(\"open\").getACall() and kind = \"io.open\"\n    or\n    call = API::moduleImport(\"os\").getMember([\"open\", \"rename\", \"replace\", \"remove\", \"unlink\", \"makedirs\", \"mkdir\", \"chmod\", \"symlink\", \"readlink\", \"lstat\", \"stat\"]).getACall() and kind = \"os file op\"\n  )\nselect call, kind + \" at \" + call.getLocation().getFile().getRelativePath() + \":\" + call.getLocation().getStartLine().toString() + \" -> \" + call.asExpr().toString()\n",
+   "hypothesis": "Check how s3transfer generates temporary filenames using random module and opens/renames files during download, looking for predictable temporary file names (CWE-330/CWE-377) or symlink vulnerabilities (CWE-59).",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-330",
+    "cwe-377",
+    "cwe-59"
+   ],
+   "results_count": 16,
+   "results": [
+    {
+     "ruleId": "py/weak-random-and-file-ops",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/weak-random-and-file-ops",
+      "index": 0
+     },
+     "message": {
+      "text": "random call at s3transfer/__init__.py:160 -> Attribute()"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "s3transfer/__init__.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 160,
+         "startColumn": 20,
+         "endColumn": 51
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "5ffa55b4d8b60048:1",
+      "primaryLocationStartColumnFingerprint": "15"
+     }
+    },
+    {
+     "ruleId": "py/weak-random-and-file-ops",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/weak-random-and-file-ops",
+      "index": 0
+     },
+     "message": {
+      "text": "builtin open at s3transfer/__init__.py:266 -> open()"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "s3transfer/__init__.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 266,
+         "startColumn": 13,
+         "endColumn": 33
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "3e3e66cc697436e6:1",
+      "primaryLocationStartColumnFingerprint": "4"
+     }
+    },
+    {
+     "ruleId": "py/weak-random-and-file-ops",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/weak-random-and-file-ops",
+      "index": 0
+     },
+     "message": {
+      "text": "builtin open at s3transfer/__init__.py:355 -> open()"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "s3transfer/__init__.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 355,
+         "startColumn": 16,
+         "endColumn": 36
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "b740c9aaf9ea6e20:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/weak-random-and-file-ops",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/weak-random-and-file-ops",
+      "index": 0
+     },
+     "message": {
+      "text": "os file op at s3transfer/__init__.py:362 -> Attribute()"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "s3transfer/__init__.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 362,
+         "startColumn": 13,
+         "endColumn": 32
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "46cef317301924de:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/weak-random-and-file-ops",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/weak-random-and-file-ops",
+      "index": 0
+     },
+     "message": {
+      "text": "os file op at s3transfer/__init__.py:367 -> Attribute()"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "s3transfer/__init__.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 367,
+         "startColumn": 9,
+         "endColumn": 70
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "556b69e196db5064:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/weak-random-and-file-ops",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/weak-random-and-file-ops",
+      "index": 0
+     },
+     "message": {
+      "text": "os file op at s3transfer/compat.py:24 -> Attribute()"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "s3transfer/compat.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 24,
+         "startColumn": 13,
+         "endColumn": 36
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "56f9ac703a2fccff:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/weak-random-and-file-ops",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/weak-random-and-file-ops",
+      "index": 0
+     },
+     "message": {
+      "text": "os file op at s3transfer/compat.py:32 -> Attribute()"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "s3transfer/compat.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 32,
+         "startColumn": 9,
+         "endColumn": 50
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "6e6ec99a1dcb1bf8:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/weak-random-and-file-ops",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/weak-random-and-file-ops",
+      "index": 0
+     },
+     "message": {
+      "text": "builtin open at s3transfer/processpool.py:991 -> open()"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "s3transfer/processpool.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 991,
+         "startColumn": 14,
+         "endColumn": 35
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "96e1108f22208528:1",
+      "primaryLocationStartColumnFingerprint": "5"
+     }
+    },
+    {
+     "ruleId": "py/weak-random-and-file-ops",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/weak-random-and-file-ops",
+      "index": 0
+     },
+     "message": {
+      "text": "builtin open at setup.py:17 -> open()"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "setup.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 3
+        },
+        "region": {
+         "startLine": 17,
+         "startColumn": 12,
+         "endColumn": 65
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "41b672a4db7d2827:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/weak-random-and-file-ops",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/weak-random-and-file-ops",
+      "index": 0
+     },
+     "message": {
+      "text": "builtin open at setup.py:25 -> open()"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "setup.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 3
+        },
+        "region": {
+         "startLine": 25,
+         "startColumn": 22,
+         "endColumn": 40
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "f3210157ba32c31a:1",
+      "primaryLocationStartColumnFingerprint": "17"
+     }
+    },
+    {
+     "ruleId": "py/weak-random-and-file-ops",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/weak-random-and-file-ops",
+      "index": 0
+     },
+     "message": {
+      "text": "random call at s3transfer/utils.py:54 -> Attribute()"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "s3transfer/utils.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 4
+        },
+        "region": {
+         "startLine": 54,
+         "startColumn": 20,
+         "endColumn": 51
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "8d36242136edfd99:1",
+      "primaryLocationStartColumnFingerprint": "15"
+     }
+    },
+    {
+     "ruleId": "py/weak-random-and-file-ops",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/weak-random-and-file-ops",
+      "index": 0
+     },
+     "message": {
+      "text": "builtin open at s3transfer/utils.py:287 -> open()"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "s3transfer/utils.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 4
+        },
+        "region": {
+         "startLine": 287,
+         "startColumn": 16,
+         "endColumn": 36
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "b740c9aaf9ea6e20:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/weak-random-and-file-ops",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/weak-random-and-file-ops",
+      "index": 0
+     },
+     "message": {
+      "text": "os file op at s3transfer/utils.py:294 -> Attribute()"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "s3transfer/utils.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 4
+        },
+        "region": {
+         "startLine": 294,
+         "startColumn": 13,
+         "endColumn": 32
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "46cef317651c0727:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/weak-random-and-file-ops",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/weak-random-and-file-ops",
+      "index": 0
+     },
+     "message": {
+      "text": "os file op at s3transfer/utils.py:299 -> rename_file()"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "s3transfer/utils.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 4
+        },
+        "region": {
+         "startLine": 299,
+         "startColumn": 9,
+         "endColumn": 52
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "8ee77f77196bc8a7:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/weak-random-and-file-ops",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/weak-random-and-file-ops",
+      "index": 0
+     },
+     "message": {
+      "text": "os file op at s3transfer/utils.py:315 -> Attribute()"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "s3transfer/utils.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 4
+        },
+        "region": {
+         "startLine": 315,
+         "startColumn": 16,
+         "endColumn": 33
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "f97473748299db32:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/weak-random-and-file-ops",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/weak-random-and-file-ops",
+      "index": 0
+     },
+     "message": {
+      "text": "builtin open at s3transfer/utils.py:509 -> open()"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "s3transfer/utils.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 4
+        },
+        "region": {
+         "startLine": 509,
+         "startColumn": 13,
+         "endColumn": 33
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "55f360cf79ea6df8:1",
+      "primaryLocationStartColumnFingerprint": "4"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20261122232639",
+   "codeql_raw_query": "/**\n * @name Insecure temporary file creation using predictable random extension and open()\n * @description Creating temporary files using random.choice and builtin open('wb') without O_EXCL allows symlink attacks and race conditions\n * @kind problem\n * @problem.severity warning\n * @id py/insecure-temp-file-creation\n * @tags security\n *        external/cwe/cwe-377\n *        external/cwe/cwe-330\n *        external/cwe/cwe-367\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom Function f, Call openCall\nwhere\n  openCall.getScope() = f and\n  openCall.getFunc().(Name).getId() = \"open\" and\n  f.getLocation().getFile().getRelativePath().regexpMatch(\"s3transfer/.*\")\nselect openCall,\n  \"Function \" + f.getQualifiedName() + \" calls open() with args: \" +\n    concat(Expr arg, int i | arg = openCall.getArg(i) | i + \"=\" + arg.toString(), \", \") +\n    \" | keywords: \" +\n    concat(Keyword kw | kw = openCall.getAKeyword() | kw.getArg() + \"=\" + kw.getValue().toString(), \", \")\n",
+   "hypothesis": "Check how open() is called across s3transfer functions, specifically checking modes and temporary file usage without O_EXCL.",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-377",
+    "cwe-330",
+    "cwe-367",
+    "cwe-59"
+   ],
+   "results_count": 5,
+   "results": [
+    {
+     "ruleId": "py/insecure-temp-file-creation",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/insecure-temp-file-creation",
+      "index": 0
+     },
+     "message": {
+      "text": "Function ReadFileChunk.from_filename calls open() with args: 0=filename, 1=StringLiteral | keywords: "
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "s3transfer/__init__.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 266,
+         "startColumn": 13,
+         "endColumn": 33
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "3e3e66cc697436e6:1",
+      "primaryLocationStartColumnFingerprint": "4"
+     }
+    },
+    {
+     "ruleId": "py/insecure-temp-file-creation",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/insecure-temp-file-creation",
+      "index": 0
+     },
+     "message": {
+      "text": "Function OSUtils.open calls open() with args: 0=filename, 1=mode | keywords: "
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "s3transfer/__init__.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 355,
+         "startColumn": 16,
+         "endColumn": 36
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "b740c9aaf9ea6e20:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/insecure-temp-file-creation",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/insecure-temp-file-creation",
+      "index": 0
+     },
+     "message": {
+      "text": "Function GetObjectWorker._write_to_file calls open() with args: 0=filename, 1=StringLiteral | keywords: "
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "s3transfer/processpool.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 991,
+         "startColumn": 14,
+         "endColumn": 35
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "96e1108f22208528:1",
+      "primaryLocationStartColumnFingerprint": "5"
+     }
+    },
+    {
+     "ruleId": "py/insecure-temp-file-creation",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/insecure-temp-file-creation",
+      "index": 0
+     },
+     "message": {
+      "text": "Function OSUtils.open calls open() with args: 0=filename, 1=mode | keywords: "
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "s3transfer/utils.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 287,
+         "startColumn": 16,
+         "endColumn": 36
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "b740c9aaf9ea6e20:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/insecure-temp-file-creation",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/insecure-temp-file-creation",
+      "index": 0
+     },
+     "message": {
+      "text": "Function ReadFileChunk.from_filename calls open() with args: 0=filename, 1=StringLiteral | keywords: "
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "s3transfer/utils.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 509,
+         "startColumn": 13,
+         "endColumn": 33
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "55f360cf79ea6df8:1",
+      "primaryLocationStartColumnFingerprint": "4"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20261122232747",
+   "codeql_raw_query": "/**\n * @name Temp file creation with predictable random extension\n * @description Using random.choice to generate temporary filenames without exclusive creation flags allows symlink and race condition attacks\n * @kind problem\n * @problem.severity warning\n * @id py/predictable-temp-file\n * @tags security\n *       external/cwe/cwe-377\n *       external/cwe/cwe-330\n */\n\nimport python\n\nfrom Call c, Attribute a\nwhere\n  c.getFunc() = a and\n  a.getAttr() = \"random_file_extension\"\nselect c, \"Call to random_file_extension in \" + c.getScope().getName()\n",
+   "hypothesis": "Predictable temporary file names generated with random_file_extension without O_EXCL",
+   "severity": "medium",
+   "cwe_ids": [
+    "CWE-377",
+    "CWE-330"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20261122232859",
+   "codeql_raw_query": "/**\n * @name Usage of random, re, and socket modules\n * @description Check calls to random, re, and socket for weak PRNG, ReDoS, or insecure socket handling\n * @kind problem\n * @problem.severity warning\n * @id py/random-re-socket-audit\n * @tags security\n *       external/cwe/cwe-330\n *       external/cwe/cwe-1333\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call, string mod\nwhere\n  mod in [\"random\", \"re\", \"socket\"] and\n  call = API::moduleImport(mod).getAMember().getACall()\nselect call, \"Call to module \" + mod + \" with arg0: \" + call.getArg(0).toString()\n",
+   "hypothesis": "Check usage of random (weak PRNG for temp filenames), re (potential ReDoS), and socket modules",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-330",
+    "cwe-1333",
+    "cwe-295"
+   ],
+   "results_count": 5,
+   "results": [
+    {
+     "ruleId": "py/random-re-socket-audit",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/random-re-socket-audit",
+      "index": 0
+     },
+     "message": {
+      "text": "Call to module random with arg0: ControlFlowNode for Attribute"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "s3transfer/__init__.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 160,
+         "startColumn": 20,
+         "endColumn": 51
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "5ffa55b4d8b60048:1",
+      "primaryLocationStartColumnFingerprint": "15"
+     }
+    },
+    {
+     "ruleId": "py/random-re-socket-audit",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/random-re-socket-audit",
+      "index": 0
+     },
+     "message": {
+      "text": "Call to module re with arg0: ControlFlowNode for StringLiteral"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "s3transfer/crt.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 965,
+         "startColumn": 23,
+         "endLine": 967,
+         "endColumn": 6
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "62824b41b10672a0:1",
+      "primaryLocationStartColumnFingerprint": "18"
+     }
+    },
+    {
+     "ruleId": "py/random-re-socket-audit",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/random-re-socket-audit",
+      "index": 0
+     },
+     "message": {
+      "text": "Call to module re with arg0: ControlFlowNode for StringLiteral"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "s3transfer/manager.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 226,
+         "startColumn": 29,
+         "endLine": 229,
+         "endColumn": 10
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "d05d510e948a01b7:1",
+      "primaryLocationStartColumnFingerprint": "20"
+     }
+    },
+    {
+     "ruleId": "py/random-re-socket-audit",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/random-re-socket-audit",
+      "index": 0
+     },
+     "message": {
+      "text": "Call to module re with arg0: ControlFlowNode for StringLiteral"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "setup.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 3
+        },
+        "region": {
+         "startLine": 8,
+         "startColumn": 14,
+         "endColumn": 64
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "86bf9739637c9705:1",
+      "primaryLocationStartColumnFingerprint": "13"
+     }
+    },
+    {
+     "ruleId": "py/random-re-socket-audit",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/random-re-socket-audit",
+      "index": 0
+     },
+     "message": {
+      "text": "Call to module random with arg0: ControlFlowNode for Attribute"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "s3transfer/utils.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 4
+        },
+        "region": {
+         "startLine": 54,
+         "startColumn": 20,
+         "endColumn": 51
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "8d36242136edfd99:1",
+      "primaryLocationStartColumnFingerprint": "15"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20261122232925",
+   "codeql_raw_query": "/**\n * @name Regex and validation patterns\n * @description Inspect regular expression patterns for ReDoS or validation bypass\n * @kind problem\n * @problem.severity warning\n * @id py/regex-validation-check\n * @tags security\n *       external/cwe/cwe-1333\n *       external/cwe/cwe-020\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call, StringLiteral s\nwhere\n  call = API::moduleImport(\"re\").getMember([\"compile\", \"match\", \"search\", \"fullmatch\", \"sub\"]).getACall() and\n  call.getArg(0).asExpr() = s\nselect call, s.getText()\n",
+   "hypothesis": "Check regular expression patterns in manager.py and crt.py for ReDoS or improper S3 bucket/ARN input validation",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-1333",
+    "cwe-20"
+   ],
+   "results_count": 3,
+   "results": [
+    {
+     "ruleId": "py/regex-validation-check",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/regex-validation-check",
+      "index": 0
+     },
+     "message": {
+      "text": "^(?P<resource_type>accesspoint|outpost)\\[/:\\](?P<resource_name>.+)$"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "s3transfer/crt.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 965,
+         "startColumn": 23,
+         "endLine": 967,
+         "endColumn": 6
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "62824b41b10672a0:1",
+      "primaryLocationStartColumnFingerprint": "18"
+     }
+    },
+    {
+     "ruleId": "py/regex-validation-check",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/regex-validation-check",
+      "index": 0
+     },
+     "message": {
+      "text": "^arn:(aws).*:s3-object-lambda:\\[a-z\\-0-9\\]+:\\[0-9\\]{{12}}:accesspoint\\[/:\\]\\[a-zA-Z0-9\\-\\]{{1,63}}"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "s3transfer/manager.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 226,
+         "startColumn": 29,
+         "endLine": 229,
+         "endColumn": 10
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "d05d510e948a01b7:1",
+      "primaryLocationStartColumnFingerprint": "20"
+     }
+    },
+    {
+     "ruleId": "py/regex-validation-check",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/regex-validation-check",
+      "index": 0
+     },
+     "message": {
+      "text": "__version__ = \\['\"\\](\\[0-9.\\]+)\\['\"\\]"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "setup.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 8,
+         "startColumn": 14,
+         "endColumn": 64
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "86bf9739637c9705:1",
+      "primaryLocationStartColumnFingerprint": "13"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20261122233009",
+   "codeql_raw_query": "/**\n * @name Predictable temporary file extension usage\n * @description Using standard random module with non-exclusive open for temporary download files\n * @kind problem\n * @problem.severity warning\n * @id py/predictable-temp-file\n * @tags security\n *        external/cwe/cwe-377\n *        external/cwe/cwe-330\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"s3transfer\").getMember(\"utils\").getMember(\"random_file_extension\").getACall() or\n  call = API::moduleImport(\"s3transfer\").getMember(\"random_file_extension\").getACall()\nselect call, \"Temporary file name uses predictable random_file_extension without exclusive O_EXCL creation.\"\n",
+   "hypothesis": "Identify where predictable random_file_extension is used to construct temporary download file paths without exclusive creation flags",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-377",
+    "cwe-330",
+    "cwe-59"
+   ],
+   "results_count": 0,
+   "results": []
+  }
+ ],
+ "cache_usage": {
+  "prompt_tokens_total": 205348,
+  "uncached_input_tokens": 193401,
+  "cache_creation_input_tokens": 0,
+  "cache_read_input_tokens": 11947,
+  "output_tokens": 9287,
+  "calls": 19,
+  "caching_enabled": false,
+  "cost_usd_with_cache": 0.480867,
+  "cost_usd_no_cache": 0.503566,
+  "cache_read_share_of_prompt": 0.0582,
+  "prices_per_mtok": {
+   "claude-sonnet-4-5-20250929": {
+    "input": 3.0,
+    "output": 15.0
+   },
+   "claude-haiku-4-5-20251001": {
+    "input": 1.0,
+    "output": 5.0
+   },
+   "deepseek/deepseek-reasoner": {
+    "input": 0.15,
+    "output": 0.6,
+    "cache_read": 0.003,
+    "cache_write_mult": 1.0,
+    "peak_mult": 2.0
+   },
+   "gpt-5.1": {
+    "input": 1.25,
+    "output": 10.0,
+    "cache_read": 0.125,
+    "cache_write_mult": 1.0
+   },
+   "gpt-4.1": {
+    "input": 2.0,
+    "output": 8.0,
+    "cache_read": 0.5,
+    "cache_write_mult": 1.0
+   },
+   "deepseek/deepseek-v4-pro": {
+    "input": 0.66,
+    "output": 1.98,
+    "cache_read": 0.022,
+    "cache_write_mult": 1.0,
+    "peak_mult": 2.0
+   },
+   "deepseek/deepseek-flash": {
+    "input": 0.15,
+    "output": 0.6,
+    "cache_read": 0.003,
+    "cache_write_mult": 1.0,
+    "peak_mult": 2.0
+   },
+   "gemini/gemini-4-carbon": {
+    "input": 2.0,
+    "output": 10.0,
+    "cache_read": 0.1,
+    "cache_write_mult": 1.0
+   },
+   "gemini/gemini-3.8-flash": {
+    "input": 0.75,
+    "output": 3.75,
+    "cache_read": 0.075,
+    "cache_write_mult": 1.0
+   },
+   "openai/gpt-6.2-sol": {
+    "input": 2.0,
+    "output": 10.0,
+    "cache_read": 0.1,
+    "cache_write_mult": 1.0,
+    "long_threshold": 272000,
+    "long": {
+     "input": 4.0,
+     "output": 15.0,
+     "cache_read": 0.2
+    }
+   },
+   "openai/gpt-6-luna": {
+    "input": 0.1,
+    "output": 0.5,
+    "cache_read": 0.01,
+    "cache_write_mult": 1.0,
+    "long_threshold": 272000,
+    "long": {
+     "input": 0.2,
+     "output": 0.75,
+     "cache_read": 0.02
+    }
+   },
+   "claude-sonnet-5-5": {
+    "input": 2.0,
+    "output": 10.0,
+    "cache_read": 0.1
+   },
+   "claude-haiku-5-5": {
+    "input": 0.1,
+    "output": 0.5,
+    "cache_read": 0.01,
+    "long_threshold": 100000,
+    "long": {
+     "input": 0.5,
+     "output": 2.5,
+     "cache_read": 0.05
+    }
+   }
+  },
+  "cache_multipliers": {
+   "write_5m": 1.25,
+   "read": 0.1
+  }
+ }
+}

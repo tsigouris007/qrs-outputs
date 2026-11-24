@@ -1,0 +1,554 @@
+{
+ "session_id": "20261118084043",
+ "package_name": "filelock-3.20.0",
+ "package_path": "packages/filelock-3.20.0",
+ "database_path": "databases/filelock-3.20.0-db",
+ "model": "claude-sonnet-4-5-20250929",
+ "temperature": 0.0,
+ "max_tokens": 4000,
+ "iterations": 19,
+ "total_input_tokens": 150124,
+ "total_output_tokens": 8040,
+ "total_tokens": 158164,
+ "elapsed_time_seconds": 446.27,
+ "estimated_cost_usd": 0.571,
+ "summary": "## Security Analysis Summary: filelock-3.20.0\n\n### Package Overview\nThe filelock package (v3.20.0) is a platform-independent file locking library with 847 lines of code across 9 files. It provides Unix, Windows, and soft lock implementations with both synchronous and asynchronous support.\n\n### Key Findings\n\nI discovered **4 categories of security vulnerabilities** across 13 specific instances:\n\n#### 1. **TOCTOU Race Condition (CWE-367)** - Medium Severity\n- **Location**: `src/filelock/_unix.py:42`\n- **Issue**: Time-of-check-time-of-use race condition where file existence checks may be followed by file operations, creating a window for race condition attacks.\n\n#### 2. **Symlink Following Vulnerabilities (CWE-59)** - Medium Severity\n- **Locations**: 7 instances found across multiple files:\n  - `src/filelock/_soft.py:27, 42`\n  - `src/filelock/_unix.py:42, 44`\n  - `src/filelock/_util.py:22`\n  - `src/filelock/_windows.py:28, 49`\n- **Issue**: File operations that follow symbolic links without proper validation, potentially allowing attackers to manipulate lock files through symlink attacks to access or modify unintended files.\n\n#### 3. **Insecure File Permissions (CWE-732)** - Medium Severity\n- **Locations**: 3 instances:\n  - `src/filelock/_soft.py:27`\n  - `src/filelock/_unix.py:44`\n  - `src/filelock/_windows.py:28`\n- **Issue**: Lock files may be created with insecure permissions, potentially allowing unauthorized users to read, modify, or delete lock files, leading to security bypass or denial of service.\n\n### Positive Findings (No Vulnerabilities Detected)\n- ✅ No path traversal vulnerabilities\n- ✅ No command injection vulnerabilities\n- ✅ No unsafe temporary file usage\n- ✅ No unsafe deserialization\n- ✅ No information disclosure through error messages\n- ✅ No lock leak issues (proper exception handling)\n- ✅ No weak random number generation\n- ✅ No hardcoded credentials\n\n### Risk Assessment\nThe identified vulnerabilities are primarily **medium severity** and relate to file system security concerns typical of file locking implementations. These issues could potentially be exploited in multi-user or untrusted environments where attackers have local file system access.\n\n### Recommendations\n1. Implement O_NOFOLLOW or equivalent flags to prevent symlink following\n2. Use secure file permissions (e.g., 0600) when creating lock files\n3. Add atomic file operations to mitigate TOCTOU race conditions\n4. Consider using file descriptors instead of paths where possible to avoid race conditions",
+ "package_classification": {
+  "type": [
+   "library"
+  ],
+  "layer": [
+   "system",
+   "infrastructure"
+  ]
+ },
+ "tool_calls": {
+  "get_package_profile_info": 1,
+  "execute_codeql_query": 14,
+  "validate_codeql_query": 0,
+  "fixup_codeql_query": 2,
+  "finalize_report": 1
+ },
+ "queries_executed": {
+  "critical": 2,
+  "high": 5,
+  "medium": 4,
+  "low": 1,
+  "total_executed": 16,
+  "total_with_results": 12,
+  "total_failed": 4
+ },
+ "query_findings": {
+  "critical": 0,
+  "high": 11,
+  "medium": 0,
+  "low": 0,
+  "total": 11
+ },
+ "findings": [
+  {
+   "codeql_query_uuid": "20261118084059",
+   "codeql_raw_query": "/**\n * @name Path traversal in file lock operations\n * @description User-controlled file paths used in file lock operations without validation could allow path traversal\n * @kind path-problem\n * @problem.severity error\n * @id py/filelock-path-traversal\n * @tags security\n *        external/cwe/cwe-022\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.dataflow.new.RemoteFlowSources\nimport semmle.python.ApiGraphs\n\nmodule PathTraversalConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    source instanceof RemoteFlowSource\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(DataFlow::CallCfgNode call |\n      // FileLock constructor or acquire calls\n      call = API::moduleImport(\"filelock\").getMember([\"FileLock\", \"SoftFileLock\", \"UnixFileLock\", \"WindowsFileLock\"]).getACall() and\n      sink = call.getArg(0)\n    )\n  }\n}\n\nmodule PathTraversalFlow = TaintTracking::Global<PathTraversalConfig>;\nimport PathTraversalFlow::PathGraph\n\nfrom PathTraversalFlow::PathNode source, PathTraversalFlow::PathNode sink\nwhere PathTraversalFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"File lock path may be controlled by untrusted input from $@.\", source.getNode(), \"user input\"",
+   "hypothesis": "Check if user-controlled input flows to file lock path arguments without validation, which could allow path traversal attacks",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-022"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20261118084130",
+   "codeql_raw_query": "/**\n * @name Time-of-check time-of-use race condition\n * @description Checking file existence before operating on it can lead to race conditions\n * @kind problem\n * @problem.severity warning\n * @id py/toctou-race-condition\n * @tags security\n *        external/cwe/cwe-367\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode check, DataFlow::CallCfgNode use\nwhere\n  // File existence checks\n  (\n    check = API::moduleImport(\"os\").getMember(\"path\").getMember([\"exists\", \"isfile\", \"isdir\"]).getACall() or\n    check = API::moduleImport(\"pathlib\").getMember(\"Path\").getReturn().getMember([\"exists\", \"is_file\", \"is_dir\"]).getACall()\n  ) and\n  // File operations that follow\n  (\n    use = API::moduleImport(\"os\").getMember([\"remove\", \"unlink\", \"rmdir\", \"rename\"]).getACall() or\n    use = API::builtin(\"open\").getACall() or\n    use = API::moduleImport(\"pathlib\").getMember(\"Path\").getReturn().getMember([\"unlink\", \"rmdir\", \"rename\"]).getACall()\n  )\nselect check, \"Potential TOCTOU race condition: file existence check may be followed by file operation.\"\n",
+   "hypothesis": "Check for Time-of-Check-Time-of-Use (TOCTOU) race conditions where file existence is checked before use",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-367"
+   ],
+   "results_count": 1,
+   "results": [
+    {
+     "ruleId": "py/toctou-race-condition",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/toctou-race-condition",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential TOCTOU race condition: file existence check may be followed by file operation."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/filelock/_unix.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 42,
+         "startColumn": 20,
+         "endColumn": 49
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "5848e7413d7cc100:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20261118084156",
+   "codeql_raw_query": "/**\n * @name Symlink following in file operations\n * @description File operations that follow symbolic links without validation can be exploited\n * @kind problem\n * @problem.severity warning\n * @id py/symlink-following\n * @tags security\n *        external/cwe/cwe-059\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  (\n    // open() without O_NOFOLLOW\n    call = API::builtin(\"open\").getACall() or\n    // os.open without O_NOFOLLOW flag\n    call = API::moduleImport(\"os\").getMember(\"open\").getACall() or\n    // Path operations that may follow symlinks\n    call = API::moduleImport(\"pathlib\").getMember(\"Path\").getReturn().getMember([\"exists\", \"is_file\", \"is_dir\", \"stat\", \"lstat\", \"unlink\", \"rmdir\"]).getACall() or\n    call = API::moduleImport(\"os\").getMember([\"stat\", \"lstat\", \"remove\", \"unlink\", \"rmdir\"]).getACall() or\n    call = API::moduleImport(\"os\").getMember(\"path\").getMember([\"exists\", \"isfile\", \"isdir\"]).getACall()\n  )\nselect call, \"File operation that may follow symbolic links without proper validation.\"\n",
+   "hypothesis": "Symlink attacks where file operations follow symbolic links without proper validation, potentially allowing attackers to manipulate file locks or access unintended files",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-59"
+   ],
+   "results_count": 7,
+   "results": [
+    {
+     "ruleId": "py/symlink-following",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/symlink-following",
+      "index": 0
+     },
+     "message": {
+      "text": "File operation that may follow symbolic links without proper validation."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/filelock/_soft.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 27,
+         "startColumn": 28,
+         "endColumn": 78
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "e0cf0771037e84c:1",
+      "primaryLocationStartColumnFingerprint": "15"
+     }
+    },
+    {
+     "ruleId": "py/symlink-following",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/symlink-following",
+      "index": 0
+     },
+     "message": {
+      "text": "File operation that may follow symbolic links without proper validation."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/filelock/_soft.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 42,
+         "startColumn": 13,
+         "endColumn": 42
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "4b2f888543c485e4:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/symlink-following",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/symlink-following",
+      "index": 0
+     },
+     "message": {
+      "text": "File operation that may follow symbolic links without proper validation."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/filelock/_unix.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 42,
+         "startColumn": 20,
+         "endColumn": 49
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "5848e7413d7cc100:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/symlink-following",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/symlink-following",
+      "index": 0
+     },
+     "message": {
+      "text": "File operation that may follow symbolic links without proper validation."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/filelock/_unix.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 44,
+         "startColumn": 18,
+         "endColumn": 73
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "d118c77731a1d2b9:1",
+      "primaryLocationStartColumnFingerprint": "5"
+     }
+    },
+    {
+     "ruleId": "py/symlink-following",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/symlink-following",
+      "index": 0
+     },
+     "message": {
+      "text": "File operation that may follow symbolic links without proper validation."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/filelock/_util.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 22,
+         "startColumn": 21,
+         "endColumn": 38
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "7ebe9e625271151c:1",
+      "primaryLocationStartColumnFingerprint": "12"
+     }
+    },
+    {
+     "ruleId": "py/symlink-following",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/symlink-following",
+      "index": 0
+     },
+     "message": {
+      "text": "File operation that may follow symbolic links without proper validation."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/filelock/_windows.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 3
+        },
+        "region": {
+         "startLine": 28,
+         "startColumn": 22,
+         "endColumn": 72
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "9a4bb758ad4769f1:1",
+      "primaryLocationStartColumnFingerprint": "5"
+     }
+    },
+    {
+     "ruleId": "py/symlink-following",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/symlink-following",
+      "index": 0
+     },
+     "message": {
+      "text": "File operation that may follow symbolic links without proper validation."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/filelock/_windows.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 3
+        },
+        "region": {
+         "startLine": 49,
+         "startColumn": 17,
+         "endColumn": 46
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "c2c1725a197986f7:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20261118084220",
+   "codeql_raw_query": "/**\n * @name Insecure file permissions on lock files\n * @description Lock files created with overly permissive permissions may allow unauthorized access\n * @kind problem\n * @problem.severity warning\n * @id py/insecure-lock-file-permissions\n * @tags security\n *        external/cwe/cwe-732\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  (\n    // Check for os.open without O_EXCL or proper mode\n    call = API::moduleImport(\"os\").getMember(\"open\").getACall() or\n    // Check for open() calls without proper mode specification\n    call = API::builtin(\"open\").getACall()\n  ) and\n  // In filelock module files\n  call.getLocation().getFile().getRelativePath().matches(\"%filelock%\")\nselect call, \"File operation may create lock file with insecure permissions.\"",
+   "hypothesis": "Check for insecure file permissions when creating lock files that could allow unauthorized access",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-732"
+   ],
+   "results_count": 3,
+   "results": [
+    {
+     "ruleId": "py/insecure-lock-file-permissions",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/insecure-lock-file-permissions",
+      "index": 0
+     },
+     "message": {
+      "text": "File operation may create lock file with insecure permissions."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/filelock/_soft.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 27,
+         "startColumn": 28,
+         "endColumn": 78
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "e0cf0771037e84c:1",
+      "primaryLocationStartColumnFingerprint": "15"
+     }
+    },
+    {
+     "ruleId": "py/insecure-lock-file-permissions",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/insecure-lock-file-permissions",
+      "index": 0
+     },
+     "message": {
+      "text": "File operation may create lock file with insecure permissions."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/filelock/_unix.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 44,
+         "startColumn": 18,
+         "endColumn": 73
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "d118c77731a1d2b9:1",
+      "primaryLocationStartColumnFingerprint": "5"
+     }
+    },
+    {
+     "ruleId": "py/insecure-lock-file-permissions",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/insecure-lock-file-permissions",
+      "index": 0
+     },
+     "message": {
+      "text": "File operation may create lock file with insecure permissions."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/filelock/_windows.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 28,
+         "startColumn": 22,
+         "endColumn": 72
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "9a4bb758ad4769f1:1",
+      "primaryLocationStartColumnFingerprint": "5"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20261118084248",
+   "codeql_raw_query": "/**\n * @name Unsafe temporary file usage\n * @description Using temporary files without proper security measures can lead to vulnerabilities\n * @kind problem\n * @problem.severity warning\n * @id py/unsafe-temp-file\n * @tags security\n *        external/cwe/cwe-377\n *        external/cwe/cwe-379\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  (\n    call = API::moduleImport(\"tempfile\").getMember([\"mktemp\", \"TemporaryFile\", \"NamedTemporaryFile\", \"mkstemp\"]).getACall() or\n    call = API::moduleImport(\"os\").getMember([\"tmpfile\", \"tempnam\", \"tmpnam\"]).getACall()\n  )\nselect call, \"Temporary file operation that may have security implications.\"",
+   "hypothesis": "Check for unsafe temporary file operations that could lead to security issues",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-377",
+    "cwe-379"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20261118084412",
+   "codeql_raw_query": "/**\n * @name Command injection\n * @description Executing system commands with user-controlled input can lead to command injection\n * @kind problem\n * @problem.severity error\n * @id py/command-injection\n * @tags security\n *        external/cwe/cwe-078\n */\n\nimport python\nimport semmle.python.ApiGraphs\nimport semmle.python.Concepts\n\nfrom SystemCommandExecution cmd\nwhere exists(cmd.getCommand())\nselect cmd, \"Potential command execution that could be vulnerable to injection.\"",
+   "hypothesis": "Check for command injection vulnerabilities where system commands are executed",
+   "severity": "critical",
+   "cwe_ids": [
+    "cwe-078"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20261118084517",
+   "codeql_raw_query": "/**\n * @name Resource exhaustion through unbounded lock acquisition\n * @description Acquiring locks without proper timeout or resource limits can lead to denial of service\n * @kind problem\n * @problem.severity warning\n * @id py/unbounded-lock-acquisition\n * @tags security\n *        external/cwe/cwe-400\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  (\n    call = API::moduleImport(\"filelock\").getMember([\"FileLock\", \"SoftFileLock\", \"UnixFileLock\", \"WindowsFileLock\"]).getACall() or\n    call = API::moduleImport(\"filelock\").getMember(\"asyncio\").getMember([\"AsyncFileLock\", \"AsyncSoftFileLock\", \"AsyncUnixFileLock\", \"AsyncWindowsFileLock\"]).getACall()\n  ) and\n  // Check if timeout parameter is not set or is None\n  not exists(call.getArgByName(\"timeout\"))\nselect call, \"Lock acquisition without explicit timeout may lead to resource exhaustion.\"",
+   "hypothesis": "Lock acquisition without explicit timeout may lead to resource exhaustion and denial of service",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-400"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20261118084543",
+   "codeql_raw_query": "/**\n * @name Lock not released on exception\n * @description Acquiring a lock without proper exception handling may prevent the lock from being released\n * @kind problem\n * @problem.severity warning\n * @id py/lock-not-released\n * @tags security\n *        external/cwe/cwe-772\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call, string methodName\nwhere\n  (\n    call = API::moduleImport(\"filelock\").getMember(_).getReturn().getMember(methodName).getACall() or\n    call = API::moduleImport(\"filelock\").getMember(\"asyncio\").getMember(_).getReturn().getMember(methodName).getACall()\n  ) and\n  methodName in [\"acquire\", \"acquire_lock\"] and\n  // Check if not used in a context manager (with statement)\n  not exists(With w | w.getContextExpr() = call.asExpr())\nselect call, \"Lock acquisition without context manager may not release lock on exception.\"",
+   "hypothesis": "Lock acquisition without proper exception handling could lead to locks not being released",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-772"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20261118084612",
+   "codeql_raw_query": "/**\n * @name Information disclosure through error messages\n * @description Error messages that expose sensitive file paths or system information\n * @kind problem\n * @problem.severity warning\n * @id py/information-disclosure-error\n * @tags security\n *        external/cwe/cwe-209\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call, string funcName\nwhere\n  (\n    call = API::moduleImport(\"logging\").getMember([\"error\", \"exception\", \"warning\", \"info\", \"debug\"]).getACall() or\n    call = API::builtin(\"print\").getACall()\n  ) and\n  funcName = call.getFunction().asExpr().(Attribute).getName()\nselect call, \"Potential information disclosure through error messages or logging.\"",
+   "hypothesis": "Error messages or logging statements may expose sensitive file paths or system information",
+   "severity": "low",
+   "cwe_ids": [
+    "cwe-209"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20261118084639",
+   "codeql_raw_query": "/**\n * @name Unsafe deserialization\n * @description Deserializing untrusted data can lead to arbitrary code execution\n * @kind problem\n * @problem.severity error\n * @id py/unsafe-deserialization\n * @tags security\n *        external/cwe/cwe-502\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  (\n    call = API::moduleImport(\"pickle\").getMember([\"load\", \"loads\", \"Unpickler\"]).getACall() or\n    call = API::moduleImport(\"yaml\").getMember([\"load\", \"unsafe_load\"]).getACall() or\n    call = API::moduleImport(\"marshal\").getMember([\"load\", \"loads\"]).getACall() or\n    call = API::moduleImport(\"shelve\").getMember(\"open\").getACall()\n  )\nselect call, \"Potentially unsafe deserialization operation.\"",
+   "hypothesis": "Check for unsafe deserialization operations that could execute arbitrary code",
+   "severity": "critical",
+   "cwe_ids": [
+    "cwe-502"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20261118084706",
+   "codeql_raw_query": "/**\n * @name Weak random number generation\n * @description Using weak random number generators for security-sensitive operations can be predictable\n * @kind problem\n * @problem.severity warning\n * @id py/weak-random\n * @tags security\n *        external/cwe/cwe-338\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"random\").getMember([\"random\", \"randint\", \"choice\", \"randrange\"]).getACall()\nselect call, \"Use of weak random number generator that may be predictable.\"",
+   "hypothesis": "Weak random number generation used in security-sensitive contexts",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-338"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20261118084736",
+   "codeql_raw_query": "/**\n * @name Hardcoded credentials\n * @description Hardcoded credentials or secrets in source code can be extracted by attackers\n * @kind problem\n * @problem.severity error\n * @id py/hardcoded-credentials\n * @tags security\n *        external/cwe/cwe-798\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom StrConst str\nwhere\n  (\n    str.getText().regexpMatch(\"(?i).*(password|passwd|pwd|secret|api[_-]?key|token|auth).*\") and\n    str.getText().length() > 8 and\n    not str.getText().regexpMatch(\"(?i).*(example|test|dummy|placeholder|your_|<|>|\\\\{|\\\\}).*\")\n  )\nselect str, \"Potential hardcoded credential or secret found in source code.\"",
+   "hypothesis": "Check for hardcoded credentials, passwords, API keys, or secrets in the code",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-798",
+    "cwe-259"
+   ],
+   "results_count": 0,
+   "results": []
+  }
+ ],
+ "cache_usage": {
+  "prompt_tokens_total": 150124,
+  "uncached_input_tokens": 103,
+  "cache_creation_input_tokens": 13866,
+  "cache_read_input_tokens": 136155,
+  "output_tokens": 8040,
+  "calls": 21,
+  "caching_enabled": true,
+  "cost_usd_with_cache": 0.213753,
+  "cost_usd_no_cache": 0.570972,
+  "cache_read_share_of_prompt": 0.907,
+  "prices_per_mtok": {
+   "claude-sonnet-4-5-20250929": {
+    "input": 3.0,
+    "output": 15.0
+   },
+   "claude-haiku-4-5-20251001": {
+    "input": 1.0,
+    "output": 5.0
+   }
+  },
+  "cache_multipliers": {
+   "write_5m": 1.25,
+   "read": 0.1
+  }
+ }
+}

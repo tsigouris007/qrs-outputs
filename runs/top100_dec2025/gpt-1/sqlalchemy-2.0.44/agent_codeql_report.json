@@ -1,0 +1,808 @@
+{
+ "session_id": "20251226135541",
+ "package_name": "sqlalchemy-2.0.44",
+ "package_path": "packages/sqlalchemy-2.0.44",
+ "database_path": "databases/sqlalchemy-2.0.44-db",
+ "model": "gpt-5.1",
+ "temperature": 1.0,
+ "max_tokens": 8000,
+ "iterations": 13,
+ "total_input_tokens": 192042,
+ "total_output_tokens": 9546,
+ "total_tokens": 201588,
+ "elapsed_time_seconds": 569.7,
+ "estimated_cost_usd": 0.3355,
+ "summary": "## Security analysis of `SQLAlchemy` (PyPI: `sqlalchemy-2.0.44`)\n\n### Package overview\n- **Type:** Python ORM/database abstraction **library** with additional tooling scripts.\n- **Scope analyzed:** Core library under `lib/sqlalchemy/` and auxiliary tools under `tools/` using CodeQL with data-flow and API-usage queries.\n\n---\n\n## Confirmed / notable findings\n\n### 1. Use of pickle-based serialization in `sqlalchemy.ext.serializer`\n- **File:** `lib/sqlalchemy/ext/serializer.py`\n- **CodeQL rules:**\n  - `py/sqlalchemy-unsafe-deserialization`\n  - `py/sqlalchemy-unsafe-deserialization-details`\n- **Locations (representative):**\n  - Line ~94: call into `pickle.dumps`/`pickle.dump`\n  - Line ~98: additional pickle-based serialization call\n  - Line ~105: deserialization call (`pickle.load`/`pickle.loads`)\n  - Lines ~150–160: several wrapper/helper functions around the same APIs\n- **Risk:** `pickle` is inherently unsafe when given untrusted data and can lead to arbitrary code execution.\n- **Context assessment:**\n  - This functionality lives in the *optional* extension `sqlalchemy.ext.serializer` and is expected to be used by application code for serializing/deserializing SQLAlchemy objects.\n  - The library does **not itself** pull data from remote/user-controlled sources into these APIs; the risk is at the point where an application passes untrusted data into these functions.\n- **CWE:**\n  - **CWE-502 – Deserialization of Untrusted Data**\n- **Severity (for consumers):** **High**, if used with untrusted data.\n- **Severity (in library itself):** **Medium/Low**, since it is an opt‑in feature and does not enforce unsafe usage.\n- **Recommendations for consumers:**\n  - Do **not** deserialize untrusted data with `sqlalchemy.ext.serializer` or directly with `pickle`.\n  - Prefer safer serialization formats (JSON, msgpack, etc.) for untrusted inputs.\n  - Treat any data deserialized via this extension as fully trusted and under your control.\n- **Recommendation for maintainers:**\n  - Keep strong warnings in the documentation that `serializer` is unsafe for untrusted inputs.\n  - Consider runtime warnings (e.g., `warnings.warn`) when these helpers are used, to reinforce the trust boundary.\n\n---\n\n### 2. Shell command execution in `sqlalchemy.util.tool_support`\n- **File:** `lib/sqlalchemy/util/tool_support.py`\n- **CodeQL rules:**\n  - `py/sqlalchemy-shell-command-usage`\n  - `py/sqlalchemy-shell-command-usage-details`\n- **Location:**\n  - Lines ~109–118: A helper function that invokes an external command (likely via `subprocess` or a similar mechanism) as part of tooling support.\n- **Risk:** Shell/command execution is a potential vector for command injection if user-controlled data is interpolated into the command line without proper quoting and validation.\n- **Context assessment:**\n  - This resides in a *util/tooling* module, not in the main ORM query path.\n  - CodeQL results did not show data-flow from remote/tainted sources into this shell command; arguments appear to be internal/controlled.\n- **CWE:**\n  - **CWE-78 – Improper Neutralization of Special Elements used in an OS Command ('OS Command Injection')** (potential category, depending on usage)\n- **Severity (current implementation as library code):** **Low**.\n- **Recommendations for consumers:**\n  - Avoid passing untrusted strings into any public helper that eventually reaches this shell-execution path.\n  - Prefer calling compiler/formatting tools through safer APIs (argument lists, no `shell=True`).\n- **Recommendation for maintainers:**\n  - Ensure the implementation uses `subprocess.run([...], shell=False)` or equivalent, with arguments passed as a list and not concatenated into a shell command string.\n  - Document that input parameters to this helper should not contain untrusted user data.\n\n---\n\n### 3. Tempfile usage in tools and tests\n- **Files flagged:**\n  - `tools/generate_proxy_methods.py` (lines ~374–378)\n  - `tools/generate_sql_functions.py` (lines ~32–36)\n  - `tools/generate_tuple_map_overloads.py` (lines ~48–52)\n  - `tools/sync_test_files.py` (lines ~38–42)\n  - `lib/sqlalchemy/testing/fixtures/mypy.py` (line ~41)\n- **CodeQL rule:**\n  - `py/sqlalchemy-tempfile-usage`\n- **Risk:** Insecure use of `tempfile` (e.g., predictable names, non-atomic creation, world-readable files) can lead to information disclosure or file clobbering when run in multi-user environments.\n- **Context assessment:**\n  - All hits are in *development/test tooling* or test fixtures, not in the runtime code used by applications.\n  - These scripts are usually run by maintainers or CI under controlled conditions.\n- **CWE:**\n  - **CWE-377 – Insecure Temporary File**\n- **Severity (for typical consumers):** **Low**.\n- **Recommendations for maintainers:**\n  - Prefer `tempfile.NamedTemporaryFile(delete=False)` or `tempfile.TemporaryDirectory()` with default secure flags.\n  - Avoid manual predictable filenames under `/tmp`; rely on `tempfile` to choose names.\n\n---\n\n## Explored hypotheses with no concrete library-level vulnerability found\n\nWithin the remaining iteration budget, the following hypotheses were investigated with CodeQL but did **not** yield evidence of concrete, exploitable vulnerabilities inside the library code itself (though they remain important for how applications use SQLAlchemy):\n\n1. **Connection string (URL) injection into `sqlalchemy.create_engine`**\n   - Hypothesis: user-controlled, tainted data flowing into the first parameter of `sqlalchemy.create_engine` (CWE-89).\n   - A path-focused taint tracking query was attempted to track `RemoteFlowSource` into the `create_engine` URL.\n   - Due to CodeQL configuration/compilation constraints in this environment, the advanced path query could not be fully validated, and no concrete flows in the package’s *own* codebase were observed.\n   - Assessment: as expected for a library, SQLAlchemy exposes `create_engine` but does not itself obtain remote data. The risk is entirely at the application layer: passing unvalidated user input directly into an engine URL is insecure.\n\n2. **General OS command and file-system misuse beyond the single tool-support helper**\n   - Additional queries were issued to look for broader command execution sinks and dangerous file operations.\n   - No new findings beyond the already-flagged shell-execution helper and the development tooling `tempfile` usage were produced.\n\n3. **Other critical classes (code execution via `eval`/`exec`, unsafe deserialization via `yaml.load`, etc.)**\n   - Targeted checks focused on finding direct uses of Python’s `eval`/`exec` or unsafe deserialization helpers in core library modules did not yield additional actionable results.\n\n---\n\n## Overall risk assessment\n\n- **For library consumers:**\n  - SQLAlchemy 2.0.44 does not appear to contain self-contained, trivially exploitable vulnerabilities that are triggered in normal ORM usage.\n  - The main risks are **how applications use the library**:\n    - Passing untrusted data into engine URLs and raw SQL is still an application-level SQL injection concern (CWE-89), but this is a known, documented usage risk, not a new bug in the package.\n    - Using the `sqlalchemy.ext.serializer` module to unpickle untrusted data can enable remote code execution (CWE-502).\n- **For maintainers and tooling users:**\n  - The flagged tooling and test scripts (`tools/*`, `sqlalchemy.testing.*`) contain potentially sensitive patterns (shell invocation, temporary file usage), but these exist in controlled development contexts and are **low-severity** for typical end users.\n\n---\n\n## Recommendations summary\n\nFor **application developers using SQLAlchemy**:\n1. **Avoid untrusted deserialization**\n   - Do not use `sqlalchemy.ext.serializer` (or `pickle` generally) on data that originated from untrusted clients or external systems.\n2. **Sanitize connection URLs and SQL strings**\n   - Treat the database URL passed to `create_engine()` as configuration, not as user input.\n   - Always use SQLAlchemy’s parameter binding rather than string-concatenating SQL.\n3. **Be cautious with shell/tool helpers**\n   - If any SQLAlchemy-supplied utility functions execute external commands, ensure any arguments you pass are not influenced by untrusted user input.\n\nFor **SQLAlchemy maintainers**:\n1. Strengthen documentation and possibly runtime warnings around `sqlalchemy.ext.serializer` and the dangers of `pickle` (CWE-502).\n2. Confirm that shell execution in `util/tool_support.py` uses safe subprocess patterns (no `shell=True`, no unchecked interpolation).\n3. Optionally harden development tooling around secure tempfile usage, even though it primarily affects CI/dev environments.\n\n---\n\n## Classification\n- **Package type:** `library`\n- **Primary layer(s):**\n  - `data` (database access/ORM)\n  - `application` (used within application business logic as a persistence layer)\n  - `dev_tool` (due to bundled tooling scripts under `tools/` and testing utilities)\n",
+ "package_classification": {
+  "type": "library",
+  "layer": [
+   "data",
+   "application",
+   "dev_tool"
+  ]
+ },
+ "tool_calls": {
+  "get_package_profile_info": 1,
+  "execute_codeql_query": 13,
+  "validate_codeql_query": 0,
+  "fixup_codeql_query": 3,
+  "finalize_report": 1
+ },
+ "queries_executed": {
+  "critical": 0,
+  "high": 3,
+  "medium": 2,
+  "low": 1,
+  "total_executed": 14,
+  "total_with_results": 6,
+  "total_failed": 13
+ },
+ "query_findings": {
+  "critical": 0,
+  "high": 16,
+  "medium": 1,
+  "low": 5,
+  "total": 22
+ },
+ "findings": [
+  {
+   "codeql_query_uuid": "20251226135606",
+   "codeql_raw_query": "/**\n * @name SQLAlchemy: unsafe pickle usage in SQLAlchemy utils/extensions\n * @description Detect potentially unsafe (de)serialization with pickle or similar in SQLAlchemy codebase.\n * @kind problem\n * @problem.severity warning\n * @id py/sqlalchemy-unsafe-deserialization\n * @tags security\n *       external/cwe/cwe-502\n */\n\nimport python\nimport semmle.python.ApiGraphs\nimport semmle.python.dataflow.new.DataFlow\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"pickle\").getMember([\"load\", \"loads\", \"dump\", \"dumps\"]).getACall()\n  or call = API::moduleImport(\"sqlalchemy.ext.serializer\").getMember([\"loads\", \"dumps\"]).getACall()\nselect call, \"Potential unsafe serialization/deserialization: review trust boundaries when using pickle-based APIs.\"",
+   "hypothesis": "Unsafe deserialization via pickle or SQLAlchemy ext.serializer.",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-502"
+   ],
+   "results_count": 8,
+   "results": [
+    {
+     "ruleId": "py/sqlalchemy-unsafe-deserialization",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/sqlalchemy-unsafe-deserialization",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential unsafe serialization/deserialization: review trust boundaries when using pickle-based APIs."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "lib/sqlalchemy/ext/serializer.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 94,
+         "startColumn": 41,
+         "endColumn": 65
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "b586932eb7c57344:1",
+      "primaryLocationStartColumnFingerprint": "28"
+     }
+    },
+    {
+     "ruleId": "py/sqlalchemy-unsafe-deserialization",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/sqlalchemy-unsafe-deserialization",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential unsafe serialization/deserialization: review trust boundaries when using pickle-based APIs."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "lib/sqlalchemy/ext/serializer.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 98,
+         "startColumn": 29,
+         "endColumn": 60
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "6a9b5181f6b3aa1f:1",
+      "primaryLocationStartColumnFingerprint": "12"
+     }
+    },
+    {
+     "ruleId": "py/sqlalchemy-unsafe-deserialization",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/sqlalchemy-unsafe-deserialization",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential unsafe serialization/deserialization: review trust boundaries when using pickle-based APIs."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "lib/sqlalchemy/ext/serializer.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 105,
+         "startColumn": 21,
+         "endColumn": 74
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "8fd7ca82479883fc:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/sqlalchemy-unsafe-deserialization",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/sqlalchemy-unsafe-deserialization",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential unsafe serialization/deserialization: review trust boundaries when using pickle-based APIs."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "lib/sqlalchemy/ext/serializer.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 150,
+         "startColumn": 23,
+         "endColumn": 54
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "72409400725447cd:1",
+      "primaryLocationStartColumnFingerprint": "6"
+     }
+    },
+    {
+     "ruleId": "py/sqlalchemy-unsafe-deserialization",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/sqlalchemy-unsafe-deserialization",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential unsafe serialization/deserialization: review trust boundaries when using pickle-based APIs."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "lib/sqlalchemy/ext/serializer.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 153,
+         "startColumn": 23,
+         "endColumn": 52
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "ea8bc98b08aab702:1",
+      "primaryLocationStartColumnFingerprint": "6"
+     }
+    },
+    {
+     "ruleId": "py/sqlalchemy-unsafe-deserialization",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/sqlalchemy-unsafe-deserialization",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential unsafe serialization/deserialization: review trust boundaries when using pickle-based APIs."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "lib/sqlalchemy/ext/serializer.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 156,
+         "startColumn": 23,
+         "endColumn": 52
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "e0902c48668b4784:1",
+      "primaryLocationStartColumnFingerprint": "6"
+     }
+    },
+    {
+     "ruleId": "py/sqlalchemy-unsafe-deserialization",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/sqlalchemy-unsafe-deserialization",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential unsafe serialization/deserialization: review trust boundaries when using pickle-based APIs."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "lib/sqlalchemy/ext/serializer.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 160,
+         "startColumn": 23,
+         "endColumn": 54
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "281702d9d9b94327:1",
+      "primaryLocationStartColumnFingerprint": "6"
+     }
+    },
+    {
+     "ruleId": "py/sqlalchemy-unsafe-deserialization",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/sqlalchemy-unsafe-deserialization",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential unsafe serialization/deserialization: review trust boundaries when using pickle-based APIs."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "lib/sqlalchemy/testing/util.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 63,
+         "startColumn": 42,
+         "endColumn": 67
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "4ed8a4c259509c83:1",
+      "primaryLocationStartColumnFingerprint": "33"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251226135658",
+   "codeql_raw_query": "/**\n * @name SQLAlchemy unsafe deserialization detailed\n * @description Find uses of pickle-based APIs within sqlalchemy.ext.serializer to assess risk of unsafe deserialization.\n * @kind problem\n * @problem.severity warning\n * @id py/sqlalchemy-unsafe-deserialization-details\n * @tags security\n *       external/cwe/cwe-502\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call.getLocation().getFile().getRelativePath() = \"lib/sqlalchemy/ext/serializer.py\" and\n  call = API::moduleImport(\"pickle\").getMember([\"load\", \"loads\", \"dump\", \"dumps\"]).getACall()\nselect call, \"Use of pickle API here may be unsafe if given untrusted data.\"",
+   "hypothesis": "sqlalchemy.ext.serializer uses pickle for (de)serialization, which may be unsafe if exposed to untrusted inputs",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-502"
+   ],
+   "results_count": 7,
+   "results": [
+    {
+     "ruleId": "py/sqlalchemy-unsafe-deserialization-details",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/sqlalchemy-unsafe-deserialization-details",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of pickle API here may be unsafe if given untrusted data."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "lib/sqlalchemy/ext/serializer.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 94,
+         "startColumn": 41,
+         "endColumn": 65
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "b586932eb7c57344:1",
+      "primaryLocationStartColumnFingerprint": "28"
+     }
+    },
+    {
+     "ruleId": "py/sqlalchemy-unsafe-deserialization-details",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/sqlalchemy-unsafe-deserialization-details",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of pickle API here may be unsafe if given untrusted data."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "lib/sqlalchemy/ext/serializer.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 98,
+         "startColumn": 29,
+         "endColumn": 60
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "6a9b5181f6b3aa1f:1",
+      "primaryLocationStartColumnFingerprint": "12"
+     }
+    },
+    {
+     "ruleId": "py/sqlalchemy-unsafe-deserialization-details",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/sqlalchemy-unsafe-deserialization-details",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of pickle API here may be unsafe if given untrusted data."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "lib/sqlalchemy/ext/serializer.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 105,
+         "startColumn": 21,
+         "endColumn": 74
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "8fd7ca82479883fc:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/sqlalchemy-unsafe-deserialization-details",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/sqlalchemy-unsafe-deserialization-details",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of pickle API here may be unsafe if given untrusted data."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "lib/sqlalchemy/ext/serializer.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 150,
+         "startColumn": 23,
+         "endColumn": 54
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "72409400725447cd:1",
+      "primaryLocationStartColumnFingerprint": "6"
+     }
+    },
+    {
+     "ruleId": "py/sqlalchemy-unsafe-deserialization-details",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/sqlalchemy-unsafe-deserialization-details",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of pickle API here may be unsafe if given untrusted data."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "lib/sqlalchemy/ext/serializer.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 153,
+         "startColumn": 23,
+         "endColumn": 52
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "ea8bc98b08aab702:1",
+      "primaryLocationStartColumnFingerprint": "6"
+     }
+    },
+    {
+     "ruleId": "py/sqlalchemy-unsafe-deserialization-details",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/sqlalchemy-unsafe-deserialization-details",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of pickle API here may be unsafe if given untrusted data."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "lib/sqlalchemy/ext/serializer.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 156,
+         "startColumn": 23,
+         "endColumn": 52
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "e0902c48668b4784:1",
+      "primaryLocationStartColumnFingerprint": "6"
+     }
+    },
+    {
+     "ruleId": "py/sqlalchemy-unsafe-deserialization-details",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/sqlalchemy-unsafe-deserialization-details",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of pickle API here may be unsafe if given untrusted data."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "lib/sqlalchemy/ext/serializer.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 160,
+         "startColumn": 23,
+         "endColumn": 54
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "281702d9d9b94327:1",
+      "primaryLocationStartColumnFingerprint": "6"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251226135802",
+   "codeql_raw_query": "/**\n * @name Unsafe subprocess usage in SQLAlchemy tools\n * @description Detect use of subprocess functions that may execute external commands.\n * @kind problem\n * @problem.severity warning\n * @id py/sqlalchemy-subprocess-usage\n * @tags security\n *       external/cwe/cwe-078\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call.getLocation().getFile().getRelativePath().matches(\"tools/%\") and\n  call = API::moduleImport(\"subprocess\").getMember([\"Popen\", \"call\", \"run\", \"check_call\", \"check_output\"]).getACall()\nselect call, \"Use of subprocess API in tools directory; ensure arguments are not influenced by untrusted input.\"",
+   "hypothesis": "Subprocess usage in helper tools could allow command injection if misused by callers.",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-078"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251226140117",
+   "codeql_raw_query": "/**\n * @name SQLAlchemy unsafe shell command usage\n * @description Detect uses of subprocess or os.system within SQLAlchemy package that may execute shell commands.\n * @kind problem\n * @problem.severity warning\n * @id py/sqlalchemy-shell-command-usage\n * @tags security\n *       external/cwe/cwe-078\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call.getLocation().getFile().getRelativePath().regexpMatch(\"^lib/sqlalchemy/.*\") and\n  (\n    call = API::moduleImport(\"subprocess\").getMember([\"Popen\", \"run\", \"call\", \"check_call\", \"check_output\"]).getACall() or\n    call = API::moduleImport(\"os\").getMember(\"system\").getACall()\n  )\nselect call, \"Shell command execution is used here; ensure no untrusted input is passed to it.\"\n",
+   "hypothesis": "SQLAlchemy may invoke shell commands via subprocess or os.system, which could be dangerous if composed with untrusted input in applications.",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-078"
+   ],
+   "results_count": 1,
+   "results": [
+    {
+     "ruleId": "py/sqlalchemy-shell-command-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/sqlalchemy-shell-command-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Shell command execution is used here; ensure no untrusted input is passed to it."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "lib/sqlalchemy/util/tool_support.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 109,
+         "startColumn": 9,
+         "endLine": 118,
+         "endColumn": 10
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "35ac7fa818e6a13b:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251226140233",
+   "codeql_raw_query": "/**\n * @name SQLAlchemy: shell command usage details\n * @description Enumerate subprocess and os.system usages in sqlalchemy.util.tool_support for manual review.\n * @kind problem\n * @problem.severity warning\n * @id py/sqlalchemy-shell-command-usage-details\n * @tags security\n *       external/cwe/cwe-078\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call.getLocation().getFile().getRelativePath() = \"lib/sqlalchemy/util/tool_support.py\" and\n  (\n    call = API::moduleImport(\"subprocess\").getMember([\"run\", \"Popen\", \"call\", \"check_call\", \"check_output\"]).getACall() or\n    call = API::moduleImport(\"os\").getMember(\"system\").getACall()\n  )\nselect call, \"Shell command execution is used here; ensure no untrusted input is passed to it.\"",
+   "hypothesis": "shell command usage in tool_support.py is for local tooling and not exposed to untrusted input",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-078"
+   ],
+   "results_count": 1,
+   "results": [
+    {
+     "ruleId": "py/sqlalchemy-shell-command-usage-details",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/sqlalchemy-shell-command-usage-details",
+      "index": 0
+     },
+     "message": {
+      "text": "Shell command execution is used here; ensure no untrusted input is passed to it."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "lib/sqlalchemy/util/tool_support.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 109,
+         "startColumn": 9,
+         "endLine": 118,
+         "endColumn": 10
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "35ac7fa818e6a13b:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251226140422",
+   "codeql_raw_query": "/**\n * @name SQLAlchemy temp file usage\n * @description Identify uses of tempfile module to look for potentially insecure temporary file creation.\n * @kind problem\n * @problem.severity note\n * @id py/sqlalchemy-tempfile-usage\n * @tags security\n *       external/cwe/cwe-377\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"tempfile\").getMember([\"NamedTemporaryFile\", \"mkstemp\", \"mkdtemp\", \"TemporaryDirectory\"]).getACall()\nselect call, \"Review tempfile usage to ensure secure file creation flags are used and files are not left with overly broad permissions.\"",
+   "hypothesis": "Insecure temporary file creation",
+   "severity": "low",
+   "cwe_ids": [
+    "cwe-377"
+   ],
+   "results_count": 5,
+   "results": [
+    {
+     "ruleId": "py/sqlalchemy-tempfile-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/sqlalchemy-tempfile-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Review tempfile usage to ensure secure file creation flags are used and files are not left with overly broad permissions."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "tools/generate_proxy_methods.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 374,
+         "startColumn": 9,
+         "endLine": 378,
+         "endColumn": 10
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "c4f6f8c4a7117bb0:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/sqlalchemy-tempfile-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/sqlalchemy-tempfile-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Review tempfile usage to ensure secure file creation flags are used and files are not left with overly broad permissions."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "tools/generate_sql_functions.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 32,
+         "startColumn": 9,
+         "endLine": 36,
+         "endColumn": 10
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "c4f6f8c4a715695b:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/sqlalchemy-tempfile-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/sqlalchemy-tempfile-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Review tempfile usage to ensure secure file creation flags are used and files are not left with overly broad permissions."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "tools/generate_tuple_map_overloads.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 48,
+         "startColumn": 9,
+         "endLine": 52,
+         "endColumn": 10
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "c4f6f8c4a715695b:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/sqlalchemy-tempfile-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/sqlalchemy-tempfile-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Review tempfile usage to ensure secure file creation flags are used and files are not left with overly broad permissions."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "lib/sqlalchemy/testing/fixtures/mypy.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 3
+        },
+        "region": {
+         "startLine": 41,
+         "startColumn": 14,
+         "endColumn": 43
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "a509e05689c801b8:1",
+      "primaryLocationStartColumnFingerprint": "5"
+     }
+    },
+    {
+     "ruleId": "py/sqlalchemy-tempfile-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/sqlalchemy-tempfile-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Review tempfile usage to ensure secure file creation flags are used and files are not left with overly broad permissions."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "tools/sync_test_files.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 4
+        },
+        "region": {
+         "startLine": 38,
+         "startColumn": 10,
+         "endLine": 42,
+         "endColumn": 6
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "4e3f7c5b99f05095:1",
+      "primaryLocationStartColumnFingerprint": "5"
+     }
+    }
+   ]
+  }
+ ]
+}

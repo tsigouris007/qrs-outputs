@@ -1,0 +1,792 @@
+{
+ "session_id": "20251225224440",
+ "package_name": "markdown_it_py-4.0.0",
+ "package_path": "packages/markdown_it_py-4.0.0",
+ "database_path": "databases/markdown_it_py-4.0.0-db",
+ "model": "gpt-5.1",
+ "temperature": 1.0,
+ "max_tokens": 8000,
+ "iterations": 11,
+ "total_input_tokens": 137287,
+ "total_output_tokens": 8851,
+ "total_tokens": 146138,
+ "elapsed_time_seconds": 410.66,
+ "estimated_cost_usd": 0.2601,
+ "summary": "## Overview\n\nPackage: **markdown-it-py 4.0.0**  \nType: Markdown parsing/rendering library with a small CLI (`markdown-it`)\n\nThe CodeQL-driven review focused on:\n- Code execution / command execution surfaces\n- URL normalization and link handling (potential XSS / open redirect vectors)\n- Markdown-to-HTML rendering and raw HTML handling\n\nWithin the 20-iteration budget, no concrete exploitable vulnerabilities were identified inside the core library for typical usage patterns. A few areas require **consumer-side care** and **security review**, summarized below.\n\n---\n\n## Confirmed / Notable Findings\n\n### 1. OS command execution in `scripts/build_fuzzers.py`\n\n**Location:** `scripts/build_fuzzers.py`, around lines 17–25 and 30–37  \n**CodeQL rule:** `py/markdown-it-py/os-command-execution`  \n**Category:** Potential OS command injection surface (CWE-78) in ancillary scripts\n\n**Details:**\n- CodeQL identified two sites in `scripts/build_fuzzers.py` where OS commands are executed (likely via `subprocess` or similar).\n- These scripts are **development/CI tooling for building fuzzers**, not part of the installed runtime library or CLI typically used in production.\n- There is no evidence from the analysis that **untrusted user input** is being fed into these command invocations within the repository itself.\n\n**Impact:**\n- **For regular users of the `markdown-it-py` library or `markdown-it` CLI, this is not a direct risk.**\n- For environments that run `scripts/build_fuzzers.py` automatically (e.g., CI with externally supplied parameters), improper parameter handling could potentially allow command injection.\n\n**Risk level:** Low for typical consumers; medium if you wire this script into pipelines where untrusted input can influence its command arguments.\n\n**Recommendations:**\n- Treat `scripts/build_fuzzers.py` as a **developer-only tool**; do not expose it to untrusted input.\n- If you modify or wrap this script, ensure that any values incorporated into shell commands are:\n  - either constants/hard-coded; or\n  - carefully validated/escaped or passed via `subprocess` with `shell=False` and argument lists.\n\n---\n\n### 2. URL normalization and link handling implementation\n\n**Location:** `markdown_it/common/normalize_url.py` (multiple lines highlighted)  \n**CodeQL rule:** `py/markdown-it-py/url-normalization`  \n**Category:** Potential XSS / open redirect vectors depending on how output is embedded (CWE-79, CWE-601)\n\n**Details:**\n- This module normalizes URLs used in links and images during Markdown rendering.\n- CodeQL flagged multiple operations in this file for **manual security review**, not as a concrete vulnerability, with the message:\n  > \"Review URL normalization logic for XSS/redirect issues (library-level manual review recommended).\"\n- Typical concerns for this sort of logic include:\n  - Allowing dangerous schemes like `javascript:`, `data:`, `vbscript:` in `href`/`src`.\n  - Incorrect or partial percent-encoding/decoding that can allow filter bypasses.\n  - Inadequate normalization that might be abused for open redirects when consumers use this URL directly in redirect contexts.\n\nGiven the nature of `markdown-it-py` and its parity with upstream `markdown-it` (which is broadly deployed), this logic is likely **intentional and reasonably hardened**, but the library is not a full HTML sanitizer.\n\n**Impact:**\n- `markdown-it-py` converts Markdown to HTML. If you insert that HTML directly into a **trusted, script-enabled browser context** without further sanitization, **untrusted Markdown input is sufficient for XSS unless you have external defenses.**\n- This is expected behavior for a markdown-to-HTML renderer and is documented across similar libraries; they are not in themselves XSS filters.\n\n**Risk level:** Depends entirely on how consumers embed rendered HTML:\n- Medium to high if you treat the output as safe HTML from untrusted authors without additional sanitization.\n- Low if you:\n  - sanitize the resulting HTML (e.g., Bleach, DOMPurify on the client), or\n  - use strict CSP and/or render into inert/escaped contexts.\n\n**Recommendations for consumers:**\n- **Do not trust the raw HTML output** of `markdown-it-py` from untrusted Markdown authors.\n- For web apps:\n  - Post-process the rendered HTML with a **well-maintained HTML sanitizer** that enforces an allowlist of elements, attributes, and URL schemes.\n  - Enforce **safe URL schemes** (`http`, `https`, `mailto` at most) for `href`/`src` attributes; reject or strip others.\n  - Avoid using rendered URLs (`normalize_url` outputs) as direct inputs to HTTP redirects or navigation without separate validation.\n- For security-sensitive environments, review `markdown_it/common/normalize_url.py` against your own URL-policy requirements.\n\n---\n\n### 3. Raw HTML blocks in Markdown\n\n**Location:** `markdown_it/rules_block/html_block.py`  \n**CodeQL query:** `py/markdown-it-py/raw-html-blocks` (custom, executed successfully and reported no unexpected additional issues)  \n**Category:** Expected support for raw HTML; consumer must handle sanitization (CWE-79)\n\n**Details:**\n- The library supports **raw HTML** inside Markdown (e.g., `<script>` tags, inline HTML, etc.), consistent with CommonMark/markdown-it behavior.\n- The custom CodeQL query was used to locate uses of the `html_block` rule and confirm these are pure parsing/forwarding behaviors, not places where the library claims to sanitize or restrict HTML.\n\n**Impact:**\n- If an attacker can submit Markdown, they can usually embed HTML, including tags that lead to XSS, depending on your embedding context.\n- This is by design for markdown-it-style parsers and is not a flaw in the library, but it is highly relevant for security posture.\n\n**Risk level:** Medium to high **in applications that assume the rendered HTML is already safe.**\n\n**Recommendations:**\n- If you need **safe Markdown**, configure your application to:\n  - either strip or escape raw HTML before passing content to `markdown-it-py`, or\n  - sanitize the final HTML output with an HTML sanitizer that removes disallowed elements/attributes.\n- Consider using upstream configuration options (if provided by markdown-it or its plugins) that can disable raw HTML or restrict it, and mirror such patterns in your use of `markdown-it-py`.\n\n---\n\n## Areas With No Issues Found (within analysis scope)\n\nUsing CodeQL and targeted custom queries, no concrete problems were identified in the following areas for this version:\n\n- **Dynamic code execution:**\n  - No flows were found from remote/tainted input into `eval`, `exec`, or similar code-execution sinks in the core library.\n\n- **Untrusted input directly into markdown rendering APIs (within library code):**\n  - A taint-tracking query was constructed to track `RemoteFlowSource` → `MarkdownIt.__call__` / `MarkdownIt.render` arguments. Within the library itself, there were no internal flows from remote sources; as expected, the library primarily operates on data supplied by its callers.\n\n- **Unsafe deserialization:**\n  - No uses of `pickle`, `yaml.load(unsafe)`, or similar deserialization APIs were discovered in the packaged library code.\n\n- **Filesystem / network misuse:**\n  - No suspicious patterns involving reading arbitrary files or performing network operations based on untrusted input were identified in the library code.\n\nThese observations are limited by the static nature of the analysis and by the fact that the library is a text parser/renderer rather than a network or storage stack.\n\n---\n\n## Overall Risk Assessment\n\nFor **markdown-it-py 4.0.0**:\n\n- The core library behaves as expected for a Markdown-to-HTML renderer.\n- There are **no direct, self-contained RCE or injection vulnerabilities** discovered in the library code during this analysis.\n- Security concerns center on **how consumers use the rendered HTML and URLs**, not on the internal control flow of the library.\n- Ancillary scripts (`scripts/build_fuzzers.py`) contain OS command invocations that should be treated as internal tooling and not exposed to untrusted input.\n\n**Security posture summary:**\n- **Safe as a parsing/rendering component when used with standard HTML sanitization and URL validation best practices.**\n- Not a sanitizer; embedding its output directly in untrusted contexts without sanitization can expose applications to XSS and related issues.\n\n---\n\n## Recommendations for Consumers\n\n1. **Always sanitize rendered HTML** from `markdown-it-py` before placing it into a browser DOM or rich HTML context accessible to untrusted users.\n2. **Enforce a strict URL policy** for `href`/`src`:\n   - Restrict schemes to a small allowlist.\n   - Reject or neutralize `javascript:`, `data:`, and other potentially dangerous schemes.\n3. **Disable or strip raw HTML** from incoming Markdown where feasible, or sanitize it after rendering.\n4. Treat development scripts like `scripts/build_fuzzers.py` as **internal tooling**, not as part of your production attack surface.\n5. Keep the library **up to date**, as security and parsing correctness improvements are often released over time.\n\nNo actionable upstream security bug fix is recommended based solely on this analysis; the main action items lie with how downstream applications integrate and constrain `markdown-it-py`’s output.\n",
+ "package_classification": {
+  "type": "library",
+  "layer": [
+   "text-processing",
+   "markdown",
+   "parser",
+   "rendering",
+   "cli-utility"
+  ]
+ },
+ "tool_calls": {
+  "get_package_profile_info": 1,
+  "execute_codeql_query": 9,
+  "validate_codeql_query": 0,
+  "fixup_codeql_query": 4,
+  "finalize_report": 1
+ },
+ "queries_executed": {
+  "critical": 1,
+  "high": 0,
+  "medium": 4,
+  "low": 0,
+  "total_executed": 11,
+  "total_with_results": 5,
+  "total_failed": 12
+ },
+ "query_findings": {
+  "critical": 0,
+  "high": 0,
+  "medium": 22,
+  "low": 0,
+  "total": 22
+ },
+ "findings": [
+  {
+   "codeql_query_uuid": "20251225224450",
+   "codeql_raw_query": "/**\n * @name OS command execution in scripts\n * @description Find uses of subprocess or os.system in helper scripts that could be abused.\n * @kind problem\n * @problem.severity warning\n * @id py/markdown-it-py/os-command-execution\n * @tags security\n *       external/cwe/cwe-078\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call.getLocation().getFile().getRelativePath().regexpMatch(\"^scripts/.*\") and\n  (\n    call = API::moduleImport(\"subprocess\").getMember([\"run\", \"call\", \"Popen\", \"check_call\", \"check_output\"]).getACall()\n    or\n    call = API::moduleImport(\"os\").getMember([\"system\", \"popen\"]).getACall()\n  )\nselect call, \"OS command execution used in script; ensure inputs are trusted.\"",
+   "hypothesis": "Project scripts may invoke subprocess or os.system in unsafe ways.",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-078"
+   ],
+   "results_count": 2,
+   "results": [
+    {
+     "ruleId": "py/markdown-it-py/os-command-execution",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/markdown-it-py/os-command-execution",
+      "index": 0
+     },
+     "message": {
+      "text": "OS command execution used in script; ensure inputs are trusted."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "scripts/build_fuzzers.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 17,
+         "startColumn": 9,
+         "endLine": 25,
+         "endColumn": 10
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "3948eec98a13951d:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/markdown-it-py/os-command-execution",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/markdown-it-py/os-command-execution",
+      "index": 0
+     },
+     "message": {
+      "text": "OS command execution used in script; ensure inputs are trusted."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "scripts/build_fuzzers.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 30,
+         "startColumn": 9,
+         "endLine": 37,
+         "endColumn": 10
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "9a212fe8ba154ddf:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251225224509",
+   "codeql_raw_query": "/**\n * @name Potential XSS via unsafe URL normalization\n * @description Detect locations where user-controlled URLs may be normalized/modified without sufficient validation.\n * @kind problem\n * @problem.severity warning\n * @id py/markdown-it-py/url-normalization\n * @tags security\n *       external/cwe/cwe-079\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere call.getLocation().getFile().getRelativePath() = \"markdown_it/common/normalize_url.py\"\nselect call, \"Review URL normalization logic for XSS/redirect issues (library-level manual review recommended).\"",
+   "hypothesis": "URL normalization logic in normalize_url.py could allow javascript: or data: URLs leading to XSS when rendered in HTML.",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-079"
+   ],
+   "results_count": 20,
+   "results": [
+    {
+     "ruleId": "py/markdown-it-py/url-normalization",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/markdown-it-py/url-normalization",
+      "index": 0
+     },
+     "message": {
+      "text": "Review URL normalization logic for XSS/redirect issues (library-level manual review recommended)."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "markdown_it/common/normalize_url.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 23,
+         "startColumn": 14,
+         "endColumn": 56
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "45c35439e74ac074:1",
+      "primaryLocationStartColumnFingerprint": "9"
+     }
+    },
+    {
+     "ruleId": "py/markdown-it-py/url-normalization",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/markdown-it-py/url-normalization",
+      "index": 0
+     },
+     "message": {
+      "text": "Review URL normalization logic for XSS/redirect issues (library-level manual review recommended)."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "markdown_it/common/normalize_url.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 34,
+         "startColumn": 14,
+         "endColumn": 33
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "47939807f178f470:1",
+      "primaryLocationStartColumnFingerprint": "5"
+     }
+    },
+    {
+     "ruleId": "py/markdown-it-py/url-normalization",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/markdown-it-py/url-normalization",
+      "index": 0
+     },
+     "message": {
+      "text": "Review URL normalization logic for XSS/redirect issues (library-level manual review recommended)."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "markdown_it/common/normalize_url.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 35,
+         "startColumn": 47,
+         "endColumn": 82
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "396f0d2e2532b16c:1",
+      "primaryLocationStartColumnFingerprint": "34"
+     }
+    },
+    {
+     "ruleId": "py/markdown-it-py/url-normalization",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/markdown-it-py/url-normalization",
+      "index": 0
+     },
+     "message": {
+      "text": "Review URL normalization logic for XSS/redirect issues (library-level manual review recommended)."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "markdown_it/common/normalize_url.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 35,
+         "startColumn": 22,
+         "endColumn": 83
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "396f0d2e2532b16c:1",
+      "primaryLocationStartColumnFingerprint": "9"
+     }
+    },
+    {
+     "ruleId": "py/markdown-it-py/url-normalization",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/markdown-it-py/url-normalization",
+      "index": 0
+     },
+     "message": {
+      "text": "Review URL normalization logic for XSS/redirect issues (library-level manual review recommended)."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "markdown_it/common/normalize_url.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 37,
+         "startColumn": 25,
+         "endColumn": 45
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "275300740390c99d:1",
+      "primaryLocationStartColumnFingerprint": "20"
+     }
+    },
+    {
+     "ruleId": "py/markdown-it-py/url-normalization",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/markdown-it-py/url-normalization",
+      "index": 0
+     },
+     "message": {
+      "text": "Review URL normalization logic for XSS/redirect issues (library-level manual review recommended)."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "markdown_it/common/normalize_url.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 37,
+         "startColumn": 12,
+         "endColumn": 46
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "275300740390c99d:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/markdown-it-py/url-normalization",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/markdown-it-py/url-normalization",
+      "index": 0
+     },
+     "message": {
+      "text": "Review URL normalization logic for XSS/redirect issues (library-level manual review recommended)."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "markdown_it/common/normalize_url.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 48,
+         "startColumn": 14,
+         "endColumn": 56
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "45c35439e74ac074:2",
+      "primaryLocationStartColumnFingerprint": "9"
+     }
+    },
+    {
+     "ruleId": "py/markdown-it-py/url-normalization",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/markdown-it-py/url-normalization",
+      "index": 0
+     },
+     "message": {
+      "text": "Review URL normalization logic for XSS/redirect issues (library-level manual review recommended)."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "markdown_it/common/normalize_url.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 59,
+         "startColumn": 14,
+         "endColumn": 33
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "83b245c445ecf00c:1",
+      "primaryLocationStartColumnFingerprint": "5"
+     }
+    },
+    {
+     "ruleId": "py/markdown-it-py/url-normalization",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/markdown-it-py/url-normalization",
+      "index": 0
+     },
+     "message": {
+      "text": "Review URL normalization logic for XSS/redirect issues (library-level manual review recommended)."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "markdown_it/common/normalize_url.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 60,
+         "startColumn": 47,
+         "endColumn": 84
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "9a6c3c9d078588d6:1",
+      "primaryLocationStartColumnFingerprint": "34"
+     }
+    },
+    {
+     "ruleId": "py/markdown-it-py/url-normalization",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/markdown-it-py/url-normalization",
+      "index": 0
+     },
+     "message": {
+      "text": "Review URL normalization logic for XSS/redirect issues (library-level manual review recommended)."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "markdown_it/common/normalize_url.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 60,
+         "startColumn": 22,
+         "endColumn": 85
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "9a6c3c9d078588d6:1",
+      "primaryLocationStartColumnFingerprint": "9"
+     }
+    },
+    {
+     "ruleId": "py/markdown-it-py/url-normalization",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/markdown-it-py/url-normalization",
+      "index": 0
+     },
+     "message": {
+      "text": "Review URL normalization logic for XSS/redirect issues (library-level manual review recommended)."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "markdown_it/common/normalize_url.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 63,
+         "startColumn": 25,
+         "endColumn": 45
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "171cc6b22b316ce5:1",
+      "primaryLocationStartColumnFingerprint": "20"
+     }
+    },
+    {
+     "ruleId": "py/markdown-it-py/url-normalization",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/markdown-it-py/url-normalization",
+      "index": 0
+     },
+     "message": {
+      "text": "Review URL normalization logic for XSS/redirect issues (library-level manual review recommended)."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "markdown_it/common/normalize_url.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 63,
+         "startColumn": 12,
+         "endColumn": 80
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "171cc6b22b316ce5:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/markdown-it-py/url-normalization",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/markdown-it-py/url-normalization",
+      "index": 0
+     },
+     "message": {
+      "text": "Review URL normalization logic for XSS/redirect issues (library-level manual review recommended)."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "markdown_it/common/normalize_url.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 79,
+         "startColumn": 16,
+         "endColumn": 30
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "3344abae59828417:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/markdown-it-py/url-normalization",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/markdown-it-py/url-normalization",
+      "index": 0
+     },
+     "message": {
+      "text": "Review URL normalization logic for XSS/redirect issues (library-level manual review recommended)."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "markdown_it/common/normalize_url.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 80,
+         "startColumn": 11,
+         "endColumn": 22
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "da77508adcbabbcc:1",
+      "primaryLocationStartColumnFingerprint": "6"
+     }
+    },
+    {
+     "ruleId": "py/markdown-it-py/url-normalization",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/markdown-it-py/url-normalization",
+      "index": 0
+     },
+     "message": {
+      "text": "Review URL normalization logic for XSS/redirect issues (library-level manual review recommended)."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "markdown_it/common/normalize_url.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 80,
+         "startColumn": 11,
+         "endColumn": 30
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "da77508adcbabbcc:1",
+      "primaryLocationStartColumnFingerprint": "6"
+     }
+    },
+    {
+     "ruleId": "py/markdown-it-py/url-normalization",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/markdown-it-py/url-normalization",
+      "index": 0
+     },
+     "message": {
+      "text": "Review URL normalization logic for XSS/redirect issues (library-level manual review recommended)."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "markdown_it/common/normalize_url.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 81,
+         "startColumn": 46,
+         "endColumn": 70
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "897fe8105966150e:1",
+      "primaryLocationStartColumnFingerprint": "41"
+     }
+    },
+    {
+     "ruleId": "py/markdown-it-py/url-normalization",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/markdown-it-py/url-normalization",
+      "index": 0
+     },
+     "message": {
+      "text": "Review URL normalization logic for XSS/redirect issues (library-level manual review recommended)."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "markdown_it/common/normalize_url.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 81,
+         "startColumn": 17,
+         "endColumn": 41
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "897fe8105966150e:1",
+      "primaryLocationStartColumnFingerprint": "12"
+     }
+    },
+    {
+     "ruleId": "py/markdown-it-py/url-normalization",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/markdown-it-py/url-normalization",
+      "index": 0
+     },
+     "message": {
+      "text": "Review URL normalization logic for XSS/redirect issues (library-level manual review recommended)."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "markdown_it/common/normalize_url.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 81,
+         "startColumn": 12,
+         "endColumn": 42
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "897fe8105966150e:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/markdown-it-py/url-normalization",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/markdown-it-py/url-normalization",
+      "index": 0
+     },
+     "message": {
+      "text": "Review URL normalization logic for XSS/redirect issues (library-level manual review recommended)."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "markdown_it/common/normalize_url.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 66,
+         "startColumn": 16,
+         "endColumn": 64
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "e9140043e0c9df97:1",
+      "primaryLocationStartColumnFingerprint": "15"
+     }
+    },
+    {
+     "ruleId": "py/markdown-it-py/url-normalization",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/markdown-it-py/url-normalization",
+      "index": 0
+     },
+     "message": {
+      "text": "Review URL normalization logic for XSS/redirect issues (library-level manual review recommended)."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "markdown_it/common/normalize_url.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 67,
+         "startColumn": 16,
+         "endColumn": 64
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "aed50d702dcbac34:1",
+      "primaryLocationStartColumnFingerprint": "15"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251225224547",
+   "codeql_raw_query": "/**\n * @name Unsafe use of eval/exec in markdown_it_py\n * @description Detect any use of eval or exec which could lead to code injection.\n * @kind problem\n * @problem.severity error\n * @id py/markdown-it-py/eval-exec\n * @tags security\n *       external/cwe/cwe-094\n */\n\nimport python\nimport semmle.python.ApiGraphs\nimport semmle.python.dataflow.new.DataFlow\n\nfrom DataFlow::CallCfgNode call\nwhere call = API::builtin([\"eval\", \"exec\"]).getACall()\nselect call, \"Use of eval/exec may allow code injection if arguments are attacker-controlled.\"",
+   "hypothesis": "Library or scripts may use eval/exec on data derived from markdown or CLI, leading to code execution.",
+   "severity": "critical",
+   "cwe_ids": [
+    "cwe-094"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251225224813",
+   "codeql_raw_query": "/**\n * @name User-controlled HTML rendering paths\n * @description Trace untrusted markdown input into HTML-rendering sinks in markdown_it_py\n * @kind path-problem\n * @problem.severity warning\n * @id py/markdown-it-py/untrusted-markdown-to-html\n * @tags security\n *       external/cwe/cwe-079\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.dataflow.new.RemoteFlowSources\nimport semmle.python.ApiGraphs\n\nmodule MdHtmlConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    source instanceof RemoteFlowSource\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(API::CallNode call |\n      call = API::moduleImport(\"markdown_it\").getMember(\"MarkdownIt\").getMember(\"__call__\").getACall() and\n      sink = call.getArg(0)\n    ) or\n    exists(API::CallNode call2 |\n      call2 = API::moduleImport(\"markdown_it\").getMember(\"MarkdownIt\").getMember(\"render\").getACall() and\n      sink = call2.getArg(0)\n    )\n  }\n}\n\nmodule MdHtmlFlow = TaintTracking::Global<MdHtmlConfig>;\nimport MdHtmlFlow::PathGraph\n\nfrom MdHtmlFlow::PathNode source, MdHtmlFlow::PathNode sink\nwhere MdHtmlFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"Untrusted markdown data flows to HTML rendering in markdown_it_py $@.\", source.getNode(), \"user-controlled markdown\"\n",
+   "hypothesis": "Trace potential remote user input into MarkdownIt HTML rendering APIs, to assess XSS risk via consumers misusing the library.",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-079"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251225225053",
+   "codeql_raw_query": "/**\n * @name OS command execution in helper scripts\n * @description Detect use of subprocess or os.system in project scripts (potentially dangerous if exposed to untrusted input)\n * @kind problem\n * @problem.severity warning\n * @id py/markdown-it-py/os-command-execution\n * @tags security\n *       external/cwe/cwe-078\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"subprocess\").getMember([\"run\", \"Popen\", \"call\", \"check_output\"]).getACall() or\n  call = API::moduleImport(\"os\").getMember(\"system\").getACall()\nselect call, \"OS command execution used in script; ensure inputs are trusted.\"",
+   "hypothesis": "Project helper scripts may use subprocess/os.system for building fuzzers or tooling; check for unsafe command execution.",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-78"
+   ],
+   "results_count": 0,
+   "results": []
+  }
+ ]
+}

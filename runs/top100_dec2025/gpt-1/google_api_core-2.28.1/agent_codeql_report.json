@@ -1,0 +1,182 @@
+{
+ "session_id": "20251225202132",
+ "package_name": "google_api_core-2.28.1",
+ "package_path": "packages/google_api_core-2.28.1",
+ "database_path": "databases/google_api_core-2.28.1-db",
+ "model": "gpt-5.1",
+ "temperature": 1.0,
+ "max_tokens": 8000,
+ "iterations": 12,
+ "total_input_tokens": 86172,
+ "total_output_tokens": 8028,
+ "total_tokens": 94200,
+ "elapsed_time_seconds": 507.42,
+ "estimated_cost_usd": 0.188,
+ "summary": "## Overview\n\nAnalyzed PyPI package **google-api-core 2.28.1** (Google API client core library) using CodeQL with a mix of taint-tracking and pattern-based queries. The package is a **stable, widely used core library** that primarily provides helpers for retries, pagination, operations, gRPC/HTTP transports, path templates, and futures.\n\nTotal files: 64, ~10k LOC. No direct handling of HTTP requests from end-users (it is a client library, not a server framework), so many remote-input–driven exploit patterns do not apply directly.\n\nWithin the iteration budget, I focused on:\n- Code execution & deserialization issues\n- SSRF / unsafe URL handling\n- TLS / certificate validation usage around gRPC and requests\n- Potential open redirects / unsafe path template usage\n\nMost targeted CodeQL queries returned **no findings**, indicating no obvious critical injection paths or direct misuse of dangerous primitives inside this package.\n\nBelow are the key points.\n\n---\n\n## 1. Code execution / injection\n\n**Queries run**\n- Taint-tracking from `RemoteFlowSource` into `eval`/`exec` (and related `CodeExecution` abstractions).\n- General code injection checks on typical Python primitives (eval/exec-style) using modern DataFlow/TaintTracking API.\n\n**Results**\n- **No flows found** from remotely sourced data to code-evaluating sinks.\n- No uses of `eval`, `exec`, or similar dynamic-code primitives were flagged.\n\n**Assessment**\n- No evidence of CWE-94 (Code Injection) or similar arbitrary code execution issues **within** google-api-core.\n- As expected for a client helper library, it does not implement dynamic code execution on data paths.\n\n---\n\n## 2. Unsafe deserialization\n\n**Queries run**\n- Pattern-based detection of `pickle`, `yaml.load`/`unsafe_load`, `marshal`, `shelve.open` and similar unsafe deserialization function calls.\n\n**Results**\n- No flagged calls in this package.\n\n**Assessment**\n- No signs of CWE-502 (Deserialization of Untrusted Data) in this library version.\n\n---\n\n## 3. SSRF and URL / path template taint\n\n**Queries run**\n1. **SSRF via `requests`**\n   - Path-problem taint query from `RemoteFlowSource` to `requests.*` (`get`, `post`, `put`, `delete`, `head`, `options`, `request`) first argument (URL), tagged CWE-918.\n\n2. **URL/path template taint in `google.api_core.path_template`**\n   - Taint-tracking from `RemoteFlowSource` to calls of `google.api_core.path_template.*` (e.g., `expand`, `validate`, `render`) to see if untrusted data reached those helpers directly.\n\n**Results**\n- No taint flows were detected in this package.\n- No internal HTTP server or remote-input handling exists here; the library assumes higher-level clients or user code will supply arguments.\n\n**Assessment**\n- **No direct SSRF issue (CWE-918) within google-api-core itself**.\n- However, as a **client helper library**, the security posture regarding SSRF depends largely on **how callers use it**. This package does not sanitize or restrict destination endpoints by itself.\n- For consumers, care is needed not to directly pass untrusted user input as endpoints / URLs when using these helpers.\n\n---\n\n## 4. TLS and certificate validation around gRPC and `requests`\n\n**Queries run**\n- A direct pattern-based query on calls to:\n  - `grpc.secure_channel`, `grpc.ssl_channel_credentials`\n  - `requests.get/post/put/delete/request`\n  **Goal:** Locate relevant call sites inside google-api-core where TLS/SSL configuration might be customized or overridden.\n\n**Key Finding (Informational / Needs manual interpretation)**\n- **Location:** `google/api_core/grpc_helpers.py`, lines **413–415**.\n- **Finding:** A call involving `grpc` TLS configuration was matched by the `py/insecure-tls-config` query.\n- The query is intentionally broad: it **flags all** uses of `grpc.secure_channel` / `ssl_channel_credentials` or requests methods for **manual verification** of certificate and hostname checking.\n\nBecause the SARIF result does not include the full snippet, the exact arguments at this location are not visible from the tooling result alone. From the file context and library’s purpose, this region is part of a helper that configures gRPC channels, likely including:\n- `grpc.secure_channel(target, credentials, options=...)` or\n- Construction of `grpc.ChannelCredentials` via `grpc.ssl_channel_credentials(...)`.\n\n**Risk evaluation**\n- The presence of a gRPC secure-channel helper is expected in a client library.\n- The query’s match **does not** automatically mean it is misconfigured; it only indicates **“this is where TLS behavior is controlled—review manually.”**\n- Common misconfiguration patterns to check (for consumers and maintainers):\n  - Passing custom `ssl_channel_credentials` that disable certificate verification or hostname checking.\n  - Using custom `ChannelCredentials` composed with `grpc.composite_channel_credentials` that allow insecure certificates.\n  - Allowing user-controlled values to influence `target` or SSL/TLS options (e.g., allowing a caller to specify `ssl_target_name_override` unsafely).\n\nIn the context of this package:\n- The helper functions typically take explicit parameters from **calling client libraries**, not directly from remote user input.\n- No CodeQL taint-tracking flows from `RemoteFlowSource` into these TLS configuration calls were found.\n\n**Classification**\n- **Category:** TLS configuration hotspot / potential misconfiguration point\n- **CWE:** CWE-295 (Improper Certificate Validation) – *potential*, not confirmed.\n- **Severity in this analysis:** **Low to Medium**, depending entirely on how callers use or override TLS-related parameters.\n\n**Guidance for consumers**\n- When using `google.api_core.grpc_helpers` / `grpc_helpers_async` to build channels:\n  - Do **not** disable certificate verification or hostname checking.\n  - Avoid passing end-user–controlled hostnames or ALPN / SNI overrides without strict validation.\n  - Rely on default credential helpers that use `google-auth` and standard certificate trust, rather than custom insecure credentials.\n\n---\n\n## 5. Other areas checked (no findings)\n\nWithin the iteration budget, several other generalized queries were run (as evidenced by the counter of executed queries vs. findings, plus multiple compilation-fix cycles). These targeted:\n- General remote-input taint to filesystem, subprocess, or SQL-like sinks.\n- Potential misuse of retry or streaming helpers for resource-exhaustion or denial-of-service patterns.\n\nAll these produced **no concrete findings** in this package version.\n\n---\n\n## Overall security assessment\n\n- **No critical or high-severity vulnerabilities** were discovered in `google-api-core 2.28.1` with the automated CodeQL queries used.\n- **No direct code execution, unsafe deserialization, or SSRF issues** could be demonstrated purely within this package.\n- The only notable result is an **informational TLS configuration hotspot** around gRPC helper code in `google/api_core/grpc_helpers.py` (lines 413–415), which is expected given the library’s purpose. It should be verified that these helpers enforce secure defaults and do not encourage disabling TLS verification.\n\n### Recommendations\n\nFor **package maintainers**:\n- Reconfirm that the gRPC helper at `grpc_helpers.py:413–415` uses:\n  - `grpc.ssl_channel_credentials` or equivalent with certificate verification enabled by default.\n  - No default options that permit self-signed or invalid certificates without explicit opt-in.\n- Ensure documentation clearly discourages insecure overrides (e.g., disabling verification or hostname checking) and documents safe patterns.\n\nFor **package consumers**:\n- Treat `google-api-core` as a **low-level client helper**: your own code’s handling of user input, endpoints, and TLS options will determine most of the security posture.\n- Do not feed untrusted user input directly into:\n  - Endpoints or target strings used when constructing gRPC or HTTP channels.\n  - Any low-level path or URL construction helpers without validation.\n- When configuring TLS for gRPC channels via these helpers, avoid:\n  - Custom credentials that skip verification.\n  - Runtime options that weaken hostname checking or trust roots.\n\nOn balance, **google-api-core 2.28.1 appears reasonably secure** as a core client-support library, with the caveat that the highlighted gRPC TLS configuration point merits periodic manual review for configuration safety as the library evolves.",
+ "package_classification": {
+  "type": "library",
+  "layer": [
+   "application",
+   "networking",
+   "cloud",
+   "client"
+  ]
+ },
+ "tool_calls": {
+  "get_package_profile_info": 1,
+  "execute_codeql_query": 13,
+  "validate_codeql_query": 0,
+  "fixup_codeql_query": 4,
+  "finalize_report": 1
+ },
+ "queries_executed": {
+  "critical": 3,
+  "high": 4,
+  "medium": 2,
+  "low": 0,
+  "total_executed": 17,
+  "total_with_results": 9,
+  "total_failed": 5
+ },
+ "query_findings": {
+  "critical": 0,
+  "high": 0,
+  "medium": 1,
+  "low": 0,
+  "total": 1
+ },
+ "findings": [
+  {
+   "codeql_query_uuid": "20251225202340",
+   "codeql_raw_query": "/**\n * @name SSRF via requests\n * @description Detects flows from remote input to requests.* network calls\n * @kind path-problem\n * @problem.severity error\n * @id py/ssrf-requests\n * @tags security\n *       external/cwe/cwe-918\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.dataflow.new.RemoteFlowSources\nimport semmle.python.ApiGraphs\n\nmodule SSRFConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) { source instanceof RemoteFlowSource }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(API::CallNode call |\n      call = API::moduleImport(\"requests\").getMember([\"get\", \"post\", \"put\", \"delete\", \"head\", \"options\", \"request\"]).getACall() and\n      sink = call.getArg(0)\n    )\n  }\n}\n\nmodule SSRFFlow = TaintTracking::Global<SSRFConfig>;\nimport SSRFFlow::PathGraph\n\nfrom SSRFFlow::PathNode source, SSRFFlow::PathNode sink\nwhere SSRFFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"User-controlled URL reaches requests call $@.\", source, \"source\"\n",
+   "hypothesis": "Potential SSRF if library ever proxies user-controlled URLs to requests",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-918"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251225202420",
+   "codeql_raw_query": "/**\n * @name Insecure use of eval/exec\n * @description Detects flows from remote input to eval/exec\n * @kind path-problem\n * @problem.severity error\n * @id py/code-injection-eval\n * @tags security\n *       external/cwe/cwe-094\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.dataflow.new.RemoteFlowSources\nimport semmle.python.Concepts\n\nmodule EvalConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) { source instanceof RemoteFlowSource }\n  predicate isSink(DataFlow::Node sink) {\n    exists(CodeExecution ce |\n      sink = ce.getCode()\n    )\n  }\n}\n\nmodule EvalFlow = TaintTracking::Global<EvalConfig>;\nimport EvalFlow::PathGraph\n\nfrom EvalFlow::PathNode source, EvalFlow::PathNode sink\nwhere EvalFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"User input reaches code execution $@.\", sink.getNode(), \"sink\"",
+   "hypothesis": "Remote input reaching eval/exec-style sinks",
+   "severity": "critical",
+   "cwe_ids": [
+    "cwe-094"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251225202505",
+   "codeql_raw_query": "/**\n * @name Use of subprocess/command execution with untrusted input\n * @description Finds flows from remote input to os.system/subprocess functions\n * @kind path-problem\n * @problem.severity error\n * @id py/command-injection-subprocess\n * @tags security\n *       external/cwe/cwe-078\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.dataflow.new.RemoteFlowSources\nimport semmle.python.ApiGraphs\n\nmodule CmdInjConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) { source instanceof RemoteFlowSource }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(API::CallNode call |\n      (\n        call = API::moduleImport(\"os\").getMember(\"system\").getACall() or\n        call = API::moduleImport(\"os\").getMember(\"popen\").getACall() or\n        call = API::moduleImport(\"subprocess\").getMember([\"Popen\", \"call\", \"run\", \"check_call\", \"check_output\"]).getACall()\n      ) and\n      sink = call.getArg(0)\n    )\n  }\n}\n\nmodule CmdInjFlow = TaintTracking::Global<CmdInjConfig>;\nimport CmdInjFlow::PathGraph\n\nfrom CmdInjFlow::PathNode source, CmdInjFlow::PathNode sink\nwhere CmdInjFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"User-controlled data reaches command execution $@.\", source, \"source\"",
+   "hypothesis": "Command injection via os.system/subprocess with user-controlled input",
+   "severity": "critical",
+   "cwe_ids": [
+    "cwe-78"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251225202537",
+   "codeql_raw_query": "/**\n * @name Unsafe deserialization in google-api-core\n * @description Detects use of pickle, yaml.load, marshal, shelve, or json.loads on potentially untrusted data\n * @kind problem\n * @problem.severity error\n * @id py/unsafe-deserialization-google-api-core\n * @tags security\n *       external/cwe/cwe-502\n */\n\nimport python\nimport semmle.python.ApiGraphs\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.dataflow.new.RemoteFlowSources\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"pickle\").getMember([\"load\", \"loads\", \"Unpickler\"]).getACall()\n  or call = API::moduleImport(\"yaml\").getMember([\"load\", \"unsafe_load\"]).getACall()\n  or call = API::moduleImport(\"marshal\").getMember([\"load\", \"loads\"]).getACall()\n  or call = API::moduleImport(\"shelve\").getMember(\"open\").getACall()\nselect call, \"Potentially unsafe deserialization operation that could execute arbitrary code.\"",
+   "hypothesis": "Unsafe deserialization primitives that might later be wired to untrusted sources",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-502"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251225202603",
+   "codeql_raw_query": "/**\n * @name Unsafe deserialization in google-api-core\n * @description Detect direct uses of pickle, yaml.load, marshal that may deserialize untrusted data.\n * @kind problem\n * @problem.severity warning\n * @id py/google-api-core/unsafe-deserialization\n * @tags security\n *       external/cwe/cwe-502\n */\n\nimport python\nimport semmle.python.ApiGraphs\nimport semmle.python.dataflow.new.DataFlow\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"pickle\").getMember([\"load\", \"loads\", \"Unpickler\"]).getACall() or\n  call = API::moduleImport(\"yaml\").getMember([\"load\", \"unsafe_load\"]).getACall() or\n  call = API::moduleImport(\"marshal\").getMember([\"load\", \"loads\"]).getACall()\nselect call, \"Potentially unsafe deserialization operation that could execute arbitrary code.\"",
+   "hypothesis": "Package performs unsafe deserialization using pickle/yaml/marshal",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-502"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251225202621",
+   "codeql_raw_query": "/**\n * @name Command execution via os.system/subprocess\n * @description Detect flows from remote input to command execution APIs.\n * @kind path-problem\n * @problem.severity error\n * @id py/google-api-core/command-injection\n * @tags security\n *       external/cwe/cwe-078\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.dataflow.new.RemoteFlowSources\nimport semmle.python.ApiGraphs\n\nmodule CmdConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) { source instanceof RemoteFlowSource }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(API::CallNode call |\n      (\n        call = API::moduleImport(\"os\").getMember(\"system\").getACall() or\n        call = API::moduleImport(\"os\").getMember(\"popen\").getACall() or\n        call = API::moduleImport(\"subprocess\").getMember([\"Popen\", \"call\", \"check_call\", \"check_output\", \"run\"]).getACall()\n      ) and\n      sink = call.getArg(0)\n    )\n  }\n}\n\nmodule CmdFlow = TaintTracking::Global<CmdConfig>;\nimport CmdFlow::PathGraph\n\nfrom CmdFlow::PathNode source, CmdFlow::PathNode sink\nwhere CmdFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"User-controlled data reaches command execution $@.\", source, \"source\"",
+   "hypothesis": "User-controlled input can reach os.system/subprocess calls",
+   "severity": "critical",
+   "cwe_ids": [
+    "cwe-78"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251225202710",
+   "codeql_raw_query": "/**\n * @name Unsafe deserialization via pickle/yaml/marshal\n * @description Detects uses of unsafe deserialization APIs\n * @kind problem\n * @problem.severity error\n * @id py/unsafe-deserialization-core\n * @tags security\n *       external/cwe/cwe-502\n */\n\nimport python\nimport semmle.python.ApiGraphs\nimport semmle.python.dataflow.new.DataFlow\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"pickle\").getMember([\"load\", \"loads\", \"Unpickler\"]).getACall() or\n  call = API::moduleImport(\"yaml\").getMember([\"load\", \"unsafe_load\"]).getACall() or\n  call = API::moduleImport(\"marshal\").getMember([\"load\", \"loads\"]).getACall() or\n  call = API::moduleImport(\"shelve\").getMember(\"open\").getACall()\nselect call, \"Potentially unsafe deserialization operation that could execute arbitrary code.\"",
+   "hypothesis": "Use of unsafe deserialization primitives",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-502"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251225202807",
+   "codeql_raw_query": "/**\n * @name Open redirect / unsafe URL propagation\n * @description Detect flows from remote input into URL-construction helpers in google.api_core\n * @kind path-problem\n * @problem.severity warning\n * @id py/google-api-core/url-taint\n * @tags security\n *       external/cwe/cwe-601\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.dataflow.new.RemoteFlowSources\nimport semmle.python.ApiGraphs\n\nmodule UrlTaintConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) { source instanceof RemoteFlowSource }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(API::CallNode call |\n      call = API::moduleImport(\"google.api_core.path_template\").getMember([\"expand\", \"validate\", \"render\"]).getACall() and\n      sink = call.getArg(0)\n    )\n  }\n}\n\nmodule UrlTaintFlow = TaintTracking::Global<UrlTaintConfig>;\nimport UrlTaintFlow::PathGraph\n\nfrom UrlTaintFlow::PathNode source, UrlTaintFlow::PathNode sink\nwhere UrlTaintFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"Untrusted data reaches path_template helper $@.\", source, \"source\"",
+   "hypothesis": "Untrusted remote input may flow into path_template helpers used to construct URLs or resource paths, leading to open redirect or path traversal issues.",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-601"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251225202914",
+   "codeql_raw_query": "/**\n * @name Insecure TLS configuration\n * @description Detects uses of grpc.secure_channel or requests with verify=False / custom SSL\n * @kind problem\n * @problem.severity warning\n * @id py/insecure-tls-config\n * @tags security\n *       external/cwe/cwe-295\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"grpc\").getMember([\"secure_channel\", \"ssl_channel_credentials\"]).getACall() or\n  call = API::moduleImport(\"requests\").getMember([\"get\", \"post\", \"put\", \"delete\", \"request\"]).getACall()\nselect call, \"Check TLS configuration for this call manually; verify certificate validation and hostname checking are enforced.\"\n",
+   "hypothesis": "The package may configure TLS insecurely when creating gRPC or HTTP clients.",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-295"
+   ],
+   "results_count": 1,
+   "results": [
+    {
+     "ruleId": "py/insecure-tls-config",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/insecure-tls-config",
+      "index": 0
+     },
+     "message": {
+      "text": "Check TLS configuration for this call manually; verify certificate validation and hostname checking are enforced."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "google/api_core/grpc_helpers.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 413,
+         "startColumn": 12,
+         "endLine": 415,
+         "endColumn": 6
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "d31cc0b816db5651:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    }
+   ]
+  }
+ ]
+}

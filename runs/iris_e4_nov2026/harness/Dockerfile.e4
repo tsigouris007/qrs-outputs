@@ -1,0 +1,54 @@
+# E4 image (2026-11-18): IRIS v1 (src/, pinned 67140e8) + pinned cwe-bench-java + Claude adapter.
+# Based on src/Dockerfile (IRIS v1). Differences, all environmental (none touch IRIS logic):
+#   1. cwe-bench-java is copied from ./cwe-bench-java (pinned afe0ebd) instead of an unpinned `git clone`.
+#   2. JDK 7u80 is not installed (Oracle login-gated, unavailable). No CWE-Bench-Java project builds with it
+#      (data/build_info.csv: 92 × 8u202, 28 × 17, 0 × 7u80); it is only build attempt 5 of 10 in build_one.py.
+#      Its jdk_version.json entry stays but points to an empty jdk1.7.0_80/ dir, so setup_jdk.py skips it and
+#      build_one.py attempt 5 fails (as it did for every project) instead of raising KeyError.
+#   3. JDK 17 is 17.0.12 (the archive the user obtained) instead of 17 GA; dir jdk-17.0.12.
+#   4. The adapter is embedded with adapter/apply.py, and `anthropic` (pinned) is installed into the iris env.
+#   5. Miniforge (conda-forge) instead of Miniconda: no Anaconda Terms of Service; same environment.yml and channels.
+# Build (outside the sandbox, from iris/):  docker build -f Dockerfile.e4 -t iris-e4:v1 .
+FROM ubuntu:22.04
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y git wget curl python3 python3-pip unzip tar \
+    && rm -rf /var/lib/apt/lists/*
+
+# Miniforge instead of Miniconda (user, 2026-11-18): Miniconda now requires accepting Anaconda's ToS for its default
+# channels; IRIS's environment.yml uses only pytorch, nvidia and conda-forge, so the Anaconda defaults are not needed.
+RUN arch=$(uname -m) && \
+    if [ "$arch" = "x86_64" ]; then CONDA_URL="https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Linux-x86_64.sh"; \
+    else echo "Unsupported architecture: $arch"; exit 1; fi && \
+    wget $CONDA_URL -O miniforge.sh && bash miniforge.sh -b -p /opt/conda && rm miniforge.sh && \
+    /opt/conda/bin/conda --version && /opt/conda/bin/conda config --show channels
+ENV PATH=/opt/conda/bin:$PATH
+
+WORKDIR /iris
+COPY src/ /iris/
+COPY cwe-bench-java/ /iris/data/cwe-bench-java/
+COPY adapter/ /iris-adapter/
+
+RUN chmod +x scripts/setup_environment.sh && bash ./scripts/setup_environment.sh
+
+SHELL ["/bin/bash", "-c"]
+RUN ENV_NAME=$(head -1 environment.yml | cut -d' ' -f2) && conda init bash && \
+    echo ". /opt/conda/etc/profile.d/conda.sh" >> ~/.bashrc && echo "conda activate $ENV_NAME" >> ~/.bashrc
+
+# Claude adapter (official SDK, same version as the QRS venv) + one get_llm branch
+RUN /opt/conda/envs/iris/bin/pip install --no-cache-dir anthropic==0.72.0 && \
+    /opt/conda/envs/iris/bin/python /iris-adapter/apply.py /iris
+
+# JDKs: 8u202 and 17.0.12 only (see header)
+COPY jdk/jdk-8u202-linux-x64.tar.gz jdk/jdk-17.0.12_linux-x64_bin.tar.gz /iris/data/cwe-bench-java/java-env/
+RUN cd /iris/data/cwe-bench-java/java-env/ && \
+    tar xzf jdk-8u202-linux-x64.tar.gz --no-same-owner && \
+    tar xzf jdk-17.0.12_linux-x64_bin.tar.gz --no-same-owner && \
+    chmod -R 755 */bin */lib && chmod -R 755 jdk1.8.0_202/jre/bin jdk1.8.0_202/jre/lib && \
+    ls -la jdk-17.0.12/lib/libjli.so && \
+    mkdir -p jdk1.7.0_80 && echo "E4: JDK 7u80 not installed (empty on purpose; build attempt 5 fails and the next attempt runs)" > jdk1.7.0_80/E4_EMPTY && \
+    printf '%s\n' '{' \
+      '  "17":    {"tar_file": "jdk-17.0.12_linux-x64_bin.tar.gz", "dir": "jdk-17.0.12"},' \
+      '  "7u80":  {"tar_file": "jdk-7u80-linux-x64.tar.gz",         "dir": "jdk1.7.0_80"},' \
+      '  "8u202": {"tar_file": "jdk-8u202-linux-x64.tar.gz",        "dir": "jdk1.8.0_202"}' \
+      '}' > /iris/data/cwe-bench-java/scripts/jdk_version.json
+CMD ["/bin/bash"]

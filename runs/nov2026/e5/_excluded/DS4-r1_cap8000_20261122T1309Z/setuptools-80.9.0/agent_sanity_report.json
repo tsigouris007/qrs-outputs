@@ -1,0 +1,255 @@
+{
+ "session_id": "20261122101109",
+ "original_report": "reports/_nov2026/e5/DS4-r1/setuptools-80.9.0/agent_codeql_report.json",
+ "package_name": "setuptools-80.9.0",
+ "package_path": "packages/setuptools-80.9.0",
+ "database_path": "databases/setuptools-80.9.0-db",
+ "package_classification": {},
+ "model": "deepseek/deepseek-flash",
+ "temperature": null,
+ "max_tokens": 8000,
+ "iterations": 14,
+ "total_input_tokens": 133061,
+ "total_output_tokens": 17177,
+ "total_tokens": 150238,
+ "elapsed_time_seconds": 194.64,
+ "estimated_cost_usd": 0.0,
+ "total_findings_submitted": 3,
+ "manual_review": 1,
+ "review_groups": {
+  "high_often_medium": 1,
+  "high_undetermined_undetermined": 1
+ },
+ "tool_calls": {
+  "extract_code_snippet": 9,
+  "grep_search": 18,
+  "trace_dataflow_path": 0,
+  "submit_finding": 3,
+  "complete_review": 0
+ },
+ "true_positives": {
+  "critical": 0,
+  "high": 1,
+  "medium": 1,
+  "low": 0,
+  "total": 2
+ },
+ "false_positives": {
+  "critical": 0,
+  "high": 0,
+  "medium": 0,
+  "low": 0,
+  "total": 0
+ },
+ "findings": [
+  {
+   "codeql_query_uuids": [
+    "20261122100853"
+   ],
+   "finding_id": "fb0998ac-f3ae-423d-bf90-6dd603231e14",
+   "verdict": "tp",
+   "confidence": 88,
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-022"
+   ],
+   "description": "Zip Slip / tar path traversal: custom extraction filter `strip_first_component` disables all of tarfile's built-in path safety checks, allowing a malicious remote tarball to write files outside the extraction directory",
+   "file_path": "setuptools/_vendor/jaraco/context.py",
+   "start_line": 40,
+   "end_line": 70,
+   "start_column": null,
+   "end_column": null,
+   "code_snippet": "    os.mkdir(target_dir)\n    try:\n        req = urllib.request.urlopen(url)\n        with tarfile.open(fileobj=req, mode='r|*') as tf:\n            tf.extractall(path=target_dir, filter=strip_first_component)\n        yield target_dir\n    finally:\n        shutil.rmtree(target_dir)\n\n\ndef strip_first_component(\n    member: tarfile.TarInfo,\n    path,\n) -> tarfile.TarInfo:\n    _, member.name = member.name.split('/', 1)\n    return member",
+   "reasoning": "`tarball()` downloads an archive from an arbitrary URL (`urllib.request.urlopen(url)`) and extracts it with `tf.extractall(path=target_dir, filter=strip_first_component)`.\\n\\nPassing a *callable* `filter` argument (introduced in Python 3.12 / backports.tarfile) completely replaces the default safety filter. The backport in `setuptools/_vendor/backports/tarfile/__init__.py` shows that without a filter, `_get_filter_function()` returns `fully_trusted_filter`, i.e. **no** validation. The custom `strip_first_component` performs zero security checks — it only does `_, member.name = member.name.split('/', 1)`:\\n\\n* no rejection of absolute paths (`/etc/cron.d/x` → becomes `etc/cron.d/x`, only leading segment stripped)\\n* no rejection of `..` traversal (`a/../../../../tmp/x` → becomes `../../../../tmp/x`)\\n* no symlink/hardlink target validation (a symlink member pointing at `/` or `../../` is passed through, enabling a two-step write outside the destination)\\n\\nThe archive contents are fully attacker-controlled if the URL is attacker-controlled (the doctest itself fetches over HTTP: `url = getfixture('tarfile_served')`). Result: arbitrary file write with the privileges of the calling process (e.g. overwriting `~/.bashrc`, `sitecustomize.py` in site-packages, or cron/systemd units). This is the classic Zip Slip (CWE-22). Note: although `setuptools` itself does not call `jaraco.context.tarball` directly (grep shows only `jaraco.text` importing `ExceptionTrap` from it), the vulnerable code is shipped inside setuptools' vendored tree and is directly reachable by any consumer of the vendored module as well as `tarball_cwd`/`tarball_context` wrappers at lines 109-120 in the same file.",
+   "evidence": {
+    "code_context": "def tarball(url, target_dir=None):\n    ...\n    req = urllib.request.urlopen(url)\n    with tarfile.open(fileobj=req, mode='r|*') as tf:\n        tf.extractall(path=target_dir, filter=strip_first_component)\n\ndef strip_first_component(member, path):\n    _, member.name = member.name.split('/', 1)\n    return member\n\ntarball_cwd = _compose(pushd, tarball)   # line 109\ntarball_context = ...                    # line 113-120",
+    "dataflow_analysis": "url (caller-supplied, network) -> urllib.request.urlopen(url) -> tarfile.open(fileobj=req) -> TarFile.extractall(path=target_dir, filter=strip_first_component) -> TarFile._extract_one -> attacker-controlled member.name written under destination. The custom filter short-circuits _get_filtered_attrs()/data_filter() which is the only place in the vendored backport performing os.path.commonpath() containment checks (backports/tarfile/__init__.py lines 740-800).",
+    "notes": "Vendored backport source confirms: _get_filter_function() -> fully_trusted_filter when no filter set; data_filter()/_get_filtered_attrs() implement OutsideDestinationError, AbsolutePathError, AbsoluteLinkError, LinkOutsideDestinationError. strip_first_component bypasses all of them."
+   },
+   "dataflow_path": null,
+   "group": "high_undetermined_undetermined",
+   "sanity_check": {
+    "verdict": "mr",
+    "confidence": 0,
+    "recommendation": "review",
+    "concerns": false,
+    "flags": [],
+    "reasoning": ""
+   }
+  },
+  {
+   "codeql_query_uuids": [
+    "20261122100853"
+   ],
+   "finding_id": "ea367f24-805c-4cef-9647-6f39e8a516b7",
+   "verdict": "tp",
+   "confidence": 72,
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-022"
+   ],
+   "description": "New finding (not flagged by CodeQL): arbitrary-path `chmod()` using the unsanitized zip member name in wheel's unpack CLI — `zipfile.extract` sanitizes the write path but `destination.joinpath(zinfo.filename)` still uses the raw `../`-laden filename",
+   "file_path": "setuptools/_vendor/wheel/cli/unpack.py",
+   "start_line": 24,
+   "end_line": 27,
+   "start_column": null,
+   "end_column": null,
+   "code_snippet": "        for zinfo in wf.filelist:\n            wf.extract(zinfo, destination)\n\n            # Set permissions to the same values as they were set in the archive\n            # We have to do this manually due to\n            # https://github.com/python/cpython/issues/59999\n            permissions = zinfo.external_attr >> 16 & 0o777\n            destination.joinpath(zinfo.filename).chmod(permissions)",
+   "reasoning": "The CodeQL alert is on line 22 (`wf.extract(zinfo, destination)`), which is **not** the vulnerable statement: `WheelFile` subclasses `zipfile.ZipFile`, and `ZipFile.extract()` → `_extract_member()` strips drive letters, leading separators and `..` components, so the *write* cannot escape `destination`.\\n\\nHowever, the following line is genuinely vulnerable: `destination.joinpath(zinfo.filename).chmod(permissions)` uses the **raw** `zinfo.filename` straight from the archive with no normalization or containment check. For a member named `../../../../home/victim/.ssh/authorized_keys` (or `../site-packages/some_module.py`), `Path.joinpath` happily produces a path outside `destination`, and `.chmod()` is applied to it with attacker-chosen mode bits from `external_attr >> 16 & 0o777`.\\n\\nImpact: an attacker-supplied wheel (installed/unpacked via `wheel unpack <file>`) can change permissions of arbitrary files the user can chmod — e.g. `0o777` on a sensitive file or directory, `0o000` to deny access (denial of service), or make an existing script/authorized_keys file writable by others. `chmod` also follows symlinks, so a combination with the extraction step can lead to modifying permissions outside the tree. Additionally, if `zinfo.filename` names a non-existent path the `chmod` raises and aborts, but the traversal primitive itself is real.",
+   "evidence": {
+    "code_context": "with WheelFile(path) as wf:\n    namever = wf.parsed_filename.group('namever')\n    destination = Path(dest) / namever\n    for zinfo in wf.filelist:\n        wf.extract(zinfo, destination)                      # line 22 - safe (zipfile sanitizes)\n        permissions = zinfo.external_attr >> 16 & 0o777\n        destination.joinpath(zinfo.filename).chmod(permissions)  # line 26 - UNSAFE, raw filename",
+    "dataflow_analysis": "zip archive member name (attacker controlled) -> ZipInfo.filename -> Path.joinpath(destination, zinfo.filename) -> Path.chmod(attacker_mode). No os.path.realpath/commonpath containment check anywhere in unpack().",
+    "notes": "CodeQL result at line 22 is a false positive for the extract call itself, but investigating it revealed the real chmod path-traversal on line 26; submitted as a new finding."
+   },
+   "dataflow_path": null,
+   "group": "high_undetermined_undetermined",
+   "sanity_check": {
+    "verdict": "tp",
+    "confidence": 72,
+    "recommendation": "review",
+    "concerns": true,
+    "flags": [
+     {
+      "type": "NOVEL_FINDING",
+      "severity": "info",
+      "message": "The technical analysis is accurate: the CodeQL alert on wf.extract() is a false positive (ZipFile._extract_member sanitizes '..' and absolute/drive components), but the following chmod() line uses the raw, unsanitized zinfo.filename via Path.joinpath, which does NOT collapse '..'. No matching CVE exists for this vendored-wheel unpack chmod issue.",
+      "evidence": "CVE-2025-47273 concerns setuptools PackageIndex path traversal (different code path); no CVE covers wheel internal unpack chmod primitive"
+     },
+     {
+      "type": "EXPLOITABILITY",
+      "severity": "warning",
+      "message": "Exploitability is conditional and reduced in this context: it requires a victim to explicitly run the vendored `wheel unpack` CLI on a malicious wheel, and Path.chmod() raises FileNotFoundError unless the target path already exists. Real impact (privilege escalation via making e.g. /etc/passwd world-writable) only materializes when unpack runs with elevated privileges; otherwise it is limited to files owned by the invoking user (DoS/permission tampering). The vendored wheel CLI is also not normally reached through setuptools' build flow.",
+      "evidence": "zinfo.filename (attacker-controlled) -> Path(dest)/namever.joinpath(filename).chmod(external_attr>>16 & 0o777); requires target file to already exist; privileged context needed for broad impact"
+     }
+    ],
+    "reasoning": "The finding is code-accurate: the extract() call is indeed sanitized while the subsequent chmod() uses the raw archive member name, and pathlib preserves '..'/absolute segments, yielding an arbitrary-path permission-change primitive (path traversal-style, CWE-22/CWE-73). It is a genuine defect in the wheel library, but in the setuptools vendored context its exploitability is limited—requiring manual invocation of the unpack CLI on a malicious wheel and elevated privileges for serious impact—so it warrants human review rather than outright rejection or unconditional acceptance."
+   }
+  },
+  {
+   "codeql_query_uuids": [
+    "20261122100853"
+   ],
+   "finding_id": "3da2f898-8405-4fb2-a3c8-726727db5b7e",
+   "verdict": "mr",
+   "confidence": 60,
+   "severity": "low",
+   "cwe_ids": [
+    "cwe-022"
+   ],
+   "description": "Vendored backports tarfile CLI extractall() defaults to unsanitized extraction (fully_trusted_filter) when no --filter is supplied, allowing member path traversal when a user extracts an untrusted archive",
+   "file_path": "setuptools/_vendor/backports/tarfile/__init__.py",
+   "start_line": 2899,
+   "end_line": 2899,
+   "start_column": null,
+   "end_column": null,
+   "code_snippet": "        if is_tarfile(src):\n            with TarFile.open(src, 'r:*') as tf:\n                tf.extractall(path=curdir, filter=args.filter)",
+   "reasoning": "Line 2899 is inside the `_main()` command-line entry point of the vendored `backports.tarfile` module (a copy of CPython's tarfile CLI). `args.filter` is optional (`-f/--filter`); when omitted it is `None`, and `TarFile._get_filter_function()` falls back to `self.extraction_filter`, which is `None` for a freshly opened TarFile (line 1661). The code then only emits a DeprecationWarning and returns `fully_trusted_filter`, which returns members unchanged — i.e. no absolute-path, `..`, or symlink-escape validation. Consequently extracting a malicious tarball via this CLI writes files outside the target directory. Severity is low/needs-review because this is a user-invoked CLI in a vendored library: the victim must deliberately download and extract an attacker-supplied archive, and no setuptools code path invokes this `_main()`. It is a legitimate tarfile semantic/known CLI behavior rather than an exploitable flaw in setuptools' own logic, but worth noting since the vendored copy could be reachable if any code shells out to `python -m backports.tarfile`.",
+   "evidence": {
+    "code_context": "elif args.extract is not None:\n    if len(args.extract) == 1:\n        src = args.extract[0]\n        curdir = os.curdir\n    elif len(args.extract) == 2:\n        src, curdir = args.extract\n    ...\n    if is_tarfile(src):\n        with TarFile.open(src, 'r:*') as tf:\n            tf.extractall(path=curdir, filter=args.filter)",
+    "dataflow_analysis": "args.filter (argparse, default None) -> TarFile.extractall(filter=None) -> _get_filter_function: filter = self.extraction_filter (class attr, None at line 1661) -> warns DeprecationWarning -> returns fully_trusted_filter -> member returned unchanged -> _extract_one writes to os.path.join(path, tarinfo.name) with no containment check",
+    "notes": "Vendored copy of CPython tarfile CLI (_main). extraction_filter/fully_trusted_filter confirmed at lines 1661 and 2251-2266. Only reachable via direct CLI invocation; no setuptools runtime path calls it. Classified manual-review/low."
+   },
+   "dataflow_path": null,
+   "group": "high_undetermined_undetermined",
+   "sanity_check": {
+    "verdict": "fp",
+    "confidence": 84,
+    "recommendation": "reject",
+    "concerns": true,
+    "flags": [
+     {
+      "type": "EXPLOITABILITY",
+      "severity": "warning",
+      "message": "The vulnerable path is in the vendored backports.tarfile CLI entry point, not a setuptools runtime code path. Exploitation requires a user to explicitly invoke the vendored tarfile CLI on an untrusted archive.",
+      "evidence": "The finding itself notes: 'Only reachable via direct CLI invocation; no setuptools runtime path calls it.' The flagged code is inside _main() and only executes for the CLI extract command."
+     },
+     {
+      "type": "CONTEXT_MISMATCH",
+      "severity": "warning",
+      "message": "This is vendored third-party code in setuptools/_vendor, and the affected CLI is not part of setuptools' normal build/install/runtime behavior.",
+      "evidence": "File path: setuptools/_vendor/backports/tarfile/__init__.py; code is CPython tarfile CLI backport copy."
+     },
+     {
+      "type": "CODE_SMELL",
+      "severity": "info",
+      "message": "The default fully_trusted extraction filter is an insecure legacy default for the tarfile CLI, but it is an intentional compatibility behavior in this backport rather than a setuptools-specific vulnerability.",
+      "evidence": "args.filter defaults to None; TarFile.extractall(filter=None) falls back to fully_trusted_filter with a DeprecationWarning."
+     }
+    ],
+    "reasoning": "The described code and dataflow are real: the vendored tarfile CLI passes filter=None and falls back to fully_trusted_filter when extracting. However, this code is not reachable through setuptools' normal operations and only affects direct CLI invocation against an untrusted archive, which is caller-controlled behavior. It is therefore not a true vulnerability in the setuptools package context."
+   }
+  }
+ ],
+ "sanity_check_metadata": {
+  "session_id": "20261122101424",
+  "model": "deepseek/deepseek-flash",
+  "temperature": null,
+  "max_tokens": 8000,
+  "total_input_tokens": 6892,
+  "total_output_tokens": 18236,
+  "total_tokens": 25128,
+  "estimated_cost_usd": 0.0,
+  "total_findings_validated": 3,
+  "findings_with_flags": 0,
+  "elapsed_time_seconds": 146.5
+ },
+ "cache_usage": {
+  "prompt_tokens_total": 6892,
+  "uncached_input_tokens": 6892,
+  "cache_creation_input_tokens": 0,
+  "cache_read_input_tokens": 0,
+  "output_tokens": 18236,
+  "calls": 3,
+  "caching_enabled": false,
+  "cost_usd_with_cache": 0.011975,
+  "cost_usd_no_cache": 0.011975,
+  "cache_read_share_of_prompt": 0.0,
+  "prices_per_mtok": {
+   "claude-sonnet-4-5-20250929": {
+    "input": 3.0,
+    "output": 15.0
+   },
+   "claude-haiku-4-5-20251001": {
+    "input": 1.0,
+    "output": 5.0
+   },
+   "deepseek/deepseek-reasoner": {
+    "input": 0.15,
+    "output": 0.6,
+    "cache_read": 0.003,
+    "cache_write_mult": 1.0,
+    "peak_mult": 2.0
+   },
+   "gpt-5.1": {
+    "input": 1.25,
+    "output": 10.0,
+    "cache_read": 0.125,
+    "cache_write_mult": 1.0
+   },
+   "gpt-4.1": {
+    "input": 2.0,
+    "output": 8.0,
+    "cache_read": 0.5,
+    "cache_write_mult": 1.0
+   },
+   "deepseek/deepseek-v4-pro": {
+    "input": 0.66,
+    "output": 1.98,
+    "cache_read": 0.022,
+    "cache_write_mult": 1.0,
+    "peak_mult": 2.0
+   },
+   "deepseek/deepseek-flash": {
+    "input": 0.15,
+    "output": 0.6,
+    "cache_read": 0.003,
+    "cache_write_mult": 1.0,
+    "peak_mult": 2.0
+   }
+  },
+  "cache_multipliers": {
+   "write_5m": 1.25,
+   "read": 0.1
+  }
+ }
+}

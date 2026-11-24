@@ -1,0 +1,1440 @@
+{
+ "session_id": "20251219023920",
+ "package_name": "pytest-8.4.2",
+ "package_path": "packages/pytest-8.4.2",
+ "database_path": "databases/pytest-8.4.2-db",
+ "model": "gpt-5.1",
+ "temperature": 0.0,
+ "max_tokens": 8000,
+ "iterations": 11,
+ "total_input_tokens": 109740,
+ "total_output_tokens": 10662,
+ "total_tokens": 120402,
+ "elapsed_time_seconds": 514.11,
+ "estimated_cost_usd": 0.2438,
+ "summary": "## Security analysis of `pytest` 8.4.2\n\nTarget: PyPI package `pytest` (8.4.2)\nType: testing framework / CLI tool\n\nScope considered: core library under `src/_pytest`, helper/bench/testing scripts, and extra utilities included in the source distribution.\n\n### Overall assessment\n\n`pytest` is a mature, widely‑used testing framework. The CodeQL‑based review did not reveal clear, directly exploitable vulnerabilities in typical usage (running tests in a local project). However, several patterns require awareness and, in some environments, hardening:\n\n* Extensive use of dynamic code execution (eval/exec, dynamic imports, assertion rewriting).\n* Use of `subprocess` to spawn external commands.\n* File I/O whose paths can be influenced by CLI options or environment.\n* A few unsafe patterns in test/bench/helper code that are not shipped as part of the runtime library, but may be present in source checkouts.\n\nThese are largely inherent to a test runner that must execute arbitrary user tests and introspect Python code. They become security‑relevant mainly when `pytest` is exposed as a service (e.g., CI SaaS running untrusted tests, multi‑tenant environments) or when its helper scripts are used in automated pipelines.\n\nBelow are the concrete findings from CodeQL queries, with context and recommendations.\n\n---\n\n### 1. Subprocess usage in pytest core\n\n**Files / locations (representative):**\n- `src/_pytest/_py/path.py` around line 1169\n- `src/_pytest/pytester.py` around lines 128, 161, 1362\n\n**Pattern:** Calls to `subprocess` APIs (`run`, `Popen`, etc.) in core modules.\n\n**Risk:**\n- If any of these calls use `shell=True` with arguments influenced by user‑controlled data (CLI options, environment, test content), they could lead to command injection (CWE‑78).\n- The CodeQL query used here was conservative and flagged all subprocess calls in core for manual review; it did not confirm tainted data flow into the command arguments.\n\n**Assessment:**\n- In normal usage, these subprocess calls are used for helper functionality (e.g., running external commands in tests, path utilities) and are not directly exposed as a remote service.\n- No evidence from the automated analysis that untrusted remote input reaches these calls.\n\n**Recommendations:**\n- Prefer `shell=False` and pass arguments as lists where possible.\n- Where `shell=True` is required, ensure arguments are constructed from trusted constants or are strictly validated/escaped.\n- For any environment where `pytest` is used to run untrusted tests as a service, review these call sites manually with a focus on data flow from CLI/env/test content into subprocess arguments.\n\n**CWE:** CWE‑78 (OS Command Injection) – potential, not confirmed.\n\n---\n\n### 2. Insecure temporary file usage in tests\n\n**File:** `testing/_py/test_local.py` around line 746\n\n**Pattern:** Use of `tempfile.mktemp()`.\n\n**Risk:**\n- `tempfile.mktemp()` is inherently race‑prone and can lead to TOCTOU issues (CWE‑377) if used in security‑sensitive contexts.\n\n**Assessment:**\n- This occurrence is in pytest’s own test suite, not in the shipped library code.\n- It does not affect consumers of the `pytest` package from PyPI in normal operation.\n\n**Recommendations:**\n- For defense‑in‑depth and best practices, replace `tempfile.mktemp()` with `NamedTemporaryFile`, `mkstemp`, or `TemporaryDirectory` in the test suite.\n\n**CWE:** CWE‑377 (Insecure Temporary File).\n\n---\n\n### 3. Potentially unsafe deserialization\n\n**Files / locations (representative):**\n- `src/_pytest/_py/error.py` around line 87\n- `src/_pytest/assertion/rewrite.py` around line 402\n- Test files: `testing/_py/test_local.py` (~734), `testing/test_pathlib.py` (~708)\n\n**Pattern:** Calls to deserialization APIs (e.g., `pickle`/similar) detected by a generic unsafe‑deserialization query.\n\n**Risk:**\n- Deserializing untrusted data with `pickle` or similar can lead to arbitrary code execution (CWE‑502).\n\n**Assessment:**\n- In core modules, these deserializations are used for internal mechanisms (e.g., assertion rewriting caches, error information) and are typically reading data that pytest itself previously wrote.\n- There is no clear indication from the automated analysis that these deserialization points read attacker‑controlled remote data.\n- Test‑suite occurrences do not affect library consumers.\n\n**Recommendations:**\n- Ensure any serialized data read by these sites is stored in locations not writable by untrusted users, or is scoped per‑user/workspace.\n- If feasible, prefer safer formats (JSON, msgpack without code execution) for caches or metadata.\n- In multi‑tenant or shared filesystem environments, treat these cache files as potentially sensitive and isolate them per tenant.\n\n**CWE:** CWE‑502 (Deserialization of Untrusted Data) – potential, context‑dependent.\n\n---\n\n### 4. Dynamic code execution (eval/exec)\n\n**Files / locations (representative):**\n- `src/_pytest/_code/code.py` (~171)\n- `src/_pytest/mark/expression.py` (~330)\n- `src/_pytest/_py/path.py` (~1153)\n- `src/_pytest/pytester.py` (~295)\n- `src/_pytest/skipping.py` (~118)\n- `src/_pytest/assertion/rewrite.py` (~186)\n- Multiple test and bench files under `testing/` and `bench/`\n\n**Pattern:** Use of `eval`, `exec`, or equivalent dynamic execution.\n\n**Risk:**\n- If untrusted input reaches these dynamic execution points, it can lead to arbitrary code execution (CWE‑94).\n\n**Assessment:**\n- Dynamic execution is fundamental to pytest’s design: it must import and execute arbitrary test code, rewrite assertions, and evaluate marker expressions.\n- In practice, the “untrusted input” here is the test code and configuration that the user explicitly asks pytest to run. This is expected and documented behavior.\n- The CodeQL query did not track taint from remote sources; it only enumerated dynamic execution sites for awareness.\n\n**Recommendations:**\n- Do not run pytest against untrusted test suites on shared infrastructure without strong isolation (containers/VMs, separate users, resource limits).\n- Treat running pytest on arbitrary code as equivalent to executing that code directly with Python.\n- For services that expose pytest as a feature (e.g., online judges, CI for untrusted users), enforce sandboxing and strict isolation.\n\n**CWE:** CWE‑94 (Code Injection) – inherent to the tool’s purpose; not a flaw in typical local use.\n\n---\n\n### 5. HTTP requests in helper script\n\n**File:** `extra/get_issues.py` around line 18\n\n**Pattern:** Use of `requests` (e.g., `requests.get(...)`) in a helper script.\n\n**Risk:**\n- If `verify=False` or insecure options were used, this could weaken TLS validation (CWE‑295). The query here was broad and only confirmed that `requests` is used; it did not find `verify=False`.\n\n**Assessment:**\n- This script is an auxiliary tool for maintainers (e.g., fetching GitHub issues), not part of the runtime library.\n- No insecure TLS configuration was flagged by the more specific query.\n\n**Recommendations:**\n- Ensure TLS certificate verification remains enabled (default) and avoid `verify=False`.\n- If this script is used in automation, treat its network access as you would any other internal tooling (e.g., restrict endpoints, use tokens securely).\n\n**CWE:** CWE‑295 (Improper Certificate Validation) – not observed, but relevant to this usage.\n\n---\n\n### 6. File I/O influenced by CLI / environment\n\n**Files / locations (representative):**\n- `src/_pytest/config/__init__.py` (~437)\n- `src/_pytest/cacheprovider.py` (~221, 223, 225)\n- `src/_pytest/capture.py` (~143, 489)\n- `src/_pytest/_py/error.py` (~87)\n- `src/_pytest/helpconfig.py` (~117)\n- `src/_pytest/junitxml.py` (~644)\n- `src/_pytest/_py/path.py` (~1152)\n- `src/_pytest/assertion/rewrite.py` (~291, 335, 371)\n\n**Pattern:** Calls to `open()` and related file operations in core modules. These paths can often be influenced by command‑line options (e.g., `--junitxml`, cache directory options) or environment variables.\n\n**Risk:**\n- If pytest is run in a context where an attacker can control CLI arguments or environment variables for another user, they might be able to cause overwriting or reading of arbitrary files (CWE‑73 / CWE‑22 style issues).\n\n**Assessment:**\n- In normal local use, the user who runs pytest controls these options and paths; this is expected behavior.\n- In multi‑tenant or privileged automation scenarios, misconfiguration could allow one tenant to influence where another tenant’s pytest process writes files.\n\n**Recommendations:**\n- When integrating pytest into shared or privileged services, sanitize or restrict user‑controlled options that specify file paths (e.g., limit to a workspace directory, disallow absolute paths or `..` components).\n- Run pytest processes under unprivileged accounts with filesystem access limited to the intended workspace.\n\n**CWE:** CWE‑73 (External Control of File Name or Path) – potential, environment‑dependent.\n\n---\n\n### 7. Summary of risk for typical consumers\n\nFor developers installing `pytest` 8.4.2 from PyPI and running it locally on their own test suites:\n\n- The patterns identified (subprocess usage, dynamic execution, deserialization, file I/O) are expected for a test framework and do not constitute exploitable vulnerabilities in this context.\n- The main security consideration remains: **do not run pytest on untrusted code without isolation**, as pytest will execute that code with the same privileges as the Python interpreter.\n\nFor operators of CI systems, online judges, or other services that run pytest on code from untrusted users:\n\n- Treat pytest as arbitrary code execution infrastructure and apply strong sandboxing (containers/VMs, separate users, resource limits, network/filesystem isolation).\n- Review and, where necessary, constrain CLI options and environment variables that can influence file paths, subprocess commands, or configuration.\n\nNo concrete, standalone CVE‑style vulnerabilities were confirmed by this automated analysis, but several areas warrant careful configuration and isolation in high‑risk deployment models.\n",
+ "package_classification": {
+  "type": "framework",
+  "layer": [
+   "testing",
+   "cli",
+   "library"
+  ]
+ },
+ "tool_calls": {
+  "get_package_profile_info": 1,
+  "execute_codeql_query": 13,
+  "validate_codeql_query": 0,
+  "fixup_codeql_query": 5,
+  "finalize_report": 1
+ },
+ "queries_executed": {
+  "critical": 0,
+  "high": 3,
+  "medium": 2,
+  "low": 2,
+  "total_executed": 15,
+  "total_with_results": 7,
+  "total_failed": 15
+ },
+ "query_findings": {
+  "critical": 0,
+  "high": 26,
+  "medium": 14,
+  "low": 2,
+  "total": 42
+ },
+ "findings": [
+  {
+   "codeql_query_uuid": "20251219024143",
+   "codeql_raw_query": "/**\n * @name HTTP requests in pytest helper scripts\n * @description Find requests.* calls for manual review of TLS verification and timeouts.\n * @kind problem\n * @problem.severity warning\n * @id py/pytest-requests-usage\n * @tags security\n *       external/cwe/cwe-295\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"requests\").getMember([\"get\", \"post\", \"put\", \"delete\", \"head\", \"options\", \"request\", \"Session\"]).getACall()\nselect call, \"requests call in pytest package helper scripts (check verify/timeout).\"\n",
+   "hypothesis": "pytest helper scripts may use requests insecurely",
+   "severity": "low",
+   "cwe_ids": [
+    "cwe-295"
+   ],
+   "results_count": 1,
+   "results": [
+    {
+     "ruleId": "py/pytest-requests-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pytest-requests-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "requests call in pytest package helper scripts (check verify/timeout)."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "extra/get_issues.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 18,
+         "startColumn": 13,
+         "endColumn": 47
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "b6f3c672c8290454:1",
+      "primaryLocationStartColumnFingerprint": "4"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251219024325",
+   "codeql_raw_query": "/**\n * @name subprocess shell usage in pytest core\n * @description Find subprocess calls in src/_pytest with shell=True.\n * @kind problem\n * @problem.severity warning\n * @id py/pytest-core-subprocess-shell\n * @tags security\n *       external/cwe/cwe-078\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"subprocess\")\n            .getMember([\"run\", \"Popen\", \"call\", \"check_call\", \"check_output\"]) \n            .getACall() and\n  call.getLocation().getFile().getRelativePath().matches(\"src/_pytest/%\")\nselect call, \"subprocess call in pytest core (review shell usage and inputs).\"",
+   "hypothesis": "pytest core may use subprocess with shell=True or untrusted input, leading to command injection.",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-078"
+   ],
+   "results_count": 4,
+   "results": [
+    {
+     "ruleId": "py/pytest-core-subprocess-shell",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pytest-core-subprocess-shell",
+      "index": 0
+     },
+     "message": {
+      "text": "subprocess call in pytest core (review shell usage and inputs)."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/_pytest/_py/path.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 1169,
+         "startColumn": 16,
+         "endLine": 1174,
+         "endColumn": 10
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "c970bcf857579e81:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/pytest-core-subprocess-shell",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pytest-core-subprocess-shell",
+      "index": 0
+     },
+     "message": {
+      "text": "subprocess call in pytest core (review shell usage and inputs)."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/_pytest/pytester.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 128,
+         "startColumn": 15,
+         "endLine": 135,
+         "endColumn": 10
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "f72c4409f0e511c:1",
+      "primaryLocationStartColumnFingerprint": "6"
+     }
+    },
+    {
+     "ruleId": "py/pytest-core-subprocess-shell",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pytest-core-subprocess-shell",
+      "index": 0
+     },
+     "message": {
+      "text": "subprocess call in pytest core (review shell usage and inputs)."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/_pytest/pytester.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 161,
+         "startColumn": 13,
+         "endColumn": 55
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "46d37f97ca182b92:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/pytest-core-subprocess-shell",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pytest-core-subprocess-shell",
+      "index": 0
+     },
+     "message": {
+      "text": "subprocess call in pytest core (review shell usage and inputs)."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/_pytest/pytester.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 1362,
+         "startColumn": 17,
+         "endColumn": 78
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "73f2ee5b44121e0f:1",
+      "primaryLocationStartColumnFingerprint": "8"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251219024347",
+   "codeql_raw_query": "/**\n * @name Insecure temporary file usage in pytest\n * @description Detect use of tempfile.mktemp which is insecure.\n * @kind problem\n * @problem.severity warning\n * @id py/pytest-insecure-tempfile-mktemp\n * @tags security\n *       external/cwe/cwe-377\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"tempfile\").getMember(\"mktemp\").getACall()\nselect call, \"Insecure use of tempfile.mktemp in pytest package.\"",
+   "hypothesis": "pytest may use tempfile.mktemp, which is race-prone and insecure.",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-377"
+   ],
+   "results_count": 1,
+   "results": [
+    {
+     "ruleId": "py/pytest-insecure-tempfile-mktemp",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pytest-insecure-tempfile-mktemp",
+      "index": 0
+     },
+     "message": {
+      "text": "Insecure use of tempfile.mktemp in pytest package."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "testing/_py/test_local.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 746,
+         "startColumn": 20,
+         "endColumn": 37
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "7f58943d42633b69:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251219024432",
+   "codeql_raw_query": "/**\n * @name Unsafe deserialization in pytest\n * @description Detect use of pickle, yaml.load, marshal, or shelve which can lead to code execution when given untrusted data.\n * @kind problem\n * @problem.severity error\n * @id py/pytest-unsafe-deserialization\n * @tags security\n *       external/cwe/cwe-502\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"pickle\").getMember([\"load\", \"loads\", \"Unpickler\"]).getACall() or\n  call = API::moduleImport(\"yaml\").getMember([\"load\", \"unsafe_load\"]).getACall() or\n  call = API::moduleImport(\"marshal\").getMember([\"load\", \"loads\"]).getACall() or\n  call = API::moduleImport(\"shelve\").getMember(\"open\").getACall()\nselect call, \"Potentially unsafe deserialization operation in pytest (ensure inputs are trusted).\"",
+   "hypothesis": "Unsafe deserialization usage",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-502"
+   ],
+   "results_count": 4,
+   "results": [
+    {
+     "ruleId": "py/pytest-unsafe-deserialization",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pytest-unsafe-deserialization",
+      "index": 0
+     },
+     "message": {
+      "text": "Potentially unsafe deserialization operation in pytest (ensure inputs are trusted)."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/_pytest/_py/error.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 87,
+         "startColumn": 20,
+         "endColumn": 41
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "53f1b8d8fe08d287:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/pytest-unsafe-deserialization",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pytest-unsafe-deserialization",
+      "index": 0
+     },
+     "message": {
+      "text": "Potentially unsafe deserialization operation in pytest (ensure inputs are trusted)."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/_pytest/assertion/rewrite.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 402,
+         "startColumn": 18,
+         "endColumn": 34
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "b8f8c75143bf2895:1",
+      "primaryLocationStartColumnFingerprint": "5"
+     }
+    },
+    {
+     "ruleId": "py/pytest-unsafe-deserialization",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pytest-unsafe-deserialization",
+      "index": 0
+     },
+     "message": {
+      "text": "Potentially unsafe deserialization operation in pytest (ensure inputs are trusted)."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "testing/_py/test_local.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 734,
+         "startColumn": 20,
+         "endColumn": 34
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "b8134219c45bf4ef:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/pytest-unsafe-deserialization",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pytest-unsafe-deserialization",
+      "index": 0
+     },
+     "message": {
+      "text": "Potentially unsafe deserialization operation in pytest (ensure inputs are trusted)."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "testing/test_pathlib.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 3
+        },
+        "region": {
+         "startLine": 708,
+         "startColumn": 20,
+         "endColumn": 35
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "44b220927311bbaa:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251219024549",
+   "codeql_raw_query": "/**\n * @name Use of eval/exec in pytest\n * @description Detect dynamic code execution via eval or exec.\n * @kind problem\n * @problem.severity warning\n * @id py/pytest-eval-exec-usage\n * @tags security\n *       external/cwe/cwe-094\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::builtin([\"eval\", \"exec\"]).getACall()\nselect call, \"Dynamic code execution (eval/exec) used in pytest; ensure inputs are trusted.\"",
+   "hypothesis": "Dynamic code execution that could be influenced by untrusted input",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-094"
+   ],
+   "results_count": 18,
+   "results": [
+    {
+     "ruleId": "py/pytest-eval-exec-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pytest-eval-exec-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Dynamic code execution (eval/exec) used in pytest; ensure inputs are trusted."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/_pytest/_code/code.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 171,
+         "startColumn": 16,
+         "endColumn": 52
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "69ed9a394bf04af9:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/pytest-eval-exec-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pytest-eval-exec-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Dynamic code execution (eval/exec) used in pytest; ensure inputs are trusted."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "testing/python/collect.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 1171,
+         "startColumn": 13,
+         "endColumn": 52
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "62115323d88b187a:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/pytest-eval-exec-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pytest-eval-exec-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Dynamic code execution (eval/exec) used in pytest; ensure inputs are trusted."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "bench/empty.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 5,
+         "startColumn": 5,
+         "endColumn": 39
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "fb9b9a98faf65991:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/pytest-eval-exec-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pytest-eval-exec-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Dynamic code execution (eval/exec) used in pytest; ensure inputs are trusted."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/_pytest/mark/expression.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 3
+        },
+        "region": {
+         "startLine": 330,
+         "startColumn": 26,
+         "endColumn": 88
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "ce9656b6ecd8ba07:1",
+      "primaryLocationStartColumnFingerprint": "17"
+     }
+    },
+    {
+     "ruleId": "py/pytest-eval-exec-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pytest-eval-exec-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Dynamic code execution (eval/exec) used in pytest; ensure inputs are trusted."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/_pytest/_py/path.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 4
+        },
+        "region": {
+         "startLine": 1153,
+         "startColumn": 25,
+         "endColumn": 53
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "85defd9eebc74299:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/pytest-eval-exec-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pytest-eval-exec-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Dynamic code execution (eval/exec) used in pytest; ensure inputs are trusted."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/_pytest/pytester.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 5
+        },
+        "region": {
+         "startLine": 295,
+         "startColumn": 24,
+         "endColumn": 62
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "b90c88f9d73f178c:1",
+      "primaryLocationStartColumnFingerprint": "3"
+     }
+    },
+    {
+     "ruleId": "py/pytest-eval-exec-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pytest-eval-exec-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Dynamic code execution (eval/exec) used in pytest; ensure inputs are trusted."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "testing/python/raises_group.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 6
+        },
+        "region": {
+         "startLine": 1216,
+         "startColumn": 18,
+         "endColumn": 25
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "cf3317425399a306:1",
+      "primaryLocationStartColumnFingerprint": "9"
+     }
+    },
+    {
+     "ruleId": "py/pytest-eval-exec-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pytest-eval-exec-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Dynamic code execution (eval/exec) used in pytest; ensure inputs are trusted."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/_pytest/assertion/rewrite.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 7
+        },
+        "region": {
+         "startLine": 186,
+         "startColumn": 9,
+         "endColumn": 34
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "ad2463f5c218253e:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/pytest-eval-exec-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pytest-eval-exec-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Dynamic code execution (eval/exec) used in pytest; ensure inputs are trusted."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/_pytest/skipping.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 8
+        },
+        "region": {
+         "startLine": 118,
+         "startColumn": 22,
+         "endColumn": 52
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "f67db054bfac3b69:1",
+      "primaryLocationStartColumnFingerprint": "9"
+     }
+    },
+    {
+     "ruleId": "py/pytest-eval-exec-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pytest-eval-exec-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Dynamic code execution (eval/exec) used in pytest; ensure inputs are trusted."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "testing/test_assertrewrite.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 9
+        },
+        "region": {
+         "startLine": 59,
+         "startColumn": 5,
+         "endColumn": 19
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "ee464798faef4f50:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/pytest-eval-exec-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pytest-eval-exec-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Dynamic code execution (eval/exec) used in pytest; ensure inputs are trusted."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "testing/test_assertrewrite.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 9
+        },
+        "region": {
+         "startLine": 177,
+         "startColumn": 13,
+         "endColumn": 40
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "48c54109540c817d:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/pytest-eval-exec-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pytest-eval-exec-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Dynamic code execution (eval/exec) used in pytest; ensure inputs are trusted."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "testing/test_assertrewrite.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 9
+        },
+        "region": {
+         "startLine": 182,
+         "startColumn": 13,
+         "endColumn": 40
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "c0b9e54d9b7fc699:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/pytest-eval-exec-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pytest-eval-exec-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Dynamic code execution (eval/exec) used in pytest; ensure inputs are trusted."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "testing/code/test_excinfo.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 10
+        },
+        "region": {
+         "startLine": 375,
+         "startColumn": 9,
+         "endColumn": 35
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "1ce64f182cc9a16e:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/pytest-eval-exec-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pytest-eval-exec-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Dynamic code execution (eval/exec) used in pytest; ensure inputs are trusted."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "testing/code/test_excinfo.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 10
+        },
+        "region": {
+         "startLine": 653,
+         "startColumn": 13,
+         "endColumn": 21
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "4ad55f7ca1a827d2:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/pytest-eval-exec-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pytest-eval-exec-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Dynamic code execution (eval/exec) used in pytest; ensure inputs are trusted."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "testing/code/test_excinfo.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 10
+        },
+        "region": {
+         "startLine": 671,
+         "startColumn": 13,
+         "endColumn": 21
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "4ad55f7ca1a827d2:2",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/pytest-eval-exec-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pytest-eval-exec-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Dynamic code execution (eval/exec) used in pytest; ensure inputs are trusted."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "testing/code/test_source.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 11
+        },
+        "region": {
+         "startLine": 338,
+         "startColumn": 5,
+         "endColumn": 16
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "8f74d2b96eb6560b:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/pytest-eval-exec-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pytest-eval-exec-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Dynamic code execution (eval/exec) used in pytest; ensure inputs are trusted."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "bench/unit_test.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 12
+        },
+        "region": {
+         "startLine": 7,
+         "startColumn": 5,
+         "endLine": 16,
+         "endColumn": 6
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "add607d76ebbd87e:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/pytest-eval-exec-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pytest-eval-exec-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Dynamic code execution (eval/exec) used in pytest; ensure inputs are trusted."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "bench/xunit.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 13
+        },
+        "region": {
+         "startLine": 5,
+         "startColumn": 5,
+         "endLine": 14,
+         "endColumn": 6
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "b93f65924e361ba:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251219024621",
+   "codeql_raw_query": "/**\n * @name Network requests in helper scripts\n * @description Find requests.* calls in non-core helper/extra scripts for manual review.\n * @kind problem\n * @problem.severity note\n * @id py/pytest-requests-usage\n * @tags security\n *       external/cwe/cwe-200\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"requests\").getMember([\"get\", \"post\", \"put\", \"delete\", \"head\", \"options\", \"request\", \"Session\"]).getACall() and\n  call.getLocation().getFile().getRelativePath().matches(\"extra/%\")\nselect call, \"requests call in pytest package helper scripts (check verify/timeout).\"",
+   "hypothesis": "Identify HTTP requests in helper scripts that might lack TLS verification or timeouts",
+   "severity": "low",
+   "cwe_ids": [
+    "cwe-200"
+   ],
+   "results_count": 1,
+   "results": [
+    {
+     "ruleId": "py/pytest-requests-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pytest-requests-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "requests call in pytest package helper scripts (check verify/timeout)."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "extra/get_issues.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 18,
+         "startColumn": 13,
+         "endColumn": 47
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "b6f3c672c8290454:1",
+      "primaryLocationStartColumnFingerprint": "4"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251219024645",
+   "codeql_raw_query": "/**\n * @name File writes based on environment or CLI in pytest core\n * @description Detect writes to the filesystem where the path is influenced by environment variables or CLI args.\n * @kind problem\n * @problem.severity warning\n * @id py/pytest-env-cli-file-write\n * @tags security\n *       external/cwe/cwe-73\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"builtins\").getMember([\"open\"]).getACall() and\n  call.getLocation().getFile().getRelativePath().matches(\"src/_pytest/%\")\nselect call, \"File open in pytest core (manual review for env/CLI-influenced paths).\"",
+   "hypothesis": "Locate file writes in core that might be influenced by environment or CLI options",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-73"
+   ],
+   "results_count": 13,
+   "results": [
+    {
+     "ruleId": "py/pytest-env-cli-file-write",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pytest-env-cli-file-write",
+      "index": 0
+     },
+     "message": {
+      "text": "File open in pytest core (manual review for env/CLI-influenced paths)."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/_pytest/config/__init__.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 437,
+         "startColumn": 23,
+         "endLine": 442,
+         "endColumn": 18
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "374727330b2c7688:1",
+      "primaryLocationStartColumnFingerprint": "6"
+     }
+    },
+    {
+     "ruleId": "py/pytest-env-cli-file-write",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pytest-env-cli-file-write",
+      "index": 0
+     },
+     "message": {
+      "text": "File open in pytest core (manual review for env/CLI-influenced paths)."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/_pytest/cacheprovider.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 221,
+         "startColumn": 18,
+         "endColumn": 73
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "82ccf6d7e7729ed2:1",
+      "primaryLocationStartColumnFingerprint": "5"
+     }
+    },
+    {
+     "ruleId": "py/pytest-env-cli-file-write",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pytest-env-cli-file-write",
+      "index": 0
+     },
+     "message": {
+      "text": "File open in pytest core (manual review for env/CLI-influenced paths)."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/_pytest/cacheprovider.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 223,
+         "startColumn": 18,
+         "endColumn": 74
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "555c8d12f0608d8c:1",
+      "primaryLocationStartColumnFingerprint": "5"
+     }
+    },
+    {
+     "ruleId": "py/pytest-env-cli-file-write",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pytest-env-cli-file-write",
+      "index": 0
+     },
+     "message": {
+      "text": "File open in pytest core (manual review for env/CLI-influenced paths)."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/_pytest/cacheprovider.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 225,
+         "startColumn": 18,
+         "endColumn": 59
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "a0e20ee23ff648a3:1",
+      "primaryLocationStartColumnFingerprint": "5"
+     }
+    },
+    {
+     "ruleId": "py/pytest-env-cli-file-write",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pytest-env-cli-file-write",
+      "index": 0
+     },
+     "message": {
+      "text": "File open in pytest core (manual review for env/CLI-influenced paths)."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/_pytest/capture.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 143,
+         "startColumn": 13,
+         "endColumn": 54
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "68af02bedd1cf5e0:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/pytest-env-cli-file-write",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pytest-env-cli-file-write",
+      "index": 0
+     },
+     "message": {
+      "text": "File open in pytest core (manual review for env/CLI-influenced paths)."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/_pytest/capture.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 489,
+         "startColumn": 28,
+         "endColumn": 62
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "a1bbf9df0459ad4c:1",
+      "primaryLocationStartColumnFingerprint": "15"
+     }
+    },
+    {
+     "ruleId": "py/pytest-env-cli-file-write",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pytest-env-cli-file-write",
+      "index": 0
+     },
+     "message": {
+      "text": "File open in pytest core (manual review for env/CLI-influenced paths)."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/_pytest/_py/error.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 3
+        },
+        "region": {
+         "startLine": 87,
+         "startColumn": 20,
+         "endColumn": 41
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "53f1b8d8fe08d287:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/pytest-env-cli-file-write",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pytest-env-cli-file-write",
+      "index": 0
+     },
+     "message": {
+      "text": "File open in pytest core (manual review for env/CLI-influenced paths)."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/_pytest/helpconfig.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 4
+        },
+        "region": {
+         "startLine": 117,
+         "startColumn": 21,
+         "endColumn": 54
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "c4bd14245ce32b34:1",
+      "primaryLocationStartColumnFingerprint": "12"
+     }
+    },
+    {
+     "ruleId": "py/pytest-env-cli-file-write",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pytest-env-cli-file-write",
+      "index": 0
+     },
+     "message": {
+      "text": "File open in pytest core (manual review for env/CLI-influenced paths)."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/_pytest/junitxml.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 5
+        },
+        "region": {
+         "startLine": 644,
+         "startColumn": 14,
+         "endColumn": 55
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "37061f61f57a5431:1",
+      "primaryLocationStartColumnFingerprint": "5"
+     }
+    },
+    {
+     "ruleId": "py/pytest-env-cli-file-write",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pytest-env-cli-file-write",
+      "index": 0
+     },
+     "message": {
+      "text": "File open in pytest core (manual review for env/CLI-influenced paths)."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/_pytest/_py/path.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 6
+        },
+        "region": {
+         "startLine": 1152,
+         "startColumn": 26,
+         "endColumn": 47
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "149eda7c39fc61c2:1",
+      "primaryLocationStartColumnFingerprint": "5"
+     }
+    },
+    {
+     "ruleId": "py/pytest-env-cli-file-write",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pytest-env-cli-file-write",
+      "index": 0
+     },
+     "message": {
+      "text": "File open in pytest core (manual review for env/CLI-influenced paths)."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/_pytest/assertion/rewrite.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 7
+        },
+        "region": {
+         "startLine": 291,
+         "startColumn": 14,
+         "endColumn": 34
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "d0d489971ac3449c:1",
+      "primaryLocationStartColumnFingerprint": "5"
+     }
+    },
+    {
+     "ruleId": "py/pytest-env-cli-file-write",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pytest-env-cli-file-write",
+      "index": 0
+     },
+     "message": {
+      "text": "File open in pytest core (manual review for env/CLI-influenced paths)."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/_pytest/assertion/rewrite.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 7
+        },
+        "region": {
+         "startLine": 335,
+         "startColumn": 14,
+         "endColumn": 34
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "7bc3a811ee27f557:1",
+      "primaryLocationStartColumnFingerprint": "5"
+     }
+    },
+    {
+     "ruleId": "py/pytest-env-cli-file-write",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/pytest-env-cli-file-write",
+      "index": 0
+     },
+     "message": {
+      "text": "File open in pytest core (manual review for env/CLI-influenced paths)."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/_pytest/assertion/rewrite.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 7
+        },
+        "region": {
+         "startLine": 371,
+         "startColumn": 14,
+         "endColumn": 29
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "8ec69406cebb2ac2:1",
+      "primaryLocationStartColumnFingerprint": "5"
+     }
+    }
+   ]
+  }
+ ]
+}

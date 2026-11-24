@@ -1,0 +1,244 @@
+{
+ "session_id": "20251206010517",
+ "package_name": "filelock-3.20.0",
+ "package_path": "packages/filelock-3.20.0",
+ "database_path": "databases/filelock-3.20.0-db",
+ "model": "claude-sonnet-4-5-20250929",
+ "temperature": 0.0,
+ "max_tokens": 4000,
+ "iterations": 19,
+ "total_input_tokens": 129064,
+ "total_output_tokens": 7188,
+ "total_tokens": 136252,
+ "elapsed_time_seconds": 367.32,
+ "estimated_cost_usd": 0.495,
+ "summary": "# Security Analysis Report: filelock-3.20.0\n\n## Package Overview\nThe `filelock` package (version 3.20.0) is a platform-independent file locking library with approximately 847 lines of code across 9 files. It provides Unix, Windows, and soft lock implementations with async support.\n\n## Key Findings\n\n### 1. **TOCTOU Race Condition (Medium Severity)** - CWE-367\n**Location:** `src/filelock/_unix.py:42`\n\nFound a Time-of-Check-Time-of-Use (TOCTOU) vulnerability where file existence is checked before file operations. This pattern can lead to race conditions:\n- The code checks if a file exists using `Path.exists()`\n- Subsequently performs operations on that file\n- An attacker could exploit the time gap between check and use\n\n**Impact:** Could allow symlink attacks or race conditions in multi-process environments.\n\n### 2. **Insecure File Permissions (Medium Severity)** - CWE-732\n**Locations:** \n- `src/filelock/_soft.py:27`\n- `src/filelock/_unix.py:44`\n- `src/filelock/_windows.py:28`\n\nThree instances where files are created without explicit secure permissions:\n- Lock files may be created with default umask permissions\n- Could allow unauthorized users to read/write lock files\n- May lead to privilege escalation or information disclosure\n\n**Impact:** Lock files created with overly permissive access could be manipulated by unauthorized users, potentially bypassing locking mechanisms or causing denial of service.\n\n## Vulnerabilities Not Found\n- **Path Traversal:** No remote flow sources in library code (expected for a library)\n- **Unsafe Temporary Files:** No insecure temporary file usage detected\n- **File Descriptor Leaks:** Proper resource management observed\n- **Unbounded Loops:** No infinite loop vulnerabilities found\n\n## Recommendations\n1. **Fix TOCTOU:** Use atomic file operations or proper locking mechanisms to avoid race conditions\n2. **Set Secure Permissions:** Explicitly set restrictive permissions (e.g., 0o600) when creating lock files\n3. **Consider Symlink Safety:** Use `O_NOFOLLOW` flag or equivalent when opening lock files to prevent symlink attacks\n\n## Risk Assessment\n- **Overall Risk:** Medium\n- The vulnerabilities found are primarily in edge cases but could be exploited in multi-user or multi-process environments\n- The library is production-stable and widely used, suggesting these issues have limited real-world impact in typical use cases",
+ "package_classification": {
+  "type": [
+   "library"
+  ],
+  "layer": [
+   "system",
+   "infrastructure"
+  ]
+ },
+ "tool_calls": {
+  "get_package_profile_info": 1,
+  "execute_codeql_query": 10,
+  "validate_codeql_query": 0,
+  "fixup_codeql_query": 3,
+  "finalize_report": 1
+ },
+ "queries_executed": {
+  "critical": 0,
+  "high": 2,
+  "medium": 4,
+  "low": 0,
+  "total_executed": 13,
+  "total_with_results": 6,
+  "total_failed": 5
+ },
+ "query_findings": {
+  "critical": 0,
+  "high": 1,
+  "medium": 3,
+  "low": 0,
+  "total": 4
+ },
+ "findings": [
+  {
+   "codeql_query_uuid": "20251206010621",
+   "codeql_raw_query": "/**\n * @name Path traversal in file lock operations\n * @description File lock operations that use unsanitized user input may allow path traversal attacks\n * @kind path-problem\n * @problem.severity error\n * @id py/filelock-path-traversal\n * @tags security\n *        external/cwe/cwe-022\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.dataflow.new.RemoteFlowSources\nimport semmle.python.ApiGraphs\n\nmodule PathTraversalConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    source instanceof RemoteFlowSource\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(DataFlow::CallCfgNode call |\n      call = API::moduleImport(\"filelock\").getMember([\"FileLock\", \"SoftFileLock\", \"UnixFileLock\", \"WindowsFileLock\"]).getACall() and\n      sink = call.getArg(0)\n    )\n  }\n}\n\nmodule PathTraversalFlow = TaintTracking::Global<PathTraversalConfig>;\nimport PathTraversalFlow::PathGraph\n\nfrom PathTraversalFlow::PathNode source, PathTraversalFlow::PathNode sink\nwhere PathTraversalFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"File lock path may be controlled by untrusted input from $@.\", source.getNode(), \"user input\"",
+   "hypothesis": "File lock operations that use unsanitized user input may allow path traversal attacks",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-022"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251206010703",
+   "codeql_raw_query": "/**\n * @name Potential symlink race condition in file operations\n * @description File operations that check file properties before use may be vulnerable to race conditions\n * @kind problem\n * @problem.severity warning\n * @id py/filelock-symlink-race\n * @tags security\n *        external/cwe/cwe-367\n *        external/cwe/cwe-59\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call, string funcName\nwhere\n  (\n    // Check for os.path.exists followed by file operations\n    call = API::moduleImport(\"os\").getMember(\"path\").getMember(\"exists\").getACall() or\n    call = API::moduleImport(\"os\").getMember(\"path\").getMember(\"isfile\").getACall() or\n    call = API::moduleImport(\"os\").getMember(\"path\").getMember(\"isdir\").getACall() or\n    call = API::moduleImport(\"pathlib\").getMember(\"Path\").getReturn().getMember(\"exists\").getACall() or\n    call = API::moduleImport(\"pathlib\").getMember(\"Path\").getReturn().getMember(\"is_file\").getACall()\n  ) and\n  funcName = call.getFunction().(DataFlow::AttrRead).getAttributeName()\nselect call, \"File existence check '\" + funcName + \"' may be vulnerable to race conditions if followed by file operations.\"\n",
+   "hypothesis": "Check for Time-of-Check-Time-of-Use (TOCTOU) vulnerabilities where file operations don't properly handle symlinks or race conditions",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-367",
+    "cwe-59"
+   ],
+   "results_count": 1,
+   "results": [
+    {
+     "ruleId": "py/filelock-symlink-race",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/filelock-symlink-race",
+      "index": 0
+     },
+     "message": {
+      "text": "File existence check 'exists' may be vulnerable to race conditions if followed by file operations."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/filelock/_unix.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 42,
+         "startColumn": 20,
+         "endColumn": 49
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "5848e7413d7cc100:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251206010729",
+   "codeql_raw_query": "/**\n * @name Insecure file permissions in file lock creation\n * @description File lock files created without explicit secure permissions may be accessible by unintended users\n * @kind problem\n * @problem.severity warning\n * @id py/filelock-insecure-permissions\n * @tags security\n *        external/cwe/cwe-732\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  (\n    call = API::builtin(\"open\").getACall() or\n    call = API::moduleImport(\"os\").getMember(\"open\").getACall()\n  ) and\n  // Check if the call is in filelock module\n  call.getLocation().getFile().getRelativePath().matches(\"%filelock%\") and\n  // Check if mode parameter is not specified or doesn't restrict permissions\n  not exists(call.getArgByName(\"mode\"))\nselect call, \"File operation without explicit secure permissions may create files with overly permissive access.\"",
+   "hypothesis": "File operations without explicit secure permissions may create files with overly permissive access",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-732"
+   ],
+   "results_count": 3,
+   "results": [
+    {
+     "ruleId": "py/filelock-insecure-permissions",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/filelock-insecure-permissions",
+      "index": 0
+     },
+     "message": {
+      "text": "File operation without explicit secure permissions may create files with overly permissive access."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/filelock/_soft.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 27,
+         "startColumn": 28,
+         "endColumn": 78
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "e0cf0771037e84c:1",
+      "primaryLocationStartColumnFingerprint": "15"
+     }
+    },
+    {
+     "ruleId": "py/filelock-insecure-permissions",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/filelock-insecure-permissions",
+      "index": 0
+     },
+     "message": {
+      "text": "File operation without explicit secure permissions may create files with overly permissive access."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/filelock/_unix.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 44,
+         "startColumn": 18,
+         "endColumn": 73
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "d118c77731a1d2b9:1",
+      "primaryLocationStartColumnFingerprint": "5"
+     }
+    },
+    {
+     "ruleId": "py/filelock-insecure-permissions",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/filelock-insecure-permissions",
+      "index": 0
+     },
+     "message": {
+      "text": "File operation without explicit secure permissions may create files with overly permissive access."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/filelock/_windows.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 28,
+         "startColumn": 22,
+         "endColumn": 72
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "9a4bb758ad4769f1:1",
+      "primaryLocationStartColumnFingerprint": "5"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251206010758",
+   "codeql_raw_query": "/**\n * @name Unsafe temporary file usage\n * @description Using predictable paths or insecure temporary file operations\n * @kind problem\n * @problem.severity warning\n * @id py/filelock-unsafe-temp-file\n * @tags security\n *        external/cwe/cwe-377\n *        external/cwe/cwe-379\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  // Check for os.path.join with temp directories\n  (call = API::moduleImport(\"os\").getMember(\"path\").getMember(\"join\").getACall() and\n   exists(DataFlow::Node arg |\n     arg = call.getArg(_) and\n     arg.asExpr().(StrConst).getText().regexpMatch(\".*(tmp|temp).*\")\n   )) or\n  // Check for hardcoded temp paths\n  (call = API::moduleImport(\"pathlib\").getMember(\"Path\").getACall() and\n   exists(DataFlow::Node arg |\n     arg = call.getArg(0) and\n     arg.asExpr().(StrConst).getText().regexpMatch(\".*(tmp|temp).*\")\n   ))\nselect call, \"Potentially unsafe temporary file path usage.\"",
+   "hypothesis": "Unsafe temporary file or directory usage that could lead to symlink attacks or race conditions",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-377",
+    "cwe-379"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251206010921",
+   "codeql_raw_query": "/**\n * @name Potential file descriptor leak\n * @description File descriptors opened without proper cleanup may lead to resource exhaustion\n * @kind problem\n * @problem.severity warning\n * @id py/filelock-fd-leak\n * @tags security\n *        reliability\n *        external/cwe/cwe-404\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::builtin(\"open\").getACall() and\n  not exists(DataFlow::CallCfgNode close_call |\n    close_call.getFunction().(DataFlow::AttrRead).getAttributeName() = \"close\" and\n    DataFlow::localFlow(call, close_call.getFunction().(DataFlow::AttrRead).getObject())\n  )\nselect call, \"File opened without guaranteed close in exception paths.\"",
+   "hypothesis": "File descriptors opened without proper cleanup may lead to resource exhaustion",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-404"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251206011032",
+   "codeql_raw_query": "/**\n * @name Unbounded loop in file lock acquisition\n * @description Loops without proper timeout or exit conditions may lead to denial of service\n * @kind problem\n * @problem.severity warning\n * @id py/filelock-unbounded-loop\n * @tags security\n *        availability\n *        external/cwe/cwe-835\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\n\nfrom While loop\nwhere\n  not exists(Break b | b.getScope() = loop.getScope()) and\n  not exists(Return r | r.getScope() = loop.getScope()) and\n  loop.getTest() instanceof Name\nselect loop, \"While loop may run indefinitely without proper exit conditions.\"",
+   "hypothesis": "Unbounded loops without proper timeout or exit conditions that could lead to denial of service",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-835"
+   ],
+   "results_count": 0,
+   "results": []
+  }
+ ]
+}

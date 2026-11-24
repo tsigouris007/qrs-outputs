@@ -1,0 +1,578 @@
+{
+ "session_id": "20251225174043",
+ "package_name": "awscli-1.42.64",
+ "package_path": "packages/awscli-1.42.64",
+ "database_path": "databases/awscli-1.42.64-db",
+ "model": "gpt-5.1",
+ "temperature": 1.0,
+ "max_tokens": 8000,
+ "iterations": 15,
+ "total_input_tokens": 192525,
+ "total_output_tokens": 10802,
+ "total_tokens": 203327,
+ "elapsed_time_seconds": 570.73,
+ "estimated_cost_usd": 0.3487,
+ "summary": "## Package\n- **Name:** awscli\n- **Version:** 1.42.64\n- **Type:** Python CLI application wrapping AWS APIs with many customizations (EKS, CloudFormation, EMR, S3, CodeDeploy, etc.)\n\n## Scope of Analysis\n- Automated CodeQL-based analysis over ~26k LOC, 208 Python files.\n- Focused on security-relevant areas for a CLI: deserialization, YAML handling, temp files, shell/command execution, filesystem use, random number generation.\n- Iteration budget reached; below are the concrete issues that queries identified plus their likely impact.\n\n---\n\n## 1. Unsafe YAML Deserialization (yaml.load without safe Loader)\n**Files & Locations**\n1. `awscli/customizations/eks/ordered_yaml.py` — around line 47\n2. `awscli/customizations/cloudformation/yamlhelper.py` — around line 99\n\n**Finding**\n- CodeQL rule `py/unsafe-deserialization-awscli` / `py/unsafe-yaml-load-awscli` flagged uses of `yaml.load(...)` which do not clearly specify a safe loader and therefore can perform **arbitrary Python object construction** when parsing attacker-controlled YAML.\n- These are part of helper modules that process YAML for:\n  - EKS-related configuration (`ordered_yaml.py`), likely kubeconfig or cluster-related YAML.\n  - CloudFormation-related YAML helper logic (`yamlhelper.py`).\n\n**Risk**\n- **CWE-502: Deserialization of Untrusted Data.**\n- If an attacker can influence the YAML input consumed via these helpers (e.g., via paths or contents given on the CLI), they may be able to:\n  - Trigger construction of arbitrary Python objects during load.\n  - Reach arbitrary code execution primitives offered by PyYAML’s unsafe loaders.\n- In CLI context, this typically requires the user to point the CLI at a malicious YAML file or accept YAML data from an untrusted source.\n\n**Impact**\n- Potential for **local code execution** when users run `aws` CLI commands that:\n  - Load YAML templates (CloudFormation packaging/deploy helpers).\n  - Load EKS or configuration YAML via `ordered_yaml`.\n- Exposure is mostly to the user running the CLI, but this is still serious given the high-privilege nature of many CLI users.\n\n**Recommendation / Remediation**\n- Replace unsafe loads with safe variants:\n  - Prefer `yaml.safe_load` / `yaml.safe_load_all` for untrusted content.\n  - If functionality requires full object loading, **explicitly specify a restricted Loader** and document the trust boundary; otherwise default to `SafeLoader`.\n- Concretely:\n  - In `ordered_yaml.py`: change `yaml.load(...)` → `yaml.safe_load(...)` unless there is a strict need for object deserialization.\n  - In `yamlhelper.py`: likewise prefer `safe_load` or enforce a safe Loader.\n- Add tests ensuring that these helpers reject or safely handle malicious YAML payloads.\n\n---\n\n## 2. Insecure Temporary File Usage\n**Files & Locations**\n1. `awscli/customizations/codedeploy/push.py` — around line 186\n2. `awscli/customizations/emr/ssh.py` — around lines 48 and 87\n\n**Finding**\n- CodeQL rule `py/insecure-tempfile-awscli` flagged several patterns of temporary file usage that may:\n  - Use deprecated or unsafe `tempfile` APIs (e.g., `mktemp`) or\n  - Create temp files without secure permission flags or robust cleanup.\n- These are in high-value flows:\n  - CodeDeploy push logic (likely building/uploading bundles).\n  - EMR SSH helper code (likely creating temporary SSH key files or scripts).\n\n**Risk**\n- **CWE-377: Insecure Temporary File.**\n- Depending on exact implementation (not fully expanded by the SARIF sample), potential issues include:\n  - Time-of-check/time-of-use (TOCTOU) race conditions\n  - Predictable filenames allowing attackers on the same host to:\n    - Pre-create or symlink the file path to sensitive targets\n    - Read or modify contents written by the CLI\n  - Overly-permissive default file permissions leaking credentials (e.g., SSH keys, CodeDeploy tokens).\n\n**Impact**\n- On multi-user systems or CI agents shared across tenants, this could lead to:\n  - Leakage or tampering of deployment artifacts or SSH material.\n  - Local privilege escalation if temp file paths are abused with symlinks.\n\n**Recommendation / Remediation**\n- Ensure **only secure tempfile APIs** are used:\n  - Prefer `tempfile.NamedTemporaryFile(delete=False)` or `TemporaryDirectory()` with `mode=0o600` where secrets are stored.\n  - Avoid `tempfile.mktemp()` entirely.\n- When temp files contain sensitive data (keys, tokens, configs):\n  - Open with `mode=0o600` and verify resulting permissions.\n  - Immediately overwrite and unlink after use.\n- Review the specific lines flagged in:\n  - `codedeploy/push.py` — confirm that\n    - Filenames are not predictable or attacker-controlled\n    - Permissions are restrictive\n  - `emr/ssh.py` — ensure SSH-related temp files are owner-only and securely removed.\n\n---\n\n## 3. Non‑Cryptographic Random for Possibly Security-Sensitive Usage\n**File & Location**\n- `awscli/customizations/cloudfront.py` — around line 66\n\n**Finding**\n- CodeQL rule `py/insecure-random-awscli` flagged usage of Python’s `random` module.\n- While `random` is acceptable for non-security purposes, it is **not suitable for anything security-critical** like tokens, secrets, or unique identifiers relied on for access control.\n\n**Risk**\n- **CWE-338: Use of Cryptographically Weak Pseudo-Random Number Generator (PRNG).**\n- If the value computed via `random` in `cloudfront.py` is used for:\n  - Signed URLs, salts, nonces, or tokens, then it is guessable with enough observations.\n- If it’s purely for UX or non-sensitive identifiers (e.g., progress, display-only tokens) the risk is low.\n\n**Impact**\n- Potential weakening of any security feature that implicitly relies on randomness from `random`.\n\n**Recommendation / Remediation**\n- Audit the use in `cloudfront.py`:\n  - If used for security properties (tokens, secrets, URL signing, etc.), switch to `secrets` module (`secrets.token_urlsafe`, `secrets.randbelow`) or `os.urandom`-backed APIs.\n  - If usage is benign (e.g., random example values), document that it is non-security-sensitive.\n\n---\n\n## 4. Shell-Executing APIs (Broad Usage, Not Proven Tainted)\n**Files (sample from noisy query)**\n- `awscli/customizations/ecs/executecommand.py` — around lines 86, 105–111\n- `awscli/help.py` — around lines 106, 190\n- `awscli/customizations/sessionmanager.py` — around lines 124–126\n\n**Finding**\n- An initial CodeQL shell-injection query showed **many** uses of shell-executing APIs (e.g., `subprocess.*`, `os.system`) across the codebase.\n- The query was intentionally conservative and considered noisy; we did not confirm tainted input reaching these calls within the iteration budget.\n\n**Risk**\n- **CWE-78: Improper Neutralization of Special Elements used in an OS Command ('OS Command Injection').**\n- In a CLI that passes user-provided parameters or environment-derived data to shell commands, any insufficient sanitization or quoting can be exploitable.\n- The modules flagged (ECS execute-command helpers, help system, session manager) are precisely where system-level commands are likely assembled.\n\n**Impact**\n- Depending on how arguments are constructed, there is potential for:\n  - Local command injection if untrusted or unvalidated input is passed verbatim to the shell.\n  - Escalation in contexts where the CLI runs with elevated privileges or on automation hosts.\n\n**Status / Limitations**\n- We **did not complete full taint-tracking to these sinks** within the budget.\n- As a result, these are **areas of interest** rather than confirmed vulnerabilities.\n\n**Recommendation / Remediation**\n- Manually review all shell-invoking code in:\n  - `customizations/ecs/executecommand.py`\n  - `sessionmanager.py`\n  - `help.py`\n  - Any other module performing `subprocess.*` or `os.system` calls\n- Ensure:\n  - Prefer `subprocess` with `shell=False` and argument lists whenever possible.\n  - If `shell=True` is required, strictly control and validate the command components; never pass raw user strings without robust quoting and strict whitelists.\n- Consider adding regression tests specifically around edge-case arguments to these commands.\n\n---\n\n## 5. Path / File System Use and Parameter Files (No Tainted Flows Found)\n**Finding**\n- A dedicated taint query for remote data flowing into file system operations (open/remove/rmtree/etc.) returned **no results**.\n- Given awscli’s design, a lot of user input is transformed into AWS API calls rather than direct local file paths, which reduces direct path traversal risk.\n\n**Risk / Status**\n- No concrete CodeQL evidence of **CWE-22: Path Traversal** using remote data.\n- However, the CLI does accept user-specified file paths (e.g., `--template-file`, `--parameter-overrides`), and some areas load content directly from disk.\n\n**Recommendation**\n- Continue relying on OS path semantics but document trust boundaries for local disk paths.\n- Where paths may be indirectly influenced (e.g., via config or plugin behavior), consider:\n  - Normalization (`os.path.abspath`),\n  - Restricting to expected directories where appropriate.\n\n---\n\n## Overall Assessment\n- **Most significant concrete issues:**\n  1. **Unsafe YAML deserialization** in EKS and CloudFormation helpers (CWE-502) — high-risk if YAML content can be influenced by an attacker.\n  2. **Potentially insecure temp file usage** in CodeDeploy and EMR SSH helpers (CWE-377) — risk on multi-user systems / CI agents.\n  3. **Use of non-cryptographic PRNG** in CloudFront customization (CWE-338) — impact depends on usage context.\n- **Additional concern:** widespread shell command usage; not proven vulnerable by taint-tracking in this run but should be manually reviewed.\n\nThe awscli package is a mature and widely used tool; many patterns will be historical and may already have mitigations (e.g., controlled inputs, documented trust assumptions). However, addressing the unsafe YAML load patterns and reviewing temp file creation would materially strengthen its security posture, particularly for users running the CLI in automation or shared environments.\n",
+ "package_classification": {
+  "type": "cli_tool",
+  "layer": [
+   "application",
+   "orchestration"
+  ]
+ },
+ "tool_calls": {
+  "get_package_profile_info": 1,
+  "execute_codeql_query": 15,
+  "validate_codeql_query": 0,
+  "fixup_codeql_query": 4,
+  "finalize_report": 1
+ },
+ "queries_executed": {
+  "critical": 2,
+  "high": 3,
+  "medium": 5,
+  "low": 1,
+  "total_executed": 18,
+  "total_with_results": 11,
+  "total_failed": 9
+ },
+ "query_findings": {
+  "critical": 0,
+  "high": 4,
+  "medium": 8,
+  "low": 1,
+  "total": 13
+ },
+ "findings": [
+  {
+   "codeql_query_uuid": "20251225174100",
+   "codeql_raw_query": "/**\n * @name Unsafe deserialization in awscli\n * @description Finds uses of pickle, yaml.load, marshal, and shelve which may deserialize untrusted data.\n * @kind problem\n * @problem.severity error\n * @id py/unsafe-deserialization-awscli\n * @tags security\n *       external/cwe/cwe-502\n */\n\nimport python\nimport semmle.python.ApiGraphs\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.RemoteFlowSources\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"pickle\").getMember([\"load\", \"loads\", \"Unpickler\"]).getACall()\n  or call = API::moduleImport(\"yaml\").getMember([\"load\", \"unsafe_load\"]).getACall()\n  or call = API::moduleImport(\"marshal\").getMember([\"load\", \"loads\"]).getACall()\n  or call = API::moduleImport(\"shelve\").getMember(\"open\").getACall()\nselect call, \"Potentially unsafe deserialization that could execute arbitrary code if fed untrusted input.\"",
+   "hypothesis": "Package may use unsafe deserialization libraries insecurely.",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-502"
+   ],
+   "results_count": 2,
+   "results": [
+    {
+     "ruleId": "py/unsafe-deserialization-awscli",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/unsafe-deserialization-awscli",
+      "index": 0
+     },
+     "message": {
+      "text": "Potentially unsafe deserialization that could execute arbitrary code if fed untrusted input."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "awscli/customizations/eks/ordered_yaml.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 47,
+         "startColumn": 12,
+         "endColumn": 48
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "c8c53bd6402f7896:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/unsafe-deserialization-awscli",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/unsafe-deserialization-awscli",
+      "index": 0
+     },
+     "message": {
+      "text": "Potentially unsafe deserialization that could execute arbitrary code if fed untrusted input."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "awscli/customizations/cloudformation/yamlhelper.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 99,
+         "startColumn": 16,
+         "endColumn": 42
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "ef673bcaccbb4da2:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251225174220",
+   "codeql_raw_query": "/**\n * @name Tainted YAML deserialization in awscli\n * @description Track remote/user-controlled data into unsafe yaml.load/FullLoader usage.\n * @kind path-problem\n * @problem.severity error\n * @id py/tainted-yaml-deserialization-awscli\n * @tags security\n *       external/cwe/cwe-502\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.dataflow.new.RemoteFlowSources\nimport semmle.python.ApiGraphs\n\nmodule YamlTaintConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    source instanceof RemoteFlowSource\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(API::CallNode call |\n      call = API::moduleImport(\"yaml\").getMember(\"load\").getACall() and\n      sink = call.getArg(0) and\n      sink instanceof DataFlow::ExprNode\n      or\n      call = API::moduleImport(\"yaml\").getMember(\"FullLoader\").getACall() and\n      sink = call.getArg(0) and\n      sink instanceof DataFlow::ExprNode\n    )\n  }\n}\n\nmodule YamlTaintFlow = TaintTracking::Global<YamlTaintConfig>;\nimport YamlTaintFlow::PathGraph\n\nfrom YamlTaintFlow::PathNode source, YamlTaintFlow::PathNode sink\nwhere YamlTaintFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"Tainted data from $@ reaches unsafe YAML deserialization.\", source, \"remote/user input\"\n",
+   "hypothesis": "Remote/user-controlled input can reach unsafe yaml.load/FullLoader usage, leading to arbitrary code execution via unsafe deserialization.",
+   "severity": "critical",
+   "cwe_ids": [
+    "cwe-502"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251225174317",
+   "codeql_raw_query": "/**\n * @name Insecure temp file usage in awscli\n * @description Detect use of tempfile.mktemp and other insecure temp file patterns.\n * @kind problem\n * @problem.severity warning\n * @id py/insecure-tempfile-awscli\n * @tags security\n *       external/cwe/cwe-377\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"tempfile\").getMember(\"mktemp\").getACall()\nselect call, \"Insecure temporary file creation using tempfile.mktemp().\"",
+   "hypothesis": "The package may use tempfile.mktemp or similar insecure temp file creation.",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-377"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251225174412",
+   "codeql_raw_query": "/**\n * @name Path injection and unsafe file access in awscli\n * @description Track remote input to file system operations like open, unlink, and file deletion helpers.\n * @kind path-problem\n * @problem.severity error\n * @id py/path-injection-awscli\n * @tags security\n *       external/cwe/cwe-022\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.dataflow.new.RemoteFlowSources\nimport semmle.python.ApiGraphs\n\nmodule FsTaintConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    source instanceof RemoteFlowSource\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(API::CallNode call |\n      call = API::builtin(\"open\").getACall() and\n      sink = call.getArg(0) and\n      sink instanceof DataFlow::ExprNode\n      or\n      call = API::moduleImport(\"os\").getMember([\"remove\", \"unlink\", \"rmdir\"]).getACall() and\n      sink = call.getArg(0) and\n      sink instanceof DataFlow::ExprNode\n      or\n      call = API::moduleImport(\"shutil\").getMember([\"rmtree\", \"copy\", \"move\"]).getACall() and\n      sink = call.getArg(0) and\n      sink instanceof DataFlow::ExprNode\n    )\n  }\n}\n\nmodule FsTaintFlow = TaintTracking::Global<FsTaintConfig>;\nimport FsTaintFlow::PathGraph\n\nfrom FsTaintFlow::PathNode source, FsTaintFlow::PathNode sink\nwhere FsTaintFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"Tainted data from $@ reaches a file system operation.\", source, \"remote/user input\"\n",
+   "hypothesis": "Remote/user input may reach file-system APIs leading to path traversal or arbitrary file access/deletion.",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-022"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251225174451",
+   "codeql_raw_query": "/**\n * @name Shell command injection in awscli\n * @description Track remote/user-controlled data into subprocess and shell command execution.\n * @kind path-problem\n * @problem.severity error\n * @id py/command-injection-awscli\n * @tags security\n *       external/cwe/cwe-078\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.dataflow.new.RemoteFlowSources\nimport semmle.python.ApiGraphs\n\nmodule CmdTaintConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    source instanceof RemoteFlowSource\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(API::CallNode call |\n      call = API::moduleImport(\"subprocess\").getMember([\"Popen\", \"call\", \"check_call\", \"check_output\", \"run\"]).getACall() and\n      sink = call.getArg(0) and\n      sink instanceof DataFlow::ExprNode\n      or\n      call = API::moduleImport(\"os\").getMember([\"system\", \"popen\"]).getACall() and\n      sink = call.getArg(0) and\n      sink instanceof DataFlow::ExprNode\n    )\n  }\n}\n\nmodule CmdTaintFlow = TaintTracking::Global<CmdTaintConfig>;\nimport CmdTaintFlow::PathGraph\n\nfrom CmdTaintFlow::PathNode source, CmdTaintFlow::PathNode sink\nwhere CmdTaintFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"Tainted data from $@ reaches a shell command execution.\", source, \"remote/user input\"\n",
+   "hypothesis": "Remote/user input reaching subprocess/os.system leading to command injection",
+   "severity": "critical",
+   "cwe_ids": [
+    "cwe-78"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251225174528",
+   "codeql_raw_query": "/**\n * @name Insecure temporary file usage in awscli\n * @description Detect use of tempfile APIs without secure flags that may lead to information disclosure or TOCTOU.\n * @kind problem\n * @problem.severity warning\n * @id py/insecure-tempfile-awscli\n * @tags security\n *       external/cwe/cwe-377\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"tempfile\").getMember([\"mktemp\", \"NamedTemporaryFile\", \"TemporaryFile\"]).getACall()\nselect call, \"Potentially insecure temporary file usage. Ensure appropriate permissions and usage patterns.\"\n",
+   "hypothesis": "Use of insecure tempfile APIs like mktemp that can lead to TOCTOU issues",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-377"
+   ],
+   "results_count": 3,
+   "results": [
+    {
+     "ruleId": "py/insecure-tempfile-awscli",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/insecure-tempfile-awscli",
+      "index": 0
+     },
+     "message": {
+      "text": "Potentially insecure temporary file usage. Ensure appropriate permissions and usage patterns."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "awscli/customizations/codedeploy/push.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 186,
+         "startColumn": 14,
+         "endColumn": 43
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "f0ca0a2f6a36a726:1",
+      "primaryLocationStartColumnFingerprint": "5"
+     }
+    },
+    {
+     "ruleId": "py/insecure-tempfile-awscli",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/insecure-tempfile-awscli",
+      "index": 0
+     },
+     "message": {
+      "text": "Potentially insecure temporary file usage. Ensure appropriate permissions and usage patterns."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "awscli/customizations/emr/ssh.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 48,
+         "startColumn": 17,
+         "endColumn": 58
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "d00310e13bb5c8fe:1",
+      "primaryLocationStartColumnFingerprint": "4"
+     }
+    },
+    {
+     "ruleId": "py/insecure-tempfile-awscli",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/insecure-tempfile-awscli",
+      "index": 0
+     },
+     "message": {
+      "text": "Potentially insecure temporary file usage. Ensure appropriate permissions and usage patterns."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "awscli/customizations/emr/ssh.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 87,
+         "startColumn": 13,
+         "endColumn": 54
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "d00310e13bb5c8fe:2",
+      "primaryLocationStartColumnFingerprint": "4"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251225174556",
+   "codeql_raw_query": "/**\n * @name Detect unsafe YAML deserialization in awscli\n * @description Find uses of yaml.load or FullLoader that may be unsafe.\n * @kind problem\n * @problem.severity warning\n * @id py/unsafe-deserialization-awscli\n * @tags security\n *       external/cwe/cwe-502\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"yaml\").getMember([\"load\", \"unsafe_load\"]).getACall()\nselect call, \"Potentially unsafe deserialization that could execute arbitrary code if fed untrusted input.\"",
+   "hypothesis": "Unsafe YAML deserialization using yaml.load/unsafe_load",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-502"
+   ],
+   "results_count": 2,
+   "results": [
+    {
+     "ruleId": "py/unsafe-deserialization-awscli",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/unsafe-deserialization-awscli",
+      "index": 0
+     },
+     "message": {
+      "text": "Potentially unsafe deserialization that could execute arbitrary code if fed untrusted input."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "awscli/customizations/eks/ordered_yaml.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 47,
+         "startColumn": 12,
+         "endColumn": 48
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "c8c53bd6402f7896:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/unsafe-deserialization-awscli",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/unsafe-deserialization-awscli",
+      "index": 0
+     },
+     "message": {
+      "text": "Potentially unsafe deserialization that could execute arbitrary code if fed untrusted input."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "awscli/customizations/cloudformation/yamlhelper.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 99,
+         "startColumn": 16,
+         "endColumn": 42
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "ef673bcaccbb4da2:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251225174624",
+   "codeql_raw_query": "/**\n * @name Insecure temporary file usage in awscli\n * @description Detect use of insecure temporary file creation methods.\n * @kind problem\n * @problem.severity warning\n * @id py/insecure-tempfile-awscli\n * @tags security\n *       external/cwe/cwe-377\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"tempfile\").getMember([\"mktemp\", \"NamedTemporaryFile\", \"TemporaryFile\"]).getACall()\nselect call, \"Potentially insecure temporary file usage. Ensure appropriate permissions and usage patterns.\"",
+   "hypothesis": "Insecure temporary file usage via tempfile without safe patterns",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-377"
+   ],
+   "results_count": 3,
+   "results": [
+    {
+     "ruleId": "py/insecure-tempfile-awscli",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/insecure-tempfile-awscli",
+      "index": 0
+     },
+     "message": {
+      "text": "Potentially insecure temporary file usage. Ensure appropriate permissions and usage patterns."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "awscli/customizations/codedeploy/push.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 186,
+         "startColumn": 14,
+         "endColumn": 43
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "f0ca0a2f6a36a726:1",
+      "primaryLocationStartColumnFingerprint": "5"
+     }
+    },
+    {
+     "ruleId": "py/insecure-tempfile-awscli",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/insecure-tempfile-awscli",
+      "index": 0
+     },
+     "message": {
+      "text": "Potentially insecure temporary file usage. Ensure appropriate permissions and usage patterns."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "awscli/customizations/emr/ssh.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 48,
+         "startColumn": 17,
+         "endColumn": 58
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "d00310e13bb5c8fe:1",
+      "primaryLocationStartColumnFingerprint": "4"
+     }
+    },
+    {
+     "ruleId": "py/insecure-tempfile-awscli",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/insecure-tempfile-awscli",
+      "index": 0
+     },
+     "message": {
+      "text": "Potentially insecure temporary file usage. Ensure appropriate permissions and usage patterns."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "awscli/customizations/emr/ssh.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 87,
+         "startColumn": 13,
+         "endColumn": 54
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "d00310e13bb5c8fe:2",
+      "primaryLocationStartColumnFingerprint": "4"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251225174835",
+   "codeql_raw_query": "/**\n * @name Shell command execution in awscli (no taint)\n * @description Find uses of subprocess and os.system with shell=True or string commands.\n * @kind problem\n * @problem.severity warning\n * @id py/shell-execution-awscli\n * @tags security\n *       external/cwe/cwe-078\n */\n\nimport python\nimport semmle.python.ApiGraphs\nimport semmle.python.dataflow.new.DataFlow\n\nfrom DataFlow::CallCfgNode call\nwhere\n  (\n    call = API::moduleImport(\"subprocess\").getMember([\"call\", \"check_call\", \"check_output\", \"run\", \"Popen\"]).getACall()\n    and\n    exists(Expr arg0 |\n      arg0 = call.asExpr().(Call).getArg(0) and\n      arg0 instanceof StringLiteral\n    )\n  )\n  or\n  call = API::moduleImport(\"os\").getMember(\"system\").getACall()\nselect call, \"Shell-executing API is used. Ensure inputs are not user-controlled and avoid shell=True where possible.\"\n",
+   "hypothesis": "Locate shell-executing APIs (subprocess, os.system) for manual review of injection risk.",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-078"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251225174859",
+   "codeql_raw_query": "/**\n * @name Unsafe YAML deserialization (non-SafeLoader) in awscli\n * @description Detect uses of yaml.load without SafeLoader/CSafeLoader/FullLoader aliases, which may be unsafe.\n * @kind problem\n * @problem.severity warning\n * @id py/unsafe-yaml-load-awscli\n * @tags security\n *       external/cwe/cwe-502\n */\n\nimport python\nimport semmle.python.ApiGraphs\nimport semmle.python.dataflow.new.DataFlow\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"yaml\").getMember(\"load\").getACall()\nselect call, \"Use of yaml.load(). Ensure a safe Loader is specified or use safe_load instead when parsing untrusted input.\"\n",
+   "hypothesis": "Additional unsafe YAML load sites",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-502"
+   ],
+   "results_count": 2,
+   "results": [
+    {
+     "ruleId": "py/unsafe-yaml-load-awscli",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/unsafe-yaml-load-awscli",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of yaml.load(). Ensure a safe Loader is specified or use safe_load instead when parsing untrusted input."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "awscli/customizations/eks/ordered_yaml.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 47,
+         "startColumn": 12,
+         "endColumn": 48
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "c8c53bd6402f7896:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/unsafe-yaml-load-awscli",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/unsafe-yaml-load-awscli",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of yaml.load(). Ensure a safe Loader is specified or use safe_load instead when parsing untrusted input."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "awscli/customizations/cloudformation/yamlhelper.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 99,
+         "startColumn": 16,
+         "endColumn": 42
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "ef673bcaccbb4da2:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251225174919",
+   "codeql_raw_query": "/**\n * @name Insecure random use for security-sensitive operations in awscli\n * @description Find uses of random module where secrets/tokens are likely generated.\n * @kind problem\n * @problem.severity recommendation\n * @id py/insecure-random-awscli\n * @tags security\n *       external/cwe/cwe-330\n */\n\nimport python\nimport semmle.python.ApiGraphs\nimport semmle.python.dataflow.new.DataFlow\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"random\").getMember([\"randint\", \"random\", \"getrandbits\"]).getACall()\nselect call, \"random module is used; avoid for cryptographic secrets or tokens. Prefer secrets or os.urandom for security-sensitive randomness.\"\n",
+   "hypothesis": "Detect potentially insecure use of random for security",
+   "severity": "low",
+   "cwe_ids": [
+    "cwe-330"
+   ],
+   "results_count": 1,
+   "results": [
+    {
+     "ruleId": "py/insecure-random-awscli",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/insecure-random-awscli",
+      "index": 0
+     },
+     "message": {
+      "text": "random module is used; avoid for cryptographic secrets or tokens. Prefer secrets or os.urandom for security-sensitive randomness."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "awscli/customizations/cloudfront.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 66,
+         "startColumn": 52,
+         "endColumn": 78
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "4e634a5ea2bd5825:1",
+      "primaryLocationStartColumnFingerprint": "47"
+     }
+    }
+   ]
+  }
+ ]
+}

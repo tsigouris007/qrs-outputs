@@ -1,0 +1,1397 @@
+{
+ "session_id": "20251219215053",
+ "package_name": "s3fs-2025.10.0",
+ "package_path": "packages/s3fs-2025.10.0",
+ "database_path": "databases/s3fs-2025.10.0-db",
+ "model": "gemini/gemini-3-pro-preview",
+ "temperature": 0.0,
+ "max_tokens": 8000,
+ "iterations": 19,
+ "total_input_tokens": 273932,
+ "total_output_tokens": 24216,
+ "total_tokens": 298148,
+ "elapsed_time_seconds": 576.7,
+ "estimated_cost_usd": 0.8385,
+ "summary": "Security analysis of the `s3fs` package (version 2025.10.0) revealed potential vulnerabilities, primarily concerning path traversal and hardcoded credentials.\n\n**Key Findings:**\n\n1.  **Path Traversal (CWE-22, CWE-23):**\n    -   CodeQL identified potential path traversal vulnerabilities in `s3fs/core.py` (lines 1261, 1374). These locations appear to handle file paths (`source`) and could potentially allow access to unauthorized files if input is not properly sanitized. This is critical for a filesystem interface.\n    -   Numerous path traversal warnings were also found in `versioneer.py`. While this file is primarily used for build-time version management, the sheer number of findings suggests it handles paths insecurely, though the runtime risk to the installed package is lower.\n\n2.  **Hardcoded Credentials (CWE-798):**\n    -   Multiple potential hardcoded credentials were flagged in `s3fs/core.py` (lines 309, 531, 532, 635, 790, 793). These include assignments to variables that appear to hold sensitive information (e.g., `contents_key`). While some may be false positives (e.g., default values or variable naming coincidences), they warrant manual review to ensure no actual secrets are embedded in the source code.\n\n3.  **Subprocess Usage (CWE-78):**\n    -   Usage of `subprocess` was detected in `versioneer.py`. This is standard for version control operations during setup but should be monitored to ensure it doesn't introduce command injection risks if the script is used in unexpected ways.\n\n**Recommendations:**\n-   **Validate Paths:** Rigorous validation and sanitization of all file paths in `s3fs/core.py` is recommended to prevent path traversal attacks.\n-   **Review Credentials:** Manually inspect the flagged lines in `s3fs/core.py` to confirm no actual secrets are hardcoded. Use environment variables or secure configuration management for sensitive keys.\n-   **Audit `versioneer.py`:** Although a build tool, ensuring `versioneer.py` handles paths and commands securely is good practice.",
+ "package_classification": {
+  "layer": [
+   "Storage",
+   "Cloud"
+  ],
+  "type": [
+   "Library",
+   "Middleware"
+  ]
+ },
+ "tool_calls": {
+  "get_package_profile_info": 1,
+  "execute_codeql_query": 22,
+  "validate_codeql_query": 0,
+  "fixup_codeql_query": 2,
+  "finalize_report": 1
+ },
+ "queries_executed": {
+  "critical": 1,
+  "high": 7,
+  "medium": 8,
+  "low": 0,
+  "total_executed": 24,
+  "total_with_results": 16,
+  "total_failed": 6
+ },
+ "query_findings": {
+  "critical": 0,
+  "high": 20,
+  "medium": 6,
+  "low": 0,
+  "total": 26
+ },
+ "findings": [
+  {
+   "codeql_query_uuid": "20251219215107",
+   "codeql_raw_query": "/**\n * @name Subprocess usage\n * @description Finds calls to subprocess and os.system/popen to identify potential command injection risks.\n * @kind problem\n * @problem.severity warning\n * @id py/subprocess-usage\n * @tags security\n *       external/cwe/cwe-078\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"subprocess\").getMember([\"call\", \"check_call\", \"check_output\", \"run\", \"Popen\"]).getACall() or\n  call = API::moduleImport(\"os\").getMember([\"system\", \"popen\"]).getACall()\nselect call, \"Usage of subprocess or os command execution.\"",
+   "hypothesis": "The package might use subprocess or os.system with arguments derived from function parameters, potentially leading to command injection.",
+   "severity": "high",
+   "cwe_ids": [
+    "CWE-78"
+   ],
+   "results_count": 1,
+   "results": [
+    {
+     "ruleId": "py/subprocess-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/subprocess-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Usage of subprocess or os command execution."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "versioneer.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 488,
+         "startColumn": 23,
+         "endLine": 495,
+         "endColumn": 14
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "c82763a37c183237:1",
+      "primaryLocationStartColumnFingerprint": "10"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251219215141",
+   "codeql_raw_query": "/**\n * @name Path Traversal\n * @description Detecting potential path traversal vulnerabilities where user input controls file paths.\n * @kind problem\n * @problem.severity error\n * @id py/path-traversal\n * @tags security\n *       external/cwe/cwe-022\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.ApiGraphs\n\nmodule PathTraversalConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    // Consider function parameters as potential sources for library code\n    source instanceof DataFlow::ParameterNode\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    // Sinks: open(), os.path.join, etc.\n    exists(DataFlow::CallCfgNode call |\n      call = API::builtin(\"open\").getACall() and\n      sink = call.getArg(0)\n    )\n    or\n    exists(DataFlow::CallCfgNode call |\n      call = API::moduleImport(\"os\").getMember(\"path\").getMember(\"join\").getACall() and\n      sink = call.getArg(_)\n    )\n  }\n}\n\nmodule PathTraversalFlow = TaintTracking::Global<PathTraversalConfig>;\n\nfrom DataFlow::Node source, DataFlow::Node sink\nwhere PathTraversalFlow::flow(source, sink)\nselect sink, \"Potential path traversal from $@\", source, \"source\"",
+   "hypothesis": "Path traversal via user-controlled file paths.",
+   "severity": "high",
+   "cwe_ids": [
+    "CWE-22"
+   ],
+   "results_count": 19,
+   "results": [
+    {
+     "ruleId": "py/path-traversal",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/path-traversal",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential path traversal from [source](1)"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "s3fs/core.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 1261,
+         "startColumn": 19,
+         "endColumn": 24
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "c5b01d01f49b2a40:1",
+      "primaryLocationStartColumnFingerprint": "10"
+     },
+     "relatedLocations": [
+      {
+       "id": 1,
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "s3fs/core.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 1230,
+         "startColumn": 9,
+         "endColumn": 14
+        }
+       },
+       "message": {
+        "text": "source"
+       }
+      }
+     ]
+    },
+    {
+     "ruleId": "py/path-traversal",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/path-traversal",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential path traversal from [source](1)"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "s3fs/core.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 1374,
+         "startColumn": 23,
+         "endColumn": 28
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "17f3550825ac5367:1",
+      "primaryLocationStartColumnFingerprint": "10"
+     },
+     "relatedLocations": [
+      {
+       "id": 1,
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "s3fs/core.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 1348,
+         "startColumn": 22,
+         "endColumn": 27
+        }
+       },
+       "message": {
+        "text": "source"
+       }
+      }
+     ]
+    },
+    {
+     "ruleId": "py/path-traversal",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/path-traversal",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential path traversal from [source](1)"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "versioneer.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 409,
+         "startColumn": 23,
+         "endColumn": 37
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "be884302f0f8b60e:1",
+      "primaryLocationStartColumnFingerprint": "10"
+     },
+     "relatedLocations": [
+      {
+       "id": 1,
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "versioneer.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 397,
+         "startColumn": 26,
+         "endColumn": 30
+        }
+       },
+       "message": {
+        "text": "source"
+       }
+      }
+     ]
+    },
+    {
+     "ruleId": "py/path-traversal",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/path-traversal",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential path traversal from [source](1)"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "versioneer.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 417,
+         "startColumn": 19,
+         "endColumn": 28
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "65fd2487d20059b2:1",
+      "primaryLocationStartColumnFingerprint": "10"
+     },
+     "relatedLocations": [
+      {
+       "id": 1,
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "versioneer.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 397,
+         "startColumn": 26,
+         "endColumn": 30
+        }
+       },
+       "message": {
+        "text": "source"
+       }
+      }
+     ]
+    },
+    {
+     "ruleId": "py/path-traversal",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/path-traversal",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential path traversal from [source](1)"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "versioneer.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 1214,
+         "startColumn": 19,
+         "endColumn": 34
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "f3767595a4621ca4:2",
+      "primaryLocationStartColumnFingerprint": "10"
+     },
+     "relatedLocations": [
+      {
+       "id": 1,
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "versioneer.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 1206,
+         "startColumn": 22,
+         "endColumn": 37
+        }
+       },
+       "message": {
+        "text": "source"
+       }
+      }
+     ]
+    },
+    {
+     "ruleId": "py/path-traversal",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/path-traversal",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential path traversal from [source](1)\nPotential path traversal from [source](2)"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "versioneer.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 1544,
+         "startColumn": 19,
+         "endColumn": 27
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "562bd4ecb0a9a679:1",
+      "primaryLocationStartColumnFingerprint": "10"
+     },
+     "relatedLocations": [
+      {
+       "id": 1,
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "versioneer.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 1541,
+         "startColumn": 24,
+         "endColumn": 32
+        }
+       },
+       "message": {
+        "text": "source"
+       }
+      },
+      {
+       "id": 2,
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "file:/",
+         "index": 2
+        }
+       },
+       "message": {
+        "text": "source"
+       }
+      }
+     ]
+    },
+    {
+     "ruleId": "py/path-traversal",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/path-traversal",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential path traversal from [source](1)\nPotential path traversal from [source](2)\nPotential path traversal from [source](3)"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "versioneer.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 1563,
+         "startColumn": 15,
+         "endColumn": 23
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "96e5e61e2c8c309b:1",
+      "primaryLocationStartColumnFingerprint": "10"
+     },
+     "relatedLocations": [
+      {
+       "id": 1,
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "versioneer.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 1560,
+         "startColumn": 27,
+         "endColumn": 35
+        }
+       },
+       "message": {
+        "text": "source"
+       }
+      },
+      {
+       "id": 2,
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "versioneer.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 2162,
+         "startColumn": 37,
+         "endColumn": 45
+        }
+       },
+       "message": {
+        "text": "source"
+       }
+      },
+      {
+       "id": 3,
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "file:/",
+         "index": 2
+        }
+       },
+       "message": {
+        "text": "source"
+       }
+      }
+     ]
+    },
+    {
+     "ruleId": "py/path-traversal",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/path-traversal",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential path traversal from [source](1)"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "versioneer.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 1848,
+         "startColumn": 42,
+         "endColumn": 64
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "cfff11aa0227d220:1",
+      "primaryLocationStartColumnFingerprint": "37"
+     },
+     "relatedLocations": [
+      {
+       "id": 1,
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "file:/",
+         "index": 2
+        }
+       },
+       "message": {
+        "text": "source"
+       }
+      }
+     ]
+    },
+    {
+     "ruleId": "py/path-traversal",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/path-traversal",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential path traversal from [source](1)"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "versioneer.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 1998,
+         "startColumn": 67,
+         "endColumn": 88
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "a2d153e67c1fcf14:1",
+      "primaryLocationStartColumnFingerprint": "50"
+     },
+     "relatedLocations": [
+      {
+       "id": 1,
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "file:/",
+         "index": 2
+        }
+       },
+       "message": {
+        "text": "source"
+       }
+      }
+     ]
+    },
+    {
+     "ruleId": "py/path-traversal",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/path-traversal",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential path traversal from [source](1)"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "versioneer.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 2025,
+         "startColumn": 63,
+         "endColumn": 84
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "355787f0ee5e7f1e:1",
+      "primaryLocationStartColumnFingerprint": "50"
+     },
+     "relatedLocations": [
+      {
+       "id": 1,
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "file:/",
+         "index": 2
+        }
+       },
+       "message": {
+        "text": "source"
+       }
+      }
+     ]
+    },
+    {
+     "ruleId": "py/path-traversal",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/path-traversal",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential path traversal from [source](1)"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "versioneer.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 2059,
+         "startColumn": 27,
+         "endColumn": 49
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "4f9e1579abf4c70b:1",
+      "primaryLocationStartColumnFingerprint": "10"
+     },
+     "relatedLocations": [
+      {
+       "id": 1,
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "file:/",
+         "index": 2
+        }
+       },
+       "message": {
+        "text": "source"
+       }
+      }
+     ]
+    },
+    {
+     "ruleId": "py/path-traversal",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/path-traversal",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential path traversal from [source](1)"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "versioneer.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 2092,
+         "startColumn": 27,
+         "endColumn": 49
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "4f9e1579abf4c70b:2",
+      "primaryLocationStartColumnFingerprint": "10"
+     },
+     "relatedLocations": [
+      {
+       "id": 1,
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "file:/",
+         "index": 2
+        }
+       },
+       "message": {
+        "text": "source"
+       }
+      }
+     ]
+    },
+    {
+     "ruleId": "py/path-traversal",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/path-traversal",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential path traversal from [source](1)"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "versioneer.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 2169,
+         "startColumn": 47,
+         "endColumn": 55
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "8887a6cff6fae81d:1",
+      "primaryLocationStartColumnFingerprint": "34"
+     },
+     "relatedLocations": [
+      {
+       "id": 1,
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "versioneer.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 2162,
+         "startColumn": 37,
+         "endColumn": 45
+        }
+       },
+       "message": {
+        "text": "source"
+       }
+      }
+     ]
+    },
+    {
+     "ruleId": "py/path-traversal",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/path-traversal",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential path traversal from [source](1)"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "versioneer.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 2169,
+         "startColumn": 57,
+         "endColumn": 79
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "8887a6cff6fae81d:1",
+      "primaryLocationStartColumnFingerprint": "44"
+     },
+     "relatedLocations": [
+      {
+       "id": 1,
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "file:/",
+         "index": 2
+        }
+       },
+       "message": {
+        "text": "source"
+       }
+      }
+     ]
+    },
+    {
+     "ruleId": "py/path-traversal",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/path-traversal",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential path traversal from [source](1)"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "versioneer.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 2243,
+         "startColumn": 15,
+         "endColumn": 37
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "4f9e1579abf4c70b:3",
+      "primaryLocationStartColumnFingerprint": "10"
+     },
+     "relatedLocations": [
+      {
+       "id": 1,
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "file:/",
+         "index": 2
+        }
+       },
+       "message": {
+        "text": "source"
+       }
+      }
+     ]
+    },
+    {
+     "ruleId": "py/path-traversal",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/path-traversal",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential path traversal from [source](1)"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "versioneer.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 2256,
+         "startColumn": 24,
+         "endColumn": 63
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "284948aad7c9dd6d:1",
+      "primaryLocationStartColumnFingerprint": "19"
+     },
+     "relatedLocations": [
+      {
+       "id": 1,
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "file:/",
+         "index": 2
+        }
+       },
+       "message": {
+        "text": "source"
+       }
+      }
+     ]
+    },
+    {
+     "ruleId": "py/path-traversal",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/path-traversal",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential path traversal from [source](1)"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "versioneer.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 2260,
+         "startColumn": 23,
+         "endColumn": 26
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "339c8433e4137d22:1",
+      "primaryLocationStartColumnFingerprint": "10"
+     },
+     "relatedLocations": [
+      {
+       "id": 1,
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "file:/",
+         "index": 2
+        }
+       },
+       "message": {
+        "text": "source"
+       }
+      }
+     ]
+    },
+    {
+     "ruleId": "py/path-traversal",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/path-traversal",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential path traversal from [source](1)"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "versioneer.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 2268,
+         "startColumn": 23,
+         "endColumn": 26
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "5bf660daa3219ba:1",
+      "primaryLocationStartColumnFingerprint": "10"
+     },
+     "relatedLocations": [
+      {
+       "id": 1,
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "file:/",
+         "index": 2
+        }
+       },
+       "message": {
+        "text": "source"
+       }
+      }
+     ]
+    },
+    {
+     "ruleId": "py/path-traversal",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/path-traversal",
+      "index": 0
+     },
+     "message": {
+      "text": "Potential path traversal from [source](1)"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "versioneer.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 2272,
+         "startColumn": 23,
+         "endColumn": 26
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "bc5ca5bf411ad371:1",
+      "primaryLocationStartColumnFingerprint": "10"
+     },
+     "relatedLocations": [
+      {
+       "id": 1,
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "file:/",
+         "index": 2
+        }
+       },
+       "message": {
+        "text": "source"
+       }
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251219215216",
+   "codeql_raw_query": "/**\n * @name Unsafe deserialization\n * @description Deserializing untrusted data using pickle or other unsafe methods can lead to arbitrary code execution\n * @kind problem\n * @problem.severity error\n * @id py/unsafe-deserialization\n * @tags security\n *        external/cwe/cwe-502\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  (\n    call = API::moduleImport(\"pickle\").getMember([\"load\", \"loads\", \"Unpickler\"]).getACall() or\n    call = API::moduleImport(\"yaml\").getMember([\"load\", \"unsafe_load\"]).getACall() or\n    call = API::moduleImport(\"marshal\").getMember([\"load\", \"loads\"]).getACall() or\n    call = API::moduleImport(\"shelve\").getMember(\"open\").getACall() or\n    call = API::moduleImport(\"jsonpickle\").getMember([\"decode\", \"unpickler\"]).getACall() or\n    call = API::moduleImport(\"dill\").getMember([\"load\", \"loads\", \"Unpickler\"]).getACall()\n  )\nselect call, \"Potentially unsafe deserialization operation.\"\n",
+   "hypothesis": "The package might be deserializing untrusted data using pickle or other unsafe methods, leading to arbitrary code execution.",
+   "severity": "high",
+   "cwe_ids": [
+    "CWE-502"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251219215303",
+   "codeql_raw_query": "/**\n * @name Hardcoded Credentials\n * @description Detecting hardcoded credentials such as AWS keys or passwords.\n * @kind problem\n * @problem.severity error\n * @id py/hardcoded-credentials\n * @tags security\n *       external/cwe/cwe-798\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\n\nfrom StrConst s\nwhere\n  (\n    s.getText().regexpMatch(\"(?i).*(password|secret|apikey|access_key|secret_key).*\") and\n    not s.getText().regexpMatch(\"(?i).*(example|test|dummy|todo).*\") and\n    s.getText().length() > 10\n  )\nselect s, \"Possible hardcoded credential.\"\n",
+   "hypothesis": "Hardcoded credentials in source code.",
+   "severity": "medium",
+   "cwe_ids": [
+    "CWE-798"
+   ],
+   "results_count": 4,
+   "results": [
+    {
+     "ruleId": "py/hardcoded-credentials",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/hardcoded-credentials",
+      "index": 0
+     },
+     "message": {
+      "text": "Possible hardcoded credential."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "s3fs/core.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 309,
+         "startColumn": 28,
+         "endColumn": 65
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "597211ad7217039a:1",
+      "primaryLocationStartColumnFingerprint": "15"
+     }
+    },
+    {
+     "ruleId": "py/hardcoded-credentials",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/hardcoded-credentials",
+      "index": 0
+     },
+     "message": {
+      "text": "Possible hardcoded credential."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "s3fs/core.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 531,
+         "startColumn": 17,
+         "endColumn": 36
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "4b04b796658f8dc6:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/hardcoded-credentials",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/hardcoded-credentials",
+      "index": 0
+     },
+     "message": {
+      "text": "Possible hardcoded credential."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "s3fs/core.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 532,
+         "startColumn": 17,
+         "endColumn": 40
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "74e171447cbef14c:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/hardcoded-credentials",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/hardcoded-credentials",
+      "index": 0
+     },
+     "message": {
+      "text": "Possible hardcoded credential."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "s3fs/core.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 635,
+         "startColumn": 32,
+         "endColumn": 49
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "da35693027235423:1",
+      "primaryLocationStartColumnFingerprint": "15"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251219215328",
+   "codeql_raw_query": "/**\n * @name Unsafe deserialization\n * @description Deserializing untrusted data using pickle or other unsafe methods can lead to arbitrary code execution\n * @kind problem\n * @problem.severity error\n * @id py/unsafe-deserialization\n * @tags security\n *        external/cwe/cwe-502\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  (\n    call = API::moduleImport(\"pickle\").getMember([\"load\", \"loads\", \"Unpickler\"]).getACall() or\n    call = API::moduleImport(\"yaml\").getMember([\"load\", \"unsafe_load\"]).getACall() or\n    call = API::moduleImport(\"marshal\").getMember([\"load\", \"loads\"]).getACall() or\n    call = API::moduleImport(\"shelve\").getMember(\"open\").getACall()\n  )\nselect call, \"Potentially unsafe deserialization operation that could execute arbitrary code.\"\n",
+   "hypothesis": "Unsafe deserialization of untrusted data.",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-502"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251219215340",
+   "codeql_raw_query": "/**\n * @name Hardcoded credentials with string literals\n * @description Detecting hardcoded credentials that are assigned actual string literals, reducing false positives.\n * @kind problem\n * @problem.severity warning\n * @id py/hardcoded-credentials-literals\n * @tags security\n *       external/cwe/cwe-798\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\n\nfrom AssignStmt assign, StrConst str\nwhere\n  assign.getValue() = str and\n  exists(Name name |\n    assign.getTargets().getAnItem() = name and\n    (\n      name.getId().matches(\"%password%\") or\n      name.getId().matches(\"%secret%\") or\n      name.getId().matches(\"%key%\") or\n      name.getId().matches(\"%token%\") or\n      name.getId().matches(\"%auth%\")\n    ) and\n    not name.getId().matches(\"%template%\") and\n    not name.getId().matches(\"%format%\") and\n    not name.getId().matches(\"%example%\")\n  ) and\n  // Filter out empty strings or placeholders\n  str.getText().length() > 5 and\n  not str.getText().matches(\"% %\")\nselect assign, \"Possible hardcoded credential assigned to variable '\" + assign.getTargets().getAnItem().(Name).getId() + \"'.\"\n",
+   "hypothesis": "Hardcoded credentials in source code.",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-798"
+   ],
+   "results_count": 2,
+   "results": [
+    {
+     "ruleId": "py/hardcoded-credentials-literals",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/hardcoded-credentials-literals",
+      "index": 0
+     },
+     "message": {
+      "text": "Possible hardcoded credential assigned to variable 'contents_key'."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "s3fs/core.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 790,
+         "startColumn": 13,
+         "endColumn": 38
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "c78fc20060136fd3:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/hardcoded-credentials-literals",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/hardcoded-credentials-literals",
+      "index": 0
+     },
+     "message": {
+      "text": "Possible hardcoded credential assigned to variable 'contents_key'."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "s3fs/core.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 793,
+         "startColumn": 13,
+         "endColumn": 38
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "159e5cb7c542a580:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251219215417",
+   "codeql_raw_query": "/**\n * @name XML External Entity (XXE)\n * @description Detects potential XXE vulnerabilities in XML parsing.\n * @kind problem\n * @problem.severity error\n * @id py/xxe\n * @tags security\n *       external/cwe/cwe-611\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  (\n    call = API::moduleImport(\"xml.etree.ElementTree\").getMember(\"parse\").getACall() or\n    call = API::moduleImport(\"xml.etree.ElementTree\").getMember(\"fromstring\").getACall() or\n    call = API::moduleImport(\"lxml.etree\").getMember(\"parse\").getACall() or\n    call = API::moduleImport(\"lxml.etree\").getMember(\"fromstring\").getACall() or\n    call = API::moduleImport(\"xml.dom.minidom\").getMember(\"parse\").getACall() or\n    call = API::moduleImport(\"xml.dom.minidom\").getMember(\"parseString\").getACall() or\n    call = API::moduleImport(\"xml.sax\").getMember(\"parse\").getACall() or\n    call = API::moduleImport(\"xml.sax\").getMember(\"parseString\").getACall()\n  )\nselect call, \"Potential XXE vulnerability: XML parsing without disabling external entities.\"\n",
+   "hypothesis": "XML parsing without disabling external entities can lead to XXE.",
+   "severity": "medium",
+   "cwe_ids": [
+    "CWE-611"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251219215513",
+   "codeql_raw_query": "/**\n * @name Use of Weak Hash\n * @description Using weak hashing algorithms like MD5 or SHA1 for security purposes is dangerous.\n * @kind problem\n * @problem.severity warning\n * @id py/weak-hash\n * @tags security\n *       external/cwe/cwe-328\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"hashlib\").getMember([\"md5\", \"sha1\"]).getACall()\nselect call, \"Usage of weak hashing algorithm.\"\n",
+   "hypothesis": "Use of Weak Hash (MD5/SHA1)",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-328"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251219215550",
+   "codeql_raw_query": "/**\n * @name Weak cryptographic hashing\n * @description Using weak hashing algorithms like MD5 or SHA1 for security purposes\n * @kind problem\n * @problem.severity warning\n * @id py/weak-crypto\n * @tags security\n *        external/cwe/cwe-327\n *        external/cwe/cwe-328\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"hashlib\").getMember([\"md5\", \"sha1\"]).getACall() or\n  call = API::moduleImport(\"cryptography.hazmat.primitives.hashes\").getMember([\"MD5\", \"SHA1\"]).getACall()\nselect call, \"Usage of weak cryptographic hashing algorithm.\"",
+   "hypothesis": "Usage of weak cryptographic hashing algorithms like MD5 or SHA1.",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-327",
+    "cwe-328"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251219215624",
+   "codeql_raw_query": "/**\n * @name Command Injection\n * @description Executing commands with untrusted input\n * @kind path-problem\n * @problem.severity error\n * @id py/command-injection\n * @tags security\n *        external/cwe/cwe-078\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.dataflow.new.RemoteFlowSources\nimport semmle.python.Concepts\n\nmodule CommandInjectionConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    source instanceof RemoteFlowSource\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    sink = any(SystemCommandExecution sce).getCommand()\n  }\n}\n\nmodule CommandInjectionFlow = TaintTracking::Global<CommandInjectionConfig>;\nimport CommandInjectionFlow::PathGraph\n\nfrom CommandInjectionFlow::PathNode source, CommandInjectionFlow::PathNode sink\nwhere CommandInjectionFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"Command injection from $@.\", source.getNode(), \"user input\"\n",
+   "hypothesis": "Command injection via subprocess or os.system with user input",
+   "severity": "critical",
+   "cwe_ids": [
+    "CWE-78"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251219215646",
+   "codeql_raw_query": "/**\n * @name Weak Cryptographic Hash\n * @description Using weak hashing algorithms like MD5 or SHA1\n * @kind problem\n * @problem.severity warning\n * @id py/weak-crypto-hash\n * @tags security\n *        external/cwe/cwe-327\n *        external/cwe/cwe-328\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"hashlib\").getMember([\"md5\", \"sha1\"]).getACall() or\n  call = API::moduleImport(\"cryptography.hazmat.primitives.hashes\").getMember([\"MD5\", \"SHA1\"]).getACall()\nselect call, \"Usage of weak cryptographic hash function.\"\n",
+   "hypothesis": "Usage of weak cryptographic hashing algorithms (MD5, SHA1)",
+   "severity": "medium",
+   "cwe_ids": [
+    "CWE-327",
+    "CWE-328"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251219215724",
+   "codeql_raw_query": "/**\n * @name SSL Verification Disabled\n * @description Disabling SSL verification allows man-in-the-middle attacks.\n * @kind problem\n * @problem.severity error\n * @id py/ssl-verification-disabled\n * @tags security\n *       external/cwe/cwe-295\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call, DataFlow::Node arg\nwhere\n  (\n    call = API::moduleImport(\"requests\").getMember([\"get\", \"post\", \"put\", \"delete\", \"head\", \"patch\", \"request\"]).getACall() or\n    call = API::moduleImport(\"aiohttp\").getMember(\"ClientSession\").getACall() or\n    call = API::moduleImport(\"botocore.client\").getMember(\"Config\").getACall() or\n    call = API::moduleImport(\"aiobotocore.session\").getMember(\"get_session\").getMember(\"create_client\").getACall()\n  ) and\n  (\n    (\n      call.getArgByName(\"verify\") = arg and\n      arg.asExpr().(ImmutableLiteral).booleanValue() = false\n    ) or\n    (\n      call.getArgByName(\"ssl\") = arg and\n      arg.asExpr().(ImmutableLiteral).booleanValue() = false\n    )\n  )\nselect call, \"SSL verification is explicitly disabled.\"\n",
+   "hypothesis": "Disabling SSL verification exposes the application to Man-in-the-Middle (MitM) attacks.",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-295"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251219215738",
+   "codeql_raw_query": "/**\n * @name Insertion of Sensitive Information into Log File\n * @description Logging sensitive information such as passwords or keys can lead to information disclosure.\n * @kind problem\n * @problem.severity warning\n * @id py/sensitive-log\n * @tags security\n *       external/cwe/cwe-532\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call, DataFlow::Node arg\nwhere\n  call = API::moduleImport(\"logging\").getMember([\"debug\", \"info\", \"warning\", \"error\", \"critical\", \"log\"]).getACall() and\n  arg = call.getArg(_) and\n  exists(string s |\n    s = arg.asExpr().(Name).getId() and\n    (\n      s.matches(\"%password%\") or\n      s.matches(\"%secret%\") or\n      s.matches(\"%token%\") or\n      s.matches(\"%key%\") or\n      s.matches(\"%auth%\")\n    ) and\n    not s.matches(\"%public%\")\n  )\nselect call, \"Potential logging of sensitive variable: \" + arg.asExpr().(Name).getId()\n",
+   "hypothesis": "Logging sensitive information like passwords, keys, or tokens can lead to accidental exposure in logs.",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-532"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251219215848",
+   "codeql_raw_query": "/**\n * @name Use of weak hashing algorithm\n * @description Using weak hashing algorithms like MD5 or SHA1 is insecure for sensitive data.\n * @kind problem\n * @problem.severity warning\n * @id py/weak-hashing\n * @tags security\n *       external/cwe/cwe-327\n *       external/cwe/cwe-328\n */\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"hashlib\").getMember([\"md5\", \"sha1\"]).getACall() or\n  call = API::moduleImport(\"cryptography\").getMember(\"hazmat\").getMember(\"primitives\").getMember(\"hashes\").getMember([\"MD5\", \"SHA1\"]).getACall()\nselect call, \"Usage of weak hashing algorithm.\"",
+   "hypothesis": "Usage of weak hashing algorithms like MD5 or SHA1.",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-327",
+    "cwe-328"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251219215900",
+   "codeql_raw_query": "/**\n * @name Server-Side Request Forgery (SSRF)\n * @description Making network requests to untrusted URLs can lead to SSRF.\n * @kind problem\n * @problem.severity error\n * @id py/ssrf\n * @tags security\n *       external/cwe/cwe-918\n */\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"requests\").getMember([\"get\", \"post\", \"put\", \"delete\", \"head\", \"patch\", \"request\"]).getACall() or\n  call = API::moduleImport(\"urllib\").getMember(\"request\").getMember(\"urlopen\").getACall() or\n  call = API::moduleImport(\"urllib3\").getMember(\"PoolManager\").getMember(\"request\").getACall() or\n  call = API::moduleImport(\"aiohttp\").getMember(\"ClientSession\").getMember([\"get\", \"post\", \"put\", \"delete\", \"head\", \"patch\", \"request\"]).getACall()\nselect call, \"Potential SSRF: Network request made.\"",
+   "hypothesis": "Potential Server-Side Request Forgery (SSRF) via network request libraries.",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-918"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251219215953",
+   "codeql_raw_query": "/**\n * @name SSRF via aiohttp\n * @description Sending network requests to untrusted URLs can lead to SSRF\n * @kind path-problem\n * @problem.severity error\n * @id py/ssrf-aiohttp\n * @tags security\n *        external/cwe/cwe-918\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.dataflow.new.RemoteFlowSources\nimport semmle.python.ApiGraphs\n\nmodule SsrfConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    source instanceof RemoteFlowSource or\n    source instanceof DataFlow::ParameterNode\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(DataFlow::CallCfgNode call |\n      call = API::moduleImport(\"aiohttp\").getMember(\"ClientSession\").getReturn().getMember([\"get\", \"post\", \"request\", \"put\", \"delete\", \"head\", \"options\", \"patch\"]).getACall() and\n      sink = call.getArg(0)\n    )\n  }\n}\n\nmodule SsrfFlow = TaintTracking::Global<SsrfConfig>;\nimport SsrfFlow::PathGraph\n\nfrom SsrfFlow::PathNode source, SsrfFlow::PathNode sink\nwhere SsrfFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"Potential SSRF from $@.\", source.getNode(), \"untrusted input\"",
+   "hypothesis": "SSRF via aiohttp requests with user-controlled URLs",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-918"
+   ],
+   "results_count": 0,
+   "results": []
+  }
+ ]
+}

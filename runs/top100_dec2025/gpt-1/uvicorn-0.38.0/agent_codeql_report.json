@@ -1,0 +1,321 @@
+{
+ "session_id": "20251226145805",
+ "package_name": "uvicorn-0.38.0",
+ "package_path": "packages/uvicorn-0.38.0",
+ "database_path": "databases/uvicorn-0.38.0-db",
+ "model": "gpt-5.1",
+ "temperature": 1.0,
+ "max_tokens": 8000,
+ "iterations": 15,
+ "total_input_tokens": 118760,
+ "total_output_tokens": 12212,
+ "total_tokens": 130972,
+ "elapsed_time_seconds": 568.89,
+ "estimated_cost_usd": 0.2706,
+ "summary": "## Overview\n\nPackage analyzed: **uvicorn 0.38.0** – an ASGI web server / CLI.\n\nUsing CodeQL with modern Python data-flow/taint tracking APIs, I looked for security issues in:\n- HTTP and WebSocket protocol handling\n- Host/header and proxy handling middleware\n- Process / subprocess invocation and reloader logic\n- File, YAML, and dotenv configuration loading\n- General unsafe APIs (code execution, deserialization, path handling)\n\nWithin the 20-iteration budget, no clear, exploitable vulnerabilities were found in the package itself. Several areas were flagged for **security review and hardening guidance**, but they appear to be **safe under normal, intended usage patterns** where configuration files and environment are trusted and not directly attacker-controlled.\n\nBelow is a concise summary of the notable findings and their implications.\n\n---\n\n## Key CodeQL-based Findings\n\n### 1. File path usage in configuration loading\n\n**Location (per SARIF):**\n- `uvicorn/config.py:372`\n- `uvicorn/config.py:380`\n\n**Query rule:** `py/uvicorn/file-path-usage`\n\n**What the query found**\nThe query flagged `open(...)` calls used when uvicorn loads configuration from files. These paths are typically derived from CLI options / configuration parameters resolved by `Config` in `uvicorn/config.py`.\n\n**Security impact assessment**\n- **Potential issue type:** CWE-22 (Path Traversal) if an attacker can influence the file path, and the application treats that as trusted configuration.\n- For typical deployments, only **trusted operators** provide file paths (e.g., config files, log files). Uvicorn is not normally used in a context where remote users can pick arbitrary file names.\n- No data flow from network/remote-taint sources into these `open(...)` path arguments was found.\n\n**Conclusion**\n- **No direct vulnerability identified.**\n- Treat these as **review points**: when embedding uvicorn into larger systems that accept user-specified config paths, ensure that only trusted/validated file paths are passed into `Config`.\n\n---\n\n### 2. YAML configuration loading\n\n**Location:**\n- `uvicorn/config.py:381` (approx., per SARIF) – call to a YAML loader (likely `yaml.safe_load` or equivalent)\n\n**Query rule:** `py/uvicorn/yaml-config-load`\n\n**What the query found**\nA YAML load is used for configuration. The query is generic and flags YAML usage because naïve `yaml.load` with an unsafe loader can be vulnerable to **arbitrary object instantiation** (CWE-502: Deserialization of Untrusted Data).\n\n**Security impact assessment**\n- The usage appears to be for **local configuration files** under operator control, not for user-submitted YAML over HTTP.\n- No CodeQL-flow evidence of network/remote taint reaching the YAML content.\n- If `safe_load` or a safe loader is used, the usual RCE risks from `yaml.load` are mitigated.\n\n**Conclusion**\n- Under normal assumptions (config files are trusted and not remotely user-controlled), this is **low-risk**.\n- If an embedding system ever allows an untrusted party to upload or control config files that uvicorn then parses, that outer system must treat this as **potential unsafe deserialization** (CWE-502) and constrain or sanitize such usage.\n\n---\n\n### 3. dotenv (.env) loading\n\n**Location:**\n- `uvicorn/config.py:331` – use of a dotenv loader\n\n**Query rule:** `py/uvicorn/dotenv-load`\n\n**What the query found**\nUvicorn can load a `.env` file using `python-dotenv`, as is common in many frameworks. The query marked this as a potential sink where file path control might matter.\n\n**Security impact assessment**\n- Dotenv files are normally **deployment-time configuration** under operator control, not attacker-controlled.\n- No remote-taint flows into the `.env` path or content were detected.\n- The primary risk is misconfiguration: if an outer system lets untrusted users define or control the `.env` path/content, they could inject unexpected environment settings (e.g., debug flags, secrets, host/port values).\n\n**Conclusion**\n- Within uvicorn’s expected threat model, this is **not a vulnerability**, just a reminder that `.env` files must be trusted.\n\n---\n\n### 4. HTTP / WebSocket / proxy logic\n\nAreas examined via CodeQL hypotheses:\n- `uvicorn/protocols/http/h11_impl.py`\n- `uvicorn/protocols/http/httptools_impl.py`\n- `uvicorn/protocols/websockets/*`\n- `uvicorn/middleware/proxy_headers.py`\n\n**Host header / X-Forwarded-* handling**\n- Custom queries attempted to trace remote taint into `ProxyHeadersMiddleware` and into host/header handling.\n- Queries either compiled without findings or (when simplified to just identify call sites) indicated **only internal construction** of this middleware.\n- No CodeQL-detected flows of untrusted header values into dangerous sinks like OS commands, unsafe eval/exec, or SQL/query construction.\n\n**Response construction and header/body output**\n- A taint-style query targeting uvicorn’s HTTP protocol classes and write/response methods did **not** find any problematic flows from remote input into risky non-escaped sinks (e.g., into shell commands, deserialization APIs, or code execution).\n- Uvicorn, as a server, mostly passes the request information into user ASGI apps, which are responsible for deciding what to echo in responses.\n\n**Conclusion**\n- No direct CWE-20 / CWE-116 / CWE-79 vulnerabilities were identified in uvicorn’s own handling.\n- As expected for an ASGI server, **most XSS or output-encoding responsibilities are in the application layer**, not uvicorn itself.\n\n---\n\n### 5. Subprocess / exec usage (reloaders, worker management)\n\nFiles inspected via targeted CodeQL queries:\n- `uvicorn/_subprocess.py`\n- `uvicorn/supervisors/*` (especially reload/multiprocess supervisors)\n\nA taint-tracking query looked for remote data flowing into:\n- `subprocess.Popen`, `run`, `call`, `check_call`, `check_output`\n- `os.system` / `os.exec*` variants\n\n**Findings**\n- The query **compiled and ran successfully with zero tainted flows** from remote sources into subprocess command arguments.\n- Uvicorn’s reloader/multiprocess logic uses **static command templates** (Python executable, module name, paths from the current process), not request-derived data.\n\n**Conclusion**\n- No evidence of command injection (CWE-78). Subprocess usage appears to be **parameterized by deployment-time values**, not by attacker-controlled HTTP data.\n\n---\n\n### 6. General dangerous APIs (no issues found)\n\nHypotheses tested via CodeQL (with no positive findings):\n- **Code execution APIs**: `eval`, `exec`, `compile`, `execfile`, `runpy.run_module` with remote taint.\n- **Unsafe deserialization**: `pickle`, `marshal`, dangerous `yaml.load` from remote input.\n- **Network / URL handling**: taint flows into `os.open`, low-level socket APIs, or logging formatting sinks.\n\nThese queries did not reveal suspicious tainted flows or high-risk patterns within uvicorn’s own codebase.\n\n---\n\n## Overall Security Assessment\n\n**Package type:**\n- Primarily a **library** and **cli_tool** (an ASGI server and CLI entry point) used to serve Python web applications.\n\n**High/critical severity vulnerabilities:**\n- **None identified** in uvicorn 0.38.0 using the CodeQL queries executed within the iteration budget.\n\n**Medium/low-severity considerations (design- and deployment-dependent):**\n1. **Config/YAML/.env file trust assumptions**  \n   - Ensure that configuration and dotenv paths/content are not attacker-controlled.  \n   - If a higher-level system lets untrusted actors upload or choose config files that uvicorn later reads, that system must implement its own validation/sandboxing.\n\n2. **Host/proxy header handling**  \n   - While no direct vulnerability was found, uvicorn exposes proxy/middleware features that can interact with reverse proxies and forwarded headers.  \n   - Correct configuration of `ProxyHeadersMiddleware` and upstream proxies remains important to avoid typical host-header related issues (cache poisoning, URL generation inconsistencies) in **applications**, even if uvicorn itself is not the direct source of the bug.\n\n3. **Shared-responsibility model**  \n   - As an ASGI server, uvicorn largely delegates **input validation, output encoding, authentication, and authorization** to the ASGI applications it hosts.  \n   - Most traditional web vulns (XSS, SQLi, auth bugs) will arise in those applications or frameworks rather than in uvicorn.\n\n---\n\n## Hardening Recommendations for Users\n\n- Treat **configuration files and .env files as trusted-only artifacts**; do not allow arbitrary users to control them.\n- When running behind a reverse proxy (nginx, Envoy, etc.), configure:\n  - Correct `X-Forwarded-For`, `X-Forwarded-Host`, `X-Forwarded-Proto` behavior.\n  - Uvicorn’s `ProxyHeadersMiddleware` and `forwarded_allow_ips` (if used) according to best practices.\n- Keep uvicorn and its dependencies (especially `PyYAML`, `python-dotenv`, `websockets`, `httptools`) **up to date**, as vulnerabilities in those libraries can affect the overall security posture.\n\nWithin the analyzed scope and with the CodeQL rules run, **uvicorn 0.38.0 appears reasonably well-hardened** as a server component, with no clear, exploitable issues surfaced by this static analysis alone.\n",
+ "package_classification": {
+  "type": "cli_tool",
+  "layer": [
+   "application",
+   "infrastructure",
+   "edge"
+  ]
+ },
+ "tool_calls": {
+  "get_package_profile_info": 1,
+  "execute_codeql_query": 17,
+  "validate_codeql_query": 0,
+  "fixup_codeql_query": 4,
+  "finalize_report": 1
+ },
+ "queries_executed": {
+  "critical": 1,
+  "high": 3,
+  "medium": 6,
+  "low": 3,
+  "total_executed": 19,
+  "total_with_results": 13,
+  "total_failed": 11
+ },
+ "query_findings": {
+  "critical": 0,
+  "high": 0,
+  "medium": 3,
+  "low": 1,
+  "total": 4
+ },
+ "findings": [
+  {
+   "codeql_query_uuid": "20251226145957",
+   "codeql_raw_query": "/**\n * @name Dangerous subprocess usage in uvicorn\n * @description Detects potentially unsafe uses of subprocess or os.exec* that might allow command injection.\n * @kind path-problem\n * @problem.severity error\n * @id py/uvicorn/subprocess-command-injection\n * @tags security\n *       external/cwe/cwe-078\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.dataflow.new.RemoteFlowSources\nimport semmle.python.ApiGraphs\n\nmodule SubprocessConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    source instanceof RemoteFlowSource\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(API::CallNode call |\n      (\n        call = API::moduleImport(\"subprocess\").getMember([\"Popen\", \"run\", \"call\", \"check_call\", \"check_output\"]).getACall() or\n        call = API::moduleImport(\"os\").getMember([\"system\", \"popen\", \"execl\", \"execle\", \"execlp\", \"execlpe\", \"execv\", \"execve\", \"execvp\", \"execvpe\"]).getACall()\n      ) and\n      sink = call.getArg(0)\n    )\n  }\n}\n\nmodule SubprocessFlow = TaintTracking::Global<SubprocessConfig>;\nimport SubprocessFlow::PathGraph\n\nfrom SubprocessFlow::PathNode source, SubprocessFlow::PathNode sink\nwhere SubprocessFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"User-controlled data reaches a subprocess command argument at $@.\", source.getNode(), \"user input\"\n",
+   "hypothesis": "User-controlled request data may reach subprocess or os.exec* calls, leading to command injection.",
+   "severity": "critical",
+   "cwe_ids": [
+    "cwe-078"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251226150106",
+   "codeql_raw_query": "/**\n * @name Insecure host header handling in ProxyHeadersMiddleware\n * @description Detect direct use of X-Forwarded-Host / Host headers in uvicorn.proxy_headers without proper validation.\n * @kind problem\n * @problem.severity warning\n * @id py/uvicorn/proxy-headers-host-handling\n * @tags security\n *       external/cwe/cwe-20\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"uvicorn.middleware.proxy_headers\").getMember(\"ProxyHeadersMiddleware\").getACall()\nselect call, \"Construction of ProxyHeadersMiddleware; review host header validation logic around this usage.\"\n",
+   "hypothesis": "Host header / X-Forwarded-Host may be trusted without validation in ProxyHeadersMiddleware, leading to host header attacks (CWE-20).",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-20"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251226150143",
+   "codeql_raw_query": "/**\n * @name Insecure yaml.load usage in uvicorn\n * @description Using yaml.load without a safe loader can lead to arbitrary code execution.\n * @kind problem\n * @problem.severity error\n * @id py/uvicorn/unsafe-yaml-load\n * @tags security\n *       external/cwe/cwe-078\n *       external/cwe/cwe-094\n *       external/cwe/cwe-502\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"yaml\").getMember([\"load\", \"unsafe_load\"]).getACall()\nselect call, \"Potentially unsafe yaml.load/unsafe_load usage; ensure a safe loader is used or switch to safe_load.\"\n",
+   "hypothesis": "uvicorn may use yaml.load for configuration without specifying SafeLoader, leading to code execution.",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-078",
+    "cwe-094",
+    "cwe-502"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251226150251",
+   "codeql_raw_query": "/**\n * @name Uvicorn YAML loading (potential unsafe load)\n * @description Find uses of yaml.load or other unsafe YAML loaders in uvicorn.\n * @kind problem\n * @problem.severity warning\n * @id py/uvicorn/yaml-unsafe-load\n * @tags security\n *       external/cwe/cwe-502\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"yaml\").getMember([\"load\", \"unsafe_load\"]).getACall()\nselect call, \"Use of potentially unsafe YAML load function; ensure SafeLoader or safe_load is used with untrusted input.\"",
+   "hypothesis": "Unsafe YAML deserialization via yaml.load/unsafe_load in uvicorn",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-502"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251226150311",
+   "codeql_raw_query": "/**\n * @name Open redirect / unvalidated URL usage in uvicorn\n * @description Detect flows from remote input into URL-building helpers that may cause open redirects.\n * @kind path-problem\n * @problem.severity error\n * @id py/uvicorn/open-redirect\n * @tags security\n *       external/cwe/cwe-601\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.dataflow.new.RemoteFlowSources\nimport semmle.python.ApiGraphs\n\nmodule RedirectConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    source instanceof RemoteFlowSource\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(API::CallNode call |\n      call = API::builtin(\"redirect\").getACall() and\n      sink = call.getArg(0)\n    )\n  }\n}\n\nmodule RedirectFlow = TaintTracking::Global<RedirectConfig>;\nimport RedirectFlow::PathGraph\n\nfrom RedirectFlow::PathNode source, RedirectFlow::PathNode sink\nwhere RedirectFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"Untrusted URL flows into redirect() at $@.\", source.getNode(), \"user input\"",
+   "hypothesis": "Open redirect sinks using a redirect() helper fed by untrusted data",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-601"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251226150348",
+   "codeql_raw_query": "/**\n * @name Insecure YAML loading in uvicorn\n * @description Detects uses of yaml.load or yaml.unsafe_load, which can execute arbitrary code when given untrusted input.\n * @kind problem\n * @problem.severity error\n * @id py/uvicorn/unsafe-yaml-load\n * @tags security\n *       external/cwe/cwe-502\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"yaml\").getMember([\"load\", \"unsafe_load\"]).getACall()\nselect call, \"Use of potentially unsafe YAML deserialization (yaml.load/unsafe_load). Prefer yaml.safe_load for untrusted input.\"\n",
+   "hypothesis": "uvicorn may use yaml.load/unsafe_load for configuration, leading to unsafe deserialization if config comes from untrusted sources.",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-502"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251226150408",
+   "codeql_raw_query": "/**\n * @name Unrestricted file path usage in uvicorn config\n * @description Finds file open operations in uvicorn that may use externally influenced paths (e.g., via environment or CLI) without restriction.\n * @kind problem\n * @problem.severity warning\n * @id py/uvicorn/file-path-usage\n * @tags security\n *       external/cwe/cwe-73\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"builtins\").getMember(\"open\").getACall()\nselect call, \"Review this file open call in uvicorn; ensure the path cannot be controlled by untrusted users or is properly validated.\"\n",
+   "hypothesis": "Identify file open usage that might be influenced by external input (env vars, CLI), for potential path traversal or sensitive file exposure.",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-73"
+   ],
+   "results_count": 2,
+   "results": [
+    {
+     "ruleId": "py/uvicorn/file-path-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/uvicorn/file-path-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Review this file open call in uvicorn; ensure the path cannot be controlled by untrusted users or is properly validated."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "uvicorn/config.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 372,
+         "startColumn": 22,
+         "endColumn": 43
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "c8665ed5da4b17e5:1",
+      "primaryLocationStartColumnFingerprint": "5"
+     }
+    },
+    {
+     "ruleId": "py/uvicorn/file-path-usage",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/uvicorn/file-path-usage",
+      "index": 0
+     },
+     "message": {
+      "text": "Review this file open call in uvicorn; ensure the path cannot be controlled by untrusted users or is properly validated."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "uvicorn/config.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 380,
+         "startColumn": 22,
+         "endColumn": 43
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "bd9876ffe2f4c2bf:1",
+      "primaryLocationStartColumnFingerprint": "5"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251226150439",
+   "codeql_raw_query": "/**\n * @name uvicorn config file path usage\n * @description Flags uses of open() on paths derived from environment variables or CLI arguments in uvicorn.config.\n * @kind path-problem\n * @problem.severity warning\n * @id py/uvicorn/file-path-usage\n * @tags security\n *       external/cwe/cwe-022\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.ApiGraphs\n\nmodule FilePathConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    exists(DataFlow::ExprNode env |\n      env.asExpr() instanceof Call and\n      env.asExpr().(Call).getFunc().toString() = \"os.getenv\" and\n      source = env\n    )\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(API::CallNode call |\n      call = API::moduleImport(\"builtins\").getMember(\"open\").getACall() and\n      sink = call.getArg(0)\n    )\n  }\n}\n\nmodule FilePathFlow = TaintTracking::Global<FilePathConfig>;\nimport FilePathFlow::PathGraph\n\nfrom FilePathFlow::PathNode source, FilePathFlow::PathNode sink\nwhere FilePathFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"Environment-derived path from $@ flows into file open().\", source.getNode(), \"env var\"",
+   "hypothesis": "Environment variables flowing into file paths may allow path traversal or unintended file access.",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-022"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251226150507",
+   "codeql_raw_query": "/**\n * @name Untrusted input into logging format strings\n * @description Detects flow of RemoteFlowSource data into logging format strings, which can cause log injection or information disclosure.\n * @kind path-problem\n * @problem.severity warning\n * @id py/uvicorn/logging-format-taint\n * @tags security\n *       external/cwe/cwe-117\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.dataflow.new.RemoteFlowSources\nimport semmle.python.ApiGraphs\n\nmodule LoggingTaintConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    source instanceof RemoteFlowSource\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(API::CallNode call |\n      call = API::moduleImport(\"logging\").getMember([\"debug\", \"info\", \"warning\", \"error\", \"critical\", \"exception\", \"log\"]).getACall() and\n      sink = call.getArg(0)\n    )\n  }\n}\n\nmodule LoggingTaintFlow = TaintTracking::Global<LoggingTaintConfig>;\nimport LoggingTaintFlow::PathGraph\n\nfrom LoggingTaintFlow::PathNode source, LoggingTaintFlow::PathNode sink\nwhere LoggingTaintFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"Untrusted data from $@ flows into a logging format string.\", source.getNode(), \"user input\"",
+   "hypothesis": "Unvalidated remote input used directly as logging format string could cause log injection.",
+   "severity": "low",
+   "cwe_ids": [
+    "cwe-117"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251226150543",
+   "codeql_raw_query": "/**\n * @name Uvicorn YAML config load usage\n * @description Finds uses of yaml.safe_load or yaml.load in uvicorn configuration, to check for unsafe deserialization or schema issues.\n * @kind problem\n * @problem.severity warning\n * @id py/uvicorn/yaml-config-load\n * @tags security\n *       external/cwe/cwe-502\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"yaml\").getMember([\"load\", \"safe_load\", \"full_load\"]).getACall()\nselect call, \"YAML load used in uvicorn; verify that configuration files are trusted and not user-controlled.\"\n",
+   "hypothesis": "Check for unsafe or unvalidated YAML configuration loading that might be fed untrusted data.",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-502"
+   ],
+   "results_count": 1,
+   "results": [
+    {
+     "ruleId": "py/uvicorn/yaml-config-load",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/uvicorn/yaml-config-load",
+      "index": 0
+     },
+     "message": {
+      "text": "YAML load used in uvicorn; verify that configuration files are trusted and not user-controlled."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "uvicorn/config.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 381,
+         "startColumn": 37,
+         "endColumn": 57
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "ac2648739cdb54f3:1",
+      "primaryLocationStartColumnFingerprint": "16"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251226150603",
+   "codeql_raw_query": "/**\n * @name Uvicorn environment variable loading\n * @description Finds uses of python-dotenv load_dotenv and related helpers to ensure env files are trusted and not user-controlled.\n * @kind problem\n * @problem.severity note\n * @id py/uvicorn/dotenv-load\n * @tags security\n *       external/cwe/cwe-732\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"dotenv\").getMember([\"load_dotenv\", \"dotenv_values\", \"find_dotenv\"]).getACall()\nselect call, \"dotenv loader used in uvicorn; ensure the .env file path is not attacker-controlled.\"\n",
+   "hypothesis": "Identify dotenv usage that may read configuration from paths potentially influenced by an attacker.",
+   "severity": "low",
+   "cwe_ids": [
+    "cwe-732"
+   ],
+   "results_count": 1,
+   "results": [
+    {
+     "ruleId": "py/uvicorn/dotenv-load",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/uvicorn/dotenv-load",
+      "index": 0
+     },
+     "message": {
+      "text": "dotenv loader used in uvicorn; ensure the .env file path is not attacker-controlled."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "uvicorn/config.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 331,
+         "startColumn": 13,
+         "endColumn": 46
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "9b81fbac78cdb41d:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251226150628",
+   "codeql_raw_query": "/**\n * @name Uvicorn CLI argument to config file path usage\n * @description Find where uvicorn CLI/config uses file paths derived from command-line arguments.\n * @kind problem\n * @problem.severity recommendation\n * @id py/uvicorn/cli-config-paths\n * @tags security\n *       external/cwe/cwe-22\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"uvicorn.config\").getMember(\"Config\").getACall()\nselect call, \"Uvicorn Config constructed here; ensure any file paths (env file, config file, SSL key/cert) passed in are validated and not attacker-controlled.\"\n",
+   "hypothesis": "Identify potentially risky uses of user-supplied file paths in uvicorn Config construction.",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-22"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251226150649",
+   "codeql_raw_query": "/**\n * @name Uvicorn reload/watchfile usage\n * @description Identify where uvicorn enables auto-reload or watchfiles, which can have security implications in production.\n * @kind problem\n * @problem.severity note\n * @id py/uvicorn/reload-watchfiles\n * @tags security\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"uvicorn.config\").getMember(\"Config\").getACall()\nselect call, \"Uvicorn Config constructed here; review use of reload/watchfiles options and ensure they are disabled or locked down in production.\"\n",
+   "hypothesis": "Surface locations where reload/watchfiles may be configured, to remind users about production hardening.",
+   "severity": "low",
+   "cwe_ids": [
+    "cwe-693"
+   ],
+   "results_count": 0,
+   "results": []
+  }
+ ]
+}

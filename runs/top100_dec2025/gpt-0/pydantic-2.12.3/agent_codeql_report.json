@@ -1,0 +1,358 @@
+{
+ "session_id": "20251218235709",
+ "package_name": "pydantic-2.12.3",
+ "package_path": "packages/pydantic-2.12.3",
+ "database_path": "databases/pydantic-2.12.3-db",
+ "model": "gpt-5.1",
+ "temperature": 0.0,
+ "max_tokens": 8000,
+ "iterations": 11,
+ "total_input_tokens": 109014,
+ "total_output_tokens": 8755,
+ "total_tokens": 117769,
+ "elapsed_time_seconds": 412.19,
+ "estimated_cost_usd": 0.2238,
+ "summary": "## Overview\nSecurity analysis was performed on the `pydantic` package version 2.12.3 (PyPI name `pydantic`, core validation delegated to `pydantic-core`). The package is a widely used data-validation library and is intended to be embedded into other applications rather than exposed directly to untrusted users. Analysis used CodeQL with a focus on high‑impact vulnerability classes: unsafe deserialization, command execution, and dynamic code execution.\n\nThe codebase is large (~35k LOC) and includes:\n- The main v2 implementation under `pydantic/` and `_internal/`\n- A full v1 compatibility layer under `pydantic/v1/`\n- Deprecated and experimental modules\n\nBelow are the key findings and their security implications.\n\n---\n\n## Finding 1 – Use of `pickle.load`/`pickle.loads` (unsafe deserialization)\n**CWE:** CWE-502 (Deserialization of Untrusted Data)  \n**Severity:** Medium (library-level; risk depends on caller)  \n**CodeQL rule:** `py/unsafe-pickle-deserialization`\n\n**Locations (from CodeQL):**\n1. `pydantic/v1/parse.py`, line ~42  \n2. `pydantic/deprecated/parse.py`, line ~54\n\nThese locations call `pickle.load`/`pickle.loads`. CodeQL flagged them as potentially unsafe deserialization operations.\n\n### Risk assessment\n- `pickle` is inherently unsafe for untrusted data; if user-controlled bytes reach these APIs, arbitrary code execution is possible.\n- In this package, the usages are in **v1 compatibility** and **deprecated parsing** helpers. They are not automatically invoked by core v2 validation.\n- The library does not itself obtain remote input; it operates on data passed in by the embedding application. Therefore, exploitability depends entirely on whether an application passes untrusted data into these helpers.\n\n### Likely intent / context\nHistorically, Pydantic v1 exposed convenience functions for parsing arbitrary Python objects, including pickled data. The v2 package keeps these for backward compatibility and in deprecated modules.\n\n### Recommendations for consumers\n- **Do not pass untrusted data** (e.g., HTTP request bodies, user-uploaded files) into any Pydantic helper that ultimately calls `pickle.load`/`pickle.loads`.\n- Prefer safe formats such as JSON and Pydantic’s standard parsing from dicts/JSON.\n- If you must use these helpers, ensure the input is from a trusted, authenticated source and not modifiable by attackers.\n\n### Recommendations for maintainers\n- Clearly document that any helpers using `pickle` are **unsafe for untrusted data**.\n- Consider:\n  - Restricting these APIs to explicitly “trusted only” contexts (e.g., naming, docstrings, or runtime warnings).\n  - Moving them further into a clearly marked `deprecated` or `unsafe` namespace, or gating them behind an explicit opt‑in flag.\n\n---\n\n## Finding 2 – Command execution via `subprocess` / `os` in `_internal/_git.py`\n**CWE:** CWE-78 (OS Command Injection)  \n**Severity:** Low–Medium (internal tooling; no direct remote input)  \n**CodeQL rule:** `py/command-execution-sinks`\n\n**Locations (from CodeQL):**\n1. `pydantic/_internal/_git.py`, line ~17  \n2. `pydantic/_internal/_git.py`, line ~27\n\nThese lines invoke `subprocess`/`os` command execution to interact with Git (e.g., retrieving version or commit information).\n\n### Risk assessment\n- These calls are **internal tooling** for version metadata, not general-purpose command execution exposed to library users.\n- No evidence (from CodeQL) that untrusted, user-controlled data flows into the command arguments.\n- As long as arguments are static or derived from trusted configuration, the risk of command injection is low.\n\n### Recommendations for maintainers\n- Ensure all command arguments are **constant strings** or derived from trusted sources (e.g., not from environment variables or user input without validation).\n- Prefer `subprocess.run([...], check=True)` with `shell=False` (which is the default when passing a list) to avoid shell interpretation.\n- If `shell=True` is used anywhere, consider refactoring to avoid it.\n\n### Recommendations for consumers\n- There is no direct evidence that these internal Git helpers are exploitable in typical usage. They may run during development or packaging, not at runtime in production services.\n- If running Pydantic in highly locked-down environments (e.g., sandboxed interpreters), be aware that importing certain modules may trigger Git introspection; review `_internal/_git.py` in that context.\n\n---\n\n## Finding 3 – Use of `eval`/`exec` in `pydantic/v1/utils.py`\n**CWE:** CWE-94 (Code Injection)  \n**Severity:** Medium (v1 compatibility; risk depends on caller)  \n**CodeQL rule:** `py/dangerous-eval-exec`\n\n**Location (from CodeQL):**\n- `pydantic/v1/utils.py`, line ~195\n\nThis location uses `eval` or `exec` for dynamic code execution in the v1 compatibility layer.\n\n### Risk assessment\n- `eval`/`exec` are dangerous if they can be influenced by untrusted input; they can lead to arbitrary code execution.\n- In Pydantic v1, such constructs are typically used for dynamic model construction or type handling, usually based on **internal metadata** rather than raw user strings.\n- The library itself does not fetch remote input; risk arises only if an application passes attacker-controlled strings into APIs that feed into this dynamic execution.\n\n### Recommendations for maintainers\n- Audit the call chain to this `eval`/`exec` usage to confirm that only trusted, library-generated strings can reach it.\n- If any public API allows arbitrary user strings to influence the evaluated code, consider:\n  - Replacing `eval`/`exec` with safer alternatives (e.g., `ast.literal_eval` where applicable, or refactoring to avoid dynamic code generation).\n  - Adding explicit validation or whitelisting of allowed expressions.\n\n### Recommendations for consumers\n- Avoid passing arbitrary user-provided Python expressions or code fragments into Pydantic v1 APIs that might influence dynamic model creation.\n- Prefer the v2 APIs where possible; v2 generally reduces reliance on dynamic Python code in favor of `pydantic-core`.\n\n---\n\n## Other areas examined\nAdditional CodeQL queries were run for broader classes of issues (e.g., tainted data to dangerous sinks, other command execution patterns, and general unsafe patterns). These either:\n- Returned **no results**, or\n- Flagged only the findings already summarized above.\n\nNo evidence was found of:\n- Direct remote input sources within the library (e.g., HTTP servers, network listeners).\n- Direct SQL execution, file write sinks with tainted data, or other high‑impact injection points.\n\nGiven Pydantic’s role as a **library** that validates data passed in by host applications, the primary security concern is how **applications** use its APIs, especially legacy/deprecated helpers.\n\n---\n\n## Overall security posture\n- The core v2 validation logic appears focused on type-safe, schema-driven processing and delegates heavy lifting to `pydantic-core`, which is not directly analyzed here but is designed for performance and safety.\n- The main flagged risks are in **v1 compatibility** and **deprecated** modules (`pydantic/v1/*`, `pydantic/deprecated/*`) and in **internal tooling** (`_internal/_git.py`).\n- None of the findings are standalone remote vulnerabilities in Pydantic itself; they become exploitable only if an embedding application:\n  - Feeds untrusted data into pickle-based helpers, or\n  - Allows untrusted strings to influence dynamic code execution paths.\n\n### High-level guidance\n- **For maintainers:**\n  - Continue to steer users toward v2 APIs and away from deprecated/v1 helpers.\n  - Clearly document the security implications of `pickle`-based helpers and any dynamic code execution.\n  - Consider adding runtime warnings or stronger deprecation for unsafe patterns.\n\n- **For consumers:**\n  - Treat any Pydantic helper that uses `pickle` or dynamic code execution as **trusted-input-only**.\n  - Prefer JSON/dict-based validation and the v2 API surface.\n  - Review your own code for how you source and pass data into these helpers; that is where most real-world vulnerabilities will arise.\n\nIn summary, `pydantic` 2.12.3 shows some inherently risky constructs (pickle, subprocess, eval/exec) in legacy and internal areas, but no direct, standalone remote exploit paths were identified within the library itself. Proper use by applications—avoiding untrusted input to these specific helpers—should mitigate the identified risks.",
+ "package_classification": {
+  "type": "library",
+  "layer": [
+   "application",
+   "data",
+   "validation"
+  ]
+ },
+ "tool_calls": {
+  "get_package_profile_info": 1,
+  "execute_codeql_query": 13,
+  "validate_codeql_query": 0,
+  "fixup_codeql_query": 4,
+  "finalize_report": 1
+ },
+ "queries_executed": {
+  "critical": 0,
+  "high": 3,
+  "medium": 4,
+  "low": 1,
+  "total_executed": 15,
+  "total_with_results": 8,
+  "total_failed": 11
+ },
+ "query_findings": {
+  "critical": 0,
+  "high": 5,
+  "medium": 2,
+  "low": 0,
+  "total": 7
+ },
+ "findings": [
+  {
+   "codeql_query_uuid": "20251218235817",
+   "codeql_raw_query": "/**\n * @name Dangerous use of pickle for deserialization\n * @description Detects uses of pickle.load/loads which may lead to unsafe deserialization\n * @kind problem\n * @problem.severity error\n * @id py/unsafe-pickle-deserialization\n * @tags security\n *       external/cwe/cwe-502\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere call = API::moduleImport(\"pickle\").getMember([\"load\", \"loads\"]).getACall()\nselect call, \"Potentially unsafe deserialization using pickle.\"",
+   "hypothesis": "Package may use pickle.load/loads leading to unsafe deserialization if exposed to untrusted data.",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-502"
+   ],
+   "results_count": 2,
+   "results": [
+    {
+     "ruleId": "py/unsafe-pickle-deserialization",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/unsafe-pickle-deserialization",
+      "index": 0
+     },
+     "message": {
+      "text": "Potentially unsafe deserialization using pickle."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pydantic/v1/parse.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 42,
+         "startColumn": 16,
+         "endColumn": 32
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "7e3762c9a7c515be:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/unsafe-pickle-deserialization",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/unsafe-pickle-deserialization",
+      "index": 0
+     },
+     "message": {
+      "text": "Potentially unsafe deserialization using pickle."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pydantic/deprecated/parse.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 54,
+         "startColumn": 16,
+         "endColumn": 32
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "5f77fce91eaa0bdf:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251218235836",
+   "codeql_raw_query": "/**\n * @name Subprocess command execution with potential user-controlled input\n * @description Finds subprocess and os command execution calls that may be exposed as sinks\n * @kind problem\n * @problem.severity warning\n * @id py/command-execution-sinks\n * @tags security\n *       external/cwe/cwe-078\n */\n\nimport python\nimport semmle.python.ApiGraphs\nimport semmle.python.dataflow.new.DataFlow\n\nfrom DataFlow::CallCfgNode call\nwhere\n  call = API::moduleImport(\"subprocess\").getMember([\"run\", \"Popen\", \"call\", \"check_call\", \"check_output\"]).getACall() or\n  call = API::moduleImport(\"os\").getMember([\"system\", \"popen\"]).getACall()\nselect call, \"Command execution sink (subprocess/os).\"",
+   "hypothesis": "Package may expose subprocess or os command execution helpers that could be misused with untrusted input.",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-78"
+   ],
+   "results_count": 2,
+   "results": [
+    {
+     "ruleId": "py/command-execution-sinks",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/command-execution-sinks",
+      "index": 0
+     },
+     "message": {
+      "text": "Command execution sink (subprocess/os)."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pydantic/_internal/_git.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 17,
+         "startColumn": 9,
+         "endColumn": 51
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "880fc4cedcc8fecd:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/command-execution-sinks",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/command-execution-sinks",
+      "index": 0
+     },
+     "message": {
+      "text": "Command execution sink (subprocess/os)."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pydantic/_internal/_git.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 27,
+         "startColumn": 12,
+         "endColumn": 85
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "139e0992398b0661:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251219000058",
+   "codeql_raw_query": "/**\n * @name Dangerous use of pickle for deserialization\n * @description Detects uses of pickle.load/loads which may lead to unsafe deserialization\n * @kind problem\n * @problem.severity error\n * @id py/unsafe-pickle-deserialization\n * @tags security\n *       external/cwe/cwe-502\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere call = API::moduleImport(\"pickle\").getMember([\"load\", \"loads\"]).getACall()\nselect call, \"Potentially unsafe deserialization using pickle.\"",
+   "hypothesis": "Package uses pickle.load/loads which can be unsafe if given untrusted data.",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-502"
+   ],
+   "results_count": 2,
+   "results": [
+    {
+     "ruleId": "py/unsafe-pickle-deserialization",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/unsafe-pickle-deserialization",
+      "index": 0
+     },
+     "message": {
+      "text": "Potentially unsafe deserialization using pickle."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pydantic/v1/parse.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 42,
+         "startColumn": 16,
+         "endColumn": 32
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "7e3762c9a7c515be:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/unsafe-pickle-deserialization",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/unsafe-pickle-deserialization",
+      "index": 0
+     },
+     "message": {
+      "text": "Potentially unsafe deserialization using pickle."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pydantic/deprecated/parse.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 54,
+         "startColumn": 16,
+         "endColumn": 32
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "5f77fce91eaa0bdf:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251219000122",
+   "codeql_raw_query": "/**\n * @name Use of yaml.load or unsafe_load\n * @description Detects potentially unsafe YAML deserialization\n * @kind problem\n * @problem.severity warning\n * @id py/unsafe-yaml-deserialization\n * @tags security\n *       external/cwe/cwe-502\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere call = API::moduleImport(\"yaml\").getMember([\"load\", \"unsafe_load\"]).getACall()\nselect call, \"Potentially unsafe YAML deserialization using yaml.load/unsafe_load.\"",
+   "hypothesis": "Package may use unsafe yaml.load/unsafe_load",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-502"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251219000143",
+   "codeql_raw_query": "/**\n * @name Insecure temporary file usage\n * @description Detects use of tempfile.mktemp which is insecure\n * @kind problem\n * @problem.severity warning\n * @id py/insecure-tempfile-usage\n * @tags security\n *       external/cwe/cwe-377\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere call = API::moduleImport(\"tempfile\").getMember(\"mktemp\").getACall()\nselect call, \"Insecure temporary file creation using tempfile.mktemp.\"",
+   "hypothesis": "Check for insecure tempfile.mktemp usage",
+   "severity": "low",
+   "cwe_ids": [
+    "cwe-377"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251219000208",
+   "codeql_raw_query": "/**\n * @name Use of eval/exec for dynamic code execution\n * @description Detects uses of eval and exec which may lead to code injection\n * @kind problem\n * @problem.severity error\n * @id py/dangerous-eval-exec\n * @tags security\n *       external/cwe/cwe-094\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere call = API::builtin([\"eval\", \"exec\"]).getACall()\nselect call, \"Use of eval/exec for dynamic code execution.\"",
+   "hypothesis": "Pydantic may use eval/exec for dynamic model or schema generation, which could be dangerous if fed untrusted input.",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-094"
+   ],
+   "results_count": 1,
+   "results": [
+    {
+     "ruleId": "py/dangerous-eval-exec",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/dangerous-eval-exec",
+      "index": 0
+     },
+     "message": {
+      "text": "Use of eval/exec for dynamic code execution."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "pydantic/v1/utils.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 195,
+         "startColumn": 9,
+         "endColumn": 28
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "403a1cfced68f18a:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20251219000232",
+   "codeql_raw_query": "/**\n * @name Insecure temporary file usage\n * @description Detects use of tempfile.mktemp which is insecure\n * @kind problem\n * @problem.severity warning\n * @id py/insecure-tempfile-mktemp\n * @tags security\n *       external/cwe/cwe-377\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere call = API::moduleImport(\"tempfile\").getMember(\"mktemp\").getACall()\nselect call, \"Insecure use of tempfile.mktemp (race condition).\"",
+   "hypothesis": "Check if pydantic uses insecure temporary file creation.",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-377"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20251219000259",
+   "codeql_raw_query": "/**\n * @name Insecure temporary file usage\n * @description Detects use of tempfile.mktemp which is insecure due to race conditions\n * @kind problem\n * @problem.severity warning\n * @id py/insecure-tempfile-mktemp\n * @tags security\n *       external/cwe/cwe-377\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere call = API::moduleImport(\"tempfile\").getMember(\"mktemp\").getACall()\nselect call, \"Insecure temporary file creation using tempfile.mktemp().\"",
+   "hypothesis": "Search for insecure use of tempfile.mktemp",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-377"
+   ],
+   "results_count": 0,
+   "results": []
+  }
+ ]
+}

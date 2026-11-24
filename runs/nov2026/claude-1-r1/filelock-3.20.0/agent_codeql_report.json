@@ -1,0 +1,1240 @@
+{
+ "session_id": "20261117130757",
+ "package_name": "filelock-3.20.0",
+ "package_path": "packages/filelock-3.20.0",
+ "database_path": "databases/filelock-3.20.0-db",
+ "model": "claude-sonnet-4-5-20250929",
+ "temperature": 1.0,
+ "max_tokens": 8000,
+ "iterations": 20,
+ "total_input_tokens": 183179,
+ "total_output_tokens": 7440,
+ "total_tokens": 190619,
+ "elapsed_time_seconds": 538.68,
+ "estimated_cost_usd": 0.6611,
+ "summary": "## Security Analysis Summary: filelock-3.20.0\n\n### Overview\nAnalyzed the filelock package (v3.20.0), a platform-independent file locking library with 847 lines of code across 9 files. The package provides synchronous and asynchronous file locking mechanisms for Unix, Windows, and soft lock implementations.\n\n### Key Findings\n\n**12 Security Issues Identified** across multiple severity levels:\n\n#### HIGH Severity Issues\n\n1. **Symlink Handling Vulnerabilities (CWE-59)** - 7 instances\n   - **Locations**: `_soft.py` (lines 27, 42), `_unix.py` (lines 42, 44), `_util.py` (line 46), `_windows.py` (lines 28, 49)\n   - **Impact**: File operations follow symlinks without validation, potentially allowing attackers to redirect lock files to unintended locations (symlink attacks)\n   - **Risk**: An attacker could create symlinks to system files or other sensitive locations, causing the application to lock/modify unintended files\n\n2. **TOCTOU Race Condition (CWE-367)** - 1 instance\n   - **Location**: `_unix.py` (line 42)\n   - **Impact**: Time-of-check-time-of-use vulnerability where file state can change between checking and using\n   - **Risk**: Race condition could allow privilege escalation or unauthorized file access in multi-user environments\n\n3. **Insecure File Permissions (CWE-732)** - 3 instances\n   - **Locations**: `_soft.py` (line 27), `_unix.py` (line 44), `_windows.py` (line 28)\n   - **Impact**: Lock files may be created with overly permissive permissions\n   - **Risk**: In shared environments, other users could read/modify/delete lock files, breaking synchronization guarantees\n\n4. **Unvalidated Lock File Paths (CWE-22)** - 4 instances\n   - **Locations**: `_soft.py` (line 42), `_unix.py` (line 42), `_util.py` (line 46), `_windows.py` (line 49)\n   - **Impact**: Lock file paths may be used without proper validation\n   - **Risk**: If user-controlled input determines lock file paths, could lead to directory traversal or unauthorized file access\n\n#### MEDIUM Severity Issues\n\n5. **Insecure Temporary File Creation (CWE-377)** - 3 instances\n   - **Locations**: `_soft.py` (line 27), `_unix.py` (line 44), `_windows.py` (line 28)\n   - **Impact**: Lock files created in potentially shared directories without secure creation mechanisms\n   - **Risk**: Predictable lock file names in multi-user environments could be exploited\n\n6. **Improper Lock Release (CWE-404)** - 14 instances\n   - **Locations**: Across `_api.py`, `_soft.py`, `_unix.py`, `_windows.py`, and `asyncio.py`\n   - **Impact**: File/lock operations that may fail without proper cleanup\n   - **Risk**: Exceptions during lock operations could leave locks unreleased, causing deadlocks or resource exhaustion\n\n#### LOW Severity Issues\n\n7. **Resource Exhaustion (CWE-400)** - 1 instance\n   - **Location**: `_api.py` (line 344)\n   - **Impact**: Unbounded time.sleep operation in lock acquisition loop\n   - **Risk**: Could be exploited for DoS if lock acquisition waits indefinitely\n\n### Positive Findings\n- No code injection vulnerabilities (CWE-94)\n- No unsafe deserialization (CWE-502)\n- No hardcoded secrets or credentials\n- No uncontrolled format string vulnerabilities\n- No direct path traversal from remote sources\n\n### Recommendations\n1. Implement symlink validation using `os.path.realpath()` or `Path.resolve()` before file operations\n2. Use `O_NOFOLLOW` flag on Unix systems to prevent symlink following\n3. Set explicit restrictive permissions (0o600) when creating lock files\n4. Validate and sanitize lock file paths, especially if derived from user input\n5. Ensure all lock operations use proper try-finally blocks for cleanup\n6. Add timeout limits to prevent unbounded waiting\n7. Consider using secure temporary file creation mechanisms in shared environments\n\n### Package Classification\n- **Type**: Library\n- **Layer**: System/Infrastructure (file locking primitives)",
+ "package_classification": {
+  "type": [
+   "library"
+  ],
+  "layer": [
+   "system",
+   "infrastructure"
+  ]
+ },
+ "tool_calls": {
+  "get_package_profile_info": 1,
+  "execute_codeql_query": 13,
+  "validate_codeql_query": 0,
+  "fixup_codeql_query": 1,
+  "finalize_report": 1
+ },
+ "queries_executed": {
+  "critical": 1,
+  "high": 6,
+  "medium": 5,
+  "low": 0,
+  "total_executed": 14,
+  "total_with_results": 12,
+  "total_failed": 2
+ },
+ "query_findings": {
+  "critical": 0,
+  "high": 11,
+  "medium": 22,
+  "low": 0,
+  "total": 33
+ },
+ "findings": [
+  {
+   "codeql_query_uuid": "20261117130816",
+   "codeql_raw_query": "/**\n * @name Path traversal in file lock operations\n * @description File lock operations using unsanitized user input may allow path traversal attacks\n * @kind path-problem\n * @problem.severity error\n * @id py/filelock-path-traversal\n * @tags security\n *        external/cwe/cwe-22\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.dataflow.new.TaintTracking\nimport semmle.python.dataflow.new.RemoteFlowSources\nimport semmle.python.ApiGraphs\n\nmodule PathTraversalConfig implements DataFlow::ConfigSig {\n  predicate isSource(DataFlow::Node source) {\n    source instanceof RemoteFlowSource\n  }\n\n  predicate isSink(DataFlow::Node sink) {\n    exists(DataFlow::CallCfgNode call |\n      // Constructor calls for FileLock classes\n      call = API::moduleImport(\"filelock\").getMember([\"FileLock\", \"SoftFileLock\", \"UnixFileLock\", \"WindowsFileLock\"]).getACall() and\n      sink = call.getArg(0)\n      or\n      // AsyncFileLock classes\n      call = API::moduleImport(\"filelock\").getMember([\"AsyncFileLock\", \"AsyncSoftFileLock\", \"AsyncUnixFileLock\", \"AsyncWindowsFileLock\"]).getACall() and\n      sink = call.getArg(0)\n    )\n  }\n}\n\nmodule PathTraversalFlow = TaintTracking::Global<PathTraversalConfig>;\nimport PathTraversalFlow::PathGraph\n\nfrom PathTraversalFlow::PathNode source, PathTraversalFlow::PathNode sink\nwhere PathTraversalFlow::flowPath(source, sink)\nselect sink.getNode(), source, sink, \"File lock path may be controlled by untrusted input from $@.\", source.getNode(), \"user input\"\n",
+   "hypothesis": "File lock operations with unsanitized user input could allow path traversal attacks, potentially locking unintended files",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-22"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20261117130905",
+   "codeql_raw_query": "/**\n * @name Unsafe symlink handling in file operations\n * @description File operations that follow symlinks without validation can lead to symlink attacks\n * @kind problem\n * @problem.severity warning\n * @id py/unsafe-symlink-handling\n * @tags security\n *        external/cwe/cwe-059\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  (\n    // Check for os.open without O_NOFOLLOW flag\n    call = API::moduleImport(\"os\").getMember(\"open\").getACall() or\n    // Check for pathlib operations\n    call = API::moduleImport(\"pathlib\").getMember(\"Path\").getACall() or\n    // Check for file operations\n    call = API::builtin(\"open\").getACall()\n  )\nselect call, \"File operation that may follow symlinks without proper validation.\"\n",
+   "hypothesis": "Check for unsafe symlink handling in file operations that could lead to symlink attacks",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-59"
+   ],
+   "results_count": 7,
+   "results": [
+    {
+     "ruleId": "py/unsafe-symlink-handling",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/unsafe-symlink-handling",
+      "index": 0
+     },
+     "message": {
+      "text": "File operation that may follow symlinks without proper validation."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/filelock/_soft.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 27,
+         "startColumn": 28,
+         "endColumn": 78
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "e0cf0771037e84c:1",
+      "primaryLocationStartColumnFingerprint": "15"
+     }
+    },
+    {
+     "ruleId": "py/unsafe-symlink-handling",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/unsafe-symlink-handling",
+      "index": 0
+     },
+     "message": {
+      "text": "File operation that may follow symlinks without proper validation."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/filelock/_soft.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 42,
+         "startColumn": 13,
+         "endColumn": 33
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "4b2f888543c485e4:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/unsafe-symlink-handling",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/unsafe-symlink-handling",
+      "index": 0
+     },
+     "message": {
+      "text": "File operation that may follow symlinks without proper validation."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/filelock/_unix.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 42,
+         "startColumn": 20,
+         "endColumn": 40
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "5848e7413d7cc100:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/unsafe-symlink-handling",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/unsafe-symlink-handling",
+      "index": 0
+     },
+     "message": {
+      "text": "File operation that may follow symlinks without proper validation."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/filelock/_unix.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 44,
+         "startColumn": 18,
+         "endColumn": 73
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "d118c77731a1d2b9:1",
+      "primaryLocationStartColumnFingerprint": "5"
+     }
+    },
+    {
+     "ruleId": "py/unsafe-symlink-handling",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/unsafe-symlink-handling",
+      "index": 0
+     },
+     "message": {
+      "text": "File operation that may follow symlinks without proper validation."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/filelock/_util.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 46,
+         "startColumn": 5,
+         "endColumn": 19
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "e02997fb6a4c5f4b:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/unsafe-symlink-handling",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/unsafe-symlink-handling",
+      "index": 0
+     },
+     "message": {
+      "text": "File operation that may follow symlinks without proper validation."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/filelock/_windows.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 3
+        },
+        "region": {
+         "startLine": 28,
+         "startColumn": 22,
+         "endColumn": 72
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "9a4bb758ad4769f1:1",
+      "primaryLocationStartColumnFingerprint": "5"
+     }
+    },
+    {
+     "ruleId": "py/unsafe-symlink-handling",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/unsafe-symlink-handling",
+      "index": 0
+     },
+     "message": {
+      "text": "File operation that may follow symlinks without proper validation."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/filelock/_windows.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 3
+        },
+        "region": {
+         "startLine": 49,
+         "startColumn": 17,
+         "endColumn": 37
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "c2c1725a197986f7:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20261117130942",
+   "codeql_raw_query": "/**\n * @name Time-of-check-time-of-use (TOCTOU) race condition\n * @description Checking file properties followed by file operations creates race conditions\n * @kind problem\n * @problem.severity warning\n * @id py/toctou-race-condition\n * @tags security\n *       external/cwe/cwe-367\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode check, DataFlow::CallCfgNode use\nwhere\n  // File existence checks\n  (\n    check = API::moduleImport(\"os\").getMember(\"path\").getMember([\"exists\", \"isfile\", \"isdir\"]).getACall() or\n    check = API::moduleImport(\"pathlib\").getMember(\"Path\").getReturn().getMember([\"exists\", \"is_file\", \"is_dir\"]).getACall()\n  ) and\n  // Followed by file operations\n  (\n    use = API::builtin(\"open\").getACall() or\n    use = API::moduleImport(\"os\").getMember([\"open\", \"remove\", \"unlink\", \"rmdir\", \"makedirs\"]).getACall() or\n    use = API::moduleImport(\"pathlib\").getMember(\"Path\").getReturn().getMember([\"open\", \"unlink\", \"rmdir\", \"mkdir\"]).getACall()\n  )\nselect check, \"File check operation that may lead to TOCTOU race condition if followed by file operation.\"\n",
+   "hypothesis": "Time-of-check-time-of-use (TOCTOU) race conditions where file existence or properties are checked before use",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-367"
+   ],
+   "results_count": 1,
+   "results": [
+    {
+     "ruleId": "py/toctou-race-condition",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/toctou-race-condition",
+      "index": 0
+     },
+     "message": {
+      "text": "File check operation that may lead to TOCTOU race condition if followed by file operation."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/filelock/_unix.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 42,
+         "startColumn": 20,
+         "endColumn": 49
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "5848e7413d7cc100:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20261117131017",
+   "codeql_raw_query": "/**\n * @name Insecure file permissions\n * @description File operations with overly permissive permissions may allow unauthorized access\n * @kind problem\n * @problem.severity warning\n * @id py/insecure-file-permissions\n * @tags security\n *        external/cwe/cwe-732\n *        external/cwe/cwe-276\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  (\n    call = API::moduleImport(\"os\").getMember(\"open\").getACall() or\n    call = API::moduleImport(\"os\").getMember(\"chmod\").getACall() or\n    call = API::moduleImport(\"os\").getMember(\"mkdir\").getACall() or\n    call = API::moduleImport(\"os\").getMember(\"makedirs\").getACall() or\n    call = API::builtin(\"open\").getACall()\n  ) and\n  exists(call.getArg(1)) // has mode/flags argument\nselect call, \"File operation that may use insecure permissions.\"\n",
+   "hypothesis": "File operations with overly permissive or insecure permissions that could allow unauthorized access",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-732",
+    "cwe-276"
+   ],
+   "results_count": 3,
+   "results": [
+    {
+     "ruleId": "py/insecure-file-permissions",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/insecure-file-permissions",
+      "index": 0
+     },
+     "message": {
+      "text": "File operation that may use insecure permissions."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/filelock/_soft.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 27,
+         "startColumn": 28,
+         "endColumn": 78
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "e0cf0771037e84c:1",
+      "primaryLocationStartColumnFingerprint": "15"
+     }
+    },
+    {
+     "ruleId": "py/insecure-file-permissions",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/insecure-file-permissions",
+      "index": 0
+     },
+     "message": {
+      "text": "File operation that may use insecure permissions."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/filelock/_unix.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 44,
+         "startColumn": 18,
+         "endColumn": 73
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "d118c77731a1d2b9:1",
+      "primaryLocationStartColumnFingerprint": "5"
+     }
+    },
+    {
+     "ruleId": "py/insecure-file-permissions",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/insecure-file-permissions",
+      "index": 0
+     },
+     "message": {
+      "text": "File operation that may use insecure permissions."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/filelock/_windows.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 28,
+         "startColumn": 22,
+         "endColumn": 72
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "9a4bb758ad4769f1:1",
+      "primaryLocationStartColumnFingerprint": "5"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20261117131055",
+   "codeql_raw_query": "/**\n * @name Insecure temporary file creation\n * @description Creating temporary files in predictable locations or with insecure permissions\n * @kind problem\n * @problem.severity warning\n * @id py/insecure-temp-file\n * @tags security\n *        external/cwe/cwe-377\n *        external/cwe/cwe-379\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  (\n    // Check for os.open with O_CREAT without O_EXCL\n    call = API::moduleImport(\"os\").getMember(\"open\").getACall() or\n    // Check for open() with mode 'w' or 'w+' without additional security\n    call = API::builtin(\"open\").getACall() or\n    // Check for pathlib operations\n    call = API::moduleImport(\"pathlib\").getMember(\"Path\").getReturn().getMember([\"touch\", \"write_text\", \"write_bytes\"]).getACall()\n  )\nselect call, \"File creation operation that may have security implications in multi-user environments.\"\n",
+   "hypothesis": "Check for insecure temporary file creation that could lead to race conditions or information disclosure",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-377",
+    "cwe-379"
+   ],
+   "results_count": 3,
+   "results": [
+    {
+     "ruleId": "py/insecure-temp-file",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/insecure-temp-file",
+      "index": 0
+     },
+     "message": {
+      "text": "File creation operation that may have security implications in multi-user environments."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/filelock/_soft.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 27,
+         "startColumn": 28,
+         "endColumn": 78
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "e0cf0771037e84c:1",
+      "primaryLocationStartColumnFingerprint": "15"
+     }
+    },
+    {
+     "ruleId": "py/insecure-temp-file",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/insecure-temp-file",
+      "index": 0
+     },
+     "message": {
+      "text": "File creation operation that may have security implications in multi-user environments."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/filelock/_unix.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 44,
+         "startColumn": 18,
+         "endColumn": 73
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "d118c77731a1d2b9:1",
+      "primaryLocationStartColumnFingerprint": "5"
+     }
+    },
+    {
+     "ruleId": "py/insecure-temp-file",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/insecure-temp-file",
+      "index": 0
+     },
+     "message": {
+      "text": "File creation operation that may have security implications in multi-user environments."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/filelock/_windows.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 28,
+         "startColumn": 22,
+         "endColumn": 72
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "9a4bb758ad4769f1:1",
+      "primaryLocationStartColumnFingerprint": "5"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20261117131129",
+   "codeql_raw_query": "/**\n * @name Improper exception handling in lock release\n * @description Lock release operations that may fail without proper exception handling\n * @kind problem\n * @problem.severity warning\n * @id py/improper-lock-release\n * @tags security\n *        reliability\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  (\n    call = API::moduleImport(\"os\").getMember([\"close\", \"unlink\", \"remove\"]).getACall() or\n    call = API::moduleImport(\"pathlib\").getMember(\"Path\").getMember([\"unlink\", \"rmdir\"]).getACall() or\n    call.asCfgNode().getNode().(Call).getFunc().(Attribute).getName() in [\"close\", \"unlink\", \"release\"]\n  )\nselect call, \"File or lock operation that may fail and prevent proper cleanup.\"\n",
+   "hypothesis": "Lock release operations may fail without proper exception handling, potentially leaving locks in inconsistent state",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-755"
+   ],
+   "results_count": 14,
+   "results": [
+    {
+     "ruleId": "py/improper-lock-release",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/improper-lock-release",
+      "index": 0
+     },
+     "message": {
+      "text": "File or lock operation that may fail and prevent proper cleanup."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/filelock/_api.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 48,
+         "startColumn": 9,
+         "endColumn": 28
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "43349bc69130e4b1:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/improper-lock-release",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/improper-lock-release",
+      "index": 0
+     },
+     "message": {
+      "text": "File or lock operation that may fail and prevent proper cleanup."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/filelock/_api.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 393,
+         "startColumn": 9,
+         "endColumn": 23
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "a4f5a2c480445f7c:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/improper-lock-release",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/improper-lock-release",
+      "index": 0
+     },
+     "message": {
+      "text": "File or lock operation that may fail and prevent proper cleanup."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/filelock/_api.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 397,
+         "startColumn": 9,
+         "endColumn": 33
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "4f405b585a7f67b1:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/improper-lock-release",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/improper-lock-release",
+      "index": 0
+     },
+     "message": {
+      "text": "File or lock operation that may fail and prevent proper cleanup."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/filelock/_soft.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 39,
+         "startColumn": 9,
+         "endColumn": 45
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "19b2effad70306f9:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/improper-lock-release",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/improper-lock-release",
+      "index": 0
+     },
+     "message": {
+      "text": "File or lock operation that may fail and prevent proper cleanup."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/filelock/_soft.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 42,
+         "startColumn": 13,
+         "endColumn": 42
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "4b2f888543c485e4:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/improper-lock-release",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/improper-lock-release",
+      "index": 0
+     },
+     "message": {
+      "text": "File or lock operation that may fail and prevent proper cleanup."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/filelock/_unix.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 50,
+         "startColumn": 17,
+         "endColumn": 29
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "9ad32ce9a804a1eb:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/improper-lock-release",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/improper-lock-release",
+      "index": 0
+     },
+     "message": {
+      "text": "File or lock operation that may fail and prevent proper cleanup."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/filelock/_unix.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 64,
+         "startColumn": 13,
+         "endColumn": 25
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "f5a148b60f81df8b:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/improper-lock-release",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/improper-lock-release",
+      "index": 0
+     },
+     "message": {
+      "text": "File or lock operation that may fail and prevent proper cleanup."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/filelock/_windows.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 3
+        },
+        "region": {
+         "startLine": 36,
+         "startColumn": 21,
+         "endColumn": 33
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "611b48403a9a5a12:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/improper-lock-release",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/improper-lock-release",
+      "index": 0
+     },
+     "message": {
+      "text": "File or lock operation that may fail and prevent proper cleanup."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/filelock/_windows.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 3
+        },
+        "region": {
+         "startLine": 46,
+         "startColumn": 13,
+         "endColumn": 25
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "16ec5f4d3ed89958:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/improper-lock-release",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/improper-lock-release",
+      "index": 0
+     },
+     "message": {
+      "text": "File or lock operation that may fail and prevent proper cleanup."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/filelock/_windows.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 3
+        },
+        "region": {
+         "startLine": 49,
+         "startColumn": 17,
+         "endColumn": 46
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "c2c1725a197986f7:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/improper-lock-release",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/improper-lock-release",
+      "index": 0
+     },
+     "message": {
+      "text": "File or lock operation that may fail and prevent proper cleanup."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/filelock/asyncio.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 4
+        },
+        "region": {
+         "startLine": 69,
+         "startColumn": 15,
+         "endColumn": 34
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "b91f20273e059683:1",
+      "primaryLocationStartColumnFingerprint": "6"
+     }
+    },
+    {
+     "ruleId": "py/improper-lock-release",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/improper-lock-release",
+      "index": 0
+     },
+     "message": {
+      "text": "File or lock operation that may fail and prevent proper cleanup."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/filelock/asyncio.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 4
+        },
+        "region": {
+         "startLine": 314,
+         "startColumn": 15,
+         "endColumn": 29
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "ccc6fc9b13752e07:1",
+      "primaryLocationStartColumnFingerprint": "6"
+     }
+    },
+    {
+     "ruleId": "py/improper-lock-release",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/improper-lock-release",
+      "index": 0
+     },
+     "message": {
+      "text": "File or lock operation that may fail and prevent proper cleanup."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/filelock/asyncio.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 4
+        },
+        "region": {
+         "startLine": 321,
+         "startColumn": 41,
+         "endColumn": 65
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "1b5125848fe7107b:1",
+      "primaryLocationStartColumnFingerprint": "24"
+     }
+    },
+    {
+     "ruleId": "py/improper-lock-release",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/improper-lock-release",
+      "index": 0
+     },
+     "message": {
+      "text": "File or lock operation that may fail and prevent proper cleanup."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/filelock/asyncio.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 4
+        },
+        "region": {
+         "startLine": 323,
+         "startColumn": 34,
+         "endColumn": 58
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "2665545b7e0c193a:1",
+      "primaryLocationStartColumnFingerprint": "17"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20261117131207",
+   "codeql_raw_query": "/**\n * @name Code injection via eval/exec\n * @description Using eval or exec with any input can lead to arbitrary code execution\n * @kind problem\n * @problem.severity error\n * @id py/code-injection\n * @tags security\n *        external/cwe/cwe-094\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  (\n    call = API::builtin(\"eval\").getACall() or\n    call = API::builtin(\"exec\").getACall() or\n    call = API::builtin(\"compile\").getACall() or\n    call = API::builtin(\"__import__\").getACall()\n  )\nselect call, \"Potentially unsafe code execution function that could execute arbitrary code.\"\n",
+   "hypothesis": "Check for use of dangerous code execution functions like eval, exec, compile, or __import__",
+   "severity": "critical",
+   "cwe_ids": [
+    "cwe-094"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20261117131254",
+   "codeql_raw_query": "/**\n * @name Unsafe deserialization\n * @description Deserializing untrusted data can lead to arbitrary code execution\n * @kind problem\n * @problem.severity error\n * @id py/unsafe-deserialization\n * @tags security\n *        external/cwe/cwe-502\n */\n\nimport python\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  (\n    call = API::moduleImport(\"pickle\").getMember([\"load\", \"loads\", \"Unpickler\"]).getACall() or\n    call = API::moduleImport(\"yaml\").getMember([\"load\", \"unsafe_load\"]).getACall() or\n    call = API::moduleImport(\"marshal\").getMember([\"load\", \"loads\"]).getACall() or\n    call = API::moduleImport(\"shelve\").getMember(\"open\").getACall()\n  )\nselect call, \"Potentially unsafe deserialization operation that could execute arbitrary code.\"",
+   "hypothesis": "Check for unsafe deserialization that could lead to arbitrary code execution",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-502"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20261117131424",
+   "codeql_raw_query": "/**\n * @name Potential Denial of Service through resource exhaustion\n * @description Unbounded loops or operations that could lead to resource exhaustion\n * @kind problem\n * @problem.severity warning\n * @id py/dos-resource-exhaustion\n * @tags security\n *        external/cwe/cwe-400\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  (\n    // Unbounded sleep or time operations\n    call = API::moduleImport(\"time\").getMember(\"sleep\").getACall() or\n    // Unbounded file operations\n    call = API::builtin(\"open\").getACall()\n  )\nselect call, \"Operation that could potentially lead to resource exhaustion or DoS.\"",
+   "hypothesis": "Check for unbounded operations that could lead to denial of service through resource exhaustion",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-400"
+   ],
+   "results_count": 1,
+   "results": [
+    {
+     "ruleId": "py/dos-resource-exhaustion",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/dos-resource-exhaustion",
+      "index": 0
+     },
+     "message": {
+      "text": "Operation that could potentially lead to resource exhaustion or DoS."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/filelock/_api.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 344,
+         "startColumn": 17,
+         "endColumn": 42
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "587c65244ef77aef:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    }
+   ]
+  },
+  {
+   "codeql_query_uuid": "20261117131459",
+   "codeql_raw_query": "/**\n * @name Hardcoded secrets or sensitive information\n * @description Hardcoded passwords, tokens, or other sensitive data in source code\n * @kind problem\n * @problem.severity error\n * @id py/hardcoded-credentials\n * @tags security\n *        external/cwe/cwe-798\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\n\nfrom StrConst str\nwhere\n  (\n    str.getText().regexpMatch(\"(?i).*(password|passwd|pwd|secret|token|api[_-]?key|private[_-]?key).*\") and\n    str.getText().length() > 8\n  )\nselect str, \"Potential hardcoded sensitive information: \" + str.getText()",
+   "hypothesis": "Looking for hardcoded credentials, API keys, passwords, or other sensitive information in string constants",
+   "severity": "high",
+   "cwe_ids": [
+    "cwe-798"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20261117131530",
+   "codeql_raw_query": "/**\n * @name Uncontrolled format string\n * @description Using user-controlled format strings can lead to information disclosure or code execution\n * @kind problem\n * @problem.severity warning\n * @id py/uncontrolled-format-string\n * @tags security\n *        external/cwe/cwe-134\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\n\nfrom DataFlow::CallCfgNode call, DataFlow::Node formatArg\nwhere\n  (\n    call.getFunction().asExpr().(Attribute).getName() = \"format\" or\n    call.getFunction().asExpr().(Name).getId() = \"format\"\n  ) and\n  formatArg = call.getArg(0)\nselect call, \"Potential format string vulnerability if user input reaches this call.\"",
+   "hypothesis": "Check for uncontrolled format strings that could lead to information disclosure",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-134"
+   ],
+   "results_count": 0,
+   "results": []
+  },
+  {
+   "codeql_query_uuid": "20261117131607",
+   "codeql_raw_query": "/**\n * @name Unvalidated path in lock file operations\n * @description Lock file operations with user-controlled paths without validation\n * @kind problem\n * @problem.severity warning\n * @id py/unvalidated-lock-path\n * @tags security\n *        external/cwe/cwe-22\n */\n\nimport python\nimport semmle.python.dataflow.new.DataFlow\nimport semmle.python.ApiGraphs\n\nfrom DataFlow::CallCfgNode call\nwhere\n  (\n    call = API::moduleImport(\"pathlib\").getMember(\"Path\").getACall() or\n    call = API::moduleImport(\"os\").getMember(\"path\").getMember([\"join\", \"abspath\", \"normpath\"]).getACall()\n  )\nselect call, \"Path operation that may be used with unvalidated user input in lock file creation.\"",
+   "hypothesis": "Lock file paths constructed from potentially untrusted input without validation",
+   "severity": "medium",
+   "cwe_ids": [
+    "cwe-22"
+   ],
+   "results_count": 4,
+   "results": [
+    {
+     "ruleId": "py/unvalidated-lock-path",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/unvalidated-lock-path",
+      "index": 0
+     },
+     "message": {
+      "text": "Path operation that may be used with unvalidated user input in lock file creation."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/filelock/_soft.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 0
+        },
+        "region": {
+         "startLine": 42,
+         "startColumn": 13,
+         "endColumn": 33
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "4b2f888543c485e4:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/unvalidated-lock-path",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/unvalidated-lock-path",
+      "index": 0
+     },
+     "message": {
+      "text": "Path operation that may be used with unvalidated user input in lock file creation."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/filelock/_unix.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 1
+        },
+        "region": {
+         "startLine": 42,
+         "startColumn": 20,
+         "endColumn": 40
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "5848e7413d7cc100:1",
+      "primaryLocationStartColumnFingerprint": "7"
+     }
+    },
+    {
+     "ruleId": "py/unvalidated-lock-path",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/unvalidated-lock-path",
+      "index": 0
+     },
+     "message": {
+      "text": "Path operation that may be used with unvalidated user input in lock file creation."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/filelock/_util.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 2
+        },
+        "region": {
+         "startLine": 46,
+         "startColumn": 5,
+         "endColumn": 19
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "e02997fb6a4c5f4b:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    },
+    {
+     "ruleId": "py/unvalidated-lock-path",
+     "ruleIndex": 0,
+     "rule": {
+      "id": "py/unvalidated-lock-path",
+      "index": 0
+     },
+     "message": {
+      "text": "Path operation that may be used with unvalidated user input in lock file creation."
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "src/filelock/_windows.py",
+         "uriBaseId": "%SRCROOT%",
+         "index": 3
+        },
+        "region": {
+         "startLine": 49,
+         "startColumn": 17,
+         "endColumn": 37
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "c2c1725a197986f7:1",
+      "primaryLocationStartColumnFingerprint": "0"
+     }
+    }
+   ]
+  }
+ ],
+ "cache_usage": {
+  "prompt_tokens_total": 183179,
+  "uncached_input_tokens": 83,
+  "cache_creation_input_tokens": 15055,
+  "cache_read_input_tokens": 168041,
+  "output_tokens": 7440,
+  "calls": 21,
+  "caching_enabled": true,
+  "cost_usd_with_cache": 0.218718,
+  "cost_usd_no_cache": 0.661137,
+  "cache_read_share_of_prompt": 0.9174,
+  "prices_per_mtok": {
+   "claude-sonnet-4-5-20250929": {
+    "input": 3.0,
+    "output": 15.0
+   },
+   "claude-haiku-4-5-20251001": {
+    "input": 1.0,
+    "output": 5.0
+   }
+  },
+  "cache_multipliers": {
+   "write_5m": 1.25,
+   "read": 0.1
+  }
+ }
+}
